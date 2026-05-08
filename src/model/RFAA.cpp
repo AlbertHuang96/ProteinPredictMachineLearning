@@ -1,4 +1,5 @@
 #include "rfaa/Model.h"
+#include "rfaa/Embedding.h"
 #include <iostream>
 
 namespace rfaa {
@@ -33,22 +34,56 @@ IterBlock::IterBlock(const RFAAConfig& config, bool update_msa_pair)
     struct_update_ = std::make_unique<StructureUpdate>();
 }
 
+void IterBlock::ProjStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state) {
+    // state -> msa[:,0]
+    // msa[:, 0] += proj(state)  (B,L,32) -> (B,L,256)
+
+    // TODO: CUDA optimize
+
+    // projected state (B, L, 256)
+    // query_row += state_proj
+    // msa (B, N, L, D) -> N = 0 the target seq to predict
+    // query_row (B, L, D)
+    int B = msa.shape().dims[0];
+    int L = msa.shape().dims[2];
+    int D = msa.shape().dims[3];
+    
+    for (int b = 0; b < B; b++) {
+        for (int l = 0; l < L; l++) {
+            for (int d = 0; d < D; d++) {
+                // 计算索引
+                size_t idx = b * L * D + l * D + d;
+                
+                // 修改值
+                msa.data()[idx] += proj_state.data()[b * L * D_MSA + l * D_MSA + d];
+            }
+        }
+    }
+    
+}
+
 void IterBlock::forward(TensorF32& msa, TensorF32& pair, 
                         TensorF32& state, const TensorF32& coords) {
     
     if (update_msa_pair_) {
         // ===== Step 1: msa2msa =====
+
+        // state -> msa[:,0]
+        // msa[:, 0] += proj(state)  (B,L,32) -> (B,L,256)
+        // CUDA optimize
+        {
+            //auto query_row = msa.select(1, 0);  // (B, L, 256)
+            // query_row += Linear(state) ...
+
+            LinearLayer linear(D_STATE, D_MSA);
+            const auto proj_state = linear.forward(state);
+            ProjStateAddToQueryRow(msa, proj_state);
+        }
+
         // pair -> attention bias
         //TensorF32 pair_bias = pair;  // to_b(pair) -> (B, L, L, n_head)
         TensorF32 pair_bias;
         pair_bias.copy_from(pair);  // 简化，实际需要线性变换
-
-        // state -> msa[:,0]
-        // msa[:, 0] += proj(state)  (B,L,32) -> (B,L,256)
-        {
-            auto query_row = msa.select(1, 0);  // (B, L, 256)
-            // query_row += Linear(state) ...
-        }
         
         // MSA Row Attention with bias
         msa = msa_row_attn_->forward(msa, pair_bias);

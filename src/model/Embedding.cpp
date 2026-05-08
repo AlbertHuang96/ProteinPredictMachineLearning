@@ -47,6 +47,7 @@ public:
                     // [(b * L + l) * D] indexing into a D-dim vector
                     // problem: output = wte + wpe
                     // wpe = position embedding, wte = token embedding
+                    // implement the position emb outside of this function
                     std::memcpy(
                         output.data() + (b * L + l) * embedding_dim_,
                         weights_.data() + idx * embedding_dim_,

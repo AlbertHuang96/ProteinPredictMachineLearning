@@ -65,6 +65,8 @@ public:
     // 输入/输出通过引用修改
     void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
                  const TensorF32& coords);
+
+    void IterBlock::ProjStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state);
     
 private:
     RFAAConfig config_;

@@ -201,6 +201,7 @@ Tensor<T> Tensor<T>::select(int dim, int64_t index) const {
     for (int i = dim + 1; i < shape_.ndim(); ++i) {
         stride *= shape_.dims[i];
     }
+    // ?
     int64_t offset = index * stride;
     
     return Tensor<T>(new_shape, data_ + offset, device_, false);
