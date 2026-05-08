@@ -1,5 +1,7 @@
 #include "rfaa/Track.h"
 
+#include "rfaa/Embedding.h"
+
 namespace rfaa {
 
 StateTrack::StateTrack(int seq_len, int dim, Device device)
@@ -10,6 +12,12 @@ StateTrack::StateTrack(int seq_len, int dim, Device device)
 
 void StateTrack::init_from_embedding(const TensorF32& seq_tokens) {
     // seq_tokens: (B, L) -> Embedding -> (B, L, D_STATE)
+    //int D_STATE = 32;             // State 隐层维度
+    // 80 -> 32
+    // 80 was the all-atom token types
+
+    EmbeddingLayer embedding(NAATOKENS, D_STATE);
+    repr_ = embedding.forward(seq_tokens);
 }
 
 void StateTrack::inject_template(const TensorF32& t1d) {

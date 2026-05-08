@@ -7,6 +7,8 @@ namespace rfaa {
 
 class EmbeddingLayer {
 public:
+// num_embeddings: 词汇表大小 (NAATOKENS)
+// embedding_dim: 嵌入向量维度 (D_STATE)
     EmbeddingLayer(int num_embeddings, int embedding_dim)
         : num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
         // Xavier 初始化
@@ -21,12 +23,18 @@ public:
         }
     }
     
+    // forward
+    // backward
     TensorF32 forward(const TensorF32& indices) {
         // indices: (B, L) 整数索引
         // output: (B, L, D)
         int B = indices.shape().dims[0];
         int L = indices.shape().dims[1];
         
+        // B for batch
+        // L for sequence length
+        // D = embedding_dim_ 嵌入向量的维度
+        // 区分 nunm_embeddings_ = vocab size 词汇表大小
         TensorF32 output({B, L, embedding_dim_}, indices.device());
         
         // CPU 实现
@@ -34,7 +42,11 @@ public:
             for (int b = 0; b < B; ++b) {
                 for (int l = 0; l < L; ++l) {
                     int idx = static_cast<int>(indices.data()[b * L + l]);
+                    // idx range [0, V - 1]
                     idx = std::max(0, std::min(idx, num_embeddings_ - 1));
+                    // [(b * L + l) * D] indexing into a D-dim vector
+                    // problem: output = wte + wpe
+                    // wpe = position embedding, wte = token embedding
                     std::memcpy(
                         output.data() + (b * L + l) * embedding_dim_,
                         weights_.data() + idx * embedding_dim_,
@@ -85,9 +97,11 @@ public:
         for (int b = 0; b < batch; ++b) {
             for (int o = 0; o < out_features_; ++o) {
                 float sum = has_bias_ ? bias_.data()[o] : 0.0f;
+                // dim of weights: (out_features, in_features)
                 for (int i = 0; i < in_features_; ++i) {
                     sum += x.data()[b * in_features_ + i] * weight_.data()[o * in_features_ + i];
                 }
+                // dim of output: (batch, out_features)
                 output.data()[b * out_features_ + o] = sum;
             }
         }
