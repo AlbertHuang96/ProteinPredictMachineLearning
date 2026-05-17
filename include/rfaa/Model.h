@@ -66,7 +66,9 @@ public:
     void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
                  const TensorF32& coords);
 
-    void IterBlock::ProjStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state);
+    void projStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state);
+
+    TensorF32 computeRBFFeature(const TensorF32& coords);
     
 private:
     RFAAConfig config_;

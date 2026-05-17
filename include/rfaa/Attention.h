@@ -43,10 +43,19 @@ class MSARowAttention {
 public:
     explicit MSARowAttention(const AttnConfig& config);
     
-    // msa: (B, N, L, D), pair_bias: (B, L, L, n_head)
-    TensorF32 forward(const TensorF32& msa, const TensorF32& pair_bias);
+    // msa: (B, N, L, D), pair: (B, L, L, n_head)
+    TensorF32 forward(const TensorF32& msa, const TensorF32& pair);
     
 private:
+    LinearLayer to_b(D_PAIR, N_HEAD);  // 将 pair 转换为 attention bias
+    LinearLayer to_g(D_MSA, N_HEAD * D_MSA);
+    LinearLayer to_out(N_HEAD * D_MSA, D_MSA);
+    
+    LinearLayer Wq(D_MSA, N_HEAD * D_MSA); 
+    // n_head 个 head，每个 head D_MSA/n_head 维
+    LinearLayer Wk(D_MSA, N_HEAD * D_MSA);
+    LinearLayer Wv(D_MSA, N_HEAD * D_MSA);
+
     AttnConfig config_;
     //struct Impl;
     //std::unique_ptr<Impl> impl_;

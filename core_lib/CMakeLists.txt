@@ -14,6 +14,10 @@ set(CORE_SOURCES
     ../src/modules/Attention.cpp
     ../src/modules/TriangleMul.cpp
     ../src/modules/SE3Transformer.cpp
+    ../src/ops/Softmax.cpp
+    ../src/ops/Activation.cpp
+    ../src/ops/LayerNorm.cpp
+    ../src/ops/MathUtils.cpp
 )
 
 # 静态库 (内部使用)

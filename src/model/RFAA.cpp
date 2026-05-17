@@ -34,7 +34,7 @@ IterBlock::IterBlock(const RFAAConfig& config, bool update_msa_pair)
     struct_update_ = std::make_unique<StructureUpdate>();
 }
 
-void IterBlock::ProjStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state) {
+void IterBlock::projStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state) {
     // state -> msa[:,0]
     // msa[:, 0] += proj(state)  (B,L,32) -> (B,L,256)
 
@@ -62,10 +62,111 @@ void IterBlock::ProjStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_sta
     
 }
 
+TensorF32 IterBlock::computeRBFFeature(const TensorF32& coords)
+{
+    // Python equivalent:
+    // cas = xyz[:, :, 1].contiguous()
+    // rbf_feat = rbf(torch.cdist(cas, cas))
+    
+    // coords: (B, L, A, 3) where A=3 (N, CA, C)
+    // Return: (B, L, L, 64) - RBF feature
+    
+    int B = coords.shape().dims[0];
+    int L = coords.shape().dims[1];
+    int A = coords.shape().dims[2];  // num atoms
+    int D = coords.shape().dims[3];  // 3 for x,y,z
+    
+    // Step1: cas = coords[:, :, 1] -> (B, L, 3)
+    // Select CA atom (index 1 on atom dimension)
+    //TensorF32 cas = coords.select(2, 1);  // shape: (B, L, 3)
+    
+    TensorF32 cas({B, L, 3}, coords.device());
+    const float* src = coords.data();
+    float* dst = cas.data();
+
+    // Each CA entry is 3 floats (x,y,z), but spaced A*3 = 9 floats apart
+    const int64_t src_stride = A * D;  // 9 floats between consecutive residues
+    const int64_t dst_stride = D;      // 3 floats between consecutive residues
+
+    for (int b = 0; b < B; b++) {
+        for (int l = 0; l < L; l++) {
+            // Source: at (b, l, 1, 0) - CA atom, x coordinate
+            const float* src_ptr = src + b * L * A * D + l * A * D + 1 * D;
+            // Destination: at (b, l, 0)
+            float* dst_ptr = dst + b * L * D + l * D;
+        
+            // Copy 3 floats (x, y, z) for this residue
+            std::memcpy(dst_ptr, src_ptr, 3 * sizeof(float));
+        }
+    }
+
+    
+    // Ensure contiguous (select returns a view, may not be contiguous)
+    // Create a contiguous copy
+    TensorF32 cas_contig = cas;  // If already contiguous, this is just a reference
+    // Force contiguous by creating new tensor and copying
+    TensorF32 cas_copy({B, L, D}, coords.device());
+    cas_copy.copy_from(cas);
+    
+    // Step2: Compute pairwise distances - torch.cdist(cas, cas)
+    // Input: (B, L, 3), Output: (B, L, L)
+    TensorF32 dists({B, L, L}, coords.device());
+    
+    const float* cas_data = cas_copy.data();
+    float* dists_data = dists.data();
+    
+    // For each batch
+    #pragma omp parallel for
+    for (int b = 0; b < B; b++) {
+        for (int i = 0; i < L; i++) {
+            for (int j = 0; j < L; j++) {
+                // Compute Euclidean distance between cas[b,i,:] and cas[b,j,:]
+                float dx = cas_data[b * L * D + i * D + 0] - cas_data[b * L * D + j * D + 0];
+                float dy = cas_data[b * L * D + i * D + 1] - cas_data[b * L * D + j * D + 1];
+                float dz = cas_data[b * L * D + i * D + 2] - cas_data[b * L * D + j * D + 2];
+                float dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+                dists_data[b * L * L + i * L + j] = dist;
+            }
+        }
+    }
+    
+    // Step3: RBF expansion
+    // rbf(x) = exp(-(x - center_i)^2 / (2*width^2)) for i in num_rbf
+    // Standard: 64 RBF centers from 0 to 20 Angstroms
+    const int num_rbf = 64;
+    const float rbf_min = 0.0f;
+    const float rbf_max = 20.0f;
+    
+    TensorF32 rbf_feature({B, L, L, num_rbf}, coords.device());
+    float* rbf_data = rbf_feature.data();
+    
+    float rbf_step = (rbf_max - rbf_min) / (num_rbf - 1);
+    
+    #pragma omp parallel for
+    for (int b = 0; b < B; b++) {
+        for (int i = 0; i < L; i++) {
+            for (int j = 0; j < L; j++) {
+                float dist = dists_data[b * L * L + i * L + j];
+                for (int k = 0; k < num_rbf; k++) {
+                    float center = rbf_min + k * rbf_step;
+                    float diff = dist - center;
+                    // Gaussian RBF with width = step
+                    rbf_data[b * L * L * num_rbf + i * L * num_rbf + j * num_rbf + k] = 
+                        std::exp(-diff * diff / (2.0f * rbf_step * rbf_step));
+                }
+            }
+        }
+    }
+    
+    return rbf_feature;
+}
+
 void IterBlock::forward(TensorF32& msa, TensorF32& pair, 
                         TensorF32& state, const TensorF32& coords) {
     
     if (update_msa_pair_) {
+
+        // ------------ 1D track update ------------
         // ===== Step 1: msa2msa =====
 
         // state -> msa[:,0]
@@ -75,39 +176,64 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             //auto query_row = msa.select(1, 0);  // (B, L, 256)
             // query_row += Linear(state) ...
 
+            // the supplemental said that a layernorm and then a linear?
+            // layernorm first
+            
             LinearLayer linear(D_STATE, D_MSA);
             const auto proj_state = linear.forward(state);
-            ProjStateAddToQueryRow(msa, proj_state);
+            projStateAddToQueryRow(msa, proj_state);
         }
 
         // pair -> attention bias
-        //TensorF32 pair_bias = pair;  // to_b(pair) -> (B, L, L, n_head)
-        TensorF32 pair_bias;
-        pair_bias.copy_from(pair);  // 简化，实际需要线性变换
         
+        TensorF32 pair_biased;
+       
+        //// (B, L, 3, 3) - 初始 Ca 坐标 (可选)
+        // compute the RBF feature to inject into pair bias
+        TensorF32 rbf_feature = computeRBFFeature(coords);
+        LayerNorm pair_layernorm(D_PAIR);
+        pair_biased = pair_layernorm.forward(pair);
+
+        pair_biased = pair_biased + rbf_feature; 
+
+        // TODO
+        // update msa query row with state from SE3 output
+
         // MSA Row Attention with bias
-        msa = msa_row_attn_->forward(msa, pair_bias);
+        msa = msa_row_attn_->forward(msa, pair_biased);
+        // RF2 code dropout(row_attn_out, 0.15);
         
         // MSA Column Attention
         msa = msa_col_attn_->forward(msa);
         
         // FeedForward
         msa = msa_ff_->forward(msa);
+        // ------------ 1D track update ------------
         
+        // to update pair : 2D track update
+
+        // msa2pair: how the pair is updated from the msa?
         // ===== Step 2: msa2pair =====
         // Outer Product Mean
         // msa (B,N,L,256) -> Linear -> (B,N,L,16)
         // outer product + mean -> (B,L,L,256) -> Linear -> (B,L,L,128)
         {
             //auto msa_proj = msa;  // Linear to 16
-            TensorF32 msa_proj;
-            msa_proj.copy_from(msa);  // 简化
+            /* TensorF32 msa_proj;
+            LinearLayer linear(D_MSA, 16);
+            // why is 16?
+            auto msa_proj = linear.forward(msa);
+            //msa_proj.copy_from(msa);  // 简化
             // einsum('bsli,bsmj->blmij') -> mean over N
             // Linear(256->128)
             //pair = msa;  // 简化，实际需要 outer product mean
-            pair.copy_from(msa);  // 简化
+            pair.copy_from(msa);  // 简化 */
         }
         
+        // Triangle Multiplication
+        //pair = tri_mul_out_->forward(pair);
+        //pair = tri_mul_in_->forward(pair);
+
         // ===== Step 3: pair2pair =====
         // state outer product -> gate
         {
@@ -121,12 +247,10 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             // pair += gate * rbf_feat
         }
         
-        // Triangle Multiplication
-        pair = tri_mul_out_->forward(pair);
-        pair = tri_mul_in_->forward(pair);
-        
+        // to update pair
         // Biased Axial Attention (row/col)
         // FeedForward
+
     }
     
     // ===== Step 4: str2str (SE3 Transformer) =====
@@ -183,6 +307,13 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // Embedding
     msa_track_->init_from_features(input.msa_latent);
     state_track_->init_from_embedding(input.seq_tokens);
+
+    // pair track need to be initialized as well
+    // pair track 从 seq_tokens 初始化 (left, right)
+    pair_track_->init_from_embedding(input.seq_tokens, input.seq_tokens);
+
+    // msa full embed?
+    // bond embed for pair track
     
     // Template injection
     if (input.t1d.numel() > 0) {
@@ -203,6 +334,9 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     TensorF32 coords;
     coords.copy_from(input.coords);
     
+    // need to modify :
+    // the block in the 4 full block was different from the main block
+
     // Extra blocks
     for (auto& block : extra_blocks_) {
         block->forward(msa, pair, state, coords);
