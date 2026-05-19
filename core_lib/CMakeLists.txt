@@ -18,6 +18,7 @@ set(CORE_SOURCES
     ../src/ops/Activation.cpp
     ../src/ops/LayerNorm.cpp
     ../src/ops/MathUtils.cpp
+    ../src/model/PositionalEncoding.cpp
 )
 
 # 静态库 (内部使用)

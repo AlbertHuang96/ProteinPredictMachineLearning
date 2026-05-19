@@ -20,4 +20,4 @@ class LayerNorm {
 public:
     LayerNorm(int normalized_shape, float eps = 1e-5);
     TensorF32 forward(const TensorF32& x);
-}
+};

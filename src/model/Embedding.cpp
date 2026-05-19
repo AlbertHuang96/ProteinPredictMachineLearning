@@ -174,4 +174,72 @@ private:
     TensorF32 beta_;
 };
 
+class BondEmbedding {
+public:
+    BondEmbedding(int num_bond_types, int embedding_dim)
+        : num_bond_types_(num_bond_types), embedding_dim_(embedding_dim) {
+
+        }
+};
+
+class FullEmbedding {
+public:
+    FullEmbedding(int d_init, int d_msa) : d_init_(d_init), d_msa_(d_msa) {
+        if (d_init_ == 0) {
+            d_init_ = ChemData().NAATOKENS - 1 + 4;
+        }
+        emb_ = LinearLayer(d_init_, d_msa_);
+        emb_q_ = EmbeddingLayer(ChemData().NAATOKENS, d_msa_);
+    }
+    
+    TensorF32 forward(const TensorF32& msa, const TensorF32& seq, const TensorF32& idx) {
+        // msa: (B, N, L, d_init)
+        // seq: (B, L)
+        // idx: (B, L)
+        
+        int B = msa.shape().dims[0];
+        int N = msa.shape().dims[1];
+        int L = msa.shape().dims[2];
+        
+        // MSA embedding
+        TensorF32 msa_emb = emb_.forward(msa.view({B * N * L, d_init_})).view({B, N, L, d_msa_});
+        
+        // Query embedding
+        TensorF32 seq_emb = emb_q_.forward(seq).unsqueeze(1); // (B, 1, L, d_msa_)
+        
+        // Add query embedding to MSA embedding
+        TensorF32 output({B, N, L, d_msa_}, msa.device());
+        for (int b = 0; b < B; ++b) {
+            for (int n = 0; n < N; ++n) {
+                for (int l = 0; l < L; ++l) {
+                    for (int d = 0; d < d_msa_; ++d) {
+                        output.data()[((b * N + n) * L + l) * d_msa_ + d] =
+                            msa_emb.data()[((b * N + n) * L + l) * d_msa_ + d] +
+                            seq_emb.data()[(b * L + l) * d_msa_ + d];
+                    }
+                }
+            }
+        }
+        
+        return output;
+    }
+/* if d_init==0:
+            d_init=ChemData().NAATOKENS-1+4
+        self.emb = nn.Linear(d_init, d_msa) # embedding for general MSA
+        self.emb_q = nn.Embedding(ChemData().NAATOKENS, d_msa) # embedding for query sequence */
+/* def forward(self, msa, seq, idx):
+        # Inputs:
+        #   - msa: Input MSA (B, N, L, d_init)
+        #   - seq: Input Sequence (B, L)
+        #   - idx: Residue index
+        # Outputs:
+        #   - msa: Initial MSA embedding (B, N, L, d_msa)
+        N = msa.shape[1] # number of sequenes in MSA
+        msa = self.emb(msa) # (B, N, L, d_model) # MSA embedding
+        seq = self.emb_q(seq).unsqueeze(1) # (B, 1, L, d_model) -- query embedding
+        msa = msa + seq.expand(-1, N, -1, -1) # adding query embedding to MSA
+        #return self.drop(msa)
+        return (msa) */
+};
+
 } // namespace rfaa

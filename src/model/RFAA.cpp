@@ -1,5 +1,6 @@
 #include "rfaa/Model.h"
 #include "rfaa/Embedding.h"
+#include "rfaa/PositionalEncoding.h"
 #include <iostream>
 
 namespace rfaa {
@@ -32,6 +33,9 @@ IterBlock::IterBlock(const RFAAConfig& config, bool update_msa_pair)
     
     se3_ = std::make_unique<SE3Transformer>(config.se3_config);
     struct_update_ = std::make_unique<StructureUpdate>();
+    
+    // 初始化 PositionalEncoding
+    pos_enc_ = std::make_unique<PositionalEncoding>(-32, 32, 8, config.d_pair);
 }
 
 void IterBlock::projStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state) {
@@ -190,7 +194,10 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
        
         //// (B, L, 3, 3) - 初始 Ca 坐标 (可选)
         // compute the RBF feature to inject into pair bias
-        TensorF32 rbf_feature = computeRBFFeature(coords);
+        TensorF32 rbf = computeRBFFeature(coords);
+        // rel_pos, bond_dist = positionalEncoding(bond feat, dist matrix)
+        // bias += linear(rel_pos) + linear(bond_dist)
+        TensorF32 rbf_feature = rbf + pos_enc_->forward(coords);
         LayerNorm pair_layernorm(D_PAIR);
         pair_biased = pair_layernorm.forward(pair);
 
@@ -313,7 +320,14 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     pair_track_->init_from_embedding(input.seq_tokens, input.seq_tokens);
 
     // msa full embed?
+    //msa_full = self.full_emb(msa_full, seq, idx)
+    
     // bond embed for pair track
+    //pair = pair + bond_embed(bond_feats)
+    //bond embed: 
+    // bond_feats = one_hot(bond_feats)
+    // linear(d_bond_type = 5, d_pair = 128)
+    // linear(bond_feats.float())
     
     // Template injection
     if (input.t1d.numel() > 0) {

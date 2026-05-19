@@ -1,7 +1,17 @@
-#include "rfaa/Ops.h"
-//#include <cblas.h>
+#include "rfaa/MathUtils.h"
+#include <numeric>  // for std::iota
+#include <vector>
 
 namespace rfaa {
+
+
+
+// 创建 [start, start+1, ..., end-1]
+std::vector<int> arange(int start, int end) {
+    std::vector<int> result(end - start);
+    std::iota(result.begin(), result.end(), start);
+    return result;
+}
 
 TensorF32 matmul(const TensorF32& a, const TensorF32& b) {
     // 假设 a: (M, K), b: (K, N), 输出: (M, N)

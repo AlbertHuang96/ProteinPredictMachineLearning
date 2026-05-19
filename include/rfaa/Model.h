@@ -3,6 +3,7 @@
 #include "Track.h"
 #include "Attention.h"
 #include "SE3Transformer.h"
+#include "PositionalEncoding.h"
 #include <string>
 
 namespace rfaa {
@@ -82,6 +83,7 @@ private:
     std::unique_ptr<TriangleMultiplication> tri_mul_in_;
     std::unique_ptr<SE3Transformer> se3_;
     std::unique_ptr<StructureUpdate> struct_update_;
+    std::unique_ptr<PositionalEncoding> pos_enc_;
 };
 
 // RFAA 主模型

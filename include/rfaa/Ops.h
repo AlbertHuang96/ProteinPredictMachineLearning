@@ -25,8 +25,8 @@ TensorF32 layer_norm(const TensorF32& input, float eps = 1e-5);
 TensorF32 layer_norm(const TensorF32& input, const TensorF32& gamma, 
                     const TensorF32& beta, float eps = 1e-5);
 
+
 // 工具函数
-TensorF32 matmul(const TensorF32& a, const TensorF32& b);
-TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b);
+// Note: matmul and batch_matmul are now in MathUtils.h
 
 } // namespace rfaa
