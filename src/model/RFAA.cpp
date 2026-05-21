@@ -1,6 +1,7 @@
 #include "rfaa/Model.h"
 #include "rfaa/Embedding.h"
 #include "rfaa/PositionalEncoding.h"
+#include "rfaa/MathUtils.h"
 #include <iostream>
 
 namespace rfaa {
@@ -188,33 +189,40 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             projStateAddToQueryRow(msa, proj_state);
         }
 
-        // pair -> attention bias
+        TensorF32 rbf_feature;
+        {
+            // pair2msa: 将 pair 转换为 attention bias 注入 msa row attention
+            // pair -> attention bias
         
-        TensorF32 pair_biased;
+            TensorF32 pair_biased;
        
-        //// (B, L, 3, 3) - 初始 Ca 坐标 (可选)
-        // compute the RBF feature to inject into pair bias
-        TensorF32 rbf = computeRBFFeature(coords);
-        // rel_pos, bond_dist = positionalEncoding(bond feat, dist matrix)
-        // bias += linear(rel_pos) + linear(bond_dist)
-        TensorF32 rbf_feature = rbf + pos_enc_->forward(coords);
-        LayerNorm pair_layernorm(D_PAIR);
-        pair_biased = pair_layernorm.forward(pair);
+            //// (B, L, 3, 3) - 初始 Ca 坐标 (可选)
+            // compute the RBF feature to inject into pair bias
+            TensorF32 rbf = computeRBFFeature(coords);
+            // rel_pos, bond_dist = positionalEncoding(bond feat, dist matrix)
+            // bias += linear(rel_pos) + linear(bond_dist)
 
-        pair_biased = pair_biased + rbf_feature; 
+            // need to get the input bond_feats, dist_matrix
+            rbf_feature = rbf + pos_enc_->forward(coords, index, bond_feats, dist_matrix, same_chain);
+            LayerNorm pair_layernorm(D_PAIR);
+            pair_biased = pair_layernorm.forward(pair);
 
-        // TODO
-        // update msa query row with state from SE3 output
+            pair_biased = pair_biased + rbf_feature; 
 
-        // MSA Row Attention with bias
-        msa = msa_row_attn_->forward(msa, pair_biased);
-        // RF2 code dropout(row_attn_out, 0.15);
+            // TODO
+            // update msa query row with state from SE3 output
+
+            // a problem: tensor reshape?
+            // MSA Row Attention with bias
+            msa = msa_row_attn_->forward(msa, pair_biased);
+            // RF2 code dropout(row_attn_out, 0.15);
         
-        // MSA Column Attention
-        msa = msa_col_attn_->forward(msa);
+            // MSA Column Attention
+            msa = msa_col_attn_->forward(msa);
         
-        // FeedForward
-        msa = msa_ff_->forward(msa);
+            // FeedForward
+            msa = msa_ff_->forward(msa);
+        }
         // ------------ 1D track update ------------
         
         // to update pair : 2D track update
@@ -225,41 +233,71 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // msa (B,N,L,256) -> Linear -> (B,N,L,16)
         // outer product + mean -> (B,L,L,256) -> Linear -> (B,L,L,128)
         {
-            //auto msa_proj = msa;  // Linear to 16
-            /* TensorF32 msa_proj;
-            LinearLayer linear(D_MSA, 16);
-            // why is 16?
-            auto msa_proj = linear.forward(msa);
-            //msa_proj.copy_from(msa);  // 简化
-            // einsum('bsli,bsmj->blmij') -> mean over N
-            // Linear(256->128)
-            //pair = msa;  // 简化，实际需要 outer product mean
-            pair.copy_from(msa);  // 简化 */
+            // msa2pair
+            LayerNorm msa_norm(D_MSA);
+            TensorF32 msa_normed = msa_norm.forward(msa);
+            LinearLayer left_proj(D_MSA, 16);
+            LinearLayer right_proj(D_MSA, 16);
+            TensorF32 left = left_proj.forward(msa_normed);   // (B,N,L,16)
+            TensorF32 right = right_proj.forward(msa_normed); // (B,N,L,16)
+            TensorF32 right_mean = right / float(N);
+            // a tensor divide a scalar
+            TensorF32 pair_update = outer_product(left, right_mean);  // (B,L,L,256)
+            // dim of pair_update?
+            // reshape to (B, L, L, 16*16) = (B, L, L, 256)?
+            LinearLayer out_proj(16 * 16, D_PAIR);
+            pair_update = out_proj.forward(pair_update);  // (B,L,L,128)
+            pair = pair + pair_update;  // residual
+
         }
         
         // Triangle Multiplication
-        //pair = tri_mul_out_->forward(pair);
+        //pair = pair + drop_row(tri_mul_out_->forward(pair));
+        //pair = pair + drop_row(tri_mul_in_->forward(pair));
         //pair = tri_mul_in_->forward(pair);
 
         // ===== Step 3: pair2pair =====
         // state outer product -> gate
         {
+            LinearLayer rbf_proj(D_RBF, D_PAIR);
+            rbf_feature = rbf_proj.forward(rbf_feature);  // (B,L,L,128)
+            LayerNorm state_norm(D_STATE);
+            TensorF32 state_normed = state_norm.forward(state);
+            LinearLayer left_proj(D_STATE, 16);
+            LinearLayer right_proj(D_STATE, 16);
+            // different weights for left and right?
+            TensorF32 left = left_proj.forward(state_normed);   // (B,L,16)
+            TensorF32 right = right_proj.forward(state_normed); // (B,L,16)
+            TensorF32 gate = outer_product(left, right);  // (B,L,L,256)
+            LinearLayer gate_proj(16 * 16, D_PAIR);
+            // d_hidden_gate = 16
+            gate = gate_proj.forward(gate);  // (B,L,L,128)
+            gate = sigmoid(gate);  // (B,L,L,128) -> (B,L,L,128) gate values between 0 and 1
+            rbf_feature = rbf_feature * gate;  // element-wise multiplication, inject the rbf feature into pair with gate control
             // left = Linear(state, 32->16)
             // right = Linear(state, 32->16)
             // gate = sigmoid(left x right -> Linear -> 128)
             //auto gate = state;  // get_gate
-            TensorF32 gate;
-            gate.copy_from(state);  // 简化，实际需要计算 gate
+            //gate.copy_from(state);  // 简化，实际需要计算 gate
             // rbf_feat 经 gate 过滤注入 pair
             // pair += gate * rbf_feat
-        }
         
-        // to update pair
-        // Biased Axial Attention (row/col)
-        // FeedForward
+            // to update pair
+            // Biased Axial Attention (row/col)
+            // pair = pair + drop_row(row_attn(pair, bias=rbf_feat))
+            // pair = pair + drop_col(col_attn(pair, bias=rbf_feat))
+            Dropout drop_row(1, 0.15);
+            Dropout drop_col(2, 0.15);
+            pair = pair + drop_row->forward(pair_row_attn_->forward(pair, rbf_feature));
+            pair = pair + drop_col->forward(pair_col_attn_->forward(pair, rbf_feature));
+            // FeedForward
+            FeedForward pair_ff(D_PAIR, D_PAIR * 2);
+            pair = pair + pair_ff.forward(pair);  // residual
+        }
 
     }
     
+    // 3D track update
     // ===== Step 4: str2str (SE3 Transformer) =====
     {
         // node features: msa[:,0] + state -> concat -> Linear
@@ -311,25 +349,39 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     pair_track_ = std::make_unique<PairTrack>(L, config_.d_pair, device_);
     state_track_ = std::make_unique<StateTrack>(L, config_.d_state, device_);
     
+    // the msa cluster embed was contained in the three track init functions below
     // Embedding
     msa_track_->init_from_features(input.msa_latent);
     state_track_->init_from_embedding(input.seq_tokens);
 
     // pair track need to be initialized as well
     // pair track 从 seq_tokens 初始化 (left, right)
-    pair_track_->init_from_embedding(input.seq_tokens, input.seq_tokens);
+    // (B, L)
+    pair_track_->init_from_embedding(input.seq_tokens, input.seq_tokens, input.bond_feats, input.dist_matrix);
 
     // msa full embed?
-    //msa_full = self.full_emb(msa_full, seq, idx)
-    
+    // msa_full = self.full_emb(msa_full, seq, idx)
+    // msa_full was used in the full block
+    TensorF32 msa_full;
+    if (input.msa_full.numel() > 0) {
+        FullEmbedding full_emb(NAATOKENS - 1 + 4, D_MSA_FULL);
+        msa_full = full_emb.forward(input.msa_full, input.seq_tokens, TensorF32());
+    }
+
     // bond embed for pair track
-    //pair = pair + bond_embed(bond_feats)
+    // need to get the bond feats
+    BondEmbedding bond_embed(0, D_PAIR);
+    pair = pair + bond_embed(input.bond_feats);
     //bond embed: 
     // bond_feats = one_hot(bond_feats)
     // linear(d_bond_type = 5, d_pair = 128)
     // linear(bond_feats.float())
+
+    // recycle embed?
     
+    // template embed
     // Template injection
+    // cross attention need to reshape
     if (input.t1d.numel() > 0) {
         state_track_->inject_template(input.t1d);
     }
@@ -350,19 +402,27 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     
     // need to modify :
     // the block in the 4 full block was different from the main block
+    // full/extra block use global column attention
 
     // Extra blocks
+    // need to use msa_full
     for (auto& block : extra_blocks_) {
-        block->forward(msa, pair, state, coords);
+        // stop grad
+        block->forward(msa_full, pair, state, coords);
     }
     
     // Main blocks
     for (auto& block : main_blocks_) {
+        // stop grad
+        // chiral grad
         block->forward(msa, pair, state, coords);
     }
     
     // Refinement blocks (仅更新结构)
     for (auto& block : refine_blocks_) {
+        // stop grad
+        // chiral grad
+        // clash grad
         block->forward(msa, pair, state, coords);
     }
     

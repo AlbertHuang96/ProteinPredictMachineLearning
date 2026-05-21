@@ -1,6 +1,7 @@
 #include "rfaa/MathUtils.h"
 #include <numeric>  // for std::iota
 #include <vector>
+#include <stdexcept>
 
 namespace rfaa {
 
@@ -94,6 +95,161 @@ TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b) {
     }
     
     return output;
+}
+
+TensorF32 one_hot(const std::vector<int>& indices, int num_classes) {
+    if (num_classes <= 0) {
+        throw std::invalid_argument("num_classes must be positive");
+    }
+    
+    // 检查索引范围
+    for (int idx : indices) {
+        if (idx < 0 || idx >= num_classes) {
+            throw std::out_of_range("Index " + std::to_string(idx) + 
+                                    " out of range [0, " + std::to_string(num_classes-1) + "]");
+        }
+    }
+    
+    int64_t n = static_cast<int64_t>(indices.size());
+    TensorF32 result({n, num_classes}, Device::CPU);
+    
+    // 初始化为0
+    result.zero_();
+    
+    // 设置one-hot位置为1
+    float* data = result.data();
+    for (int64_t i = 0; i < n; i++) {
+        data[i * num_classes + indices[i]] = 1.0f;
+    }
+    
+    return result;
+}
+
+TensorF32 one_hot(int index, int num_classes) {
+    if (num_classes <= 0) {
+        throw std::invalid_argument("num_classes must be positive");
+    }
+    
+    if (index < 0 || index >= num_classes) {
+        throw std::out_of_range("Index " + std::to_string(index) + 
+                                " out of range [0, " + std::to_string(num_classes-1) + "]");
+    }
+    
+    TensorF32 result({1, num_classes}, Device::CPU);
+    
+    // 初始化为0
+    result.zero_();
+    
+    // 设置one-hot位置为1
+    float* data = result.data();
+    data[index] = 1.0f;
+    
+    return result;
+}
+
+TensorF32 outer_sum(const TensorF32& left, const TensorF32& right) {
+    const auto& left_shape = left.shape().dims;
+    const auto& right_shape = right.shape().dims;
+    
+    // 检查输入是否为 4D 张量
+    if (left_shape.size() != 4 || right_shape.size() != 4) {
+        throw RFAAError("outer_sum expects 4D tensors");
+    }
+    
+    // 检查维度：left (B,1,L,D), right (B,L,1,D)
+    if (left_shape[0] != right_shape[0] || left_shape[3] != right_shape[3]) {
+        throw RFAAError("outer_sum dimension mismatch: batch or feature dim doesn't match");
+    }
+    if (left_shape[1] != 1) {
+        throw RFAAError("outer_sum: left shape[1] should be 1, got " + std::to_string(left_shape[1]));
+    }
+    if (right_shape[2] != 1) {
+        throw RFAAError("outer_sum: right shape[2] should be 1, got " + std::to_string(right_shape[2]));
+    }
+    
+    int64_t B = left_shape[0];
+    int64_t L = left_shape[2];  // left: (B,1,L,D) -> L 在 dim 2
+    int64_t D = left_shape[3];
+    
+    // 创建结果张量 (B, L, L, D)
+    TensorF32 result({B, L, L, D}, left.device());
+    result.zero_();
+    
+    const float* left_data = left.data();
+    const float* right_data = right.data();
+    float* result_data = result.data();
+    
+    // 计算 outer sum: result[b, i, j, d] = left[b, 0, i, d] + right[b, j, 0, d]
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t i = 0; i < L; i++) {
+            for (int64_t j = 0; j < L; j++) {
+                for (int64_t d = 0; d < D; d++) {
+                    // left[b, 0, i, d] -> index = b*1*L*D + 0*L*D + i*D + d
+                    int64_t left_idx = (b * 1 * L * D) + (0 * L * D) + (i * D) + d;
+                    // right[b, j, 0, d] -> index = b*L*1*D + j*1*D + 0*D + d
+                    int64_t right_idx = (b * L * 1 * D) + (j * 1 * D) + (0 * D) + d;
+                    // result[b, i, j, d] -> index = b*L*L*D + i*L*D + j*D + d
+                    int64_t result_idx = (b * L * L * D) + (i * L * D) + (j * D) + d;
+                    
+                    result_data[result_idx] = left_data[left_idx] + right_data[right_idx];
+                }
+            }
+        }
+    }
+    
+    return result;
+}
+
+TensorF32 outer_product(const TensorF32& left, const TensorF32& right) {
+    const auto& left_shape = left.shape().dims;
+    const auto& right_shape = right.shape().dims;
+    
+    // 检查输入是否为 4D 张量
+    if (left_shape.size() != 4 || right_shape.size() != 4) {
+        throw RFAAError("outer_product expects 4D tensors");
+    }
+    
+    // 检查维度：left (B,1,L,D), right (B,L,1,D)
+    if (left_shape[0] != right_shape[0] || left_shape[3] != right_shape[3]) {
+        throw RFAAError("outer_product dimension mismatch: batch or feature dim doesn't match");
+    }
+    if (left_shape[1] != 1) {
+        throw RFAAError("outer_product: left shape[1] should be 1, got " + std::to_string(left_shape[1]));
+    }
+    if (right_shape[2] != 1) {
+        throw RFAAError("outer_product: right shape[2] should be 1, got " + std::to_string(right_shape[2]));
+    }
+    
+    int64_t B = left_shape[0];
+    int64_t L = left_shape[2];  // left: (B,1,L,D) -> L 在 dim 2
+    int64_t D = left_shape[3];
+    
+    // 创建结果张量 (B, L, L, D)
+    TensorF32 result({B, L, L, D}, left.device());
+    
+    const float* left_data = left.data();
+    const float* right_data = right.data();
+    float* result_data = result.data();
+    
+    // 计算 outer product: result[b, i, j, d] = left[b, 0, i, d] * right[b, j, 0, d]
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t i = 0; i < L; i++) {
+            for (int64_t j = 0; j < L; j++) {
+                for (int64_t d = 0; d < D; d++) {
+                    // left[b, 0, i, d] -> index = b*1*L*D + 0*L*D + i*D + d
+                    int64_t left_idx = (b * 1 * L * D) + (0 * L * D) + (i * D) + d;
+                    // right[b, j, 0, d] -> index = b*L*1*D + j*1*D + 0*D + d
+                    int64_t right_idx = (b * L * 1 * D) + (j * 1 * D) + (0 * D) + d;
+                    // result[b, i, j, d] -> index = b*L*L*D + i*L*D + j*D + d
+                    int64_t result_idx = (b * L * L * D) + (i * L * D) + (j * D) + d;
+                    
+                    result_data[result_idx] = left_data[left_idx] * right_data[right_idx];
+                }
+            }
+        }
+    }
+    
+    return result;
 }
 
 } // namespace rfaa

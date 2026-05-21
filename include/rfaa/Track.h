@@ -71,7 +71,7 @@ public:
     PairTrack(int seq_len, int dim = D_PAIR, Device device = Device::CPU);
     
     // 从 embedding 初始化
-    void init_from_embedding(const TensorF32& left, const TensorF32& right);
+    void init_from_embedding(const TensorF32& left, const TensorF32& right, const TensorF32& bond_feats, const TensorF32& dist_matrix);
     
     // Step 2: msa2pair (Outer Product Mean)
     void update_from_msa(const TensorF32& msa);

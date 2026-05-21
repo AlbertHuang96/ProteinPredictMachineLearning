@@ -30,6 +30,7 @@ void MSATrack::init_from_features(const TensorF32& features) {
     // the supplemental note of the paper was as followed:
     // seq = linear(seq)
     // msa += seq
+    // the source code may be the wrong or another version
     // but the source code was not the same:
     // in the Embeddings.py
     // a learned 2-entry nn.Embedding(2, d_model) is element-wise added to 

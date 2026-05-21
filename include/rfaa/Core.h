@@ -10,8 +10,11 @@ namespace rfaa {
 
 // 维度常量 (与 RFAA 对齐)
 constexpr int NAATOKENS = 80;           // 统一 token 空间
+constexpr int D_RBF = 64;
+constexpr int D_MSA_FULL = 64;
 constexpr int D_MSA = 256;              // MSA 隐层维度
 constexpr int D_PAIR = 128;             // Pair 隐层维度
+constexpr int D_PAIR_HIDDEN = 32;
 constexpr int D_STATE = 32;             // State 隐层维度
 constexpr int D_T1D = 80;               // 模板 1D 特征维度
 constexpr int MSA_LATENT_DIM = 164;     // msa_latent 输入维度

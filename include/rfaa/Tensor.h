@@ -48,6 +48,10 @@ public:
     Tensor slice(int dim, int64_t start, int64_t end) const;
     Tensor select(int dim, int64_t index) const;
     
+    // 维度操作
+    Tensor unsqueeze(int dim) const;  // 在指定维度插入大小为1的维度
+    Tensor permute(const std::vector<int>& dims) const; // 维度重排
+    
     // 内存管理
     void zero_();
     void copy_from(const Tensor& other);

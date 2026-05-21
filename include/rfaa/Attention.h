@@ -27,7 +27,7 @@ public:
     ~SelfAttention();
     
     // Q, K, V 来自同一输入
-    TensorF32 forward(const TensorF32& x, const TensorF32* bias = nullptr);
+    TensorF32 forward(const TensorF32& Q, const TensorF32& K, const TensorF32& V, const TensorF32* bias = nullptr);
     
     // 加载权重
     void load_weights(const std::string& prefix);
@@ -44,9 +44,10 @@ public:
     explicit MSARowAttention(const AttnConfig& config);
     
     // msa: (B, N, L, D), pair: (B, L, L, n_head)
-    TensorF32 forward(const TensorF32& msa, const TensorF32& pair);
+    TensorF32 forward(const TensorF32& msa, const TensorF32& pair_biased);
     
 private:
+    SelfAttention self_attn_;
     LinearLayer to_b(D_PAIR, N_HEAD);  // 将 pair 转换为 attention bias
     LinearLayer to_g(D_MSA, N_HEAD * D_MSA);
     LinearLayer to_out(N_HEAD * D_MSA, D_MSA);
@@ -70,6 +71,29 @@ public:
     TensorF32 forward(const TensorF32& msa);
     
 private:
+    AttnConfig config_;
+    //struct Impl;
+    //std::unique_ptr<Impl> impl_;
+};
+
+class PairRowAttention {
+public:
+    explicit PairRowAttention(const AttnConfig& config);
+    
+    //
+    TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
+    
+private:
+    SelfAttention self_attn_;
+    LinearLayer to_b(D_PAIR, N_HEAD);  // 将 str_bias 转换为 attention bias
+    LinearLayer to_g(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
+    LinearLayer to_out(N_HEAD * D_PAIR_HIDDEN, D_PAIR);
+    
+    LinearLayer Wq(D_PAIR, N_HEAD * D_PAIR_HIDDEN); 
+    // n_head 个 head，每个 head D_MSA/n_head 维
+    LinearLayer Wk(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
+    LinearLayer Wv(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
+
     AttnConfig config_;
     //struct Impl;
     //std::unique_ptr<Impl> impl_;
@@ -109,12 +133,18 @@ private:
 // FeedForward
 class FeedForward {
 public:
-    FeedForward(int dim, int hidden_dim, float dropout = 0.0f);
+    FeedForward(int dim, int hidden_dim, float dropout = 0.1f);
     
     TensorF32 forward(const TensorF32& x);
     
 private:
     int dim_, hidden_dim_;
+    LayerNorm layernorm_(dim_);
+    LinearLayer linear1_(dim_, dim_ * hidden_dim_); 
+    // linear1 kaiming normal initialization
+    LinearLayer linear2_(dim_ * hidden_dim_, dim_); 
+    // linear2_  zero initialization
+    Dropout dropout_(dropout_);
     //struct Impl;
     //std::unique_ptr<Impl> impl_;
 };

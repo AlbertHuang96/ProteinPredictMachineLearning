@@ -45,4 +45,78 @@ TensorF32 matmul(const TensorF32& a, const TensorF32& b);
  */
 TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b);
 
+/**
+ * @brief One-hot encoding for categorical data
+ * 
+ * Converts a vector of indices to one-hot encoded tensor.
+ * Equivalent to PyTorch's torch.nn.functional.one_hot() or tf.one_hot().
+ * 
+ * Example:
+ *   indices = [0, 2, 1] with num_classes = 4
+ *   output = [[1, 0, 0, 0],
+ *             [0, 0, 1, 0],
+ *             [0, 1, 0, 0]]
+ * 
+ * @param indices Vector of indices (each index should be in [0, num_classes-1])
+ * @param num_classes Number of classes (length of one-hot vector, default 8)
+ * @return TensorF32 One-hot encoded tensor, shape (indices.size(), num_classes)
+ * @throws RFAAError If any index is out of range [0, num_classes-1]
+ */
+TensorF32 one_hot(const std::vector<int>& indices, int num_classes = 8);
+
+/**
+ * @brief One-hot encoding for a single index
+ * 
+ * Converts a single index to one-hot encoded vector.
+ * 
+ * @param index Index to encode (should be in [0, num_classes-1])
+ * @param num_classes Number of classes (length of one-hot vector, default 8)
+ * @return TensorF32 One-hot encoded tensor, shape (1, num_classes)
+ * @throws RFAAError If index is out of range [0, num_classes-1]
+ */
+TensorF32 one_hot(int index, int num_classes = 8);
+
+/**
+ * @brief Outer sum of two tensors (via broadcasting)
+ * 
+ * Computes the outer sum of two 4D tensors, equivalent to PyTorch:
+ *   result = left[:, 1, :, :] + right[:, :, 1, :]
+ * 
+ * where:
+ *   - left has shape (B, 1, L, D) - query embedding
+ *   - right has shape (B, L, 1, D) - token embedding
+ *   - result has shape (B, L, L, D) - pair representation
+ * 
+ * This creates a pair representation where:
+ *   result[b, i, j, d] = left[b, 0, i, d] + right[b, j, 0, d]
+ * 
+ * @param left Left tensor, shape (B, 1, L, D)
+ * @param right Right tensor, shape (B, L, 1, D)
+ * @return TensorF32 Result tensor, shape (B, L, L, D)
+ * @throws RFAAError If inputs are not 4D tensors
+ * @throws RFAAError If batch dimension B or feature dimension D doesn't match
+ * @throws RFAAError If left shape[1] != 1 or right shape[2] != 1
+ */
+TensorF32 outer_sum(const TensorF32& left, const TensorF32& right);
+
+/**
+ * @brief Outer product of two tensors (element-wise multiplication via broadcasting)
+ * 
+ * Computes the outer product of two 4D tensors, equivalent to PyTorch:
+ *   result = left[:, 1, :, :] * right[:, :, 1, :]
+ * 
+ * where:
+ *   - left has shape (B, 1, L, D) - query embedding
+ *   - right has shape (B, L, 1, D) - token embedding
+ *   - result has shape (B, L, L, D) - pair representation
+ * 
+ * @param left Left tensor, shape (B, 1, L, D)
+ * @param right Right tensor, shape (B, L, 1, D)
+ * @return TensorF32 Result tensor, shape (B, L, L, D)
+ * @throws RFAAError If inputs are not 4D tensors
+ * @throws RFAAError If batch dimension B or feature dimension D doesn't match
+ * @throws RFAAError If left shape[1] != 1 or right shape[2] != 1
+ */
+TensorF32 outer_product(const TensorF32& left, const TensorF32& right);
+
 } // namespace rfaa

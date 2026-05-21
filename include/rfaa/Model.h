@@ -78,6 +78,8 @@ private:
     // 子模块
     std::unique_ptr<MSARowAttention> msa_row_attn_;
     std::unique_ptr<MSAColAttention> msa_col_attn_;
+    std::unique_ptr<PairRowAttention> pair_row_attn_;
+    std::unique_ptr<PairColAttention> pair_col_attn_;
     std::unique_ptr<FeedForward> msa_ff_;
     std::unique_ptr<TriangleMultiplication> tri_mul_out_;
     std::unique_ptr<TriangleMultiplication> tri_mul_in_;
