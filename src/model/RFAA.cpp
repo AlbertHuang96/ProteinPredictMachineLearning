@@ -254,7 +254,9 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // Triangle Multiplication
         //pair = pair + drop_row(tri_mul_out_->forward(pair));
         //pair = pair + drop_row(tri_mul_in_->forward(pair));
-        //pair = tri_mul_in_->forward(pair);
+        Dropout drop_row(1, 0.15);
+        pair = pair + drop_row.forward(tri_mul_out_->forward(pair, true));
+        pair = pair + drop_row.forward(tri_mul_in_->forward(pair, false));
 
         // ===== Step 3: pair2pair =====
         // state outer product -> gate
@@ -382,8 +384,9 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // template embed
     // Template injection
     // cross attention need to reshape
+    // state cross attention and pair cross attention
     if (input.t1d.numel() > 0) {
-        state_track_->inject_template(input.t1d);
+        state_track_->inject_template(input.t1d, input.tor_feat);
     }
     
     // 获取初始表示
@@ -406,6 +409,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
 
     // Extra blocks
     // need to use msa_full
+    // and use global column attention as well
     for (auto& block : extra_blocks_) {
         // stop grad
         block->forward(msa_full, pair, state, coords);

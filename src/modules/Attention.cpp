@@ -43,13 +43,29 @@ TensorF32 MSARowAttention::forward(const TensorF32& msa, const TensorF32& pair_b
     return attn_out_proj;
 }
 
-MSAColAttention::MSAColAttention(const AttnConfig& config) : config_(config) {}
+MSAColAttention::MSAColAttention(const AttnConfig& config) : config_(config) {
 
+}
+
+// difference between msa row and col?
+// no attention bias
 TensorF32 MSAColAttention::forward(const TensorF32& msa) {
-    TensorF32 col_attention_forward;
-    // tmp spaceholder
-    col_attention_forward.copy_from(msa);
-    return col_attention_forward;
+    LayerNorm msa_layernorm(D_MSA);
+    TensorF32 msa_norm = msa_layernorm.forward(msa);
+    
+    TensorF32 Q = Wq.forward(msa_norm);
+    TensorF32 K = Wk.forward(msa_norm);
+    TensorF32 V = Wv.forward(msa_norm);
+
+    TensorF32 gate = sigmoid(to_g(msa_norm));
+    // call the multi_head_attention function
+    //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
+    TensorF32 attn_out = self_attn_.forward(Q, K, V);
+    // gated attention
+    attn_out = gate * attn_out;
+    TensorF32 attn_out_proj = to_out(attn_out);
+
+    return attn_out_proj;
 }
 
 PairRowAttention::PairRowAttention(const AttnConfig& config) : config_(config) {
@@ -86,6 +102,36 @@ TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_
     return attn_out_proj;
 }
 
+PairColAttention::PairColAttention(const AttnConfig& config) : config_(config) {
+    // init all the linear layers
+    to_out.zeros_weight();
+    to_g.zeros_weight();
+    to_g.ones_bias();
+}
+
+// pair column attention will use str_bias as well and add to the attention score
+TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_bias) {
+    // col attention
+    LayerNorm pair_layernorm(D_PAIR);
+    TensorF32 pair_norm = pair_layernorm.forward(pair);
+    LayerNorm bias_layernorm(D_PAIR);
+    TensorF32 bias_norm = bias_layernorm.forward(str_bias);
+    
+    TensorF32 Q = Wq.forward(pair_norm);
+    TensorF32 K = Wk.forward(pair_norm);
+    TensorF32 V = Wv.forward(pair_norm);
+
+    TensorF32 bias = to_b(bias_norm);
+    TensorF32 gate = sigmoid(to_g(pair_norm));
+    // call the multi_head_attention function
+    //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
+    TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
+    // gated attention
+    attn_out = gate * attn_out;
+    TensorF32 attn_out_proj = to_out(attn_out);
+    return attn_out_proj;
+}
+
 CrossAttention::CrossAttention(int q_dim, int kv_dim, int n_head)
     : q_dim_(q_dim), kv_dim_(kv_dim), n_head_(n_head) {}
 
@@ -96,13 +142,41 @@ TensorF32 CrossAttention::forward(const TensorF32& query, const TensorF32& kv) {
     return cross_attention_forward;
 }
 
-TriangleMultiplication::TriangleMultiplication(int dim, Direction dir)
-    : dim_(dim), dir_(dir) {}
+TriangleMultiplication::TriangleMultiplication(int dim)
+    : dim_(dim) {
+        left_gate_.zeros_weight();
+        right_gate_.zeros_weight();
+        gate_.zeros_weight();
 
-TensorF32 TriangleMultiplication::forward(const TensorF32& pair) {
+        output_proj_.zeros_weight();
+    }
+
+TensorF32 TriangleMultiplication::forward(const TensorF32& pair, bool bOutgoing = true) {
+    TensorF32 pair_norm = layernorm_.forward(pair);
+    TensorF32 left = left_proj_.forward(pair_norm); //(B, L, L,D_HIDDEN_TRIMUL)
+    TensorF32 right = right_proj_.forward(pair_norm);
+    TensorF32 left_gate = sigmoid(left_gate_.forward(pair_norm));
+    TensorF32 right_gate = sigmoid(right_gate_.forward(pair_norm));
+    left = left * left_gate;
+    right = right * right_gate;
+    // outer product for outgoing and incoming
     TensorF32 tri_mul_forward;
-    // tmp spaceholder
-    tri_mul_forward.copy_from(pair);
+    if (bOutgoing) {
+        // need the unit test for the triangle mult function
+        tri_mul_forward = triangle_mult(left, right, float(pair.shape().dims[1]), true);  
+        // (B, L, L, D_HIDDEN_TRIMUL*D_HIDDEN_TRIMUL)
+        //tri_mul_forward = outer_product(left, right);  // (B, L, L, D_HIDDEN_TRIMUL*D_HIDDEN_TRIMUL)
+    } else {
+        tri_mul_forward = triangle_mult(left, right, float(pair.shape().dims[1]), false);  
+        //tri_mul_forward = outer_product(right, left);  // (B, L, L, D_HIDDEN_TRIMUL*D_HIDDEN_TRIMUL)
+    }
+    tri_mul_forward = output_layernorm_.forward(tri_mul_forward);
+    tri_mul_forward = output_proj_.forward(tri_mul_forward);
+
+    //(B, L, L, D_PAIR))
+    TensorF32 gate = sigmoid(gate_.forward(pair_norm));
+    tri_mul_forward = gate * tri_mul_forward;
+
     return tri_mul_forward;
 }
 

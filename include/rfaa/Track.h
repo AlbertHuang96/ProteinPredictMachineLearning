@@ -107,7 +107,7 @@ public:
     void init_from_embedding(const TensorF32& seq_tokens);
     
     // Template 注入 (cross-attention)
-    void inject_template(const TensorF32& t1d);
+    void inject_template(const TensorF32& t1d, const TensorF32& tor_feat);
     
     // Step 4: str2str (SE3 Transformer 重建)
     void rebuild_from_se3(const TensorF32& msa_query, const TensorF32& pair, 

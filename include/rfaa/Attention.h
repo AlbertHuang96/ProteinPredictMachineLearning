@@ -71,6 +71,16 @@ public:
     TensorF32 forward(const TensorF32& msa);
     
 private:
+    SelfAttention self_attn_;
+    LinearLayer to_b(D_PAIR, N_HEAD);  // 将 pair 转换为 attention bias
+    LinearLayer to_g(D_MSA, N_HEAD * D_MSA);
+    LinearLayer to_out(N_HEAD * D_MSA, D_MSA);
+    
+    LinearLayer Wq(D_MSA, N_HEAD * D_MSA); 
+    // n_head 个 head，每个 head D_MSA/n_head 维
+    LinearLayer Wk(D_MSA, N_HEAD * D_MSA);
+    LinearLayer Wv(D_MSA, N_HEAD * D_MSA);
+
     AttnConfig config_;
     //struct Impl;
     //std::unique_ptr<Impl> impl_;
@@ -79,6 +89,30 @@ private:
 class PairRowAttention {
 public:
     explicit PairRowAttention(const AttnConfig& config);
+    
+    //
+    TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
+    
+private:
+    SelfAttention self_attn_;
+    LinearLayer to_b(D_PAIR, N_HEAD);  // 将 str_bias 转换为 attention bias
+    LinearLayer to_g(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
+    LinearLayer to_out(N_HEAD * D_PAIR_HIDDEN, D_PAIR);
+    
+    LinearLayer Wq(D_PAIR, N_HEAD * D_PAIR_HIDDEN); 
+    // n_head 个 head，每个 head D_MSA/n_head 维
+    LinearLayer Wk(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
+    LinearLayer Wv(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
+
+    AttnConfig config_;
+    //struct Impl;
+    //std::unique_ptr<Impl> impl_;
+};
+
+
+class PairColAttention {
+public:
+    explicit PairColAttention(const AttnConfig& config);
     
     //
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
@@ -116,16 +150,27 @@ private:
 // Triangle Multiplication (Outgoing / Incoming)
 class TriangleMultiplication {
 public:
-    enum class Direction { Outgoing, Incoming };
+    //enum class Direction { Outgoing, Incoming };
     
-    TriangleMultiplication(int dim, Direction dir);
+    TriangleMultiplication(int dim);
     
     // pair: (B, L, L, D)
-    TensorF32 forward(const TensorF32& pair);
+    TensorF32 forward(const TensorF32& pair, bool bOutgoing = true);
     
 private:
+    static constexpr int D_HIDDEN_TRIMUL = 128;
+    LayerNorm layernorm_(D_PAIR);
+    LinearLayer left_proj_(D_PAIR, D_HIDDEN_TRIMUL);
+    LinearLayer right_proj_(D_PAIR, D_HIDDEN_TRIMUL);
+    LinearLayer left_gate_(D_PAIR, D_HIDDEN_TRIMUL);
+    LinearLayer right_gate_(D_PAIR, D_HIDDEN_TRIMUL);
+    LinearLayer gate_(D_PAIR, D_PAIR);
+    LayerNorm output_layernorm_(D_HIDDEN_TRIMUL);
+    LinearLayer out_proj_(D_HIDDEN_TRIMUL, D_PAIR);
+     //struct Impl;
+     //std::unique_ptr<Impl> impl_;
     int dim_;
-    Direction dir_;
+    //Direction dir_;
     //struct Impl;
     //std::unique_ptr<Impl> impl_;
 };

@@ -2,6 +2,7 @@
 #include <numeric>  // for std::iota
 #include <vector>
 #include <stdexcept>
+#include <cassert>
 
 namespace rfaa {
 
@@ -250,6 +251,176 @@ TensorF32 outer_product(const TensorF32& left, const TensorF32& right) {
     }
     
     return result;
+}
+
+TensorF32 triangle_mult(
+    const TensorF32& left,
+    const TensorF32& right,
+    float L,
+    bool outgoing
+) {
+    if (outgoing) {
+        // outgoing: einsum('bikd,bjkd->bijd', left, right/L)
+        // left: (B, I, K, D)
+        // right: (B, J, K, D)
+        // output: (B, I, J, D)
+        
+        int64_t B = left.shape().dims[0];
+        int64_t I = left.shape().dims[1];
+        int64_t K = left.shape().dims[2];
+        int64_t D = left.shape().dims[3];
+        
+        int64_t J = right.shape().dims[1];
+        
+        assert(right.shape().dims[0] == B);
+        assert(right.shape().dims[2] == K);
+        assert(right.shape().dims[3] == D);
+        
+        TensorF32 output({B, I, J, D}, left.device());
+        float* out_data = output.data();
+        const float* left_data = left.data();
+        const float* right_data = right.data();
+        
+        float inv_L = 1.0f / L;
+        
+        // Compute einsum
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t i = 0; i < I; ++i) {
+                for (int64_t j = 0; j < J; ++j) {
+                    for (int64_t d = 0; d < D; ++d) {
+                        float sum = 0.0f;
+                        for (int64_t k = 0; k < K; ++k) {
+                            int64_t left_idx = ((b * I + i) * K + k) * D + d;
+                            int64_t right_idx = ((b * J + j) * K + k) * D + d;
+                            sum += left_data[left_idx] * right_data[right_idx];
+                        }
+                        int64_t out_idx = ((b * I + i) * J + j) * D + d;
+                        out_data[out_idx] = sum * inv_L;
+                    }
+                }
+            }
+        }
+        
+        return output;
+    } else {
+        // incoming: einsum('bkid,bkjd->bijd', left, right/L)
+        // left: (B, K, I, D)
+        // right: (B, K, J, D)
+        // output: (B, I, J, D)
+        
+        int64_t B = left.shape().dims[0];
+        int64_t K = left.shape().dims[1];
+        int64_t I = left.shape().dims[2];
+        int64_t D = left.shape().dims[3];
+        
+        int64_t J = right.shape().dims[2];
+        
+        assert(right.shape().dims[0] == B);
+        assert(right.shape().dims[1] == K);
+        assert(right.shape().dims[3] == D);
+        
+        TensorF32 output({B, I, J, D}, left.device());
+        float* out_data = output.data();
+        const float* left_data = left.data();
+        const float* right_data = right.data();
+        
+        float inv_L = 1.0f / L;
+        
+        // Compute einsum
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t i = 0; i < I; ++i) {
+                for (int64_t j = 0; j < J; ++j) {
+                    for (int64_t d = 0; d < D; ++d) {
+                        float sum = 0.0f;
+                        for (int64_t k = 0; k < K; ++k) {
+                            int64_t left_idx = ((b * K + k) * I + i) * D + d;
+                            int64_t right_idx = ((b * K + k) * J + j) * D + d;
+                            sum += left_data[left_idx] * right_data[right_idx];
+                        }
+                        int64_t out_idx = ((b * I + i) * J + j) * D + d;
+                        out_data[out_idx] = sum * inv_L;
+                    }
+                }
+            }
+        }
+        
+        return output;
+    }
+
+    
+    //dim=-1: 沿着最后一个维度拼接（-1表示最后一个维度）
+TensorF32 concat(const std::vector<TensorF32>& tensors, int dim) {
+    if (tensors.empty()) {
+        throw RFAAError("cat: cannot concatenate empty list of tensors");
+    }
+    
+    // 获取第一个张量的形状和设备
+    const Shape& first_shape = tensors[0].shape();
+    int ndim = first_shape.ndim();
+    
+    // 处理负维度
+    if (dim < 0) {
+        dim += ndim;
+    }
+    if (dim < 0 || dim >= ndim) {
+        throw RFAAError("cat: dim " + std::to_string(dim) + " out of range");
+    }
+    
+    // 检查所有张量形状是否兼容
+    for (size_t i = 1; i < tensors.size(); ++i) {
+        const Shape& shape = tensors[i].shape();
+        if (shape.ndim() != ndim) {
+            throw RFAAError("cat: all tensors must have same number of dimensions");
+        }
+        for (int d = 0; d < ndim; ++d) {
+            if (d != dim && shape.dims[d] != first_shape.dims[d]) {
+                throw RFAAError("cat: shape mismatch at dim " + std::to_string(d));
+            }
+        }
+    }
+    
+    // 计算输出形状
+    Shape output_shape = first_shape;
+    for (size_t i = 1; i < tensors.size(); ++i) {
+        output_shape.dims[dim] += tensors[i].shape().dims[dim];
+    }
+    
+    // 创建输出张量
+    Device device = tensors[0].device();
+    TensorF32 output(output_shape, device);
+    
+    // 计算 stride
+    std::vector<int64_t> stride(ndim, 1);
+    for (int d = ndim - 2; d >= 0; --d) {
+        stride[d] = stride[d + 1] * output_shape.dims[d + 1];
+    }
+    
+    // 当前拼接位置的偏移量
+    int64_t offset = 0;
+    
+    for (size_t t = 0; t < tensors.size(); ++t) {
+        const TensorF32& src = tensors[t];
+        const float* src_data = src.data();
+        float* dst_data = output.data();
+        
+        int64_t src_size = src.shape().dims[dim];
+        int64_t total_outer = 1;
+        for (int d = 0; d < dim; ++d) {
+            total_outer *= output_shape.dims[d];
+        }
+        
+        // 拷贝数据
+        for (int64_t outer = 0; outer < total_outer; ++outer) {
+            int64_t dst_offset = outer * stride[dim] + offset * stride[dim + 1];
+            int64_t src_offset = outer * src_size * stride[dim + 1];
+            int64_t block_size = src_size * stride[dim + 1];
+            std::memcpy(dst_data + dst_offset, src_data + src_offset, block_size * sizeof(float));
+        }
+        
+        offset += src_size;
+    }
+    
+    return output;
 }
 
 } // namespace rfaa

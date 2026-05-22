@@ -17,6 +17,7 @@ constexpr int D_PAIR = 128;             // Pair 隐层维度
 constexpr int D_PAIR_HIDDEN = 32;
 constexpr int D_STATE = 32;             // State 隐层维度
 constexpr int D_T1D = 80;               // 模板 1D 特征维度
+constexpr int D_TOR = 30;               // 侧链扭转角维度
 constexpr int MSA_LATENT_DIM = 164;     // msa_latent 输入维度
 constexpr int MSA_FULL_DIM = 83;        // msa_full 输入维度
 constexpr int N_HEAD = 8;               // Attention head 数
