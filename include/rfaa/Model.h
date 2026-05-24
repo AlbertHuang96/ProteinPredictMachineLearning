@@ -96,10 +96,12 @@ public:
     
     // 前向传播
     ModelOutput forward(const ModelInput& input);
+
+    TensorF32 getTemplEmb(const TensorF32& t1d, const TensorF32& t2d);
     
     // 加载/保存权重
-    void load_weights(const std::string& path);
-    void save_weights(const std::string& path) const;
+    void loadWeights(const std::string& path);
+    void saveWeights(const std::string& path) const;
     
     // 设备管理
     void to(Device device);
@@ -108,7 +110,7 @@ public:
     // 训练/推理模式
     void train();
     void eval();
-    bool is_training() const;
+    bool isTraining() const;
     
 private:
     RFAAConfig config_;

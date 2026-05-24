@@ -195,4 +195,35 @@ TensorF32 FeedForward::forward(const TensorF32& x) {
     
 }
 
+TemplatePairStack::TemplatePairStack() {
+    // init all the layers
+    
+    gate_proj_.zeros_weight();
+    gate_proj_.ones_bias();
+}
+
+TensorF32 TemplatePairStack::forward(const TensorF32& pair, const TensorF32& rbf_feature, const TensorF32& state) {
+    
+    TensorF32 rbf_proj = rbf_proj_.forward(rbf_feature);  // (B,L,L,128)
+    
+    TensorF32 state_normed = state_norm_.forward(state);
+    
+            // different weights for left and right?
+    TensorF32 left = left_proj_.forward(state_normed);   // (B,L,16)
+    TensorF32 right = right_proj_.forward(state_normed); // (B,L,16)
+    TensorF32 gate = outer_product(left, right);  // (B,L,L,256)
+    gate = gate_proj_.forward(gate);  // (B,L,L,128)
+    gate = sigmoid(gate);
+    rbf_feature = rbf_feature * gate;
+    
+    TensorF32 pair_tmp;
+    pair_tmp.copy_from(pair);
+    pair_tmp = pair_tmp + drop_row.forward(tri_mul_out_->forward(pair_tmp, true));
+    pair_tmp = pair_tmp + drop_row.forward(tri_mul_in_->forward(pair_tmp, false));
+    pair_tmp = pair_tmp + drop_row_.forward(pair_row_attn_.forward(pair_tmp, rbf_proj));
+    pair_tmp = pair_tmp + drop_col_.forward(pair_col_attn_.forward(pair_tmp, rbf_proj));
+    pair_tmp = pair_tmp + pair_ff_.forward(pair_tmp);
+    return pair_tmp;
+}
+
 } // namespace rfaa

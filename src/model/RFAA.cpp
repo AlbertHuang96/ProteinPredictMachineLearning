@@ -373,6 +373,8 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // bond embed for pair track
     // need to get the bond feats
     BondEmbedding bond_embed(0, D_PAIR);
+    TensorF32 pair;
+    pair.copy_from(pair_track_->representation());
     pair = pair + bond_embed(input.bond_feats);
     //bond embed: 
     // bond_feats = one_hot(bond_feats)
@@ -387,6 +389,11 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // state cross attention and pair cross attention
     if (input.t1d.numel() > 0) {
         state_track_->inject_template(input.t1d, input.tor_feat);
+        //(B, T, L, L, 64)
+        TensorF32 templ_pair = getTemplEmb(input.t1d, input.t2d);
+        // template pair stack
+        pair_track_->templ_stack(templ_pair, rbf_feature, input.t1d);
+        pair_track_->inject_template(templ_pair);
     }
     
     // 获取初始表示
@@ -394,7 +401,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     TensorF32 msa;
     msa.copy_from(msa_track_->representation());
     //auto pair = pair_track_->representation();
-    TensorF32 pair;
+    //TensorF32 pair;
     pair.copy_from(pair_track_->representation());
     //auto state = state_track_->representation();
     TensorF32 state;
@@ -441,6 +448,29 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     output.coords.copy_from(coords);  // 简化
     
     return output;
+}
+
+//The t1d feature has shape (B, T, L, d_t1d) where B is batch size,
+// T is number of templates, L is sequence length, 
+//and d_t1d is the feature dimension that varies by model configuration
+TensorF32 RFAAModel::getTemplEmb(const TensorF32& t1d, const TensorF32& t2d) {
+    int L = t1d.shape().dims[2];
+    // src t1d[b, l, t, d] the l-th residue's t-th template's t1d feature
+    // left[b, l, t, l2, d] for every target residue l2, make a copy of t1d[b, l, t, d]
+    TensorF32 left = t1d.unsqueeze(3);//.expand({-1, -1, -1, L, -1});  // (B, T, L, L, 80)
+    TensorF32 right = t1d.unsqueeze(2);//.expand({-1, -1, L, -1, -1}); 
+    // (B, T, L, d_t1d) (B, T, 1, L, d_t1d) (B, T, L, L, d_t1d)
+    // expand the certain dimension of a tensor
+    left.shape.dims[3] = L;
+    right.shape.dims[3] = L;
+    
+    std::vector<TensorF32> templ_list = {t2d, left, right};
+    TensorF32 templ = concat(templ_list, -1);
+    // dim of templ is (B, T, L, L, d_t1d*2 + d_t2d) = (B, T, L, L, 224)
+    // d_templ = 64
+    LinearLayer emb(D_T1D * 2 + D_T2D, 64);
+    return emb.forward(templ);
+    // (B, T, L, L, 64)
 }
 
 void RFAAModel::to(Device device) {

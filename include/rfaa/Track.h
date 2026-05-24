@@ -73,6 +73,8 @@ public:
     // 从 embedding 初始化
     void init_from_embedding(const TensorF32& left, const TensorF32& right, const TensorF32& bond_feats, const TensorF32& dist_matrix);
     
+    void inject_template(const TensorF32& templ);
+    TensorF32 templ_stack(const TensorF32& in_templ, const TensorF32& rbf_feat, const TensorF32& t1d);
     // Step 2: msa2pair (Outer Product Mean)
     void update_from_msa(const TensorF32& msa);
     

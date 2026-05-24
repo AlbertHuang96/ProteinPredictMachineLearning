@@ -194,4 +194,31 @@ private:
     //std::unique_ptr<Impl> impl_;
 };
 
+class TemplatePairStack {
+public:
+    TemplatePairStack();
+    
+    TensorF32 forward(const TensorF32& pair, const TensorF32& rbf_feature, const TensorF32& state);
+    
+private:
+    LinearLayer rbf_proj_(D_RBF, D_PAIR);
+
+    LayerNorm state_norm_(D_STATE);
+    
+    LinearLayer left_proj_(D_STATE, 16);
+    LinearLayer right_proj_(D_STATE, 16);
+    LinearLayer gate_proj_(16 * 16, D_PAIR);
+
+    TriangleMultiplication tri_mul_out_;
+    TriangleMultiplication tri_mul_in_;
+
+    Dropout drop_row_(1, 0.15);
+    Dropout drop_col_(2, 0.15);
+    PairRowAttention pair_row_attn_;
+    PairColAttention pair_col_attn_;
+            // FeedForward
+    FeedForward pair_ff_(D_PAIR, 2);
+
+}
+
 } // namespace rfaa
