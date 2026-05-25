@@ -34,8 +34,9 @@ TensorF32 PairTrack::templ_stack(const TensorF32& in_templ, const TensorF32& rbf
     TensorF32 state_proj = t1d_proj.forward(t1d_reshaped);
     TensorF32 out;
     for (int i = 0; i < 2; i++) {
+        TensorF32 input = templ;
         TemplatePairStack block;
-        block.forward(templ, rbf_feat, state_proj);
+        templ = block.forward(input, rbf_feat, state_proj);
     }
     
     // d_templ = 64

@@ -68,6 +68,43 @@ TensorF32 MSAColAttention::forward(const TensorF32& msa) {
     return attn_out_proj;
 }
 
+MSAGlobalColAttention::MSAGlobalColAttention(const AttnConfig& config) : MSAColAttention(config) {
+    // 可以在这里覆盖父类的成员变量初始化
+    Wk(D_MSA, D_MSA);
+    Wv(D_MSA, D_MSA);
+    // not multi-headed attention
+
+    to_out.zeros_weight();
+    to_g.zeros_weight();
+    to_g.ones_bias();
+}
+
+TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
+    LayerNorm msa_layernorm(D_MSA);
+    TensorF32 msa_norm = msa_layernorm.forward(msa);
+    
+    TensorF32 Q = Wq.forward(msa_norm);
+    // Q = Q.mean(dim=1);
+    // (B, L, h, d_head)
+    TensorF32 K = Wk.forward(msa_norm);
+    TensorF32 V = Wv.forward(msa_norm);
+
+    TensorF32 gate = sigmoid(to_g(msa_norm));
+    // call the multi_head_attention function
+    //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
+    TensorF32 attn_out = self_attn_.forward(Q, K, V);
+    // concat on the head dimension
+    //attn = rearrange(attn, 'b l h n -> b 1 l (h n)') # (B, 1, L, d_msa)
+    // attn rearrange (B, 1, L, d_msa)
+    
+    // gated attention
+    attn_out = gate * attn_out;
+    TensorF32 attn_out_proj = to_out(attn_out);
+
+    return attn_out_proj;
+}
+
+
 PairRowAttention::PairRowAttention(const AttnConfig& config) : config_(config) {
     // init all the linear layers
     to_out.zeros_weight();

@@ -86,6 +86,12 @@ private:
     //std::unique_ptr<Impl> impl_;
 };
 
+class MSAGlobalColAttention : public MSAColAttention {
+public:    explicit MSAGlobalColAttention(const AttnConfig& config) : MSAColAttention(config);
+
+    TensorF32 forward(const TensorF32& msa);
+};
+
 class PairRowAttention {
 public:
     explicit PairRowAttention(const AttnConfig& config);

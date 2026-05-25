@@ -67,9 +67,9 @@ public:
     void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
                  const TensorF32& coords);
 
-    void projStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state);
+    void proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state);
 
-    TensorF32 computeRBFFeature(const TensorF32& coords);
+    TensorF32 compute_rbf_feature(const TensorF32& coords);
     
 private:
     RFAAConfig config_;
@@ -88,6 +88,19 @@ private:
     std::unique_ptr<PositionalEncoding> pos_enc_;
 };
 
+class FullBlock : public IterBlock {
+public:
+    explicit FullBlock(const RFAAConfig& config) : IterBlock(config, true) {}
+
+    // a virtual dtor
+    virtual ~FullBlock() = default;
+
+    void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
+                 const TensorF32& coords) override;
+private:
+    std::unique_ptr<MSAGlobalColAttention> msa_global_col_attn_;
+};
+
 // RFAA 主模型
 class RFAAModel {
 public:
@@ -97,11 +110,11 @@ public:
     // 前向传播
     ModelOutput forward(const ModelInput& input);
 
-    TensorF32 getTemplEmb(const TensorF32& t1d, const TensorF32& t2d);
+    TensorF32 get_templ_emb(const TensorF32& t1d, const TensorF32& t2d);
     
     // 加载/保存权重
-    void loadWeights(const std::string& path);
-    void saveWeights(const std::string& path) const;
+    void load_weights(const std::string& path);
+    void save_weights(const std::string& path) const;
     
     // 设备管理
     void to(Device device);
@@ -110,7 +123,7 @@ public:
     // 训练/推理模式
     void train();
     void eval();
-    bool isTraining() const;
+    bool is_training() const;
     
 private:
     RFAAConfig config_;
