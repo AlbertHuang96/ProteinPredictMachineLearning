@@ -15,6 +15,100 @@ std::vector<int> arange(int start, int end) {
     return result;
 }
 
+
+TensorF32 mean(const TensorF32& input, int dim) {
+    if (dim < 0) {
+        dim += input.shape().ndim();
+    }
+    if (dim < 0 || dim >= input.shape().ndim()) {
+        throw RFAAError("mean: dim " + std::to_string(dim) + " out of range");
+    }
+    
+    // 计算输出形状
+    Shape output_shape;
+    for (int i = 0; i < input.shape().ndim(); ++i) {
+        if (i != dim) {
+            output_shape.dims.push_back(input.shape().dims[i]);
+        }
+    }
+    
+    TensorF32 output(output_shape, input.device());
+    
+    // 计算stride
+    int ndim = input.shape().ndim();
+    std::vector<int64_t> stride(ndim, 1);
+    for (int i = ndim - 2; i >= 0; --i) {
+        stride[i] = stride[i + 1] * input.shape().dims[i + 1];
+    }
+    
+    const float* src = input.data();
+    float* dst = output.data();
+    
+    int64_t dim_size = input.shape().dims[dim];
+    float inv_dim_size = 1.0f / static_cast<float>(dim_size);
+    
+    int64_t total_output = output.numel();
+    
+    // 使用简单的嵌套循环（针对4D情况优化）
+    if (ndim == 4 && dim == 1) {
+        // 常见情况: Q.shape = (B, N, L, D), mean(dim=1) -> (B, L, D)
+        int64_t B = input.shape().dims[0];
+        int64_t N = input.shape().dims[1];
+        int64_t L = input.shape().dims[2];
+        int64_t D = input.shape().dims[3];
+        
+        for (int64_t b = 0; b < B; ++b) {
+            for (int64_t l = 0; l < L; ++l) {
+                for (int64_t d = 0; d < D; ++d) {
+                    float sum = 0.0f;
+                    for (int64_t n = 0; n < N; ++n) {
+                        int64_t src_idx = ((b * N + n) * L + l) * D + d;
+                        sum += src[src_idx];
+                    }
+                    int64_t dst_idx = (b * L + l) * D + d;
+                    dst[dst_idx] = sum / N;
+                }
+            }
+        }
+    } else {
+        // 通用情况
+        for (int64_t idx = 0; idx < total_output; ++idx) {
+            // 计算输出坐标
+            int64_t tmp = idx;
+            std::vector<int64_t> out_coord(ndim - 1, 0);
+            int out_dim = 0;
+            for (int i = 0; i < ndim; ++i) {
+                if (i == dim) continue;
+                out_coord[out_dim] = tmp % output_shape.dims[out_dim];
+                tmp /= output_shape.dims[out_dim];
+                out_dim++;
+            }
+            
+            // 计算源基准索引
+            int64_t src_base = 0;
+            out_dim = 0;
+            for (int i = 0; i < ndim; ++i) {
+                if (i == dim) {
+                    src_base += 0 * stride[i];
+                } else {
+                    src_base += out_coord[out_dim] * stride[i];
+                    out_dim++;
+                }
+            }
+            
+            // 求和平均
+            float sum = 0.0f;
+            for (int64_t d = 0; d < dim_size; ++d) {
+                sum += src[src_base + d * stride[dim]];
+            }
+            dst[idx] = sum * inv_dim_size;
+        }
+    }
+    
+    return output;
+}
+
+
 TensorF32 matmul(const TensorF32& a, const TensorF32& b) {
     // 假设 a: (M, K), b: (K, N), 输出: (M, N)
     const auto& a_shape = a.shape().dims;

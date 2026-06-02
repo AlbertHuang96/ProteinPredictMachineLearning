@@ -84,7 +84,10 @@ TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
     TensorF32 msa_norm = msa_layernorm.forward(msa);
     
     TensorF32 Q = Wq.forward(msa_norm);
+    Q = mean(Q, 1);
     // Q = Q.mean(dim=1);
+    // mean Q_mean[b, l, d] = (Q[b, 0, l, d] + Q[b, 1, l, d] + ... + Q[b, 7, l, d]) / 8
+
     // (B, L, h, d_head)
     TensorF32 K = Wk.forward(msa_norm);
     TensorF32 V = Wv.forward(msa_norm);

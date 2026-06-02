@@ -17,6 +17,16 @@ namespace rfaa {
 std::vector<int> arange(int start, int end);
 
 /**
+ * @brief Compute mean along a dimension
+ * 
+ * @param input Input tensor
+ * @param dim Dimension along which to compute mean
+ * @return TensorF32 Output tensor with dim dimension reduced
+ */
+TensorF32 mean(const TensorF32& input, int dim);
+
+
+/**
  * @brief Matrix multiplication
  * 
  * Computes the matrix product of two 2D tensors.

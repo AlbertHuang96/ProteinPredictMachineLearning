@@ -489,6 +489,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     TensorF32 pair;
     pair.copy_from(pair_track_->representation());
     pair = pair + bond_embed(input.bond_feats);
+    //bond_feats: (B, L, L, d_init)
     //bond embed: 
     // bond_feats = one_hot(bond_feats)
     // linear(d_bond_type = 5, d_pair = 128)
