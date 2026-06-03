@@ -41,6 +41,7 @@ struct ModelInput {
     TensorF32 t1d;           // (B, T, L, 80) - 模板特征
     TensorF32 t2d;           // (B, T, L, L, ...) - 模板 2D 特征
     TensorF32 coords;        // (B, L, 3, 3) - 初始 Ca 坐标 (可选)
+    TensorF32 tor_feat;
     TensorF32 bond_feats;    // (B, L, L, d_bond) - 键特征
     TensorF32 dist_matrix;   // (B, L, L) - 距离矩阵
 };

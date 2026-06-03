@@ -73,6 +73,8 @@ private:
 using TensorF32 = Tensor<float>;
 using TensorF16 = Tensor<half>;
 
+using TensorI64 = Tensor<int64_t>;
+
 // 工厂函数
 template<typename T = float>
 Tensor<T> zeros(const Shape& shape, Device device = Device::CPU) {

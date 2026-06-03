@@ -51,6 +51,7 @@ struct HHRData {
 
 struct TemplateDataInternal {
     rfaa::TensorF32 xyz;      // (total_atoms, 3)
+    rfaa::TensorF32 masks;    // (total_atoms, 1)
     rfaa::TensorF32 qmap;     // (total_alignments, 2) - [query_idx, template_hit_idx]
     rfaa::TensorF32 f0d;      // (n_templates, 8) - per-hit stats
     rfaa::TensorF32 f1d;      // (total_alignments, 3) - per-position scores
@@ -69,6 +70,7 @@ struct TemplateHitInput {
 // 对应 Python: read_templates(qlen, ffdb, hhr_fn, atab_fn, n_templ=10)
 struct ReadTemplatesResult {
     rfaa::TensorF32 xyz;   // (npick, qlen, 3, 3) - N,CA,C 坐标
+    rfaa::TensorF32 masks; // (npick, qlen, 1) - 掩码
     rfaa::TensorF32 f1d;   // (npick, qlen, 3) - 位置特征
     rfaa::TensorF32 f0d;   // (npick, 3) - 全局特征 [Probab/100, Identities/100, Similarity]
     std::vector<std::string> ids;  // 模板 ID
@@ -82,8 +84,16 @@ struct ReadTemplatesResult {
 struct TemplateData {
     TensorF32 t1d;                        // (T, L, 80) 模板 1D 特征
     TensorF32 t2d;                        // (T, L, L, ...) 模板 2D 特征
-    TensorF32 coords;                      // (T, L, 3, 3) 模板坐标
+    TensorF32 coords;                     // (T, L, 3) 模板坐标
+    //TensorF32 masks;                      // (T, L, 3) 模板掩码
     std::vector<std::string> template_names; // 模板名称列表
+};
+
+struct TorsionResult {
+    rfaa::TensorF32 torsions;      // (B, L, 10, 2)
+    rfaa::TensorF32 torsions_alt;  // (B, L, 10, 2)
+    rfaa::TensorF32 tors_mask;     // (B, L, 10)
+    rfaa::TensorF32 tors_planar;   // (B, L, 10) bool
 };
 
 
@@ -238,6 +248,23 @@ private:
     int max_seqs_;
     int max_templates_;
     int max_length_;
+
+    void init_torsion_indices();
+
+    // 扭转角索引: (NAATOKENS, NTOTALDOFS, 4)
+    // 使用 int8_t 存储原子索引（可能为负表示跨残基）
+    int8_t torsion_indices[NAATOKENS][NTOTALDOFS][4];
+    
+    // 是否可以翻转: (NAATOKENS, NTOTALDOFS)
+    bool torsion_can_flip[NAATOKENS][NTOTALDOFS];
+    
+    // 氨基酸长格式原子列表 (每个氨基酸最多14个原子)
+    // aa2long[i] = ["N","CA","C","O","CB",...]
+    std::vector<std::vector<std::string>> aa2long;
+    std::vector<std::vector<std::string>> aa2longalt;
+    
+    // 扭转角定义: torsions[i][j] = [atom1, atom2, atom3, atom4] 或 None
+    std::vector<std::vector<std::vector<std::string>>> torsions;
 
     TensorF32 get_protein_bond_feats(int protein_L);
     

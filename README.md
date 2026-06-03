@@ -79,6 +79,18 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON -DBUILD_PYTHON_BRIDGE=ON
 make -j$(nproc)
 ```
 
+homo-oligomers
+
+# resolve torsion indices
+        #  a negative index indicates the previous residue
+        # order:
+        #    omega/phi/psi: 0-2
+        #    chi_1-4(prot): 3-6
+        #    cb/cg bend: 7-9
+        #    eps(p)/zeta(p): 10-11
+        #    alpha/beta/gamma/delta: 12-15
+        #    nu2/nu1/nu0: 16-18
+        #    chi_1(na): 19
 
 #road map:
 

@@ -851,7 +851,9 @@ C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
 //   t0d: (B, T, 3) - 模板级特征
 // 输出:
 //   t2d: (B, T, L, L, 10) - 模板 2D 特征
-
+// old version of RosettaFold
+// d_t2d = 10 is old version
+// RF2 d_t2d = 68
 rfaa::TensorF32 xyz_to_t2d(const rfaa::TensorF32& xyz_t, 
                             const rfaa::TensorF32& t0d, 
                             float DMAX = 20.0f) {
@@ -969,6 +971,271 @@ rfaa::TensorF32 xyz_to_t2d(const rfaa::TensorF32& xyz_t,
     return t2d;
 }
 
+//using TensorI64 = Tensor<int64_t>;
+std::vector<float> linspace(float start, float end, int n) {
+    std::vector<float> result;
+    result.reserve(n);
+    for (int i = 0; i < n; i++) {
+        result.push_back(start + static_cast<float>(i) * (end - start) / static_cast<float>(n - 1));
+    }
+    return result;
+}
+
+// ========== 参数结构体 ==========
+struct DistParams {
+    float DMIN = 1.0f;      // 最小距离
+    float DMID = 4.0f;     // 中间距离
+    float DMAX = 20.0f;     // 最大距离
+    int DBINS1 = 30;        // 近距离 bin 数
+    int DBINS2 = 30;        // 远距离 bin 数
+    
+    int num_classes() const { return DBINS1 + DBINS2 + 1; }
+};
+
+// ========== dist_to_bins: 距离离散化为 bin 索引 ==========
+// 对应 Python: dist_to_bins(dist, params=PARAMS)
+// 输入: dist (...,) - 距离矩阵
+// 输出: db (...,) - bin 索引 (long/int64)
+rfaa::TensorI64 dist_to_bins(const rfaa::TensorF32& dist, const DistParams& params = DistParams()) {
+    // ========== 1. 处理 NaN ==========
+    rfaa::TensorF32 dist_clean = dist;  // 克隆
+    for (int64_t i = 0; i < dist_clean.numel(); i++) {
+        if (std::isnan(dist_clean.data()[i])) {
+            dist_clean.data()[i] = 999.9f;
+        }
+    }
+    
+    // ========== 2. 计算 bin 边界 ==========
+    // dstep1 = (DMID - DMIN) / DBINS1
+    float dstep1 = (params.DMID - params.DMIN) / static_cast<float>(params.DBINS1);
+    // dstep2 = (DMAX - DMID) / DBINS2
+    float dstep2 = (params.DMAX - params.DMID) / static_cast<float>(params.DBINS2);
+    
+    // dbins = cat(linspace(DMIN+dstep1, DMID, DBINS1), linspace(DMID+dstep2, DMAX, DBINS2))
+    std::vector<float> dbins;
+    dbins.reserve(params.DBINS1 + params.DBINS2);
+    
+    // 第一段: linspace(DMIN+dstep1, DMID, DBINS1)
+    for (int i = 0; i < params.DBINS1; i++) {
+        float val = params.DMIN + dstep1 + static_cast<float>(i) * (params.DMID - params.DMIN - dstep1) / static_cast<float>(params.DBINS1 - 1);
+        // 更准确: linspace(start, end, n) = start + i * (end - start) / (n - 1)
+        val = params.DMIN + dstep1 + static_cast<float>(i) * (params.DMID - (params.DMIN + dstep1)) / static_cast<float>(params.DBINS1 - 1);
+        dbins.push_back(val);
+    }
+    
+    // 第二段: linspace(DMID+dstep2, DMAX, DBINS2)
+    for (int i = 0; i < params.DBINS2; i++) {
+        float val = params.DMID + dstep2 + static_cast<float>(i) * (params.DMAX - (params.DMID + dstep2)) / static_cast<float>(params.DBINS2 - 1);
+        dbins.push_back(val);
+    }
+    
+    // ========== 3. bucketize: 离散化 ==========
+    // torch.bucketize(dist, dbins) -> 返回 dist[i] 应该插入 dbins 的位置
+    rfaa::TensorI64 db(dist.shape());  // 假设 TensorI64 是 int64_t 张量
+    
+    for (int64_t i = 0; i < dist.numel(); i++) {
+        float d = dist_clean.data()[i];
+        
+        // 找到第一个 >= d 的位置 (upper_bound)
+        auto it = std::upper_bound(dbins.begin(), dbins.end(), d);
+        int64_t idx = std::distance(dbins.begin(), it);
+        
+        db.data()[i] = idx;
+    }
+    
+    return db;
+}
+
+// ========== dist_to_onehot: 距离转 one-hot ==========
+// 对应 Python: dist_to_onehot(dist, params=PARAMS)
+// 输入: dist (...,) - 距离矩阵
+// 输出: onehot (..., num_classes) - one-hot 编码
+rfaa::TensorF32 dist_to_onehot(const rfaa::TensorF32& dist, const DistParams& params = DistParams()) {
+    // ========== 1. 离散化 ==========
+    rfaa::TensorI64 db = dist_to_bins(dist, params);
+    int num_classes = params.num_classes();
+    
+    // ========== 2. One-hot 编码 ==========
+    // 输出形状: dist.shape + (num_classes,)
+    std::vector<int64_t> out_dims = dist.shape().dims;
+    out_dims.push_back(num_classes);
+    
+    rfaa::TensorF32 onehot(out_dims, 0.0f);
+    
+    // 计算总元素数（排除最后一维）
+    int64_t total_prefix = dist.numel();
+    
+    for (int64_t i = 0; i < total_prefix; i++) {
+        int64_t class_idx = db.data()[i];
+        
+        // 边界检查
+        if (class_idx < 0 || class_idx >= num_classes) {
+            // 超出范围，可能是 999.9 距离 -> 放到最后一个 bin
+            class_idx = num_classes - 1;
+        }
+        
+        // onehot[i, class_idx] = 1.0
+        onehot.data()[i * num_classes + class_idx] = 1.0f;
+    }
+    
+    return onehot;
+}
+
+// ========== 辅助函数：单个距离离散化 ==========
+int dist_to_bin_single(float dist, const DistParams& params) {
+    // 处理 NaN
+    if (std::isnan(dist)) dist = 999.9f;
+    
+    // 计算 bin 边界（与 dist_to_bins 相同逻辑）
+    float dstep1 = (params.DMID - params.DMIN) / static_cast<float>(params.DBINS1);
+    float dstep2 = (params.DMAX - params.DMID) / static_cast<float>(params.DBINS2);
+    
+    // 找到 bin 索引
+    if (dist <= params.DMIN + dstep1) {
+        return 0;
+    } else if (dist <= params.DMID) {
+        float bin_width = (params.DMID - (params.DMIN + dstep1)) / static_cast<float>(params.DBINS1 - 1);
+        return static_cast<int>((dist - (params.DMIN + dstep1)) / bin_width);
+    } else if (dist <= params.DMAX) {
+        float bin_width = (params.DMAX - (params.DMID + dstep2)) / static_cast<float>(params.DBINS2 - 1);
+        return params.DBINS1 + static_cast<int>((dist - (params.DMID + dstep2)) / bin_width);
+    } else {
+        return params.num_classes() - 1;  // 最后一个 bin
+    }
+}
+
+// new version of RF2 t2d = 68
+// 输入:
+//   xyz_t: (B, T, L, 3, 3) - 模板坐标
+//   mask: (B, T, L, L) - 有效对掩码
+// 输出:
+//   t2d: (B, T, L, L, D) - 模板 2D 特征 (D = num_classes + 6 + 1) = 61 + 7 = 68
+rfaa::TensorF32 xyz_to_t2d(
+    const rfaa::TensorF32& xyz_t,
+    const rfaa::TensorF32& mask,
+    const DistParams& params = DistParams()
+) {
+    // ========== 参数检查 ==========
+    if (xyz_t.shape().dims.size() != 5 || xyz_t.shape().dims[3] != 3 || xyz_t.shape().dims[4] != 3) {
+        throw std::runtime_error("xyz_t must have shape (B, T, L, 3, 3)");
+    }
+    if (mask.shape().dims.size() != 4) {
+        throw std::runtime_error("mask must have shape (B, T, L, L)");
+    }
+    
+    int B = static_cast<int>(xyz_t.shape().dims[0]);
+    int T = static_cast<int>(xyz_t.shape().dims[1]);
+    int L = static_cast<int>(xyz_t.shape().dims[2]);
+    int num_classes = params.num_classes();  // DBINS1 + DBINS2 + 1 = 61
+    
+    // ========== 1. 计算 6D 坐标 ==========
+    // xyz_t[:,:,:,:3].view(B*T, L, 3, 3)
+    rfaa::TensorF32 xyz_reshaped({B*T, L, 3, 3});
+    std::memcpy(xyz_reshaped.data(), xyz_t.data(), xyz_t.numel() * sizeof(float));
+    
+    //auto [c6d_flat, mask_flat] = xyz_to_c6d_simple(xyz_reshaped, params);
+    C6DResult xyz_to_c6d_result = xyz_to_c6d(xyz_reshaped, params.DMAX);
+    
+    // c6d.view(B, T, L, L, 4)
+    rfaa::TensorF32 c6d({B, T, L, L, 4});
+    std::memcpy(c6d.data(), xyz_to_c6d_result.c6d.data(), xyz_to_c6d_result.c6d.numel() * sizeof(float));
+    
+    // ========== 2. 距离 one-hot 编码 ==========
+    // mask[...,None] -> (B, T, L, L, 1)
+    // dist = dist_to_onehot(c6d[...,0]) * mask
+    rfaa::TensorF32 dist_onehot({B, T, L, L, num_classes}, 0.0f);
+    
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            for (int i = 0; i < L; i++) {
+                for (int j = 0; j < L; j++) {
+                    float dist_val = c6d.data()[((b*T + t)*L + i)*L*4 + j*4 + 0];
+                    float mask_val = mask.data()[(b*T + t)*L*L + i*L + j];
+                    
+                    // ?
+                    // 离散化距离
+                    int class_idx = dist_to_bin_single(dist_val, params);
+                    class_idx = std::max(0, std::min(num_classes-1, class_idx));
+                    
+                    // one-hot
+                    dist_onehot.data()[((b*T + t)*L + i)*L*num_classes + j*num_classes + class_idx] 
+                    = dist_val * mask_val;
+                    // ? dist = one hot float * mask
+                }
+            }
+        }
+    }
+    
+    // ========== 3. 方向编码 (sin/cos) ==========
+    // orien = cat(sin(c6d[...,1:]), cos(c6d[...,1:])) * mask
+    // c6d[...,1:] = omega, theta, phi (3个角度) -> sin+cos = 6维
+    rfaa::TensorF32 orien({B, T, L, L, 6}, 0.0f);
+    
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            for (int i = 0; i < L; i++) {
+                for (int j = 0; j < L; j++) {
+                    float mask_val = mask.data()[(b*T + t)*L*L + i*L + j];
+                    int c6d_offset = ((b*T + t)*L + i)*L*4 + j*4;
+                    
+                    for (int k = 0; k < 3; k++) {  // omega=1, theta=2, phi=3
+                        float angle = c6d.data()[c6d_offset + 1 + k];
+                        orien.data()[((b*T + t)*L + i)*L*6 + j*6 + k*2 + 0] = std::sin(angle) * mask_val;
+                        orien.data()[((b*T + t)*L + i)*L*6 + j*6 + k*2 + 1] = std::cos(angle) * mask_val;
+                    }
+                }
+            }
+        }
+    }
+    
+    // ========== 4. 扩展 mask 到最后维 ==========
+    // mask 已经是 (B,T,L,L)，需要扩展为 (B,T,L,L,1)
+    rfaa::TensorF32 mask_expanded({B, T, L, L, 1});
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            for (int i = 0; i < L; i++) {
+                for (int j = 0; j < L; j++) {
+                    mask_expanded.data()[((b*T + t)*L + i)*L*1 + j*1 + 0] = 
+                        mask.data()[(b*T + t)*L*L + i*L + j];
+                }
+            }
+        }
+    }
+    
+    // ========== 5. 拼接 ==========
+    // t2d = cat(dist, orien, mask, dim=-1)
+    // 维度: num_classes + 6 + 1 = num_classes + 7
+    int D = num_classes + 6 + 1;
+    rfaa::TensorF32 t2d({B, T, L, L, D}, 0.0f);
+    
+    for (int b = 0; b < B; b++) {
+        for (int t = 0; t < T; t++) {
+            for (int i = 0; i < L; i++) {
+                for (int j = 0; j < L; j++) {
+                    int dst_offset = ((b*T + t)*L + i)*L*D + j*D;
+                    int src_offset_dist = ((b*T + t)*L + i)*L*num_classes + j*num_classes;
+                    int src_offset_orien = ((b*T + t)*L + i)*L*6 + j*6;
+                    
+                    // dist: num_classes 维
+                    for (int k = 0; k < num_classes; k++) {
+                        t2d.data()[dst_offset + k] = dist_onehot.data()[src_offset_dist + k];
+                    }
+                    
+                    // orien: 6 维
+                    for (int k = 0; k < 6; k++) {
+                        t2d.data()[dst_offset + num_classes + k] = orien.data()[src_offset_orien + k];
+                    }
+                    
+                    // mask: 1 维
+                    t2d.data()[dst_offset + num_classes + 6] = mask_expanded.data()[((b*T + t)*L + i)*L*1 + j*1 + 0];
+                }
+            }
+        }
+    }
+    
+    return t2d;
+}
+
 ModelInput RFAADataLoader::load_from_files(
     const std::string& a3m_path,
     const std::string& hhr_path,
@@ -983,6 +1250,7 @@ ModelInput RFAADataLoader::load_from_files(
     input.seq_tokens = prepare_seq_tokens(sequence);
 
     // read templates
+    // TODO: add mask to the import result of read_templates
     ReadTemplatesResult read_templates_result = read_templates(
         sequence.length(), ffdb_, hhr_path, atab_path, max_templates_);
     TensorF32 xyz_t = read_templates_result.xyz;  // (T, L, 3, 3)
@@ -993,11 +1261,33 @@ ModelInput RFAADataLoader::load_from_files(
     t0d = t0d.unsqueeze(0);
 
     t2d = xyz_to_t2d(xyz_t);
+    // xyz_to_t2d(xyz, mask, params)
+    // mask from the template reading
+
 
     input.coords = xyz_t;  // (1, T, L, 3, 3)
     input.t1d = t1d;      // (1, T, L, 3)
     input.t2d = t2d;
+
+    /* alpha, _, alpha_mask, _ = util.get_torsions(
+            xyz_t.reshape(-1,L,27,3),
+            seq_tmp,
+            util.torsion_indices,
+            util.torsion_can_flip,
+            util.reference_angles
+        ) */
+    /* alpha_mask = torch.logical_and(alpha_mask, ~torch.isnan(alpha[...,0])) */
+    /* alpha[torch.isnan(alpha)] = 0.0 */
+    /* alpha = alpha.reshape(1,-1,L,10,2) */
+    /* alpha_mask = alpha_mask.reshape(1,-1,L,10,1) */
+    /* alpha_t = torch.cat((alpha, alpha_mask), dim=-1).reshape(1, -1, L, 30) */
+
+    input.tor_feat = get_torsions(xyz_t, sequence).torsions;
     
+    // int L = len(sequence); ?
+    input.bond_feat = get_protein_bond_feats();
+    //input.dist_matrix = get_protein_dist_matrix(xyz_t);
+
     // Step 2: 解析 HHR
     /* HHRData hhr_data = parse_hhr(hhr_path);
     TemplateData template_data = hhr_extract_template_features(
@@ -1023,7 +1313,7 @@ ReadTemplatesResult RFAADataLoader::read_templates(
 ) {
     // ========== 1. 调用 parse_templates ==========
     // 注意：这里需要先实现 parse_templates，返回 TemplateData
-    TemplateData parsed = parse_templates(ffdb, hhr_fn, atab_fn, n_templ);
+    TemplateDataInternal parsed = parse_templates(ffdb, hhr_fn, atab_fn, n_templ);
     
     int npick = std::min(n_templ, static_cast<int>(parsed.ids.size()));
     if (npick <= 0) {
@@ -1032,6 +1322,7 @@ ReadTemplatesResult RFAADataLoader::read_templates(
         result.xyz = rfaa::TensorF32({0, qlen, 3, 3});
         result.f1d = rfaa::TensorF32({0, qlen, 3});
         result.f0d = rfaa::TensorF32({0, 3});
+        result.masks = rfaa::TensorF32({0, qlen, 1});
         return result;
     }
     
@@ -1135,6 +1426,7 @@ ReadTemplatesResult RFAADataLoader::read_templates(
     // ========== 5. 返回结果 ==========
     ReadTemplatesResult result;
     result.xyz = std::move(xyz);
+    result.masks = std::move(masks);
     result.f1d = std::move(f1d);
     result.f0d = std::move(f0d_stacked);
     result.ids = std::move(parsed.ids);
@@ -1192,7 +1484,7 @@ std::vector<TemplateHitInput> RFAADataLoader::parse_atab(const std::string& atab
     return hits;
 }
 
-TemplateData RFAADataLoader::parse_templates(
+TemplateDataInternal RFAADataLoader::parse_templates(
     const std::string& db_prefix,  // e.g., "pdb100_2021Mar03/pdb100_2021Mar03"
     const std::string& hhr_fn,
     const std::string& atab_fn,
@@ -1226,6 +1518,7 @@ TemplateData RFAADataLoader::parse_templates(
     // 
     // ========== 4. 处理 hits ==========
     std::vector<rfaa::TensorF32> all_xyz;
+    std::vector<rfaa::TensorF32> all_mask;
     std::vector<rfaa::TensorF32> all_qmap;
     std::vector<rfaa::TensorF32> all_f0d;
     std::vector<rfaa::TensorF32> all_f1d;
@@ -1244,6 +1537,7 @@ TemplateData RFAADataLoader::parse_templates(
             continue;
         }
         
+        //_,sel1,sel2 = np.intersect1d(ti, data[6], return_indices=True)
         // 创建 qi, ti 张量 (简化：假设所有对齐都有效)
         rfaa::TensorF32 qi({ncol});
         rfaa::TensorF32 ti({ncol});
@@ -1273,10 +1567,15 @@ TemplateData RFAADataLoader::parse_templates(
             }
             all_f1d.push_back(std::move(f1d_mat));
         }
-        
+
+        //xyz.append(data[4][sel2])
         // ========== xyz: hit.xyz -> (ncol, 3) ==========
         // 简化：使用全部坐标
         all_xyz.push_back(hit.xyz);
+        
+        // ========== mask: hit.mask -> (ncol, 1) ==========
+        all_mask.push_back(hit.mask);
+        //mask.append(data[5][sel2])
         
         // ========== qmap: [qi-1, counter] -> (ncol, 2) ==========
         {
@@ -1295,8 +1594,22 @@ TemplateData RFAADataLoader::parse_templates(
         }
     }
     // ========== 5. 堆叠结果 (vstack) ==========
-    TemplateData result;
+    TemplateDataInternal result;
     
+    // ========== mask: vstack ==========
+    {
+        int64_t total_rows = 0;
+        for (const auto& t : all_mask) total_rows += t.shape().dims[0];
+        
+        result.masks = rfaa::TensorF32({total_rows, 1});
+        bool* dst = result.masks.data();
+        for (const auto& t : all_mask) {
+            int64_t n = t.numel();
+            std::memcpy(dst, t.data(), n * sizeof(bool));
+            dst += n;
+        }
+    }
+
     // ========== xyz: vstack ==========
     {
         int64_t total_rows = 0;
@@ -1546,6 +1859,260 @@ TemplateData RFAADataLoader::hhr_extract_template_features(
     // TODO: 实际特征提取逻辑
     
     return result;
+}
+
+TorsionResult RFAADataLoader::get_torsions(
+    const rfaa::TensorF32& xyz_in,           // (B, L, 14, 3)
+    const rfaa::TensorF32& seq,              // (B, L)
+    const std::vector<std::vector<std::vector<int>>>& torsion_indices, // (21, 7, 4)
+    const std::vector<std::vector<bool>>& torsion_can_flip,            // (21, 7)
+    const std::vector<std::vector<std::array<float, 2>>>& ref_angles  // (21, 3, 2)
+) {
+    int B = static_cast<int>(xyz_in.shape().dims[0]);
+    int L = static_cast<int>(xyz_in.shape().dims[1]);
+    
+    // ========== 1. 计算 tors_mask (简化：假设所有都有效) ==========
+    rfaa::TensorF32 tors_mask({B, L, 10}, 1.0f);
+    
+    // ========== 2. tors_planar: TYR chi 3 should be planar ==========
+    rfaa::TensorF32 tors_planar({B, L, 10}, 0.0f);
+    for (int b = 0; b < B; b++) {
+        for (int l = 0; l < L; l++) {
+            int seq_val = static_cast<int>(seq.data()[b*L + l]);
+            if (seq_val == 18) {  // TYR = 18
+                tors_planar.data()[(b*L + l)*10 + 5] = 1.0f;  // chi 3 (index 5)
+            }
+        }
+    }
+    
+    // ========== 3. 理想化坐标 ==========
+    rfaa::TensorF32 xyz = xyz_in;  // 克隆（这里假设调用者会管理）
+    
+    // Rs, Ts = rigid_from_3_points(N, Ca, C)
+    rfaa::TensorF32 N = xyz.select(2, 0);  // (B, L, 3)
+    rfaa::TensorF32 Ca = xyz.select(2, 1);
+    rfaa::TensorF32 C = xyz.select(2, 2);
+    
+    auto [Rs, Ts] = rigid_from_3_points(N, Ca, C);
+    
+    // Nideal = [-0.5272, 1.3593, 0.000], Cideal = [1.5233, 0.000, 0.000]
+    std::array<float, 3> Nideal = {-0.5272f, 1.3593f, 0.0f};
+    std::array<float, 3> Cideal = {1.5233f, 0.0f, 0.0f};
+    
+    // xyz[...,0,:] = einsum('brij,j->bri', Rs, Nideal) + Ts
+    // xyz[...,2,:] = einsum('brij,j->bri', Rs, Cideal) + Ts
+    for (int b = 0; b < B; b++) {
+        for (int l = 0; l < L; l++) {
+            int rs_offset = (b*L + l) * 9;
+            int ts_offset = (b*L + l) * 3;
+            
+            // Nideal 旋转 + 平移
+            float nx = Rs.data()[rs_offset+0]*Nideal[0] + Rs.data()[rs_offset+1]*Nideal[1] + Rs.data()[rs_offset+2]*Nideal[2] + Ts.data()[ts_offset+0];
+            float ny = Rs.data()[rs_offset+3]*Nideal[0] + Rs.data()[rs_offset+4]*Nideal[1] + Rs.data()[rs_offset+5]*Nideal[2] + Ts.data()[ts_offset+1];
+            float nz = Rs.data()[rs_offset+6]*Nideal[0] + Rs.data()[rs_offset+7]*Nideal[1] + Rs.data()[rs_offset+8]*Nideal[2] + Ts.data()[ts_offset+2];
+            
+            // Cideal 旋转 + 平移
+            float cx = Rs.data()[rs_offset+0]*Cideal[0] + Rs.data()[rs_offset+1]*Cideal[1] + Rs.data()[rs_offset+2]*Cideal[2] + Ts.data()[ts_offset+0];
+            float cy = Rs.data()[rs_offset+3]*Cideal[0] + Rs.data()[rs_offset+4]*Cideal[1] + Rs.data()[rs_offset+5]*Cideal[2] + Ts.data()[ts_offset+1];
+            float cz = Rs.data()[rs_offset+6]*Cideal[0] + Rs.data()[rs_offset+7]*Cideal[1] + Rs.data()[rs_offset+8]*Cideal[2] + Ts.data()[ts_offset+2];
+            
+            // 写回 xyz
+            xyz.data()[((b*L + l)*14 + 0)*3 + 0] = nx;
+            xyz.data()[((b*L + l)*14 + 0)*3 + 1] = ny;
+            xyz.data()[((b*L + l)*14 + 0)*3 + 2] = nz;
+            
+            xyz.data()[((b*L + l)*14 + 2)*3 + 0] = cx;
+            xyz.data()[((b*L + l)*14 + 2)*3 + 1] = cy;
+            xyz.data()[((b*L + l)*14 + 2)*3 + 2] = cz;
+        }
+    }
+    
+    // ========== 4. 计算 torsions ==========
+    rfaa::TensorF32 torsions({B, L, 10, 2}, 0.0f);
+    
+    // omega: torsions[:,:-1,0,:] = th_dih(Ca[i], C[i], N[i+1], Ca[i+1])
+    for (int b = 0; b < B; b++) {
+        for (int l = 0; l < L-1; l++) {
+            // 需要提取 Ca[b,l], C[b,l], N[b,l+1], Ca[b,l+1]
+            // 简化：假设已有 th_dih 函数支持不同索引
+            // 这里省略具体实现...
+        }
+    }
+    
+    // phi: torsions[:,1:,1,:] = th_dih(C[i-1], N[i], Ca[i], C[i])
+    // psi: torsions[:,:,2,:] = -th_dih(N[i], Ca[i], C[i], N[i+1])
+    // chis: torsions[:,:,3:7,:] = th_dih(ti0, ti1, ti2, ti3)
+    // CB bend, CB twist, CG bend...
+    
+    // ========== 5. 处理 NaN ==========
+    for (int i = 0; i < torsions.numel(); i += 2) {
+        if (std::isnan(torsions.data()[i])) {
+            torsions.data()[i] = 1.0f;      // sin = 0 -> angle = 0
+            torsions.data()[i+1] = 0.0f;   // cos = 1
+        }
+    }
+    
+    // ========== 6. torsions_alt = torsions * -1 (可翻转的) ==========
+    rfaa::TensorF32 torsions_alt = torsions;
+    for (int b = 0; b < B; b++) {
+        for (int l = 0; l < L; l++) {
+            int seq_val = static_cast<int>(seq.data()[b*L + l]);
+            for (int t = 0; t < 7; t++) {
+                if (t < static_cast<int>(torsion_can_flip[seq_val].size()) && 
+                    torsion_can_flip[seq_val][t]) {
+                    // 翻转: sin -> -sin, cos -> cos (或者根据实现)
+                    torsions_alt.data()[((b*L + l)*10 + (t+3))*2 + 0] *= -1;  // sin 取负
+                }
+            }
+        }
+    }
+    
+    return {torsions, torsions_alt, tors_mask, tors_planar};
+}
+
+void init_torsion_indices() {
+    for (int i = 0; i < NPROTAAS; i++) {
+        const auto& i_l = aa2long[i];
+        const auto& i_a = aa2longalt[i];
+            
+        // ========== 蛋白质 omega/phi/psi ==========
+        // omega: [-1, -2, 0, 1]
+        torsion_indices[i][0][0] = -1;
+        torsion_indices[i][0][1] = -2;
+        torsion_indices[i][0][2] = 0;
+        torsion_indices[i][0][3] = 1;
+            
+        // phi: [-2, 0, 1, 2]
+        torsion_indices[i][1][0] = -2;
+        torsion_indices[i][1][1] = 0;
+        torsion_indices[i][1][2] = 1;
+        torsion_indices[i][1][3] = 2;
+            
+        // psi: [0, 1, 2, 3]
+        torsion_indices[i][2][0] = 0;
+        torsion_indices[i][2][1] = 1;
+        torsion_indices[i][2][2] = 2;
+        torsion_indices[i][2][3] = 3;
+            
+        // ========== 蛋白质 chis ==========
+        for (int j = 0; j < 4; j++) {
+            if (torsions[i][j].empty() || torsions[i][j][0].empty()) {
+                // None 或空，跳过
+                continue;
+            }
+                
+            for (int k = 0; k < 4; k++) {
+                const std::string& a = torsions[i][j][k];
+                    
+                // 在 i_l 中查找索引
+                auto it = std::find(i_l.begin(), i_l.end(), a);
+                if (it != i_l.end()) {
+                    torsion_indices[i][3 + j][k] = static_cast<int8_t>(std::distance(i_l.begin(), it));
+                } else {
+                    torsion_indices[i][3 + j][k] = -1;  // 未找到
+                }
+                    
+                // 检查是否可以翻转
+                auto it_a = std::find(i_a.begin(), i_a.end(), a);
+                if (it_a != i_a.end() && std::distance(i_a.begin(), it_a) != std::distance(i_l.begin(), it)) {
+                    torsion_can_flip[i][3 + j] = true;
+                }
+            }
+        }
+            
+        // ========== CB/CG angles ==========
+        // CB ang1: [0, 2, 1, 4]
+        torsion_indices[i][7][0] = 0;
+        torsion_indices[i][7][1] = 2;
+        torsion_indices[i][7][2] = 1;
+        torsion_indices[i][7][3] = 4;
+            
+        // CB ang2: [0, 2, 1, 4]
+        torsion_indices[i][8][0] = 0;
+        torsion_indices[i][8][1] = 2;
+        torsion_indices[i][8][2] = 1;
+        torsion_indices[i][8][3] = 4;
+            
+        // CG ang: [0, 2, 4, 5]
+        torsion_indices[i][9][0] = 0;
+        torsion_indices[i][9][1] = 2;
+        torsion_indices[i][9][2] = 4;
+        torsion_indices[i][9][3] = 5;
+    }
+        
+    // ========== HIS 特殊情况 ==========
+    torsion_can_flip[8][4] = false;  // HIS chi2 不翻转
+        
+    // ========== DNA/RNA ==========
+    // 假设 use_phospate_frames_for_NA = false (默认)
+    for (int i = NPROTAAS; i < NNAPROTAAS; i++) {
+        // ribose frame
+        // epsilon_prev: [-2, -9, -10, 4]
+        torsion_indices[i][10][0] = -2;
+        torsion_indices[i][10][1] = -9;
+        torsion_indices[i][10][2] = -10;
+        torsion_indices[i][10][3] = 4;
+            
+        // zeta_prev: [-9, -10, 4, 6]
+        torsion_indices[i][11][0] = -9;
+        torsion_indices[i][11][1] = -10;
+        torsion_indices[i][11][2] = 4;
+        torsion_indices[i][11][3] = 6;
+            
+        // alpha: [7, 6, 4, 3]
+        torsion_indices[i][12][0] = 7;
+        torsion_indices[i][12][1] = 6;
+        torsion_indices[i][12][2] = 4;
+        torsion_indices[i][12][3] = 3;
+            
+        // beta: [8, 7, 6, 4]
+        torsion_indices[i][13][0] = 8;
+        torsion_indices[i][13][1] = 7;
+        torsion_indices[i][13][2] = 6;
+        torsion_indices[i][13][3] = 4;
+            
+        // gamma: [9, 8, 7, 6]
+        torsion_indices[i][14][0] = 9;
+        torsion_indices[i][14][1] = 8;
+        torsion_indices[i][14][2] = 7;
+        torsion_indices[i][14][3] = 6;
+            
+        // delta: [2, 9, 8, 7]
+        torsion_indices[i][15][0] = 2;
+        torsion_indices[i][15][1] = 9;
+        torsion_indices[i][15][2] = 8;
+        torsion_indices[i][15][3] = 7;
+            
+        // nu2: [1, 2, 9, 8]
+        torsion_indices[i][16][0] = 1;
+        torsion_indices[i][16][1] = 2;
+        torsion_indices[i][16][2] = 9;
+        torsion_indices[i][16][3] = 8;
+            
+        // nu1: [0, 1, 2, 9]
+        torsion_indices[i][17][0] = 0;
+        torsion_indices[i][17][1] = 1;
+        torsion_indices[i][17][2] = 2;
+        torsion_indices[i][17][3] = 9;
+            
+        // nu0: [2, 1, 0, 8]
+        torsion_indices[i][18][0] = 2;
+        torsion_indices[i][18][1] = 1;
+        torsion_indices[i][18][2] = 0;
+        torsion_indices[i][18][3] = 8;
+            
+        // NA chi: [如果 torsions[i][0] 不为 None]
+        if (!torsions[i][0].empty() && !torsions[i][0][0].empty()) {
+            const auto& i_l = aa2long[i];
+            for (int k = 0; k < 4; k++) {
+                const std::string& a = torsions[i][0][k];
+                auto it = std::find(i_l.begin(), i_l.end(), a);
+                if (it != i_l.end()) {
+                    torsion_indices[i][19][k] = static_cast<int8_t>(std::distance(i_l.begin(), it));
+                }
+            }
+        }
+    }
 }
 
 TensorF32 RFAADataLoader::get_protein_bond_feats(int protein_L) {
