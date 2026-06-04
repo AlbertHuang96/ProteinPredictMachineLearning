@@ -12,6 +12,10 @@
 #include <string>
 #include <vector>
 
+#include <queue>
+#include <algorithm>
+#include <limits>
+
 // ========== FFindex 数据结构 ==========
 
 struct FFindexEntry {
@@ -1260,8 +1264,9 @@ ModelInput RFAADataLoader::load_from_files(
     t1d = t1d.unsqueeze(0);
     t0d = t0d.unsqueeze(0);
 
-    t2d = xyz_to_t2d(xyz_t);
+    //t2d = xyz_to_t2d(xyz_t);
     // xyz_to_t2d(xyz, mask, params)
+    t2d = xyz_to_t2d(xyz_t, read_templates_result.masks);
     // mask from the template reading
 
 
@@ -1285,8 +1290,9 @@ ModelInput RFAADataLoader::load_from_files(
     input.tor_feat = get_torsions(xyz_t, sequence).torsions;
     
     // int L = len(sequence); ?
-    input.bond_feat = get_protein_bond_feats();
-    //input.dist_matrix = get_protein_dist_matrix(xyz_t);
+    int L = static_cast<int>(sequence.length());
+    input.bond_feat = get_protein_bond_feats(L);
+    input.dist_matrix = get_bond_distances(input.bond_feat);
 
     // Step 2: 解析 HHR
     /* HHRData hhr_data = parse_hhr(hhr_path);
@@ -1412,7 +1418,7 @@ ReadTemplatesResult RFAADataLoader::read_templates(
         rfaa::TensorF32 f0d_row({1, 3});
         f0d_row.data()[0] = parsed.f0d.data()[nt * 8 + 0] / 100.0f;  // Probab/100
         f0d_row.data()[1] = parsed.f0d.data()[nt * 8 + 4] / 100.0f;  // Identities/100
-        f0d_row.data()[2] = parsed.f0d.data()[nt * 8 + 5] / 100.0f;  // Similarity
+        f0d_row.data()[2] = parsed.f0d.data()[nt * 8 + 5] / 100.0f;  // Similarity / 100
         f0d_list.push_back(std::move(f0d_row));
     }
     
@@ -2129,6 +2135,78 @@ TensorF32 RFAADataLoader::get_protein_bond_feats(int protein_L) {
     }
     
     return bond_feats;
+}
+
+// ========== 辅助函数：BFS 计算最短路径 ==========
+// 输入: adj (L, L) - 邻接矩阵 (bool)
+// 输出: dist (L, L) - 最短路径矩阵
+rfaa::TensorF32 compute_shortest_path(const rfaa::TensorF32& adj) {
+    int L = static_cast<int>(adj.shape().dims[0]);
+    rfaa::TensorF32 dist({L, L});
+    float* dist_data = dist.data();
+    
+    const float* adj_data = adj.data();
+    
+    // 对每个源点做 BFS
+    for (int src = 0; src < L; src++) {
+        // 初始化距离
+        for (int i = 0; i < L; i++) {
+            dist_data[src * L + i] = (i == src) ? 0.0f : std::numeric_limits<float>::infinity();
+        }
+        
+        // BFS 队列
+        std::queue<int> q;
+        q.push(src);
+        
+        while (!q.empty()) {
+            int u = q.front();
+            q.pop();
+            
+            // 遍历邻居
+            for (int v = 0; v < L; v++) {
+                if (adj_data[u * L + v] > 0.5f) {  // 有边
+                    if (std::isinf(dist_data[src * L + v])) {
+                        dist_data[src * L + v] = dist_data[src * L + u] + 1.0f;
+                        q.push(v);
+                    }
+                }
+            }
+        }
+    }
+    
+    return dist;
+}
+
+TensorF32 RFAADataLoader::get_bond_distances(const rfaa::TensorF32& bond_feats) {
+    // Impl
+    // ========== 1. 创建邻接矩阵 ==========
+    // atom_bonds = (bond_feats > 0) * (bond_feats < 5)
+    int L = static_cast<int>(bond_feats.shape().dims[0]);
+    rfaa::TensorF32 atom_bonds({L, L});
+    float* bonds_data = atom_bonds.data();
+    const float* bf_data = bond_feats.data();
+    
+    for (int i = 0; i < L; i++) {
+        for (int j = 0; j < L; j++) {
+            float val = bf_data[i * L + j];
+            bonds_data[i * L + j] = (val > 0.0f && val < 5.0f) ? 1.0f : 0.0f;
+        }
+    }
+    
+    // ========== 2. 计算最短路径 ==========
+    rfaa::TensorF32 dist_matrix = compute_shortest_path(atom_bonds);
+    
+    // ========== 3. 处理 inf (可选) ==========
+    // 将 inf 替换为 4.0 (如果需要的话)
+    float* dm_data = dist_matrix.data();
+    for (int i = 0; i < L * L; i++) {
+        if (std::isinf(dm_data[i])) {
+            dm_data[i] = 4.0f;  // 或者保持 inf，取决于使用场景
+        }
+    }
+    
+    return dist_matrix;
+    
 }
 
 TensorF32 RFAADataLoader::prepare_msa_latent(const A3MData& a3m_data) {

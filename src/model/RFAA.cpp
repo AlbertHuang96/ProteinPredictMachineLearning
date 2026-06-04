@@ -39,7 +39,7 @@ IterBlock::IterBlock(const RFAAConfig& config, bool update_msa_pair)
     pos_enc_ = std::make_unique<PositionalEncoding>(-32, 32, 8, config.d_pair);
 }
 
-void IterBlock::projStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_state) {
+void IterBlock::proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state) {
     // state -> msa[:,0]
     // msa[:, 0] += proj(state)  (B,L,32) -> (B,L,256)
 
@@ -67,7 +67,7 @@ void IterBlock::projStateAddToQueryRow(TensorF32& msa, const TensorF32& proj_sta
     
 }
 
-TensorF32 IterBlock::computeRBFFeature(const TensorF32& coords)
+TensorF32 IterBlock::compute_rbf_feature(const TensorF32& coords)
 {
     // Python equivalent:
     // cas = xyz[:, :, 1].contiguous()
