@@ -79,6 +79,9 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON -DBUILD_PYTHON_BRIDGE=ON
 make -j$(nproc)
 ```
 
+todo:
+move modules into models
+
 homo-oligomers
 
 # resolve torsion indices
