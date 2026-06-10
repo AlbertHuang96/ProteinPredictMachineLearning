@@ -2,6 +2,14 @@
 #include "Tensor.h"
 #include "HashSet.h"
 
+#define GGML_MAX_DIMS           4
+#define GGML_MAX_PARAMS         2048
+#define GGML_MAX_SRC            10
+#define GGML_MAX_N_THREADS      512
+#define GGML_MAX_OP_PARAMS      64
+
+#define GGML_PAD(x, n) (((x) + ((n)-1)) & ~((n)-1))
+
 namespace rfaa {
 
     //遍历方式

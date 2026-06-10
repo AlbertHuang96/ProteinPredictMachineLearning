@@ -53,6 +53,10 @@ static size_t hash_find(const struct HashSet * hash_set, const struct Tensor * k
     return i;
 }
 
+void hash_set_reset(struct HashSet * hash_set) {  
+    memset(hash_set->used, 0, sizeof(bitset_t) * bitset_size(hash_set->size));  
+}
+
 
 static bool hash_contains(const struct HashSet * hash_set, struct Tensor * key) {
     size_t i = hash_find(hash_set, key);

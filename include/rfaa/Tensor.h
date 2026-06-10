@@ -6,6 +6,116 @@
 
 namespace rfaa {
 
+enum tensor_flag {
+    TENSOR_FLAG_INPUT   = 1,
+    TENSOR_FLAG_OUTPUT  = 2,
+    TENSOR_FLAG_PARAM   = 4,
+    TENSOR_FLAG_LOSS    = 8,
+    TENSOR_FLAG_COMPUTE = 16,
+};
+
+enum tensor_op {
+    OP_NONE = 0,
+    OP_DUP,
+    OP_ADD,
+    OP_ADD_ID,
+    OP_ADD1,
+    OP_ACC,
+    OP_SUB,
+    OP_MUL,
+    OP_DIV,
+    OP_SQR,
+    OP_SQRT,
+    OP_LOG,
+    OP_SIN,
+    OP_COS,
+    OP_SUM,
+    OP_SUM_ROWS,
+    OP_CUMSUM,
+    OP_MEAN,
+    OP_ARGMAX,
+    OP_COUNT_EQUAL,
+    OP_REPEAT,
+    OP_REPEAT_BACK,
+    OP_CONCAT,
+    OP_SILU_BACK,
+    OP_NORM, // normalize
+    OP_RMS_NORM,
+    OP_RMS_NORM_BACK,
+    OP_GROUP_NORM,
+    OP_L2_NORM,
+    OP_MUL_MAT,
+    OP_MUL_MAT_ID,
+    OP_OUT_PROD,
+    OP_SCALE,
+    OP_SET,
+    OP_CPY,
+    OP_CONT,
+    OP_RESHAPE,
+    OP_VIEW,
+    OP_PERMUTE,
+    OP_TRANSPOSE,
+    OP_GET_ROWS,
+    OP_GET_ROWS_BACK,
+    OP_SET_ROWS,
+    OP_DIAG,
+    OP_DIAG_MASK_INF,
+    OP_DIAG_MASK_ZERO,
+    OP_SOFT_MAX,
+    OP_SOFT_MAX_BACK,
+    OP_ROPE,
+    OP_ROPE_BACK,
+    OP_CLAMP,
+    OP_CONV_TRANSPOSE_1D,
+    OP_IM2COL,
+    OP_IM2COL_BACK,
+    OP_IM2COL_3D,
+    OP_COL2IM_1D,
+    OP_CONV_2D,
+    OP_CONV_3D,
+    OP_CONV_2D_DW,
+    OP_CONV_TRANSPOSE_2D,
+    OP_POOL_1D,
+    OP_POOL_2D,
+    OP_POOL_2D_BACK,
+    OP_UPSCALE,
+    OP_PAD,
+    OP_PAD_REFLECT_1D,
+    OP_ROLL,
+    OP_ARANGE,
+    OP_TIMESTEP_EMBEDDING,
+    OP_ARGSORT,
+    OP_TOP_K,
+    OP_LEAKY_RELU,
+    OP_TRI,
+    OP_FILL,
+    OP_FLASH_ATTN_EXT,
+    OP_FLASH_ATTN_BACK,
+    OP_SSM_CONV,
+    OP_SSM_SCAN,
+    OP_WIN_PART,
+    OP_WIN_UNPART,
+    OP_GET_REL_POS,
+    OP_ADD_REL_POS,
+    OP_RWKV_WKV6,
+    OP_GATED_LINEAR_ATTN,
+    OP_RWKV_WKV7,
+    OP_SOLVE_TRI,
+    OP_GATED_DELTA_NET,
+    OP_UNARY,
+    OP_MAP_CUSTOM1,
+    OP_MAP_CUSTOM2,
+    OP_MAP_CUSTOM3,
+    OP_CUSTOM,
+    OP_CROSS_ENTROPY_LOSS,
+    OP_CROSS_ENTROPY_LOSS_BACK,
+    OP_OPT_STEP_ADAMW,
+    OP_OPT_STEP_SGD,
+    OP_GLU,
+    OP_COUNT,
+};
+
+
 // 张量接口：CPU/CUDA 统一抽象
 template<typename T = float>
 class Tensor {
@@ -58,6 +168,22 @@ public:
     
     // 打印调试用
     std::string to_string() const;
+
+    // ==== 新增：从 Context 初始化（不自己分配内存）====
+    void init_from_context(int n_dims, const int64_t* ne, void* data_ptr) {
+        Shape s;
+        for (int i = 0; i < n_dims; i++) s.dims.push_back(ne[i]);
+        shape_ = s;
+        data_ = static_cast<T*>(data_ptr);
+        device_ = Device::CPU;
+        own_data_ = false;  // Context 管理生命周期
+    }
+
+    //tensor flag
+    int32_t flag;
+
+    enum tensor_op op;
+
     
 private:
     Shape shape_;

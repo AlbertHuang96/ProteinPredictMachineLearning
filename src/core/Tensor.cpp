@@ -350,8 +350,6 @@ Tensor<T> Tensor<T>::permute(const std::vector<int>& dims) const {
     return result;
 }
 
-
-
 template<typename T>
 std::string Tensor<T>::to_string() const {
     std::ostringstream oss;
@@ -363,6 +361,7 @@ std::string Tensor<T>::to_string() const {
     oss << ", device=" << (device_ == Device::CPU ? "cpu" : "cuda") << ")";
     return oss.str();
 }
+
 
 // 显式实例化
 template class Tensor<float>;
