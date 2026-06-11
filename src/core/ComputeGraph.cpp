@@ -3,46 +3,46 @@
 
 namespace rfaa {
 
-void graph_clear(struct ComputeGraph * cgraph) {
-    cgraph->n_leafs = 0;
-    cgraph->n_nodes = 0;
-    hash_set_reset(&cgraph->visited_hash_set);
+void ComputeGraph::graph_clear() {
+    this->n_leafs = 0;
+    this->n_nodes = 0;
+    hash_set_reset(&this->visited_hash_set);
 }
  
-int graph_size(struct ComputeGraph * cgraph) {
-    return cgraph->size;
+int ComputeGraph::graph_size() {
+    return this->size;
 }
  
-struct Tensor * graph_node(struct ComputeGraph * cgraph, int i) {
+Tensor * ComputeGraph::graph_node(int i) {
     if (i < 0) {
         //GGML_ASSERT(cgraph->n_nodes + i >= 0);
-        return cgraph->nodes[cgraph->n_nodes + i];
+        return this->nodes[this->n_nodes + i];
     }
  
     //GGML_ASSERT(i < cgraph->n_nodes);
-    return cgraph->nodes[i];
+    return this->nodes[i];
 }
  
-struct Tensor ** graph_nodes(struct ComputeGraph * cgraph) {
-    return cgraph->nodes;
+Tensor ** ComputeGraph::graph_nodes() {
+    return this->nodes;
 }
 
-struct ComputeGraph * new_graph_custom(struct RFAAContext * ctx, size_t size, bool grads) {
+static ComputeGraph * ComputeGraph::new_graph_custom(struct RFAAContext * ctx, size_t size, bool grads) {
     const size_t obj_size = graph_nbytes(size, grads);
     struct RFAAObject * obj = new_object(ctx, RFAA_OBJECT_TYPE_GRAPH, obj_size);
-    struct ComputeGraph * cgraph = (struct ComputeGraph *) ((char *) ctx->mem_buffer + obj->offs);
+    ComputeGraph * cgraph = (ComputeGraph *) ((char *) ctx->mem_buffer + obj->offs);
  
     // the size of the hash table is doubled since it needs to hold both nodes and leafs
-    size_t hash_size = ggml_hash_size(size * 2);
+    size_t hash_size = hash_size(size * 2);
  
     void * p = cgraph + 1;
  
-    struct Tensor ** nodes_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct Tensor *), sizeof(struct Tensor *));
-    struct Tensor ** leafs_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct Tensor *), sizeof(struct Tensor *));
+    Tensor ** nodes_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct Tensor *), sizeof(struct Tensor *));
+    Tensor ** leafs_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct Tensor *), sizeof(struct Tensor *));
     int32_t             * use_counts_ptr =         incr_ptr_aligned(&p, hash_size * sizeof(int32_t), sizeof(int32_t));
-    struct Tensor ** hash_keys_ptr  =         incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *));
-    struct Tensor ** grads_ptr      = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)) : NULL;
-    struct Tensor ** grad_accs_ptr  = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)) : NULL;
+    Tensor ** hash_keys_ptr  =         incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *));
+    Tensor ** grads_ptr      = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)) : NULL;
+    Tensor ** grad_accs_ptr  = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)) : NULL;
  
     bitset_t * hash_used = incr_ptr_aligned(&p, bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
  
@@ -65,35 +65,41 @@ struct ComputeGraph * new_graph_custom(struct RFAAContext * ctx, size_t size, bo
  
     hash_set_reset(&cgraph->visited_hash_set);
     if (grads) {
-        memset(cgraph->grads,     0, hash_size*sizeof(struct Tensor *));
-        memset(cgraph->grad_accs, 0, hash_size*sizeof(struct Tensor *));
+        memset(cgraph->grads,     0, hash_size*sizeof(Tensor *));
+        memset(cgraph->grad_accs, 0, hash_size*sizeof(Tensor *));
     }
  
     return cgraph;
 }
  
-struct ComputeGraph * new_graph(struct RFAAContext * ctx) {
+static ComputeGraph * ComputeGraph::new_graph(struct RFAAContext * ctx) {
     return new_graph_custom(ctx, GGML_DEFAULT_GRAPH_SIZE, false);
 }
 
-static size_t visit_parents_graph(struct ComputeGraph * cgraph, struct Tensor * node, bool compute) {
+static ComputeGraph * ComputeGraph::graph_dup(struct RFAAContext * ctx, struct ComputeGraph * cgraph, bool force_grads) {
+    ComputeGraph * result = new_graph_custom(ctx, cgraph->size, cgraph->grads || force_grads);
+    graph_cpy(cgraph, result);
+    return result;
+}
+
+size_t ComputeGraph::visit_parents_graph(Tensor * node, bool compute) {
     
     if (node->op != OP_NONE && compute) {
         node->flags |= TENSOR_FLAG_COMPUTE;
     }
  
-    const size_t node_hash_pos = hash_find(&cgraph->visited_hash_set, node);
+    const size_t node_hash_pos = hash_find(&this->visited_hash_set, node);
     //GGML_ASSERT(node_hash_pos != GGML_HASHSET_FULL);
  
-    if (bitset_get(cgraph->visited_hash_set.used, node_hash_pos)) {
+    if (bitset_get(this->visited_hash_set.used, node_hash_pos)) {
     // already visited
  
         if (compute) {
             // update the compute flag regardless
             for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                struct Tensor * src = node->src[i];
+                Tensor * src = node->src[i];
                 if (src && ((src->flags & TENSOR_FLAG_COMPUTE) == 0)) {
-                    rfaa::visit_parents_graph(cgraph, src, true);
+                    rfaa::visit_parents_graph(src, true);
                 }
             }
         }
@@ -102,22 +108,22 @@ static size_t visit_parents_graph(struct ComputeGraph * cgraph, struct Tensor * 
     }
  
     // This is the first time we see this node in the current graph.
-    cgraph->visited_hash_set.keys[node_hash_pos] = node;
-    bitset_set(cgraph->visited_hash_set.used, node_hash_pos);
-    cgraph->use_counts[node_hash_pos] = 0;
+    this->visited_hash_set.keys[node_hash_pos] = node;
+    bitset_set(this->visited_hash_set.used, node_hash_pos);
+    this->use_counts[node_hash_pos] = 0;
  
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         const int k =
-            (cgraph->order == CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT) ? i :
-            (cgraph->order == CGRAPH_EVAL_ORDER_RIGHT_TO_LEFT) ? (GGML_MAX_SRC-1-i) :
+            (this->order == CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT) ? i :
+            (this->order == CGRAPH_EVAL_ORDER_RIGHT_TO_LEFT) ? (GGML_MAX_SRC-1-i) :
             /* unknown order, just fall back to using i */ i;
  
-        struct Tensor * src = node->src[k];
+        Tensor * src = node->src[k];
         if (src) {
-            const size_t src_hash_pos = rfaa::visit_parents_graph(cgraph, src, compute);
+            const size_t src_hash_pos = rfaa::visit_parents_graph(src, compute);
  
             // Update the use count for this operand.
-            cgraph->use_counts[src_hash_pos]++;
+            this->use_counts[src_hash_pos]++;
         }
     }
     
@@ -130,8 +136,8 @@ static size_t visit_parents_graph(struct ComputeGraph * cgraph, struct Tensor * 
             //ggml_format_name(node, "leaf_%d", cgraph->n_leafs);
         }
  
-        cgraph->leafs[cgraph->n_leafs] = node;
-        cgraph->n_leafs++;
+        this->leafs[this->n_leafs] = node;
+        this->n_leafs++;
     } else {
         //GGML_ASSERT(cgraph->n_nodes < cgraph->size);
  
@@ -139,14 +145,14 @@ static size_t visit_parents_graph(struct ComputeGraph * cgraph, struct Tensor * 
             //ggml_format_name(node, "node_%d", cgraph->n_nodes);
         }
  
-        cgraph->nodes[cgraph->n_nodes] = node;
-        cgraph->n_nodes++;
+        this->nodes[this->n_nodes] = node;
+        this->n_nodes++;
     }
  
     return node_hash_pos;
 }
 
-static void build_forward_impl(struct ComputeGraph * cgraph, struct Tensor * tensor, bool expand, bool compute) {
+void ComputeGraph::build_forward_impl(Tensor * tensor, bool expand, bool compute) {
     if (!expand) {
         // TODO: this branch isn't accessible anymore, maybe move this to ggml_build_forward_expand
         graph_clear(cgraph);
@@ -166,11 +172,11 @@ static void build_forward_impl(struct ComputeGraph * cgraph, struct Tensor * ten
     }
 }
 
-void build_forward_expand(struct ComputeGraph * cgraph, struct Tensor * tensor) {
-    build_forward_impl(cgraph, tensor, true, true);
+void ComputeGraph::build_forward_expand(Tensor * tensor) {
+    build_forward_impl(tensor, true, true);
 }
 
-void build_backward_expand(
+void ComputeGraph::build_backward_expand(
         struct RFAAContext *  ctx,
         struct ComputeGraph  *  cgraph,
         struct Tensor  ** grad_accs) {
@@ -239,7 +245,7 @@ void build_backward_expand(
                 continue;
             }
             //GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16);
-            //assert(node->src[j]->type == TENSOR_TYPE_F32 || node->src[j]->type == TENSOR_TYPE_F16);
+            assert(node->src[j]->type == TENSOR_TYPE_F32 || node->src[j]->type == TENSOR_TYPE_F16);
             node_needs_grad = true;
             break;
         }
@@ -262,7 +268,7 @@ void build_backward_expand(
             cgraph->grads[ihash]     = cgraph->grad_accs[ihash];
         } else if (node->flags & TENSOR_FLAG_LOSS) {
             // loss tensors always need a gradient accumulator
-            cgraph->grad_accs[ihash] = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+            cgraph->grad_accs[ihash] = new_tensor(ctx, TENSOR_TYPE_F32, GGML_MAX_DIMS, node->ne);
             cgraph->grads[ihash]     = cgraph->grad_accs[ihash];
         }
         grads_needed[ihash] = true;
@@ -276,27 +282,309 @@ void build_backward_expand(
  
     free(grads_needed);
 }
+
+Tensor * ComputeGraph::graph_get_grad(const Tensor * node) {
+    const size_t igrad = hash_find(&this->visited_hash_set, node);
+    return igrad != HASHSET_FULL && bitset_get(this->visited_hash_set.used, igrad) && this->grads ? this->grads[igrad] : NULL;
+}
+
+void ComputeGraph::compute_backward(
+    struct RFAAContext * ctx, int i, const bool * grads_needed) {
+    Tensor * tensor = this->nodes[i];
+    Tensor * grad   = graph_get_grad(this, tensor);
  
-static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
+    if (!grad) {
+        return;
+    }
+ 
+    Tensor * src0 = tensor->src[0];
+    Tensor * src1 = tensor->src[1];
+    Tensor * src2 = tensor->src[2];
+    HashSet * hash_set = &this->visited_hash_set;
+    const size_t isrc0 = src0 ? hash_find(hash_set, src0) : (size_t) -1;
+    const size_t isrc1 = src1 ? hash_find(hash_set, src1) : (size_t) -1;
+    const size_t isrc2 = src2 ? hash_find(hash_set, src2) : (size_t) -1;
+    const bool src0_needs_grads = src0 && isrc0 != HASHSET_FULL && bitset_get(hash_set->used, isrc0) && grads_needed[isrc0];
+    const bool src1_needs_grads = src1 && isrc1 != HASHSET_FULL && bitset_get(hash_set->used, isrc1) && grads_needed[isrc1];
+    const bool src2_needs_grads = src2 && isrc2 != HASHSET_FULL && bitset_get(hash_set->used, isrc2) && grads_needed[isrc2];
+ 
+    switch (tensor->op) {
+        case OP_ADD: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, grad);
+            }
+            if (src1_needs_grads) {
+                Tensor * tmp = grad;
+                if (!src0->same_shape(src1)) {
+                    //tmp = src1->repeat_back(tmp);
+                    tmp = repeat_back(tmp, src1);
+                }
+                add_or_set(ctx, cgraph, isrc1, tmp);
+            }
+        } break;
+        case OP_ADD1: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, grad);
+            }
+            if (src1_needs_grads) {
+                add_or_set(ctx, cgraph, isrc1, ggml_mean(ctx, grad)); // TODO: should probably be sum instead of mean
+            }
+        } break;
+        case OP_SUB: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, grad);
+            }
+            if (src1_needs_grads) {
+                sub_or_set(ctx, cgraph, isrc1, grad);
+            }
+        } break;
+        case OP_MUL: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, src1));
+            }
+            if (src1_needs_grads) {
+                Tensor * tmp = ggml_mul(ctx, src0, grad);
+                if (!tmp->same_shape(src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                add_or_set(ctx, cgraph, isrc1, tmp);
+            }
+        } break;
+        case OP_DIV: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
+            }
+            if (src1_needs_grads) {
+                sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
+            }
+        } break;
+        case GGML_OP_MUL_MAT: {
+            // https://cs231n.github.io/optimization-2/#staged
+            // # forward pass
+            // s0 = np.random.randn(5, 10)
+            // s1 = np.random.randn(10, 3)
+            // t = s0.dot(s1)
+ 
+            // # now suppose we had the gradient on t from above in the circuit
+            // dt = np.random.randn(*t.shape) # same shape as t
+            // ds0 = dt.dot(s1.T) #.T gives the transpose of the matrix
+            // ds1 = t.T.dot(dt)
+ 
+            // tensor.shape [m,p,qq,rr]
+            // src0.shape   [n,m,q1,r1]
+            // src1.shape   [n,p,qq,rr]
+ 
+            if (src0_needs_grads) {
+                //GGML_ASSERT(grad->ne[2] == src1->ne[2]);
+                //GGML_ASSERT(grad->ne[3] == src1->ne[3]);
+                assert(grad->Shape().dims[2] == src1->Shape().dims[2]);
+                assert(grad->Shape().dims[3] == src1->Shape().dims[3]);
+                Tensor * tmp =
+                    ggml_out_prod(ctx, // [n,m,qq,rr]
+                        src1,          // [n,p,qq,rr]
+                        grad);         // [m,p,qq,rr]
+                if (!tmp->same_shape(src0)) {
+                    //GGML_ASSERT(tmp->ne[0] == src0->ne[0]);
+                    //GGML_ASSERT(tmp->ne[1] == src0->ne[1]);
+                    //GGML_ASSERT(tmp->ne[3] == 1);
+                    assert(tmp->Shape().dims[0] == src0->Shape().dims[0]);
+                    assert(tmp->Shape().dims[1] == src0->Shape().dims[1]);
+                    assert(tmp->Shape().dims[3] == 1);
+ 
+                    const int64_t nr2 = tmp->Shape().dims[2] / src0->Shape().dims[2];
+                    const size_t nb2 = tmp->nb[2] * nr2;
+                    const size_t nb3 = tmp->nb[2];
+ 
+                    tmp = ggml_view_4d(ctx, tmp, src0->Shape().dims[0], src0->Shape().dims[1], src0->Shape().dims[2], nr2, tmp->nb[1], nb2, nb3, 0);
+                    tmp = ggml_repeat_back(ctx, tmp, src0);
+                    //tmp = 
+                }
+                add_or_set(ctx, cgraph, isrc0, tmp);
+            }
+            if (src1_needs_grads) {
+                add_or_set(ctx, cgraph, isrc1,
+                        // ggml_mul_mat(ctx,                   // [n,p,qq,rr]
+                        //     ggml_cont(ctx,                  // [m,n,q1,r1]
+                        //         ggml_transpose(ctx, src0)), // [m,n,q1,r1]
+                        //     grad),                          // [m,p,qq,rr]
+ 
+                        // when src0 is bigger than tensor->grad (this is mostly the case in llama),
+                        // avoid transpose of src0, rather transpose smaller tensor->grad
+                        // and then use ggml_out_prod
+                        ggml_out_prod(ctx,      // [n,p,qq,rr]
+                            src0,               // [n,m,q1,r1]
+                            ggml_transpose(ctx, // [p,m,qq,rr]
+                                grad)));        // [m,p,qq,rr]
+            }
+        } break;
+        case OP_NONE: {
+
+        } break;
+        case OP_COUNT:
+        default: {
+
+        }
+    }
+}
+
+static void ComputeGraph::add_or_set(
+        struct RFAAContext * ctx,
+        struct ComputeGraph  * cgraph,
+        size_t                isrc,
+        Tensor  * tensor) {
+    Tensor * src = cgraph->visited_hash_set.keys[isrc];
+    //GGML_ASSERT(src);
+    assert(src);
+    if (cgraph->grads[isrc]) {
+        cgraph->grads[isrc] = add_impl(cgraph->grads[isrc], tensor, /*inplace =*/ cgraph->grad_accs[isrc]);
+    } else {
+        cgraph->grads[isrc] = tensor;
+    }
+    //ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
+    //build_forward_expand(cgraph, cgraph->grads[isrc]);
+    cgraph->build_forward_expand(cgraph->grads[isrc]);
+}
+ 
+static void ComputeGraph::acc_or_set(
+        struct RFAAContext * ctx,
+        struct ComputeGraph  * cgraph,
+        size_t                isrc,
+        Tensor  * tensor,
+        const  size_t         nb1,
+        const  size_t         nb2,
+        const  size_t         nb3,
+        const  size_t         offset) {
+    Tensor * src = cgraph->visited_hash_set.keys[isrc];
+    GGML_ASSERT(src);
+    if (cgraph->grads[isrc]) {
+        cgraph->grads[isrc] = acc_impl(cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
+    } else {
+        Tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+        cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
+    }
+    ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
+    //build_forward_expand(cgraph, cgraph->grads[isrc]);
+    cgraph->build_forward_expand(cgraph->grads[isrc]);
+}
+ 
+static void ComputeGraph::add1_or_set(
+        struct RFAAContext * ctx,
+        struct ComputeGraph  * cgraph,
+        size_t                isrc,
+        Tensor  * tensor) {
+    Tensor * src = cgraph->visited_hash_set.keys[isrc];
+    //GGML_ASSERT(src);
+    assert(src);
+    if (cgraph->grads[isrc]) {
+        cgraph->grads[isrc] = add1_impl(cgraph->grads[isrc], tensor, cgraph->grad_accs[isrc]);
+    } else {
+        cgraph->grads[isrc] = ggml_repeat(ctx, tensor, src);
+
+    }
+    //ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
+    //build_forward_expand(cgraph, cgraph->grads[isrc]);
+    cgraph->build_forward_expand(cgraph->grads[isrc]);
+}
+ 
+static void ComputeGraph::sub_or_set(
+        struct RFAAContext * ctx,
+        struct ComputeGraph  * cgraph,
+        size_t                isrc,
+        Tensor  * tensor) {
+    Tensor * src = cgraph->visited_hash_set.keys[isrc];
+    //GGML_ASSERT(src);
+    assert(src);
+    if (cgraph->grads[isrc]) {
+        cgraph->grads[isrc] = ggml_sub_impl(ctx, cgraph->grads[isrc], tensor, cgraph->grad_accs[isrc]);
+    } else {
+        cgraph->grads[isrc] = ggml_neg(ctx, tensor);
+    }
+    //ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
+    //build_forward_expand(cgraph, cgraph->grads[isrc]);
+    cgraph->build_forward_expand(cgraph->grads[isrc]);
+}
+
+void ComputeGraph::graph_cpy(struct ComputeGraph * src, struct ComputeGraph * dst) {
+    //GGML_ASSERT(dst->size >= src->n_leafs);
+    //GGML_ASSERT(dst->size >= src->n_nodes);
+    //GGML_ASSERT(dst->visited_hash_set.size >= src->visited_hash_set.size);
+
+    assert(dst->size >= src->n_leafs);
+    assert(dst->size >= src->n_nodes);
+    assert(dst->visited_hash_set.size >= src->visited_hash_set.size);
+ 
+    dst->n_leafs = src->n_leafs;
+    dst->n_nodes = src->n_nodes;
+    dst->order   = src->order;
+ 
+    for (int i = 0; i < src->n_leafs; ++i) {
+        dst->leafs[i] = src->leafs[i];
+    }
+ 
+    for (int i = 0; i < src->n_nodes; ++i) {
+        dst->nodes[i] = src->nodes[i];
+    }
+ 
+    for (size_t i = 0; i < src->visited_hash_set.size; ++i) {
+        // copy all hashset keys (tensors) that are in use
+        if (bitset_get(src->visited_hash_set.used, i)) {
+            size_t new_hash_pos = hash_insert(&dst->visited_hash_set, src->visited_hash_set.keys[i]);
+            dst->use_counts[new_hash_pos] = src->use_counts[i];
+        }
+    }
+ 
+    if (dst->grads) {
+        memset(dst->grads,     0, dst->visited_hash_set.size*sizeof(struct Tensor *));
+        memset(dst->grad_accs, 0, dst->visited_hash_set.size*sizeof(struct Tensor *));
+    }
+    if (src->grads) {
+        //GGML_ASSERT(dst->grads     != NULL);
+        //GGML_ASSERT(dst->grad_accs != NULL);
+        assert(dst->grads     != NULL);
+        assert(dst->grad_accs != NULL);
+
+        for (int i = 0; i < src->n_nodes; ++i) {
+            const size_t igrad_src = hash_find(&src->visited_hash_set, src->nodes[i]);
+            const size_t igrad_dst = hash_find(&dst->visited_hash_set, dst->nodes[i]);
+ 
+            //GGML_ASSERT(igrad_src != GGML_HASHSET_FULL);
+            //GGML_ASSERT(bitset_get(src->visited_hash_set.used, igrad_src));
+            //GGML_ASSERT(igrad_dst != GGML_HASHSET_FULL);
+            //GGML_ASSERT(ggml_bitset_get(dst->visited_hash_set.used, igrad_dst));
+
+            assert(igrad_src != HASHSET_FULL);
+            assert(bitset_get(src->visited_hash_set.used, igrad_src));
+            assert(igrad_dst != HASHSET_FULL);
+            assert(bitset_get(dst->visited_hash_set.used, igrad_dst));
+
+ 
+            dst->grads[igrad_dst]     = src->grads[igrad_src];
+            dst->grad_accs[igrad_dst] = src->grad_accs[igrad_src];
+        }
+    }
+}
+
+ 
+static void * ComputeGraph::incr_ptr_aligned(void ** p, size_t size, size_t align) {
     void * ptr = *p;
     ptr = (void *) GGML_PAD((uintptr_t) ptr, align);
     *p = (void *) ((char *) ptr + size);
     return ptr;
 }
  
-static size_t graph_nbytes(size_t size, bool grads) {
+static size_t ComputeGraph::graph_nbytes(size_t size, bool grads) {
     size_t hash_size = hash_size(size * 2);
     void * p = 0;
-    incr_ptr_aligned(&p, sizeof(struct ComputeGraph), 1);
-    incr_ptr_aligned(&p, size * sizeof(struct Tensor *), sizeof(struct Tensor *)); // nodes
-    incr_ptr_aligned(&p, size * sizeof(struct Tensor *), sizeof(struct Tensor *)); // leafs
-    incr_ptr_aligned(&p, hash_size * sizeof(int32_t), sizeof(int32_t)); // use_counts
-    incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)); // hash keys
+    ComputeGraph::incr_ptr_aligned(&p, sizeof(ComputeGraph), 1);
+    ComputeGraph::incr_ptr_aligned(&p, size * sizeof(Tensor *), sizeof( Tensor *)); // nodes
+    ComputeGraph::incr_ptr_aligned(&p, size * sizeof(Tensor *), sizeof( Tensor *)); // leafs
+    ComputeGraph::incr_ptr_aligned(&p, hash_size * sizeof(int32_t), sizeof(int32_t)); // use_counts
+    ComputeGraph::incr_ptr_aligned(&p, hash_size * sizeof(Tensor *), sizeof( Tensor *)); // hash keys
     if (grads) {
-        incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)); // grads
-        incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)); // grad_accs
+        ComputeGraph::incr_ptr_aligned(&p, hash_size * sizeof( Tensor *), sizeof( Tensor *)); // grads
+        ComputeGraph::incr_ptr_aligned(&p, hash_size * sizeof( Tensor *), sizeof( Tensor *)); // grad_accs
     }
-    incr_ptr_aligned(&p, bitset_size(hash_size) * sizeof(bitset_t), sizeof(bitset_t));
+    ComputeGraph::incr_ptr_aligned(&p, bitset_size(hash_size) * sizeof(bitset_t), sizeof(bitset_t));
  
     size_t nbytes = (size_t) p;
     return nbytes;

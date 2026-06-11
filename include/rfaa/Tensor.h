@@ -14,6 +14,31 @@ enum tensor_flag {
     TENSOR_FLAG_COMPUTE = 16,
 };
 
+enum tensor_type {
+    TENSOR_TYPE_F32  = 0,
+    TENSOR_TYPE_F16  = 1,
+    TENSOR_TYPE_Q4_0 = 2,
+    TENSOR_TYPE_Q4_1 = 3,
+    // TENSOR_TYPE_Q4_2 = 4, support has been removed
+    // TENSOR_TYPE_Q4_3 (5) support has been removed
+    TENSOR_TYPE_Q5_0 = 6,
+    TENSOR_TYPE_Q5_1 = 7,
+    TENSOR_TYPE_Q8_0 = 8,
+    TENSOR_TYPE_Q8_1 = 9,
+    // k-quantizations
+    TENSOR_TYPE_Q2_K = 10,
+    TENSOR_TYPE_Q3_K = 11,
+    TENSOR_TYPE_Q4_K = 12,
+    TENSOR_TYPE_Q5_K = 13,
+    TENSOR_TYPE_Q6_K = 14,
+    TENSOR_TYPE_Q8_K = 15,
+    TENSOR_TYPE_I8,
+    TENSOR_TYPE_I16,
+    TENSOR_TYPE_I32,
+    TENSOR_TYPE_COUNT,
+};
+
+
 enum tensor_op {
     OP_NONE = 0,
     OP_DUP,
@@ -136,6 +161,8 @@ public:
     const Shape& shape() const { return shape_; }
     Device device() const { return device_; }
     DType dtype() const;
+    // DType deprecate?
+
     int64_t numel() const { return shape_.numel(); }
     size_t nbytes() const { return numel() * sizeof(T); }
     
@@ -169,9 +196,44 @@ public:
     // 打印调试用
     std::string to_string() const;
 
+    bool is_contiguous() const {
+        // for now the data is contiguous
+        return own_data_;
+    }
+
+    bool is_scalar() const { 
+        for (int i = 0; i < shape_.ndim(); i++) {
+            if (shape_.dims[i] != 1) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // compare shape
+    bool same_shape(const Tensor& other) const {
+        return shape_.dims == other.shape_.dims;
+    }
+
+    bool can_repeat(const Tensor& other) const {
+        if (shape_.ndim() != other.shape_.ndim()) return false;
+        // check any dim is zero of two tensors
+        if (shape_.numel() == 0 || other.shape_.numel() == 0) return false;
+
+        for (int i = 0; i < shape_.ndim(); i++) {
+            // divisible check
+            if (shape_.dims[i] % other.shape_.dims[i] != 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     // ==== 新增：从 Context 初始化（不自己分配内存）====
     void init_from_context(int n_dims, const int64_t* ne, void* data_ptr) {
         Shape s;
+        // need to modify?
+        // no need to change: ne is the number of elements
         for (int i = 0; i < n_dims; i++) s.dims.push_back(ne[i]);
         shape_ = s;
         data_ = static_cast<T*>(data_ptr);
@@ -183,6 +245,8 @@ public:
     int32_t flag;
 
     enum tensor_op op;
+
+    enum tensor_type type;
 
     
 private:

@@ -3,12 +3,28 @@
 
 #include "Tensor.h"
 
+#define GGML_PAD(x, n) (((x) + ((n)-1)) & ~((n)-1))
+
 namespace rfaa {
 
 static constexpr size_t RFAA_TENSOR_SIZE = sizeof(struct Tensor<float>);
 static constexpr size_t RFAA_OBJECT_SIZE = sizeof(struct RFAAObject);
 static constexpr size_t RFAA_MEM_ALIGN   = 16;
 static constexpr int    RFAA_MAX_CONTEXTS = 8;
+
+// about the MEM_ALIGN:
+// 32 bit:
+/* #if UINTPTR_MAX == 0xFFFFFFFF
+    #define GGML_MEM_ALIGN 4
+#elif defined(__EMSCRIPTEN__)
+// emscripten uses max_align_t == 8, so we need GGML_MEM_ALIGN == 8 for 64-bit wasm.
+// (for 32-bit wasm, the first conditional is true and GGML_MEM_ALIGN stays 4.)
+// ref: https://github.com/ggml-org/llama.cpp/pull/18628
+    #define GGML_MEM_ALIGN 8
+#else
+64 bit:
+    #define GGML_MEM_ALIGN 16
+#endif */
 
 enum RFAAObjectType {
     RFAA_OBJECT_TYPE_TENSOR,

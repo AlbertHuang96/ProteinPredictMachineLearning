@@ -6,6 +6,15 @@
 #include <cstring>
 #include <cassert>
 #include <algorithm>
+#include <mutex>
+
+#if defined(_WIN32)  
+#define WIN32_LEAN_AND_MEAN  
+#ifndef NOMINMAX  
+    #define NOMINMAX  
+#endif  
+#include <windows.h>  
+#endif
 
 namespace rfaa {
 
@@ -15,8 +24,72 @@ static struct {
     struct RFAAContext context;
 } g_contexts[RFAA_MAX_CONTEXTS];
 
+ 
+std::mutex rfaa_critical_section_mutex;
+ 
+void rfaa_critical_section_start() {
+    rfaa_critical_section_mutex.lock();
+}
+ 
+void rfaa_critical_section_end(void) {
+    rfaa_critical_section_mutex.unlock();
+}
+
+#if defined(_MSC_VER) || defined(__MINGW32__)
+static int64_t timer_freq, timer_start;
+void rfaa_time_init(void) {
+    LARGE_INTEGER t;
+    QueryPerformanceFrequency(&t);
+    timer_freq = t.QuadPart;
+ 
+    // The multiplication by 1000 or 1000000 below can cause an overflow if timer_freq
+    // and the uptime is high enough.
+    // We subtract the program start time to reduce the likelihood of that happening.
+    QueryPerformanceCounter(&t);
+    timer_start = t.QuadPart;
+}
+int64_t rfaa_time_ms(void) {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return ((t.QuadPart-timer_start) * 1000) / timer_freq;
+}
+int64_t rfaa_time_us(void) {
+    LARGE_INTEGER t;
+    QueryPerformanceCounter(&t);
+    return ((t.QuadPart-timer_start) * 1000000) / timer_freq;
+}
+#else
+void rfaa_time_init(void) {}
+int64_t rfaa_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec*1000 + (int64_t)ts.tv_nsec/1000000;
+}
+ 
+int64_t rfaa_time_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec*1000000 + (int64_t)ts.tv_nsec/1000;
+}
+#endif
+
 // ========== init() ==========
 RFAAContext* RFAAContext::init(const CtxInitParams& params) {
+
+    static bool is_first_call = true;
+ 
+    // thread safe init for time system
+    rfaa_critical_section_start();
+ 
+    if (is_first_call) {
+        // initialize time system (required on Windows)
+        rfaa_time_init();
+ 
+        is_first_call = false;
+    }
+ 
+    rfaa_critical_section_end();
+
     // 找个空槽位
     RFAAContext* ctx = nullptr;
     for (int i = 0; i < RFAA_MAX_CONTEXTS; i++) {
@@ -31,7 +104,9 @@ RFAAContext* RFAAContext::init(const CtxInitParams& params) {
     size_t mem_size = params.mem_size;
     if (mem_size == 0) mem_size = RFAA_MEM_ALIGN;
     // 对齐
-    mem_size = (mem_size + RFAA_MEM_ALIGN - 1) / RFAA_MEM_ALIGN * RFAA_MEM_ALIGN;
+    // RFAA_MEM_ALIGN == 16 standard alignment for a 64 bit system
+    //mem_size = (mem_size + RFAA_MEM_ALIGN - 1) / RFAA_MEM_ALIGN * RFAA_MEM_ALIGN;
+    mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(mem_size, RFAA_MEM_ALIGN);
 
     *ctx = {};
     ctx->mem_size = mem_size;
