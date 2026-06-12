@@ -590,5 +590,55 @@ static size_t ComputeGraph::graph_nbytes(size_t size, bool grads) {
     return nbytes;
 }
 
+void ggml_compute_forward_out_prod(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+ 
+    const ggml_tensor * src0 = dst->src[0];
+ 
+    switch (src0->type) {
+        case GGML_TYPE_Q1_0:
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_TQ1_0:
+        case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ1_M:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ2_S:
+            {
+                ggml_compute_forward_out_prod_q_f32(params, dst);
+            } break;
+        case GGML_TYPE_F16:
+            {
+                GGML_ABORT("fatal error"); // todo
+                // ggml_compute_forward_out_prod_f16_f32(params, dst);
+            }
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_out_prod_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 
 } // namespace rfaa

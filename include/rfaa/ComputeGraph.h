@@ -103,6 +103,81 @@ private:
     enum cgraph_eval_order order;
 };
 
+// ============================================================
+// 图节点构造函数（全局函数，公开 API）
+// ============================================================
 
+// 1. 算术
+Tensor* add_impl (Tensor* a, Tensor* b);
+Tensor* sub (Tensor* a, Tensor* b);
+Tensor* mul (Tensor* a, Tensor* b);
+Tensor* div (Tensor* a, Tensor* b);
+Tensor* add1_impl(Tensor* a, Tensor* scalar, bool inplace);
+Tensor* scale(Tensor* a, float s);
+Tensor* neg (Tensor* a);
+
+// 2. 矩阵
+Tensor* mul_mat  (Tensor* a, Tensor* b);
+Tensor* out_prod (Tensor* a, Tensor* b);
+Tensor* transpose(Tensor* a);
+
+// 3. 激活
+Tensor* softmax(Tensor* a);
+Tensor* silu   (Tensor* a);
+Tensor* gelu   (Tensor* a);
+Tensor* relu   (Tensor* a);
+Tensor* leaky_relu(Tensor* a, float alpha = 0.01f);
+
+// 4. 归一化
+Tensor* rms_norm(Tensor* a, float eps = 1e-6f);
+Tensor* norm   (Tensor* a, float eps = 1e-5f);
+
+// 5. 规约
+Tensor* sum     (Tensor* a);
+Tensor* mean    (Tensor* a);
+Tensor* sum_rows(Tensor* a);
+
+// 6. 形状
+Tensor* view     (Tensor* a, const Shape& new_shape);
+Tensor* reshape  (Tensor* a, const Shape& new_shape);
+Tensor* permute  (Tensor* a, const std::vector<int>& dims);
+Tensor* unsqueeze(Tensor* a, int dim);
+Tensor* concat   (const std::vector<Tensor*>& tensors, int dim);
+Tensor* repeat   (Tensor* a, Tensor* b);
+Tensor* repeat_back(Tensor* a, Tensor* b);
+Tensor* cont     (Tensor* a);
+
+// 7. 索引
+Tensor* get_rows(Tensor* a, Tensor* b);
+Tensor* set_rows(Tensor* a, Tensor* b, Tensor* c);
+
+// 8. 特殊
+Tensor* diag_mask_inf (Tensor* a, int n_past);
+Tensor* diag_mask_zero(Tensor* a, int n_past);
+Tensor* clamp(Tensor* a, float min_val, float max_val);
+Tensor* sqr  (Tensor* a);
+Tensor* sqrt (Tensor* a);
+Tensor* log  (Tensor* a);
+Tensor* sin  (Tensor* a);
+Tensor* cos  (Tensor* a);
+
+// 9. 损失
+Tensor* cross_entropy_loss(Tensor* logits, Tensor* targets);
+
+// 10. 位置编码
+Tensor* rope(Tensor* a, int n_past, int n_dims = 0);
+
+// 11. 辅助
+Tensor* pad (Tensor* a, const std::vector<int>& pad_dims);
+Tensor* acc (Tensor* a, Tensor* b, size_t nb1, size_t nb2, size_t nb3, size_t offset);
+Tensor* cpy (Tensor* dst, Tensor* src);
+Tensor* dup (Tensor* a);
+
+// 12. 标记
+Tensor* param(Tensor* a);  // 设为可训练参数
+Tensor* loss (Tensor* a);  // 设为损失节点
+
+// 13. 常量
+Tensor* arange(float start, float end, float step = 1.0f);
 
 } // namespace rfaa
