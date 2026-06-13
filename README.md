@@ -80,6 +80,7 @@ make -j$(nproc)
 ```
 
 todo:
+替换所有的图节点构造函数
 move modules into models
 
 homo-oligomers
@@ -101,3 +102,19 @@ flash attention
 
 Inference:
 KV cache
+
+ggml:
+struct ggml_context * ctx = ggml_init(params);
+
+    struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_A, rows_A);
+    struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_B, rows_B);
+    memcpy(tensor_a->data, matrix_A, ggml_nbytes(tensor_a));
+    memcpy(tensor_b->data, matrix_B, ggml_nbytes(tensor_b));
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    struct ggml_tensor *result = ggml_mul_mat(ctx, tensor_a, tensor_b);
+
+    ggml_build_forward_expand(gf, result);
+
+    int n_threads = 1;
+    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
