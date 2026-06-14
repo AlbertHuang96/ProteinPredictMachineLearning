@@ -7,6 +7,8 @@
 #include <memory>
 #include "ComputeGraph.h"
 
+#define CACHE_LINE_SIZE 64
+
 namespace rfaa {
 
 // ==================== 前向声明 ====================
@@ -119,6 +121,9 @@ private:
 
     // ===== op 分发 =====
     static Status  dispatch_node(Tensor * node, ComputeParams * p);
+
+    static int get_n_tasks(Tensor * node, int n_threads);
+    static size_t estimate_work_size(Tensor * node, int n_threads, int n_tasks = -1);
 
     // ===== kernels (static: 无需 this, 仅操作张量数据) =====
     static void kernel_elemwise(Tensor * node, ComputeParams * p);
