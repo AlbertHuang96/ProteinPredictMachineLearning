@@ -6,6 +6,8 @@
 #include "PositionalEncoding.h"
 #include <string>
 
+#include "rfaa/Embedding.h"
+
 namespace rfaa {
 
 // RFAA 模型配置
@@ -132,7 +134,39 @@ private:
     RFAAConfig config_;
     Device device_ = Device::CPU;
     bool training_ = false;
-    
+
+    // ===== 所有权重（从 context 分配，FLAG_PARAM）=====
+    // embedding
+    LinearLayer* msa_emb_           = nullptr;
+    EmbeddingLayer* state_emb_      = nullptr;
+    EmbeddingLayer* pair_left_emb_  = nullptr;
+    EmbeddingLayer* pair_right_emb_ = nullptr;
+    LinearLayer* full_linear_       = nullptr;
+    EmbeddingLayer* full_emb_       = nullptr;
+    LinearLayer* bond_emb_          = nullptr;
+    LinearLayer* emb_t1d_           = nullptr;
+    LinearLayer* proj_t1d_          = nullptr;
+    LinearLayer* emb_t1d_t2d_       = nullptr; //get_templ_emb
+    LinearLayer* temp_stack_t1d_proj_ = nullptr; //templ_stack
+    LayerNorm* temp_stack_norm_     = nullptr;
+    //msa2msa
+    LayerNorm* msa2msa_norm_        = nullptr;
+    LinearLayer* msa2msa_linear_    = nullptr;
+    LayerNorm* pair2msa_norm_       = nullptr;
+    //msa2pair
+    LayerNorm* msa_norm_            = nullptr;
+    LinearLayer* left_proj_         = nullptr;
+    LinearLayer* right_proj_        = nullptr;
+    LinearLayer* out_proj_          = nullptr;
+    //pair2pair
+    LinearLayer* rbf_proj_         = nullptr;
+    LayerNorm* state_norm_         = nullptr;
+    LinearLayer* left_proj_        = nullptr;
+    LinearLayer* right_proj_       = nullptr;
+    LinearLayer* gate_proj_        = nullptr;
+    //TODO: 3D SE
+
+
     // Tracks
     std::unique_ptr<MSATrack> msa_track_;
     std::unique_ptr<PairTrack> pair_track_;

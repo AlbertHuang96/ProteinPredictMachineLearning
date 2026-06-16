@@ -19,9 +19,9 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_MUL_MAT:   kernel_mul_mat(node, p);  break;
         case OP_SOFT_MAX:  kernel_softmax(node, p);  break;
         case OP_RMS_NORM:  kernel_rms_norm(node, p); break;
-        case OP_SILU:   kernel_silu(node);           break;
-        case OP_GELU:   kernel_gelu(node);           break;
-        case OP_RELU:   kernel_relu(node);           break;
+        //case OP_SILU:   kernel_silu(node);           break;
+        //case OP_GELU:   kernel_gelu(node);           break;
+        //case OP_RELU:   kernel_relu(node);           break;
         case OP_SUM:    kernel_sum(node, p);         break;
         case OP_MEAN:   kernel_mean(node, p);        break;
         default:
@@ -67,13 +67,14 @@ void CPUBackend::kernel_mul_mat(Tensor * node, ComputeParams * p) {
     if (p->ith == 0) tp->current_chunk.store(0);
     tp->barrier_wait();
 
+    // a (M * K), b (K * N), d (M * N)
     while (true) {
         int i = tp->current_chunk.fetch_add(1);
         if (i >= M) break;
+        float sum = 0;
         for (int j = 0; j < N; j++) {
-            float sum = 0;
             for (int k = 0; k < K; k++) sum += a[i * K + k] * b[j * K + k];
-            d[j * M + i] = sum;
+            d[j + i * N] = sum;
         }
     }
     tp->barrier_wait();
@@ -92,10 +93,24 @@ void CPUBackend::kernel_softmax(Tensor * node, ComputeParams * p) {
     for (int r = start; r < end; r++) {
         float * sr = src + r * D, * dr = dst + r * D;
         float mx = sr[0];
-        for (int d = 1; d < D; d++) if (sr[d] > mx) mx = sr[d];
         float sum = 0;
-        for (int d = 0; d < D; d++) { dr[d] = expf(sr[d] - mx); sum += dr[d]; }
-        for (int d = 0; d < D; d++) dr[d] /= sum;
+        for (int d = 1; d < D; d++) {
+            float mx_prev = mx;
+            if (sr[d] > mx) {
+                mx = sr[d];
+                sum = sum * expf(mx_prev - mx) + expf(sr[d] - mx);
+                // online softmax
+            }
+            else {
+                sum += expf(sr[d] - mx);
+            }
+        }
+        for (int d = 1; d < D; d++) {
+            dr[d] = expf(sr[d] - mx) / sum;
+        }
+
+        //for (int d = 0; d < D; d++) { dr[d] = expf(sr[d] - mx); sum += dr[d]; }
+        //for (int d = 0; d < D; d++) dr[d] /= sum;
     }
 }
 

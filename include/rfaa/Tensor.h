@@ -248,6 +248,9 @@ public:
 
     enum tensor_type type;
 
+    //src GGML_MAX_SRC
+    std::vector<Tensor*> src;
+
     
 private:
     Shape shape_;

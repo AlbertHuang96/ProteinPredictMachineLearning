@@ -3,6 +3,9 @@
 #include "rfaa/MathUtils.h"
 #include <random>
 
+#include "rfaa/ComputeGraph.h"
+#include "rfaa/Context.h"
+
 namespace rfaa {
 
 // Embedding 层实现
@@ -11,7 +14,7 @@ class EmbeddingLayer {
 public:
 // num_embeddings: 词汇表大小 (NAATOKENS)
 // embedding_dim: 嵌入向量维度 (D_STATE)
-    EmbeddingLayer(int num_embeddings, int embedding_dim)
+    /* EmbeddingLayer(int num_embeddings, int embedding_dim)
         : num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
         // Xavier 初始化
         weights_ = zeros<float>({num_embeddings, embedding_dim}, Device::CPU);
@@ -23,11 +26,41 @@ public:
         for (int i = 0; i < num_embeddings * embedding_dim; ++i) {
             weights_.data()[i] = dist(gen);
         }
+    } */
+
+    EmbeddingLayer() = default;
+
+    static EmbeddingLayer* create(int num_embeddings, int embedding_dim) {
+        auto* layer = new EmbeddingLayer();
+        layer->num_embeddings_ = num_embeddings;
+        layer->embedding_dim_  = embedding_dim;
+
+        int64_t dims[] = {embedding_dim, num_embeddings};  // (D, V)
+        layer->weights_ = context().new_tensor<float>(2, dims);
+        layer->weights_->flag = TENSOR_FLAG_PARAM;
+
+        // Xavier init
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        float scale = sqrtf(2.0f / (num_embeddings + embedding_dim));
+        std::normal_distribution<float> dist(0.0f, scale);
+        for (int i = 0; i < num_embeddings * embedding_dim; ++i)
+            layer->weights_->data()[i] = dist(gen);
+
+        return layer;
     }
-    
+
+    // ===== 图模式：get_rows =====
+    Tensor* forward_graph(Tensor* indices) {
+        // embedding 本质是 get_rows(weight, indices)
+        //return get_rows(weights_, indices);
+    }
+
+    // TODO
+    // all the forward_exec need to be removed
     // forward
     // backward
-    TensorF32 forward(const TensorF32& indices) {
+    TensorF32 forward_exec(const TensorF32& indices) {
         // indices: (B, L) 整数索引
         // output: (B, L, D)
         int B = indices.shape().dims[0];
@@ -62,16 +95,19 @@ public:
         
         return output;
     }
+
+    Tensor* weight() { return weights_; }
     
 private:
     int num_embeddings_;
     int embedding_dim_;
-    TensorF32 weights_;
+    Tensor* weights_ = nullptr;
+    //TensorF32 weights_;
 };
 
 class LinearLayer {
 public:
-    LinearLayer(int in_features, int out_features, bool bias = true)
+    /* LinearLayer(int in_features, int out_features, bool bias = true)
         : in_features_(in_features), out_features_(out_features), has_bias_(bias) {
         weight_ = zeros<float>({out_features, in_features}, Device::CPU);
         if (bias) {
@@ -87,6 +123,31 @@ public:
         for (int i = 0; i < out_features * in_features; ++i) {
             weight_.data()[i] = dist(gen);
         }
+    } */
+
+    LinearLayer() = default;
+
+    // 工厂函数：从 context 分配权重
+    static LinearLayer* create(int in_features, int out_features, bool bias = true) {
+        LinearLayer* layer = new LinearLayer();
+        layer->in_features_  = in_features;
+        layer->out_features_ = out_features;
+        layer->has_bias_     = bias;
+
+        // ===== 从全局 context 分配权重 =====
+        int64_t w_dims[] = {in_features, out_features};  // (in, out)
+        layer->weight_ = context().new_tensor<float>(2, w_dims);
+        layer->weight_->flag = TENSOR_FLAG_PARAM;  // ← 标记为可训练
+
+        if (bias) {
+            int64_t b_dims[] = {out_features};
+            layer->bias_ = context().new_tensor<float>(1, b_dims);
+            layer->bias_->flag = TENSOR_FLAG_PARAM;  // ← 标记为可训练
+        }
+
+        // ===== Xavier 初始化 =====
+        layer->init_weights();
+        return layer;
     }
 
     void zeros_weight() {
@@ -97,8 +158,21 @@ public:
         std::memset(bias_.data(), 1, bias_.shape().numel() * sizeof(float));
     }
     
+    // ===== 图模式前向（训练用）=====
+    // x: 输入 Tensor* (图节点), 返回输出 Tensor* (图节点)
+    Tensor* forward_graph(Tensor* x) {
+        // Linear: y = x @ weight^T + bias
+        // weight: (in, out), x: (..., in)
+        // transpose: weight^T: (in, out) → (out, in)?
+        // mul_mat: x (..., in) @ weight (in, out) → y (..., out)
+        Tensor* y = mul_mat(x, weight_);
+        if (has_bias_) {
+            y = add_impl(y, bias_);  // broadcast bias
+        }
+        return y;
+    }
     
-    TensorF32 forward(const TensorF32& x) {
+    TensorF32 forward_exec(const TensorF32& x) {
         // x: (..., in_features)
         // output: (..., out_features)
         
@@ -123,18 +197,37 @@ public:
         out_shape.dims.back() = out_features_;
         return output.view(out_shape);
     }
+
+    // 获取权重指针（加载/保存用）
+    Tensor* weight() { return weight_; }
+    Tensor* bias()   { return bias_; }
     
 private:
+    void init_weights() {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        float scale = sqrtf(2.0f / in_features_);
+        std::normal_distribution<float> dist(0.0f, scale);
+        
+        for (int i = 0; i < out_features_ * in_features_; ++i)
+            weight_->data()[i] = dist(gen);
+
+        if (has_bias_) {
+            std::memset(bias_->data(), 0, out_features_ * sizeof(float));
+        }
+    }
     int in_features_, out_features_;
     bool has_bias_;
-    TensorF32 weight_;
-    TensorF32 bias_;
+    Tensor* weight_ = nullptr;  // ← 改为指针, Context 管理
+    Tensor* bias_   = nullptr;
+    //TensorF32 weight_;
+    //TensorF32 bias_;
 };
 
 // LayerNorm
 class LayerNorm {
 public:
-    LayerNorm(int normalized_shape, float eps = 1e-5)
+    /* LayerNorm(int normalized_shape, float eps = 1e-5)
         : normalized_shape_(normalized_shape), eps_(eps) {
         gamma_ = zeros<float>({normalized_shape}, Device::CPU);
         beta_ = zeros<float>({normalized_shape}, Device::CPU);
@@ -143,9 +236,38 @@ public:
         for (int i = 0; i < normalized_shape; ++i) {
             gamma_.data()[i] = 1.0f;
         }
+    } */
+
+    LayerNorm() = default;
+
+    static LayerNorm* create(int normalized_shape, float eps = 1e-5) {
+        auto* layer = new LayerNorm();
+        layer->normalized_shape_ = normalized_shape;
+        layer->eps_ = eps;
+
+        int64_t dims[] = {normalized_shape};
+        layer->gamma_ = context().new_tensor<float>(1, dims);
+        layer->beta_  = context().new_tensor<float>(1, dims);
+        layer->gamma_->flag = TENSOR_FLAG_PARAM;
+        layer->beta_->flag  = TENSOR_FLAG_PARAM;
+
+        // gamma = 1, beta = 0
+        for (int i = 0; i < normalized_shape; i++)
+            layer->gamma_->data()[i] = 1.0f;
+        std::memset(layer->beta_->data(), 0, normalized_shape * sizeof(float));
+
+        return layer;
+    }
+
+    Tensor* forward_graph(Tensor* x) {
+        // y = norm(x) * gamma + beta
+        // rms_norm
+        Tensor* normed = norm(x, eps_);  // or norm() for layernorm
+        Tensor* scaled = mul_mat(normed, gamma_);
+        return add_impl(scaled, beta_);
     }
     
-    TensorF32 forward(const TensorF32& x) {
+    TensorF32 forward_exec(const TensorF32& x) {
         // 在最后一个维度上做 LayerNorm
         int batch = x.shape().numel() / normalized_shape_;
         TensorF32 output(x.shape(), x.device());
@@ -181,8 +303,10 @@ public:
 private:
     int normalized_shape_;
     float eps_;
-    TensorF32 gamma_;
-    TensorF32 beta_;
+    Tensor* gamma_ = nullptr;
+    Tensor* beta_  = nullptr;
+    //TensorF32 gamma_;
+    //TensorF32 beta_;
 };
 
 class BondEmbedding {

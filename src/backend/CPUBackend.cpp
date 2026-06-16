@@ -174,9 +174,24 @@ size_t CPUBackend::estimate_work_size(Tensor * node, int n_threads, int n_tasks)
             //int n_tasks = get_n_tasks(node, n_threads);
             // 保守估计：attn weights 的中间存储
             cur = sizeof(float) * node->dims()[2] * node->dims()[3] * n_tasks;
+            // TODO: further need to change to tiled version
+
         } break;
         case OP_FLASH_ATTN_BACK: {
             // 反向还需要存储 dS
+            // D = head dim (如 64 or 128)
+            // Q's head dim
+            const int64_t D = node->src[0]->dims()[0];
+
+            // Lkv = K 的序列长度，对齐到 UNROLL
+            const int64_t ne11 = align_up(node->src[1]->dims()[1], SOFT_MAX_UNROLL);
+
+            // mxDn: 取 max 是为了用较大的维度兜底，×2 因为 S + SM 两份
+            const int64_t mxDn = std::max(D, ne11) * 2;
+
+            // RFAA 目前只支持 F32，直接计算
+            cur  = sizeof(float) * mxDn * n_tasks;   // S: softmax 分数缓冲
+            cur += sizeof(float) * mxDn * n_tasks;   // SM: max 缓冲 (高估 ×2)
             
         } break;
         // ===== 交叉熵 =====

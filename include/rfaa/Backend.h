@@ -7,6 +7,8 @@
 #include <memory>
 #include "ComputeGraph.h"
 
+static constexpr int SOFT_MAX_UNROLL = 32;  // SIMD unroll
+
 #define CACHE_LINE_SIZE 64
 
 namespace rfaa {
@@ -124,6 +126,9 @@ private:
 
     static int get_n_tasks(Tensor * node, int n_threads);
     static size_t estimate_work_size(Tensor * node, int n_threads, int n_tasks = -1);
+    static constexpr int64_t align_up(int64_t n, int64_t align) {
+        return (n + align - 1) / align * align;
+    }
 
     // ===== kernels (static: 无需 this, 仅操作张量数据) =====
     static void kernel_elemwise(Tensor * node, ComputeParams * p);
