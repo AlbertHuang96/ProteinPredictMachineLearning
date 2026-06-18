@@ -164,6 +164,58 @@ private:
     LinearLayer* left_proj_        = nullptr;
     LinearLayer* right_proj_       = nullptr;
     LinearLayer* gate_proj_        = nullptr;
+    // sub attention block
+    //msa_ff_
+    LayerNorm* msa_ff_norm_        = nullptr;
+    LinearLayer* msa_linear_1_     = nullptr;
+    LinearLayer* msa_linear_2_     = nullptr;
+    //msa_row_attn_;
+    LinearLayer msa_row_to_b_      = nullptr;
+    LinearLayer msa_row_to_g_      = nullptr;
+    LinearLayer msa_row_to_out_    = nullptr;
+    LinearLayer msa_row_Wq_        = nullptr;
+    LinearLayer msa_row_Wk_        = nullptr;
+    LinearLayer msa_row_Wv_        = nullptr;
+    //msa_col_attn_;
+    LinearLayer row_col_to_b_      = nullptr; 
+    LinearLayer row_col_to_g_      = nullptr;
+    LinearLayer row_col_to_out_    = nullptr;
+    LinearLayer row_col_Wq_        = nullptr;
+    LinearLayer row_col_Wk_        = nullptr;
+    LinearLayer row_col_Wv_        = nullptr;
+    //pair_row_attn_;
+    LinearLayer pair_row_to_b_      = nullptr;
+    LinearLayer pair_row_to_g_      = nullptr;
+    LinearLayer pair_row_to_out_    = nullptr;
+    LinearLayer pair_row_Wq_        = nullptr;
+    LinearLayer pair_row_Wk_        = nullptr;
+    LinearLayer pair_row_Wv_        = nullptr;
+    //pair_col_attn_;
+    LinearLayer pair_col_to_b_      = nullptr;
+    LinearLayer pair_col_to_g_      = nullptr;
+    LinearLayer pair_col_to_out_    = nullptr;
+    LinearLayer pair_col_Wq_        = nullptr;
+    LinearLayer pair_col_Wk_        = nullptr;
+    LinearLayer pair_col_Wv_        = nullptr;
+    //tri_mul_out_;
+    LayerNorm   tri_mul_out_layernorm_        = nullptr;
+    LinearLayer tri_mul_out_left_proj_        = nullptr;
+    LinearLayer tri_mul_out_right_proj_       = nullptr;
+    LinearLayer tri_mul_out_left_gate_        = nullptr;
+    LinearLayer tri_mul_out_right_gate_       = nullptr;
+    LinearLayer tri_mul_out_gate_             = nullptr;
+    LayerNorm   tri_mul_out_output_layernorm_ = nullptr;
+    LinearLayer tri_mul_out_out_proj_         = nullptr;
+    //tri_mul_in_;
+    LayerNorm   tri_mul_in_layernorm_         = nullptr;
+    LinearLayer tri_mul_in_left_proj_         = nullptr;
+    LinearLayer tri_mul_in_right_proj_        = nullptr;
+    LinearLayer tri_mul_in_left_gate_         = nullptr;
+    LinearLayer tri_mul_in_right_gate_        = nullptr;
+    LinearLayer tri_mul_in_gate_              = nullptr;
+    LayerNorm   tri_mul_in_output_layernorm_  = nullptr;
+    LinearLayer tri_mul_in_out_proj_          = nullptr;
+
     //TODO: 3D SE
 
 

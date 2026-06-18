@@ -4,6 +4,8 @@
 #include "rfaa/MathUtils.h"
 #include <iostream>
 
+#include "rfaa/Dropout.h"
+
 namespace rfaa {
 
 RFAAConfig::RFAAConfig() {
