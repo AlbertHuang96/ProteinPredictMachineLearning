@@ -1,6 +1,51 @@
-# RFAA C++ 蛋白质学习框架
+
+# ProteinPredictMachineLearning Project
+PPML project
+Inspired by RosettaFoldAllAtom
+and 
+llama.cpp and GGML
 
 ## 项目结构
+
+Main goal:
+predict the 3D structure of a protein with limited compute resources, 
+i.e. personal computer
+still leave potential to running on a GPU server
+or multiplatform deploy
+Theoretically, it could predict structure of all-atom protein.
+
+### Data pipeline
+preprocessing
+inputs:
+MSA
+templates
+
+### Transformers
+1D tracks
+2D tracks
+3D tracks
+
+forward and backend process
+backend graph
+loss functions
+GGUF saving and loading
+
+### Optimize (TODOs)
+GPU backend i.e. CUDA node
+graph Op fuse?
+grad accumulation
+grad checkpoint?
+
+flash attention?
+
+detect hardware:
+kv-cache
+paged attention?
+
+quantized data training?
+mixed precision training?
+
+
 
 ```
 RFAA-Cpp/

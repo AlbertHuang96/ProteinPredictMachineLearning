@@ -22,23 +22,23 @@ MSARowAttention::MSARowAttention(const AttnConfig& config) : config_(config) {
 
 TensorF32 MSARowAttention::forward(const TensorF32& msa, const TensorF32& pair_biased) {
     
-    LayerNorm msa_layernorm(D_MSA);
-    TensorF32 msa_norm = msa_layernorm.forward(msa);
-    LayerNorm pair_layernorm(D_PAIR);
-    TensorF32 pair_norm = pair_layernorm.forward(pair_biased);
+    //LayerNorm msa_row_layernorm(D_MSA);
+    TensorF32 msa_norm = msa_row_layernorm_.forward(msa);
+    //LayerNorm pair_row_layernorm(D_PAIR);
+    TensorF32 pair_norm = pair_row_layernorm_.forward(pair_biased);
     
-    TensorF32 Q = Wq.forward(msa_norm);
-    TensorF32 K = Wk.forward(msa_norm);
-    TensorF32 V = Wv.forward(msa_norm);
+    TensorF32 Q = msa_row_Wq_.forward(msa_norm);
+    TensorF32 K = msa_row_Wk_.forward(msa_norm);
+    TensorF32 V = msa_row_Wv_.forward(msa_norm);
 
-    TensorF32 bias = to_b(pair_norm);
-    TensorF32 gate = sigmoid(to_g(msa_norm));
+    TensorF32 bias = msa_row_to_b_.forward(pair_norm);
+    TensorF32 gate = sigmoid(msa_row_to_g_.forward(msa_norm));
     // call the multi_head_attention function
     //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
     TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
     // gated attention
     attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = to_out(attn_out);
+    TensorF32 attn_out_proj = msa_row_to_out_.forward(attn_out);
 
     return attn_out_proj;
 }
@@ -50,20 +50,19 @@ MSAColAttention::MSAColAttention(const AttnConfig& config) : config_(config) {
 // difference between msa row and col?
 // no attention bias
 TensorF32 MSAColAttention::forward(const TensorF32& msa) {
-    LayerNorm msa_layernorm(D_MSA);
-    TensorF32 msa_norm = msa_layernorm.forward(msa);
+    //LayerNorm msa_col_layernorm(D_MSA);
+    TensorF32 msa_norm = msa_col_layernorm_.forward(msa);
     
-    TensorF32 Q = Wq.forward(msa_norm);
-    TensorF32 K = Wk.forward(msa_norm);
-    TensorF32 V = Wv.forward(msa_norm);
-
-    TensorF32 gate = sigmoid(to_g(msa_norm));
+    TensorF32 Q = msa_col_Wq_.forward(msa_norm);
+    TensorF32 K = msa_col_Wk_.forward(msa_norm);
+    TensorF32 V = msa_col_Wv_.forward(msa_norm);
+    TensorF32 gate = sigmoid(msa_col_to_g_.forward(msa_norm));
     // call the multi_head_attention function
     //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
     TensorF32 attn_out = self_attn_.forward(Q, K, V);
     // gated attention
     attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = to_out(attn_out);
+    TensorF32 attn_out_proj = msa_col_to_out_.forward(attn_out);
 
     return attn_out_proj;
 }
@@ -80,19 +79,20 @@ MSAGlobalColAttention::MSAGlobalColAttention(const AttnConfig& config) : MSAColA
 }
 
 TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
-    LayerNorm msa_layernorm(D_MSA);
-    TensorF32 msa_norm = msa_layernorm.forward(msa);
+    //LayerNorm msa_global_col_layernorm(D_MSA);
+    TensorF32 msa_norm = msa_global_col_layernorm_.forward(msa);
     
-    TensorF32 Q = Wq.forward(msa_norm);
+    TensorF32 Q = msa_global_col_Wq_.forward(msa_norm);
+    // mean graph node?
     Q = mean(Q, 1);
     // Q = Q.mean(dim=1);
     // mean Q_mean[b, l, d] = (Q[b, 0, l, d] + Q[b, 1, l, d] + ... + Q[b, 7, l, d]) / 8
 
     // (B, L, h, d_head)
-    TensorF32 K = Wk.forward(msa_norm);
-    TensorF32 V = Wv.forward(msa_norm);
+    TensorF32 K = msa_global_col_Wk_.forward(msa_norm);
+    TensorF32 V = msa_global_col_Wv_.forward(msa_norm);
 
-    TensorF32 gate = sigmoid(to_g(msa_norm));
+    TensorF32 gate = sigmoid(msa_global_col_to_g_.forward(msa_norm));
     // call the multi_head_attention function
     //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
     TensorF32 attn_out = self_attn_.forward(Q, K, V);
@@ -102,7 +102,7 @@ TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
     
     // gated attention
     attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = to_out(attn_out);
+    TensorF32 attn_out_proj = msa_global_col_to_out_.forward(attn_out);
 
     return attn_out_proj;
 }
@@ -121,23 +121,25 @@ TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_
     TensorF32 pair_row = pair.permute({0, 2, 1, 3});
     TensorF32 str_bias_row = str_bias.permute({0, 2, 1, 3});
 
-    LayerNorm pair_layernorm(D_PAIR);
-    TensorF32 pair_norm = pair_layernorm.forward(pair_row);
-    LayerNorm bias_layernorm(D_PAIR);
-    TensorF32 bias_norm = bias_layernorm.forward(str_bias_row);
+    //LayerNorm pair_layernorm(D_PAIR);
+    TensorF32 pair_norm = pair_row_layernorm_.forward(pair_row);
+    //LayerNorm bias_layernorm(D_PAIR);
+    TensorF32 bias_norm = bias_row_layernorm_.forward(str_bias_row);
     
-    TensorF32 Q = Wq.forward(pair_norm);
-    TensorF32 K = Wk.forward(pair_norm);
-    TensorF32 V = Wv.forward(pair_norm);
+    TensorF32 Q = pair_row_Wq_.forward(pair_norm);
+    TensorF32 K = pair_row_Wk_.forward(pair_norm);
+    TensorF32 V = pair_row_Wv_.forward(pair_norm);
 
-    TensorF32 bias = to_b(bias_norm);
-    TensorF32 gate = sigmoid(to_g(pair_norm));
+    TensorF32 bias = pair_row_to_b_.forward(bias_norm);
+    TensorF32 gate = sigmoid(pair_row_to_g_.forward(pair_norm));
     // call the multi_head_attention function
     //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
     TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
     // gated attention
+    // elementwise multiply:?
     attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = to_out(attn_out);
+
+    TensorF32 attn_out_proj = pair_row_to_out_.forward(attn_out);
     attn_out_proj = attn_out_proj.permute({0, 2, 1, 3});
     return attn_out_proj;
 }
@@ -152,23 +154,26 @@ PairColAttention::PairColAttention(const AttnConfig& config) : config_(config) {
 // pair column attention will use str_bias as well and add to the attention score
 TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_bias) {
     // col attention
-    LayerNorm pair_layernorm(D_PAIR);
-    TensorF32 pair_norm = pair_layernorm.forward(pair);
-    LayerNorm bias_layernorm(D_PAIR);
-    TensorF32 bias_norm = bias_layernorm.forward(str_bias);
+    //LayerNorm pair_layernorm(D_PAIR);
+    TensorF32 pair_norm = pair_col_layernorm_.forward(pair);
+    //LayerNorm bias_layernorm(D_PAIR);
+    TensorF32 bias_norm = bias_col_layernorm_.forward(str_bias);
     
-    TensorF32 Q = Wq.forward(pair_norm);
-    TensorF32 K = Wk.forward(pair_norm);
-    TensorF32 V = Wv.forward(pair_norm);
+    TensorF32 Q = pair_col_Wq_.forward(pair_norm);
+    TensorF32 K = pair_col_Wk_.forward(pair_norm);
+    TensorF32 V = pair_col_Wv_.forward(pair_norm);
 
-    TensorF32 bias = to_b(bias_norm);
-    TensorF32 gate = sigmoid(to_g(pair_norm));
+    //TensorF32 bias = to_b(bias_norm);
+    TensorF32 bias = pair_col_to_b_.forward(bias_norm);
+    TensorF32 gate = sigmoid(pair_col_to_g_.forward(pair_norm));
+    //TensorF32 gate = sigmoid(to_g(pair_norm));
+    
     // call the multi_head_attention function
     //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
     TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
     // gated attention
     attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = to_out(attn_out);
+    TensorF32 attn_out_proj = pair_col_to_out_.forward(attn_out);
     return attn_out_proj;
 }
 
