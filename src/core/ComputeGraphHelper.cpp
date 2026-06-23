@@ -51,7 +51,7 @@ Tensor * add1_impl(
     assert(a->is_contiguous());
  
     //struct Tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
-    struct Tensor * result; 
+    Tensor * result; 
     result = inplace ? result->view(a->shape()) : result->copy_from(a);
  
     result->op     = OP_ADD1;
@@ -606,6 +606,8 @@ static Shape broadcast_shape(Tensor* a, Tensor* b) {
 // 创建常量标量节点
 static Tensor* make_scalar(float value) {
     int64_t ne[4] = {1, 1, 1, 1};
+    // why is [4]?
+    // ne[1] = {1}
     Tensor* t = context().new_tensor(1, ne);
     // 标量数据直接写入
     t->data()[0] = value;
@@ -642,6 +644,17 @@ Tensor* div(Tensor* a, Tensor* b) {
     return result;
 }
 
-
+Tensor* sigmoid(Tensor* a) {
+    Tensor* result;
+    //result = inplace ? result->view(a->shape()) : result->copy_from(a);
+    // provide a inplace sigmoid
+    result = result->copy_from(a);
+    result->op     = OP_UNARY;
+    // many unarys...
+    // sigmoid is just one of them
+    //ggml_set_op_params_i32(result, 0, (int32_t) op);
+    result->src[0] = a;
+    return result;
+}
 
 } // namespace rfaa

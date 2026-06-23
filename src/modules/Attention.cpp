@@ -9,9 +9,36 @@ SelfAttention::SelfAttention(const AttnConfig& config) : config_(config) {}
 SelfAttention::~SelfAttention() = default;
 
 TensorF32 SelfAttention::forward(const TensorF32& Q, const TensorF32& K, const TensorF32& V, const TensorF32* bias) {
-    // 简化：返回输入 (占位)
-    TensorF32 output;
-    output.copy_from(Q);
+    // ===== 1. K^T: 交换最后两维 =====
+    // permute op
+    Tensor* K_T = permute(K, {0, 1, 3, 2});  // (B, H, D_head, L)
+
+    // tensor multiply out_prod
+    // ===== 2. scores = Q @ K^T =====
+    Tensor* scores = out_prod(Q, K_T);         // (B, H, L, L)
+
+    // sqrt op
+    // ===== 3. scale = 1/sqrt(d_head) =====
+    //float scale_val = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
+    // test for Q.shape()[3] before make a tensor
+    Tensor* dim_head = make_scalar(Q.shape()[3]);
+    float scale_val = 1.0f / sqrt(dim_head);
+    Tensor* scaled = scale(scores, scale_val);
+
+    // elementwise tensor add
+    // ===== 4. add bias =====
+    if (bias != nullptr) {
+        scaled = add_impl(scaled, bias);           // broadcast (B,1,L,L) → (B,H,L,L)
+    }
+
+    // softmax op
+    // ===== 5. softmax =====
+    Tensor* attn = softmax(scaled);
+
+    // ===== 6. out = attn @ V =====
+    // mul_mat
+    Tensor* output = out_prod(attn, V);        // (B, H, L, D_head)
+
     return output;
 }
 
@@ -37,8 +64,9 @@ TensorF32 MSARowAttention::forward(const TensorF32& msa, const TensorF32& pair_b
     //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
     TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
     // gated attention
-    attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = msa_row_to_out_.forward(attn_out);
+    //TensorF32 gated_attn_out = gate * attn_out;
+    TensorF32 gated_attn_out = out_prod(gate, attn_out);
+    TensorF32 attn_out_proj = msa_row_to_out_.forward(gated_attn_out);
 
     return attn_out_proj;
 }
@@ -61,8 +89,8 @@ TensorF32 MSAColAttention::forward(const TensorF32& msa) {
     //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
     TensorF32 attn_out = self_attn_.forward(Q, K, V);
     // gated attention
-    attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = msa_col_to_out_.forward(attn_out);
+    TensorF32 gated_attn_out = out_prod(gate, attn_out);
+    TensorF32 attn_out_proj = msa_col_to_out_.forward(gated_attn_out);
 
     return attn_out_proj;
 }
@@ -101,8 +129,8 @@ TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
     // attn rearrange (B, 1, L, d_msa)
     
     // gated attention
-    attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = msa_global_col_to_out_.forward(attn_out);
+    TensorF32 gated_attn_out = out_prod(gate, attn_out);
+    TensorF32 attn_out_proj = msa_global_col_to_out_.forward(gated_attn_out);
 
     return attn_out_proj;
 }
@@ -118,8 +146,10 @@ PairRowAttention::PairRowAttention(const AttnConfig& config) : config_(config) {
 TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_bias) {
 
     // row attention
-    TensorF32 pair_row = pair.permute({0, 2, 1, 3});
-    TensorF32 str_bias_row = str_bias.permute({0, 2, 1, 3});
+    //TensorF32 pair_row = pair.permute({0, 2, 1, 3});
+    //TensorF32 str_bias_row = str_bias.permute({0, 2, 1, 3});
+    TensorF32 pair_row = permute(pair, {0, 2, 1, 3});
+    TensorF32 str_bias_row = permute(str_bias, {0, 2, 1, 3});
 
     //LayerNorm pair_layernorm(D_PAIR);
     TensorF32 pair_norm = pair_row_layernorm_.forward(pair_row);
@@ -137,10 +167,11 @@ TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_
     TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
     // gated attention
     // elementwise multiply:?
-    attn_out = gate * attn_out;
-
-    TensorF32 attn_out_proj = pair_row_to_out_.forward(attn_out);
-    attn_out_proj = attn_out_proj.permute({0, 2, 1, 3});
+    //TensorF32 gated_attn_out = gate * attn_out;
+    TensorF32 gated_attn_out = out_prod(gate, attn_out);
+    TensorF32 attn_out_proj = pair_row_to_out_.forward(gated_attn_out);
+    //attn_out_proj = attn_out_proj.permute({0, 2, 1, 3});
+    TensorF32 result = permute(attn_out_proj, {0, 2, 1, 3});
     return attn_out_proj;
 }
 
@@ -172,8 +203,9 @@ TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_
     //TensorF32 attn_out = multi_head_attention(Q, K, V, bias);
     TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
     // gated attention
-    attn_out = gate * attn_out;
-    TensorF32 attn_out_proj = pair_col_to_out_.forward(attn_out);
+    //TensorF32 gated_attn_out = gate * attn_out;
+    TensorF32 gated_attn_out = out_prod(gate, attn_out);
+    TensorF32 attn_out_proj = pair_col_to_out_.forward(gated_attn_out);
     return attn_out_proj;
 }
 
@@ -202,25 +234,29 @@ TensorF32 TriangleMultiplication::forward(const TensorF32& pair, bool bOutgoing 
     TensorF32 right = right_proj_.forward(pair_norm);
     TensorF32 left_gate = sigmoid(left_gate_.forward(pair_norm));
     TensorF32 right_gate = sigmoid(right_gate_.forward(pair_norm));
-    left = left * left_gate;
-    right = right * right_gate;
+    //left = left * left_gate;
+    //right = right * right_gate;
+    TensorF32 left_gated = out_prod(left, left_gate);
+    TensorF32 right_gated = out_prod(right, right_gate);
+
     // outer product for outgoing and incoming
     TensorF32 tri_mul_forward;
     if (bOutgoing) {
         // need the unit test for the triangle mult function
-        tri_mul_forward = triangle_mult(left, right, float(pair.shape().dims[1]), true);  
+        tri_mul_forward = triangle_mult(left_gated, right_gated, float(pair.shape().dims[1]), true);  
         // (B, L, L, D_HIDDEN_TRIMUL*D_HIDDEN_TRIMUL)
         //tri_mul_forward = outer_product(left, right);  // (B, L, L, D_HIDDEN_TRIMUL*D_HIDDEN_TRIMUL)
     } else {
-        tri_mul_forward = triangle_mult(left, right, float(pair.shape().dims[1]), false);  
+        tri_mul_forward = triangle_mult(left_gated, right_gated, float(pair.shape().dims[1]), false);  
         //tri_mul_forward = outer_product(right, left);  // (B, L, L, D_HIDDEN_TRIMUL*D_HIDDEN_TRIMUL)
     }
-    tri_mul_forward = output_layernorm_.forward(tri_mul_forward);
-    tri_mul_forward = output_proj_.forward(tri_mul_forward);
+    TensorF32 tri_mul_forward_norm = output_layernorm_.forward(tri_mul_forward);
+    TensorF32 tri_mul_forward_proj = output_proj_.forward(tri_mul_forward_norm);
 
     //(B, L, L, D_PAIR))
     TensorF32 gate = sigmoid(gate_.forward(pair_norm));
-    tri_mul_forward = gate * tri_mul_forward;
+    //tri_mul_forward = gate * tri_mul_forward;
+    TensorF32 tri_mul_forward_gated = out_prod(gate, tri_mul_forward_proj);
 
     return tri_mul_forward;
 }
@@ -247,7 +283,7 @@ TemplatePairStack::TemplatePairStack() {
     gate_proj_.ones_bias();
 }
 
-TensorF32 TemplatePairStack::forward(const TensorF32& pair, const TensorF32& rbf_feature, const TensorF32& state) {
+TensorF32 TemplatePairStack::forward(const TensorF32& pair, TensorF32& rbf_feature, const TensorF32& state) {
     
     TensorF32 rbf_proj = rbf_proj_.forward(rbf_feature);  // (B,L,L,128)
     
@@ -256,19 +292,41 @@ TensorF32 TemplatePairStack::forward(const TensorF32& pair, const TensorF32& rbf
             // different weights for left and right?
     TensorF32 left = left_proj_.forward(state_normed);   // (B,L,16)
     TensorF32 right = right_proj_.forward(state_normed); // (B,L,16)
-    TensorF32 gate = outer_product(left, right);  // (B,L,L,256)
-    gate = gate_proj_.forward(gate);  // (B,L,L,128)
-    gate = sigmoid(gate);
-    rbf_feature = rbf_feature * gate;
-    
+    TensorF32 gate = out_prod(left, right);  // (B,L,L,256)
+    TensorF32 gate_proj = gate_proj_.forward(gate);  // (B,L,L,128)
+    TensorF32 gate_sig = sigmoid(gate_proj);
+    //rbf_feature = rbf_feature * gate;
+    //rbf_feature = out_prod(rbf_feature, gate_sig);
+    Tensor* out_rbf_feature = out_prod(rbf_feature, gate_sig);
+    rbf_feature = &(*out_rbf_feature);
+
     TensorF32 pair_tmp;
     pair_tmp.copy_from(pair);
-    pair_tmp = pair_tmp + drop_row.forward(tri_mul_out_->forward(pair_tmp, true));
-    pair_tmp = pair_tmp + drop_row.forward(tri_mul_in_->forward(pair_tmp, false));
+    // dup op?
+    /* pair_tmp = pair_tmp + drop_row_.forward(tri_mul_out_->forward(pair_tmp, true));
+    pair_tmp = pair_tmp + drop_row_.forward(tri_mul_in_->forward(pair_tmp, false));
     pair_tmp = pair_tmp + drop_row_.forward(pair_row_attn_.forward(pair_tmp, rbf_proj));
     pair_tmp = pair_tmp + drop_col_.forward(pair_col_attn_.forward(pair_tmp, rbf_proj));
-    pair_tmp = pair_tmp + pair_ff_.forward(pair_tmp);
-    return pair_tmp;
+    pair_tmp = pair_tmp + pair_ff_.forward(pair_tmp); */
+
+    Tensor* tri_out = tri_mul_out_->forward(pair_tmp, true);
+    Tensor* tri_out_drop_row = drop_row_.forward(tri_out);
+    Tensor* pair_tri_out = add_impl(pair_tmp, tri_out_drop_row);
+
+    Tensor* tri_in = tri_mul_in_->forward(pair_tri_out, true);
+    Tensor* tri_in_drop_row = drop_row_.forward(tri_in);
+    Tensor* pair_tri_in = add_impl(pair_tri_out, tri_in_drop_row);
+
+    Tensor* pair_row_attn = pair_row_attn_.forward(pair_tri_in, rbf_proj);
+    Tensor* pair_row_attn_drop_row = drop_row_.forward(pair_row_attn);
+    Tensor* pair_row_attn = add_impl(pair_tri_in, pair_row_attn_drop_row);
+
+    Tensor* pair_col_attn = pair_col_attn_.forward(pair_row_attn, rbf_proj);
+    Tensor* pair_col_attn_drop_col = drop_col_.forward(pair_row_attn);
+    Tensor* pair_ff = pair_ff_.forward(pair_col_attn_drop_col);
+    Tensor* pair_final = add_impl(pair_row_attn, pair_ff);
+
+    return pair_final;
 }
 
 } // namespace rfaa

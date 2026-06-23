@@ -7,7 +7,7 @@
 namespace rfaa {
 
 // Softmax 操作
-TensorF32 softmax(const TensorF32& input, int dim = -1);
+/* TensorF32 softmax(const TensorF32& input, int dim = -1);
 TensorF32 softmax_forward(const TensorF32& input, int dim = -1);
 void softmax_backward(const TensorF32& grad_output, const TensorF32& output, 
                       TensorF32& grad_input, int dim = -1);
@@ -23,7 +23,7 @@ TensorF32 tanh(const TensorF32& input);
 // Layer Normalization
 TensorF32 layer_norm(const TensorF32& input, float eps = 1e-5);
 TensorF32 layer_norm(const TensorF32& input, const TensorF32& gamma, 
-                    const TensorF32& beta, float eps = 1e-5);
+                    const TensorF32& beta, float eps = 1e-5); */
 
 
 // 工具函数

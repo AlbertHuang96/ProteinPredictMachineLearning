@@ -345,7 +345,7 @@ void ComputeGraph::compute_backward(
             if (src1_needs_grads) {
                 Tensor * tmp = ggml_mul(ctx, src0, grad);
                 if (!tmp->same_shape(src1)) {
-                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                    //tmp = ggml_repeat_back(ctx, tmp, src1);
                 }
                 add_or_set(ctx, cgraph, isrc1, tmp);
             }
@@ -358,7 +358,7 @@ void ComputeGraph::compute_backward(
                 sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
             }
         } break;
-        case GGML_OP_MUL_MAT: {
+        case OP_MUL_MAT: {
             // https://cs231n.github.io/optimization-2/#staged
             // # forward pass
             // s0 = np.random.randn(5, 10)
@@ -396,7 +396,7 @@ void ComputeGraph::compute_backward(
                     const size_t nb3 = tmp->nb[2];
  
                     tmp = ggml_view_4d(ctx, tmp, src0->Shape().dims[0], src0->Shape().dims[1], src0->Shape().dims[2], nr2, tmp->nb[1], nb2, nb3, 0);
-                    tmp = ggml_repeat_back(ctx, tmp, src0);
+                    tmp = repeat_back(ctx, tmp, src0);
                     //tmp = 
                 }
                 add_or_set(ctx, cgraph, isrc0, tmp);
@@ -455,14 +455,14 @@ static void ComputeGraph::acc_or_set(
         const  size_t         nb3,
         const  size_t         offset) {
     Tensor * src = cgraph->visited_hash_set.keys[isrc];
-    GGML_ASSERT(src);
+    //GGML_ASSERT(src);
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = acc_impl(cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
-        Tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
-        cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
+        //Tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
+        //cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
     }
-    ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
+    //ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
     //build_forward_expand(cgraph, cgraph->grads[isrc]);
     cgraph->build_forward_expand(cgraph->grads[isrc]);
 }
@@ -478,7 +478,7 @@ static void ComputeGraph::add1_or_set(
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = add1_impl(cgraph->grads[isrc], tensor, cgraph->grad_accs[isrc]);
     } else {
-        cgraph->grads[isrc] = ggml_repeat(ctx, tensor, src);
+        //cgraph->grads[isrc] = ggml_repeat(ctx, tensor, src);
 
     }
     //ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);

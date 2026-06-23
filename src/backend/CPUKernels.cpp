@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cmath>
 
+//#include <omp.h>
+
 namespace rfaa {
 
 // ===== dispatch =====
@@ -24,6 +26,7 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         //case OP_RELU:   kernel_relu(node);           break;
         case OP_SUM:    kernel_sum(node, p);         break;
         case OP_MEAN:   kernel_mean(node, p);        break;
+        case OP_UNARY:  kernel_sigmoid(node, p);     break;
         default:
             p->threadpool->ec = Status::NOT_SUPPORTED;
             break;
@@ -149,5 +152,18 @@ void CPUBackend::kernel_scale(Tensor * node, ComputeParams * p) { /* ... */ }
 void CPUBackend::kernel_add1(Tensor * node, ComputeParams * p)  { /* ... */ }
 void CPUBackend::kernel_sum(Tensor * node, ComputeParams * p)   { /* ... */ }
 void CPUBackend::kernel_mean(Tensor * node, ComputeParams * p)  { /* ... */ }
+
+void CPUBackend::kernel_sigmoid(Tensor * node, ComputeParams * p) {
+    Tensor* output = node->src[0];
+    float* data = output->data();
+    int64_t n = node->src[0]->numel();
+    
+    #pragma omp parallel for
+    for (int64_t i = 0; i < n; i++) {
+        data[i] = 1.0f / (1.0f + std::exp(-data[i]));
+    }
+    
+    return output;
+}
 
 } // namespace rfaa

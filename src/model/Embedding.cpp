@@ -259,11 +259,12 @@ public:
         return layer;
     }
 
-    Tensor* forward_graph(Tensor* x) {
+    Tensor* forward(Tensor* x) {
         // y = norm(x) * gamma + beta
         // rms_norm
         Tensor* normed = norm(x, eps_);  // or norm() for layernorm
-        Tensor* scaled = mul_mat(normed, gamma_);
+        //Tensor* scaled = mul_mat(normed, gamma_);
+        Tensor* scaled = out_prod(normed, gamma_);
         return add_impl(scaled, beta_);
     }
     

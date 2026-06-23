@@ -144,6 +144,8 @@ private:
     static void kernel_sum     (Tensor * node, ComputeParams * p);
     static void kernel_mean    (Tensor * node, ComputeParams * p);
 
+    static void kernel_sigmoid (Tensor * node, ComputeParams * p);
+
     // ===== 数据成员 =====
     int          n_threads_;
     ThreadPool * threadpool_ = nullptr;

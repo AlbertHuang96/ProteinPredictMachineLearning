@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Tensor.h"
+#include "ComputeGraph.h"
 
 namespace rfaa {
 
@@ -204,7 +205,7 @@ class TemplatePairStack {
 public:
     TemplatePairStack();
     
-    TensorF32 forward(const TensorF32& pair, const TensorF32& rbf_feature, const TensorF32& state);
+    TensorF32 forward(const TensorF32& pair, TensorF32& rbf_feature, const TensorF32& state);
     
 private:
     LinearLayer rbf_proj_(D_RBF, D_PAIR);
