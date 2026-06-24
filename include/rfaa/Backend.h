@@ -97,6 +97,87 @@ public:
     virtual const char * get_name() const = 0;
     virtual Status graph_compute(ComputeGraph * cgraph) = 0;
     virtual void   synchronize() = 0;
+
+    // ===== 调度器需要的能力查询 =====
+    // 是否支持该 op
+    virtual bool supports_op(Tensor * node) const { return true; }
+
+    // 该后端的默认 buffer 类型
+    virtual int buffer_type() const = 0;
+
+    // 是否支持给定的 buffer 类型（跨后端传输用）
+    virtual bool supports_buffer_type(int buf_type) const { return false; }
+    // for CPU RAM host memory buffer it is always true
+    //static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {  
+    //return ggml_backend_buft_is_host(buft) 
+
+    // 优先级（越大越优先被调度）
+    virtual int priority() const { return 0; }
+};
+
+class BackendScheduler {
+public:
+    BackendScheduler();
+    ~BackendScheduler();
+
+    // 注册后端（按 priority 自动排序）
+    void add_backend(Backend * backend);
+
+    // 核心：将一张图分裂成多段，每段分配给对应后端
+    void split_graph(ComputeGraph * graph);
+
+    // 获取分裂后的第 i 段子图
+    ComputeGraph * get_split(int i);
+    int n_splits() const { return n_splits_; }
+
+    // 获取指定 tensor 的"绑定后端"
+    int tensor_backend_id(Tensor * t) const;
+    int tensor_backend_id(Tensor * t, int default_id) const;
+
+private:
+    // ===== 三趟扫描 =====
+    void pass_assign_leafs(ComputeGraph * graph);        // 第一趟：叶子节点分配
+    void pass_expand_assignments(ComputeGraph * graph);   // 第二趟：扩展分配
+    void pass_fill_unassigned(ComputeGraph * graph);      // 第三趟：填充未分配节点
+
+    // helper
+    bool is_view_op(int op) const;
+    void set_backend_if_supported(Tensor * node, int backend_id);
+    int count_supported_inputs(Tensor * node, int backend_id) const;
+    bool tensor_buffer_compatible(const Tensor * src, int backend_id) const;
+
+    // ===== 数据成员 =====
+    std::vector<Backend *> backends_;          // 按优先级排序的后端列表
+    int n_backends_ = 0;
+
+    // tensor → backend_id 映射
+    using BackendMap = std::unordered_map<const Tensor *, int>;
+    BackendMap backend_map_;
+
+    ComputeGraph* current_graph_ = nullptr;
+    
+    std::vector<int> node_backend_id_;
+    std::vector<int> prev_node_backend_id_;
+    std::vector<int> leaf_backend_id_;
+    std::vector<int> prev_leaf_backend_id_;
+    
+    std::vector<int> bufts_;
+
+    bool graph_reserved_ = false;
+    int split_backend_[MAX_SPLITS];
+
+    // 分裂结果
+    static constexpr int MAX_SPLITS = 64;
+    int n_splits_ = 0;
+    ComputeGraph * splits_[MAX_SPLITS];   // 每段子图
+    int split_backend_[MAX_SPLITS];       // 每段对应的后端
+
+    // 图输入收集
+    int n_graph_inputs_ = 0;
+    Tensor * graph_inputs_[256];
+
+    // context
+    RFAAContext * ctx_ = nullptr;
 };
 
 // ==================== CPUBackend ====================
