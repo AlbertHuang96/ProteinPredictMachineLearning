@@ -13,7 +13,7 @@ int ComputeGraph::graph_size() {
     return this->size;
 }
  
-Tensor * ComputeGraph::graph_node(int i) {
+TensorF32 * ComputeGraph::graph_node(int i) {
     if (i < 0) {
         //GGML_ASSERT(cgraph->n_nodes + i >= 0);
         return this->nodes[this->n_nodes + i];
@@ -23,7 +23,7 @@ Tensor * ComputeGraph::graph_node(int i) {
     return this->nodes[i];
 }
  
-Tensor ** ComputeGraph::graph_nodes() {
+TensorF32 ** ComputeGraph::graph_nodes() {
     return this->nodes;
 }
 
@@ -37,19 +37,19 @@ static ComputeGraph * ComputeGraph::new_graph_custom(struct RFAAContext * ctx, s
  
     void * p = cgraph + 1;
  
-    Tensor ** nodes_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct Tensor *), sizeof(struct Tensor *));
-    Tensor ** leafs_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct Tensor *), sizeof(struct Tensor *));
+    TensorF32 ** nodes_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct Tensor *), sizeof(struct Tensor *));
+    TensorF32 ** leafs_ptr      =         incr_ptr_aligned(&p, size      * sizeof(struct Tensor *), sizeof(struct Tensor *));
     int32_t             * use_counts_ptr =         incr_ptr_aligned(&p, hash_size * sizeof(int32_t), sizeof(int32_t));
-    Tensor ** hash_keys_ptr  =         incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *));
-    Tensor ** grads_ptr      = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)) : NULL;
-    Tensor ** grad_accs_ptr  = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)) : NULL;
+    TensorF32 ** hash_keys_ptr  =         incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *));
+    TensorF32 ** grads_ptr      = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)) : NULL;
+    TensorF32 ** grad_accs_ptr  = grads ? incr_ptr_aligned(&p, hash_size * sizeof(struct Tensor *), sizeof(struct Tensor *)) : NULL;
  
     bitset_t * hash_used = incr_ptr_aligned(&p, bitset_size(hash_size) * sizeof(ggml_bitset_t), sizeof(ggml_bitset_t));
  
     // check that we allocated the correct amount of memory
     assert(obj_size == (size_t)((char *)p - (char *)cgraph));
  
-    *cgraph = (struct ComputeGraph) {
+    *cgraph = (ComputeGraph) {
         /*.size         =*/ size,
         /*.n_nodes      =*/ 0,
         /*.n_leafs      =*/ 0,
@@ -65,8 +65,8 @@ static ComputeGraph * ComputeGraph::new_graph_custom(struct RFAAContext * ctx, s
  
     hash_set_reset(&cgraph->visited_hash_set);
     if (grads) {
-        memset(cgraph->grads,     0, hash_size*sizeof(Tensor *));
-        memset(cgraph->grad_accs, 0, hash_size*sizeof(Tensor *));
+        memset(cgraph->grads,     0, hash_size*sizeof(TensorF32 *));
+        memset(cgraph->grad_accs, 0, hash_size*sizeof(TensorF32 *));
     }
  
     return cgraph;
@@ -82,7 +82,7 @@ static ComputeGraph * ComputeGraph::graph_dup(struct RFAAContext * ctx, struct C
     return result;
 }
 
-size_t ComputeGraph::visit_parents_graph(Tensor * node, bool compute) {
+size_t ComputeGraph::visit_parents_graph(TensorF32 * node, bool compute) {
     
     if (node->op != OP_NONE && compute) {
         node->flags |= TENSOR_FLAG_COMPUTE;
@@ -97,7 +97,7 @@ size_t ComputeGraph::visit_parents_graph(Tensor * node, bool compute) {
         if (compute) {
             // update the compute flag regardless
             for (int i = 0; i < GGML_MAX_SRC; ++i) {
-                Tensor * src = node->src[i];
+                TensorF32 * src = node->src[i];
                 if (src && ((src->flags & TENSOR_FLAG_COMPUTE) == 0)) {
                     rfaa::visit_parents_graph(src, true);
                 }
@@ -118,7 +118,7 @@ size_t ComputeGraph::visit_parents_graph(Tensor * node, bool compute) {
             (this->order == CGRAPH_EVAL_ORDER_RIGHT_TO_LEFT) ? (GGML_MAX_SRC-1-i) :
             /* unknown order, just fall back to using i */ i;
  
-        Tensor * src = node->src[k];
+        TensorF32 * src = node->src[k];
         if (src) {
             const size_t src_hash_pos = rfaa::visit_parents_graph(src, compute);
  
@@ -152,7 +152,7 @@ size_t ComputeGraph::visit_parents_graph(Tensor * node, bool compute) {
     return node_hash_pos;
 }
 
-void ComputeGraph::build_forward_impl(Tensor * tensor, bool expand, bool compute) {
+void ComputeGraph::build_forward_impl(TensorF32 * tensor, bool expand, bool compute) {
     if (!expand) {
         // TODO: this branch isn't accessible anymore, maybe move this to ggml_build_forward_expand
         graph_clear(cgraph);
@@ -172,14 +172,14 @@ void ComputeGraph::build_forward_impl(Tensor * tensor, bool expand, bool compute
     }
 }
 
-void ComputeGraph::build_forward_expand(Tensor * tensor) {
+void ComputeGraph::build_forward_expand(TensorF32 * tensor) {
     build_forward_impl(tensor, true, true);
 }
 
 void ComputeGraph::build_backward_expand(
         struct RFAAContext *  ctx,
-        struct ComputeGraph  *  cgraph,
-        struct Tensor  ** grad_accs) {
+        ComputeGraph  *  cgraph,
+        TensorF32  ** grad_accs) {
     //GGML_ASSERT(cgraph->n_nodes > 0);
     //GGML_ASSERT(cgraph->grads);
     //GGML_ASSERT(cgraph->grad_accs);
@@ -190,15 +190,15 @@ void ComputeGraph::build_backward_expand(
  
     const int n_nodes_f = cgraph->n_nodes;
  
-    memset(cgraph->grads,     0, cgraph->visited_hash_set.size*sizeof(struct Tensor *));
-    memset(cgraph->grad_accs, 0, cgraph->visited_hash_set.size*sizeof(struct Tensor *));
+    memset(cgraph->grads,     0, cgraph->visited_hash_set.size*sizeof(TensorF32 *));
+    memset(cgraph->grad_accs, 0, cgraph->visited_hash_set.size*sizeof(TensorF32 *));
     bool * grads_needed = calloc(cgraph->visited_hash_set.size, sizeof(bool));
  
     {
         bool any_params = false;
         bool any_loss   = false;
         for (int i = 0; i < n_nodes_f; ++i) {
-            struct Tensor * node = cgraph->nodes[i];
+            TensorF32 * node = cgraph->nodes[i];
             any_params = any_params || (node->flags & TENSOR_FLAG_PARAM);
             any_loss   = any_loss   || (node->flags & TENSOR_FLAG_LOSS);
         }
@@ -207,7 +207,7 @@ void ComputeGraph::build_backward_expand(
     }
  
     for (int i = 0; i < n_nodes_f; ++i) {
-        struct Tensor * node = cgraph->nodes[i];
+        TensorF32 * node = cgraph->nodes[i];
  
         if (node->type == TENSOR_TYPE_I32) {
             continue;
@@ -283,23 +283,23 @@ void ComputeGraph::build_backward_expand(
     free(grads_needed);
 }
 
-Tensor * ComputeGraph::graph_get_grad(const Tensor * node) {
+TensorF32 * ComputeGraph::graph_get_grad(TensorF32 * node) {
     const size_t igrad = hash_find(&this->visited_hash_set, node);
     return igrad != HASHSET_FULL && bitset_get(this->visited_hash_set.used, igrad) && this->grads ? this->grads[igrad] : NULL;
 }
 
 void ComputeGraph::compute_backward(
     struct RFAAContext * ctx, int i, const bool * grads_needed) {
-    Tensor * tensor = this->nodes[i];
-    Tensor * grad   = graph_get_grad(this, tensor);
+    TensorF32 * tensor = this->nodes[i];
+    TensorF32 * grad   = graph_get_grad(this, tensor);
  
     if (!grad) {
         return;
     }
  
-    Tensor * src0 = tensor->src[0];
-    Tensor * src1 = tensor->src[1];
-    Tensor * src2 = tensor->src[2];
+    TensorF32 * src0 = tensor->src[0];
+    TensorF32 * src1 = tensor->src[1];
+    TensorF32 * src2 = tensor->src[2];
     HashSet * hash_set = &this->visited_hash_set;
     const size_t isrc0 = src0 ? hash_find(hash_set, src0) : (size_t) -1;
     const size_t isrc1 = src1 ? hash_find(hash_set, src1) : (size_t) -1;
@@ -314,7 +314,7 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                Tensor * tmp = grad;
+                TensorF32 * tmp = grad;
                 if (!src0->same_shape(src1)) {
                     //tmp = src1->repeat_back(tmp);
                     tmp = repeat_back(tmp, src1);
@@ -343,7 +343,7 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, src1));
             }
             if (src1_needs_grads) {
-                Tensor * tmp = ggml_mul(ctx, src0, grad);
+                TensorF32 * tmp = ggml_mul(ctx, src0, grad);
                 if (!tmp->same_shape(src1)) {
                     //tmp = ggml_repeat_back(ctx, tmp, src1);
                 }
@@ -379,7 +379,7 @@ void ComputeGraph::compute_backward(
                 //GGML_ASSERT(grad->ne[3] == src1->ne[3]);
                 assert(grad->Shape().dims[2] == src1->Shape().dims[2]);
                 assert(grad->Shape().dims[3] == src1->Shape().dims[3]);
-                Tensor * tmp =
+                TensorF32 * tmp =
                     ggml_out_prod(ctx, // [n,m,qq,rr]
                         src1,          // [n,p,qq,rr]
                         grad);         // [m,p,qq,rr]
@@ -395,7 +395,7 @@ void ComputeGraph::compute_backward(
                     const size_t nb2 = tmp->nb[2] * nr2;
                     const size_t nb3 = tmp->nb[2];
  
-                    tmp = ggml_view_4d(ctx, tmp, src0->Shape().dims[0], src0->Shape().dims[1], src0->Shape().dims[2], nr2, tmp->nb[1], nb2, nb3, 0);
+                    //tmp = ggml_view_4d(ctx, tmp, src0->Shape().dims[0], src0->Shape().dims[1], src0->Shape().dims[2], nr2, tmp->nb[1], nb2, nb3, 0);
                     tmp = repeat_back(ctx, tmp, src0);
                     //tmp = 
                 }
@@ -411,9 +411,9 @@ void ComputeGraph::compute_backward(
                         // when src0 is bigger than tensor->grad (this is mostly the case in llama),
                         // avoid transpose of src0, rather transpose smaller tensor->grad
                         // and then use ggml_out_prod
-                        ggml_out_prod(ctx,      // [n,p,qq,rr]
+                        out_prod(ctx,      // [n,p,qq,rr]
                             src0,               // [n,m,q1,r1]
-                            ggml_transpose(ctx, // [p,m,qq,rr]
+                            transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
             }
         } break;

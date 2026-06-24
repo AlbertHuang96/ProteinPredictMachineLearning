@@ -1,7 +1,9 @@
 #pragma once
 
+#include "Core.h"
 #include "Tensor.h"
 #include "ComputeGraph.h"
+#include "Embedding.h"
 
 namespace rfaa {
 

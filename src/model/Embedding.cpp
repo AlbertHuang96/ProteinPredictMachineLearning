@@ -10,27 +10,11 @@ namespace rfaa {
 
 // Embedding 层实现
 
-class EmbeddingLayer {
-public:
-// num_embeddings: 词汇表大小 (NAATOKENS)
-// embedding_dim: 嵌入向量维度 (D_STATE)
-    /* EmbeddingLayer(int num_embeddings, int embedding_dim)
-        : num_embeddings_(num_embeddings), embedding_dim_(embedding_dim) {
-        // Xavier 初始化
-        weights_ = zeros<float>({num_embeddings, embedding_dim}, Device::CPU);
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        float scale = sqrtf(2.0f / (num_embeddings + embedding_dim));
-        std::normal_distribution<float> dist(0.0f, scale);
-        
-        for (int i = 0; i < num_embeddings * embedding_dim; ++i) {
-            weights_.data()[i] = dist(gen);
-        }
-    } */
 
-    EmbeddingLayer() = default;
 
-    static EmbeddingLayer* create(int num_embeddings, int embedding_dim) {
+// e
+
+    EmbeddingLayer* EmbeddingLayer::create(int num_embeddings, int embedding_dim) {
         auto* layer = new EmbeddingLayer();
         layer->num_embeddings_ = num_embeddings;
         layer->embedding_dim_  = embedding_dim;
@@ -51,7 +35,7 @@ public:
     }
 
     // ===== 图模式：get_rows =====
-    Tensor* forward_graph(Tensor* indices) {
+    TensorF32* EmbeddingLayer::forward_graph(TensorF32* indices) {
         // embedding 本质是 get_rows(weight, indices)
         //return get_rows(weights_, indices);
     }
@@ -60,7 +44,7 @@ public:
     // all the forward_exec need to be removed
     // forward
     // backward
-    TensorF32 forward_exec(const TensorF32& indices) {
+    TensorF32 EmbeddingLayer::forward_exec(const TensorF32& indices) {
         // indices: (B, L) 整数索引
         // output: (B, L, D)
         int B = indices.shape().dims[0];
@@ -96,39 +80,14 @@ public:
         return output;
     }
 
-    Tensor* weight() { return weights_; }
+    TensorF32* EmbeddingLayer::weight() { return weights_; }
     
-private:
-    int num_embeddings_;
-    int embedding_dim_;
-    Tensor* weights_ = nullptr;
-    //TensorF32 weights_;
-};
 
-class LinearLayer {
-public:
-    /* LinearLayer(int in_features, int out_features, bool bias = true)
-        : in_features_(in_features), out_features_(out_features), has_bias_(bias) {
-        weight_ = zeros<float>({out_features, in_features}, Device::CPU);
-        if (bias) {
-            bias_ = zeros<float>({out_features}, Device::CPU);
-        }
-        
-        // 初始化
-        std::random_device rd;
-        std::mt19937 gen(rd());
-        float scale = sqrtf(2.0f / in_features);
-        std::normal_distribution<float> dist(0.0f, scale);
-        
-        for (int i = 0; i < out_features * in_features; ++i) {
-            weight_.data()[i] = dist(gen);
-        }
-    } */
 
-    LinearLayer() = default;
+
 
     // 工厂函数：从 context 分配权重
-    static LinearLayer* create(int in_features, int out_features, bool bias = true) {
+    LinearLayer* LinearLayer::create(int in_features, int out_features, bool bias = true) {
         LinearLayer* layer = new LinearLayer();
         layer->in_features_  = in_features;
         layer->out_features_ = out_features;
@@ -150,29 +109,29 @@ public:
         return layer;
     }
 
-    void zeros_weight() {
+    void LinearLayer::zeros_weight() {
         std::memset(weight_.data(), 0, weight_.shape().numel() * sizeof(float));
     }
 
-    void ones_bias() {
+    void LinearLayer::ones_bias() {
         std::memset(bias_.data(), 1, bias_.shape().numel() * sizeof(float));
     }
     
     // ===== 图模式前向（训练用）=====
     // x: 输入 Tensor* (图节点), 返回输出 Tensor* (图节点)
-    Tensor* forward_graph(Tensor* x) {
+    TensorF32* LinearLayer::forward_graph(TensorF32* x) {
         // Linear: y = x @ weight^T + bias
         // weight: (in, out), x: (..., in)
         // transpose: weight^T: (in, out) → (out, in)?
         // mul_mat: x (..., in) @ weight (in, out) → y (..., out)
-        Tensor* y = mul_mat(x, weight_);
+        TensorF32* y = mul_mat(x, weight_);
         if (has_bias_) {
             y = add_impl(y, bias_);  // broadcast bias
         }
         return y;
     }
     
-    TensorF32 forward_exec(const TensorF32& x) {
+    TensorF32 LinearLayer::forward(const TensorF32& x) {
         // x: (..., in_features)
         // output: (..., out_features)
         
@@ -199,11 +158,11 @@ public:
     }
 
     // 获取权重指针（加载/保存用）
-    Tensor* weight() { return weight_; }
-    Tensor* bias()   { return bias_; }
+    TensorF32* LinearLayer::weight() { return weight_; }
+    TensorF32* LinearLayer::bias()   { return bias_; }
     
-private:
-    void init_weights() {
+
+    void LinearLayer::init_weights() {
         std::random_device rd;
         std::mt19937 gen(rd());
         float scale = sqrtf(2.0f / in_features_);
@@ -216,31 +175,12 @@ private:
             std::memset(bias_->data(), 0, out_features_ * sizeof(float));
         }
     }
-    int in_features_, out_features_;
-    bool has_bias_;
-    Tensor* weight_ = nullptr;  // ← 改为指针, Context 管理
-    Tensor* bias_   = nullptr;
-    //TensorF32 weight_;
-    //TensorF32 bias_;
-};
+   
 
 // LayerNorm
-class LayerNorm {
-public:
-    /* LayerNorm(int normalized_shape, float eps = 1e-5)
-        : normalized_shape_(normalized_shape), eps_(eps) {
-        gamma_ = zeros<float>({normalized_shape}, Device::CPU);
-        beta_ = zeros<float>({normalized_shape}, Device::CPU);
-        
-        // 初始化为 gamma=1, beta=0
-        for (int i = 0; i < normalized_shape; ++i) {
-            gamma_.data()[i] = 1.0f;
-        }
-    } */
 
-    LayerNorm() = default;
 
-    static LayerNorm* create(int normalized_shape, float eps = 1e-5) {
+    LayerNorm* LayerNorm::create(int normalized_shape, float eps = 1e-5) {
         auto* layer = new LayerNorm();
         layer->normalized_shape_ = normalized_shape;
         layer->eps_ = eps;
@@ -259,16 +199,16 @@ public:
         return layer;
     }
 
-    Tensor* forward(Tensor* x) {
+    TensorF32* LayerNorm::forward(TensorF32* x) {
         // y = norm(x) * gamma + beta
         // rms_norm
-        Tensor* normed = norm(x, eps_);  // or norm() for layernorm
+        TensorF32* normed = norm(x, eps_);  // or norm() for layernorm
         //Tensor* scaled = mul_mat(normed, gamma_);
-        Tensor* scaled = out_prod(normed, gamma_);
+        TensorF32* scaled = out_prod(normed, gamma_);
         return add_impl(scaled, beta_);
     }
     
-    TensorF32 forward_exec(const TensorF32& x) {
+    TensorF32 LayerNorm::forward_exec(const TensorF32& x) {
         // 在最后一个维度上做 LayerNorm
         int batch = x.shape().numel() / normalized_shape_;
         TensorF32 output(x.shape(), x.device());
@@ -301,26 +241,10 @@ public:
         return output;
     }
     
-private:
-    int normalized_shape_;
-    float eps_;
-    Tensor* gamma_ = nullptr;
-    Tensor* beta_  = nullptr;
-    //TensorF32 gamma_;
-    //TensorF32 beta_;
-};
 
-class BondEmbedding {
-private:
-    LinearLayer emb_;
-    
-    int d_init_;
-    int d_pair_;
 
-    const int NBYTES = 8;
 
-public:
-    BondEmbedding(int d_init, int d_pair)
+    BondEmbedding::BondEmbedding(int d_init, int d_pair)
         : d_init_(d_init), d_pair_(d_pair) {
             if (d_init_ == 0) {
                 d_init_ = NBYTES;
@@ -331,7 +255,7 @@ public:
 
         //ChemData().NBTYPES represents the number of categorical bond types the model recognizes, 
         //and its value is 8
-        TensorF32 forward(const TensorF32& bond_feats) {
+        TensorF32 BondEmbedding::forward(const TensorF32& bond_feats) {
             // bond_feats: (B, L, L, d_init)
             // output: (B, L, L, d_pair)
             int B = bond_feats.shape().dims[0];
@@ -343,16 +267,10 @@ public:
             
             return output;
         }
-};
 
-class FullEmbedding {
-private:
-    LinearLayer emb_;
-    EmbeddingLayer emb_q_;
-    int d_init_;
-    int d_msa_;
-public:
-    FullEmbedding(int d_init, int d_msa) : d_init_(d_init), d_msa_(d_msa) {
+
+
+    FullEmbedding::FullEmbedding(int d_init, int d_msa) : d_init_(d_init), d_msa_(d_msa) {
         if (d_init_ == 0) {
             d_init_ = NAATOKENS - 1 + 4;
         }
@@ -360,7 +278,7 @@ public:
         emb_q_ = EmbeddingLayer(NAATOKENS, d_msa_);
     }
     
-    TensorF32 forward(const TensorF32& msa, const TensorF32& seq, const TensorF32& idx) {
+    TensorF32 FullEmbedding::forward(const TensorF32& msa, const TensorF32& seq, const TensorF32& idx) {
         // msa: (B, N, L, d_init)
         // seq: (B, L)
         // idx: (B, L)
@@ -415,6 +333,6 @@ public:
         msa = msa + seq.expand(-1, N, -1, -1) # adding query embedding to MSA
         #return self.drop(msa)
         return (msa) */
-};
+
 
 } // namespace rfaa

@@ -7,6 +7,23 @@
 
 namespace rfaa {
 
+enum RFAAObjectType {
+    RFAA_OBJECT_TYPE_TENSOR,
+    RFAA_OBJECT_TYPE_GRAPH,
+    RFAA_OBJECT_TYPE_WORK_BUFFER
+};
+
+struct RFAAObject {
+    size_t offs;
+    size_t size;
+
+    struct RFAAObject * next;
+
+    enum RFAAObjectType type;
+
+    char padding[4];
+};
+
 static constexpr size_t RFAA_TENSOR_SIZE = sizeof(struct Tensor<float>);
 static constexpr size_t RFAA_OBJECT_SIZE = sizeof(struct RFAAObject);
 static constexpr size_t RFAA_MEM_ALIGN   = 16;
@@ -26,11 +43,7 @@ static constexpr int    RFAA_MAX_CONTEXTS = 8;
     #define GGML_MEM_ALIGN 16
 #endif */
 
-enum RFAAObjectType {
-    RFAA_OBJECT_TYPE_TENSOR,
-    RFAA_OBJECT_TYPE_GRAPH,
-    RFAA_OBJECT_TYPE_WORK_BUFFER
-};
+
 
 struct CtxInitParams {
     size_t mem_size;
@@ -38,16 +51,6 @@ struct CtxInitParams {
     bool   no_alloc;
 };
 
-struct RFAAObject {
-    size_t offs;
-    size_t size;
-
-    struct RFAAObject * next;
-
-    enum RFAAObjectType type;
-
-    char padding[4];
-};
 
 struct RFAAContext {
     size_t mem_size;

@@ -2,7 +2,8 @@
 
 #include "Tensor.h"
 
-typedef uint32_t bitset_t;
+//typedef uint32_t bitset_t;
+using bitset_t = uint64_t;
 
 namespace rfaa {
 
@@ -27,19 +28,26 @@ static inline void bitset_clear(bitset_t * bitset, size_t i) {
 #define HASHSET_FULL ((size_t)-1)
 #define HASHSET_ALREADY_EXISTS ((size_t)-2)
 struct HashSet {
-    size_t size;
+    size_t     size;
     bitset_t * used;       // whether or not the keys are in use i.e. set
-    struct Tensor ** keys; // actual tensors in the set, keys[i] is only defined if bitset_get(used, i)
+    void    ** keys;
+    //struct Tensor ** keys; // actual tensors in the set, keys[i] is only defined if bitset_get(used, i)
+    //error: template argument required for ‘struct Tensor
 };
 
 
 // hash function for ggml_tensor
-static inline size_t hash(const struct Tensor * p) {
+//void* p
+//struct Tensor * p
+static inline size_t hash(void * p) {
     // the last 4 bits are always zero due to alignment
-    return (size_t)(uintptr_t)p >> 4;
+    //return (size_t)(uintptr_t)p >> 4;
+    return (size_t)p ^ ((size_t)p >> 32);
 }
  
-static size_t hash_find(const struct HashSet * hash_set, const struct Tensor * key) {
+//void *
+//struct Tensor *
+static size_t hash_find(const struct HashSet * hash_set, void * key) {
     size_t h = hash(key) % hash_set->size;
     // linear probing
     size_t i = h;
@@ -58,11 +66,11 @@ void hash_set_reset(struct HashSet * hash_set) {
 }
 
 
-static bool hash_contains(const struct HashSet * hash_set, struct Tensor * key) {
+static bool hash_contains(const struct HashSet * hash_set, void * key) {
     size_t i = hash_find(hash_set, key);
     return i != HASHSET_FULL && bitset_get(hash_set->used, i);
 }
-static size_t hash_insert(struct HashSet * hash_set, struct Tensor * key) {
+static size_t hash_insert(struct HashSet * hash_set, void * key) {
     size_t h = hash(key) % hash_set->size;
     // linear probing
     size_t i = h;
@@ -70,6 +78,7 @@ static size_t hash_insert(struct HashSet * hash_set, struct Tensor * key) {
         if (!bitset_get(hash_set->used, i)) {
             bitset_set(hash_set->used, i);
             hash_set->keys[i] = key;
+            //error: invalid conversion from ‘const void*’ to ‘void*’
             return i;
         }
         if (hash_set->keys[i] == key) {

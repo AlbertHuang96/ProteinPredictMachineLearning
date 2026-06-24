@@ -32,70 +32,74 @@ public:
     void graph_clear();
  
     int graph_size();
-    Tensor * graph_node(int i);
-    Tensor ** graph_nodes();
-    Tensor * graph_get_grad(const Tensor * node);
+    //error: deduced class type ‘Tensor’ in function return type
+    // use void*
+    // or TensorF32
+    // fixme: quantize case?
+    TensorF32 * graph_node(int i);
+    TensorF32 ** graph_nodes();
+    TensorF32 * graph_get_grad(const TensorF32 * node);
 
-    void build_forward_expand(struct Tensor * tensor);
+    void build_forward_expand(TensorF32 * tensor);
     void build_backward_expand(
         struct RFAAContext *  ctx,
-        struct Tensor  ** grad_accs);
+        TensorF32  ** grad_accs);
 
     static ComputeGraph * new_graph_custom(struct RFAAContext * ctx, size_t size, bool grads);
 
     static ComputeGraph * new_graph(struct RFAAContext * ctx);
 
-    static ComputeGraph * graph_dup(struct RFAAContext * ctx, struct ComputeGraph * cgraph, bool force_grads);
+    static ComputeGraph * graph_dup(struct RFAAContext * ctx, ComputeGraph * cgraph, bool force_grads);
 
 private:
     // this -- struct ComputeGraph * cgraph
-    size_t visit_parents_graph( Tensor * node, bool compute);
-    void build_forward_impl( Tensor * tensor, bool expand, bool compute);
-    void graph_cpy(struct ComputeGraph * src, struct ComputeGraph * dst);
+    size_t visit_parents_graph( TensorF32 * node, bool compute);
+    void build_forward_impl(TensorF32 * tensor, bool expand, bool compute);
+    void graph_cpy(ComputeGraph * src, ComputeGraph * dst);
     void compute_backward(
         struct RFAAContext * ctx, int i, const bool * grads_needed);
 
-    static size_t ComputeGraph::graph_nbytes(size_t size, bool grads);
-    static void * ComputeGraph::incr_ptr_aligned(void ** p, size_t size, size_t align);
+    static size_t graph_nbytes(size_t size, bool grads);
+    static void * incr_ptr_aligned(void ** p, size_t size, size_t align);
 
     static void sub_or_set(
         struct RFAAContext * ctx,
-        struct ComputeGraph  * cgraph,
+        ComputeGraph  * cgraph,
         size_t                isrc,
-        Tensor  * tensor);
+        TensorF32  * tensor);
     static void add1_or_set(
         struct RFAAContext * ctx,
-        struct ComputeGraph  * cgraph,
+        ComputeGraph  * cgraph,
         size_t                isrc,
-        Tensor  * tensor);
+        TensorF32  * tensor);
     static void acc_or_set(
         struct RFAAContext * ctx,
-        struct ComputeGraph  * cgraph,
+        ComputeGraph  * cgraph,
         size_t                isrc,
-        Tensor  * tensor,
+        TensorF32  * tensor,
         const  size_t         nb1,
         const  size_t         nb2,
         const  size_t         nb3,
         const  size_t         offset);
     static void add_or_set(
         struct RFAAContext * ctx,
-        struct ComputeGraph  * cgraph,
+        ComputeGraph  * cgraph,
         size_t                isrc,
-        Tensor  * tensor);
+        TensorF32  * tensor);
 
     // 构造只能通过静态工厂
     ComputeGraph() = default;  // placement new 构造
 
     friend class RFAAContext;  // Context 可以访问私有构造
 
-    int size;
-    int n_nodes;
-    int n_leafs;
+    int size_;
+    int n_nodes_;
+    int n_leafs_;
 
-    struct Tensor ** nodes;
-    struct Tensor ** grads;     // the outputs of these tensors are the gradients of the nodes
-    struct Tensor ** grad_accs; // accumulators for node gradients
-    struct Tensor ** leafs;
+    TensorF32 ** nodes;
+    TensorF32 ** grads;     // the outputs of these tensors are the gradients of the nodes
+    TensorF32 ** grad_accs; // accumulators for node gradients
+    TensorF32 ** leafs;
 
     //一个图中存一个hash表，size的大小取决于图中nodes和leafs的数量之和
     struct HashSet visited_hash_set;
@@ -108,76 +112,76 @@ private:
 // ============================================================
 
 // 1. 算术
-Tensor* add_impl (Tensor* a, Tensor* b);
-Tensor* sub (Tensor* a, Tensor* b);
-Tensor* mul (Tensor* a, Tensor* b);
-Tensor* div (Tensor* a, Tensor* b);
-Tensor* add1_impl(Tensor* a, Tensor* scalar, bool inplace);
-Tensor* scale(Tensor* a, float s);
-Tensor* neg (Tensor* a);
+TensorF32* add_impl (TensorF32* a, TensorF32* b);
+TensorF32* sub (TensorF32* a, TensorF32* b);
+TensorF32* mul (TensorF32* a, TensorF32* b);
+TensorF32* div (TensorF32* a, TensorF32* b);
+TensorF32* add1_impl(TensorF32* a, TensorF32* scalar, bool inplace);
+TensorF32* scale(TensorF32* a, float s);
+TensorF32* neg (TensorF32* a);
 
 // 2. 矩阵
-Tensor* mul_mat  (Tensor* a, Tensor* b);
-Tensor* out_prod (Tensor* a, Tensor* b);
-Tensor* transpose(Tensor* a);
+TensorF32* mul_mat  (TensorF32* a, TensorF32* b);
+TensorF32* out_prod (TensorF32* a, TensorF32* b);
+TensorF32* transpose(TensorF32* a);
 
 // 3. 激活
-Tensor* softmax(Tensor* a);
-Tensor* silu   (Tensor* a);
-Tensor* gelu   (Tensor* a);
-Tensor* relu   (Tensor* a);
-Tensor* leaky_relu(Tensor* a, float alpha = 0.01f);
+TensorF32* softmax(TensorF32* a);
+TensorF32* silu   (TensorF32* a);
+TensorF32* gelu   (TensorF32* a);
+TensorF32* relu   (TensorF32* a);
+TensorF32* leaky_relu(TensorF32* a, float alpha = 0.01f);
 
 // 4. 归一化
-Tensor* rms_norm(Tensor* a, float eps = 1e-6f);
-Tensor* norm   (Tensor* a, float eps = 1e-5f);
+TensorF32* rms_norm(TensorF32* a, float eps = 1e-6f);
+TensorF32* norm   (TensorF32* a, float eps = 1e-5f);
 
 // 5. 规约
-Tensor* sum     (Tensor* a);
-Tensor* mean    (Tensor* a);
-Tensor* sum_rows(Tensor* a);
+TensorF32* sum     (TensorF32* a);
+TensorF32* mean    (TensorF32* a);
+TensorF32* sum_rows(TensorF32* a);
 
 // 6. 形状
-Tensor* view     (Tensor* a, const Shape& new_shape);
-Tensor* reshape  (Tensor* a, const Shape& new_shape);
-Tensor* permute  (Tensor* a, const std::vector<int>& dims);
-Tensor* unsqueeze(Tensor* a, int dim);
-Tensor* concat   (const std::vector<Tensor*>& tensors, int dim);
-Tensor* repeat   (Tensor* a, Tensor* b);
-Tensor* repeat_back(Tensor* a, Tensor* b);
-Tensor* cont     (Tensor* a);
+TensorF32* view     (TensorF32* a, const Shape& new_shape);
+TensorF32* reshape  (TensorF32* a, const Shape& new_shape);
+TensorF32* permute  (TensorF32* a, const std::vector<int>& dims);
+TensorF32* unsqueeze(TensorF32* a, int dim);
+TensorF32* concat   (const std::vector<TensorF32*>& tensors, int dim);
+TensorF32* repeat   (TensorF32* a, TensorF32* b);
+TensorF32* repeat_back(TensorF32* a, TensorF32* b);
+TensorF32* cont     (TensorF32* a);
 
 // 7. 索引
-Tensor* get_rows(Tensor* a, Tensor* b);
-Tensor* set_rows(Tensor* a, Tensor* b, Tensor* c);
+TensorF32* get_rows(TensorF32* a, TensorF32* b);
+TensorF32* set_rows(TensorF32* a, TensorF32* b, TensorF32* c);
 
 // 8. 特殊
-Tensor* diag_mask_inf (Tensor* a, int n_past);
-Tensor* diag_mask_zero(Tensor* a, int n_past);
-Tensor* clamp(Tensor* a, float min_val, float max_val);
-Tensor* sqr  (Tensor* a);
-Tensor* sqrt (Tensor* a);
-Tensor* log  (Tensor* a);
-Tensor* sin  (Tensor* a);
-Tensor* cos  (Tensor* a);
+TensorF32* diag_mask_inf (TensorF32* a, int n_past);
+TensorF32* diag_mask_zero(TensorF32* a, int n_past);
+TensorF32* clamp(TensorF32* a, float min_val, float max_val);
+TensorF32* sqr  (TensorF32* a);
+TensorF32* sqrt (TensorF32* a);
+TensorF32* log  (TensorF32* a);
+TensorF32* sin  (TensorF32* a);
+TensorF32* cos  (TensorF32* a);
 
 // 9. 损失
-Tensor* cross_entropy_loss(Tensor* logits, Tensor* targets);
+TensorF32* cross_entropy_loss(TensorF32* logits, TensorF32* targets);
 
 // 10. 位置编码
-Tensor* rope(Tensor* a, int n_past, int n_dims = 0);
+TensorF32* rope(TensorF32* a, int n_past, int n_dims = 0);
 
 // 11. 辅助
-Tensor* pad (Tensor* a, const std::vector<int>& pad_dims);
-Tensor* acc (Tensor* a, Tensor* b, size_t nb1, size_t nb2, size_t nb3, size_t offset);
-Tensor* cpy (Tensor* dst, Tensor* src);
-Tensor* dup (Tensor* a);
+TensorF32* pad (TensorF32* a, const std::vector<int>& pad_dims);
+TensorF32* acc (TensorF32* a, TensorF32* b, size_t nb1, size_t nb2, size_t nb3, size_t offset);
+TensorF32* cpy (TensorF32* dst, TensorF32* src);
+TensorF32* dup (TensorF32* a);
 
 // 12. 标记
-Tensor* param(Tensor* a);  // 设为可训练参数
-Tensor* loss (Tensor* a);  // 设为损失节点
+TensorF32* param(TensorF32* a);  // 设为可训练参数
+TensorF32* loss (TensorF32* a);  // 设为损失节点
 
 // 13. 常量
-Tensor* arange(float start, float end, float step = 1.0f);
+TensorF32* arange(float start, float end, float step = 1.0f);
 
 } // namespace rfaa
