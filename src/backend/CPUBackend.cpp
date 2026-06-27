@@ -22,6 +22,53 @@ std::unique_ptr<CPUBackend> CPUBackend::create(int n_threads) {
     return std::make_unique<CPUBackend>(n_threads);
 }
 
+bool CPUBackend::supports_op(TensorF32* node) const {
+    const TensorF32* src0 = node->src.empty() ? nullptr : node->src[0];
+    const TensorF32* src1 = node->src.size() < 2 ? nullptr : node->src[1];
+    
+    if (node->op == OP_NONE   || node->op == OP_RESHAPE ||
+        node->op == OP_VIEW   || node->op == OP_PERMUTE ||
+        node->op == OP_TRANSPOSE) {
+        return true;
+    }
+
+    switch (node->op) {
+        case OP_CPY:
+        case OP_SET_ROWs:
+        // ggml IQ quantize
+        // now only have F32
+            return true;
+        
+        case OP_MUL_MAT:
+        // ggml src1->type == vec_dot_type(src0->type)
+            if (!src1) return true;
+            return src1->type == TENSOR_TYPE_F32;
+
+        case OP_SOFT_MAX_BACK: {
+            if (!src0 || !src1) return false;
+            if (src0->type != TENSOR_TYPE_F32 ||
+                src1->type != TENSOR_TYPE_F32) {
+                    return false;
+                }
+            // ggml op_params max_bias == 0.0f
+            return true;
+        }
+
+        case OP_GET_ROWS_BACK:
+            if (!src) return true;
+            return src0->type == TENSOR_TYPE_F32 ||
+                   src0->type == TENSOR_TYPE_F16;
+        case OP_OUT_PROD:
+            if (!src0 || !src1) return false;
+            // if quantize ne[2]/ne[3] match
+            return src0->type == TENSOR_TYPE_F32 &&
+                   src1->type == TENSOR_TYPE_F32 && 
+                   node->type == TENSOR_TYPE_F32;
+        default:
+            return true;
+    }
+}
+
 // ===== graph_plan (公有，可外部调用预估算) =====
 ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
     ComputePlan plan;

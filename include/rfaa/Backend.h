@@ -5,6 +5,8 @@
 #include <condition_variable>
 #include <thread>
 #include <memory>
+#include <vector>
+#include <unordered_map>
 #include "ComputeGraph.h"
 
 static constexpr int SOFT_MAX_UNROLL = 32;  // SIMD unroll
@@ -16,6 +18,9 @@ namespace rfaa {
 // ==================== 前向声明 ====================
 class Backend;
 class CPUBackend;
+struct RFAAContext;
+template<typename T> class Tensor;
+using TensorF32 = Tensor<float>;
 
 // ==================== 状态码 ====================
 enum class Status {
@@ -88,6 +93,76 @@ private:
     void (*worker_fn_)(ThreadState *) = nullptr;   // 由 CPUBackend 注入
 };
 
+// Buffer
+enum class BufferUsage {
+    WEIGHTS = 0;
+    COMPUTE = 1;
+    STORAGE = 2;
+};
+
+// buffer type ggml_backend_buffer_type_t
+class BufferType {
+public:
+    virtual const char* get_name() const = 0;
+    virtual void* alloc(size_t size) = 0;
+    virtual void free(void* ptr) = 0;
+    virtual size_t get_alignment() const { return 32; }
+    virtual size_t get_max_size() const { return SIZE_MAX; }
+    // default size SIZE_MAX
+
+    virtual size_t get_alloc_size(const TensorF32* tensor) const {
+        return tensor->nbytes();
+    }
+
+    virtual bool is_host() const { return false; }
+    virtual ~BufferType() = default;
+}
+
+// ggml_backend_buffer
+class  Buffer {
+public:
+    Buffer(BufferType* buft, size_t size, BufferUsage usage = BufferUsage::COMPUTE)
+    : buft_(buft), size_(size), usage_(usage) {}
+
+    virtual ~Buffer() = default;
+
+    const BufferType* type()  const { return buft_; }
+    size_t            size()  const { return size_; }
+    BufferUsage       usage() const { return usage_; }
+
+    // ggml_backend_buffer_i.get_base
+    virtual void* data() = 0;
+    virtual void memset_tensor(TensorF32* tensor, uint8_t value, size_t offset, size_t size) {
+        uint8_t ptr = static_cast<uint8_t*>(data());
+        std::memset(ptr + offset, value, size);
+    }
+
+    virtual void set_tensor(TensorF32* tensor, const void* data, size_t offset, size_t size) {
+        uint8_t* ptr = static_cast<uint8_t*>(data());
+        std::memcpy(ptr + offset, data, size);
+    }
+
+    virtual void get_tensor(const TensorF32* tensor,
+                            void* data, size_t offset, size_t size) {
+        const uint8_t* ptr = static_cast<const uint8_t*>(data());
+        std::memcpy(data, ptr + offset, size);
+    }
+    
+    // cpy_tensor  not implement yet
+
+    // clear the whole buffer with value
+    virtual void clear(uint8_t value) {
+        std::memset(data(), value, size_);
+    }
+
+protected:
+    BufferType* buft_  = nullptr;
+    size_t      size_  = 0;
+    BufferUsage usage_ = BufferUsage::COMPUTE;
+
+}
+
+
 // ==================== Backend (抽象基类) ====================
 
 class Backend {
@@ -100,13 +175,13 @@ public:
 
     // ===== 调度器需要的能力查询 =====
     // 是否支持该 op
-    virtual bool supports_op(Tensor * node) const { return true; }
+    virtual bool supports_op(TensorF32 * node) const { return true; }
 
     // 该后端的默认 buffer 类型
-    virtual int buffer_type() const = 0;
+    virtual const BufferType* buffer_type() const = 0;
 
     // 是否支持给定的 buffer 类型（跨后端传输用）
-    virtual bool supports_buffer_type(int buf_type) const { return false; }
+    virtual bool supports_buffer_type(const BufferType* buft) const { return false; }
     // for CPU RAM host memory buffer it is always true
     //static bool ggml_backend_cpu_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {  
     //return ggml_backend_buft_is_host(buft) 
@@ -126,6 +201,8 @@ public:
     // 核心：将一张图分裂成多段，每段分配给对应后端
     void split_graph(ComputeGraph * graph);
 
+    bool alloc_splits();
+
     // 获取分裂后的第 i 段子图
     ComputeGraph * get_split(int i);
     int n_splits() const { return n_splits_; }
@@ -143,8 +220,13 @@ private:
     // helper
     bool is_view_op(int op) const;
     void set_backend_if_supported(Tensor * node, int backend_id);
-    int count_supported_inputs(Tensor * node, int backend_id) const;
+    int  count_supported_inputs(Tensor * node, int backend_id) const;
     bool tensor_buffer_compatible(const Tensor * src, int backend_id) const;
+
+    // alloc_splits invoke this function to allocate the memory
+    bool reserve_graph_memory();
+
+    static constexpr int MAX_SPLITS = 64;
 
     // ===== 数据成员 =====
     std::vector<Backend *> backends_;          // 按优先级排序的后端列表
@@ -164,10 +246,8 @@ private:
     std::vector<int> bufts_;
 
     bool graph_reserved_ = false;
-    int split_backend_[MAX_SPLITS];
 
     // 分裂结果
-    static constexpr int MAX_SPLITS = 64;
     int n_splits_ = 0;
     ComputeGraph * splits_[MAX_SPLITS];   // 每段子图
     int split_backend_[MAX_SPLITS];       // 每段对应的后端
@@ -191,6 +271,8 @@ public:
     static std::unique_ptr<CPUBackend> create(int n_threads = 1);
 
     // ===== Backend 接口 =====
+    virtual bool supports_op(TensorF32 * node) const override;
+    
     const char * get_name() const override { return "CPU"; }
     Status       graph_compute(ComputeGraph * cgraph) override;
     void         synchronize() override {}
