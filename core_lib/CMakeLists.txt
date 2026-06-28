@@ -13,7 +13,7 @@ set(CORE_SOURCES
     ../src/tracks/State.cpp
     ../src/modules/Attention.cpp
     ../src/modules/TriangleMul.cpp
-    ../src/modules/SE3Transformer.cpp
+    ../src/model/SE3Transformer.cpp
     ../src/ops/Softmax.cpp
     ../src/ops/Activation.cpp
     ../src/ops/LayerNorm.cpp
