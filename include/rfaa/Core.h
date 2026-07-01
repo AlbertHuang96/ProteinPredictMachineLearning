@@ -26,6 +26,9 @@ constexpr int N_EXTRA_BLOCKS = 4;       // Extra blocks 数
 constexpr int N_MAIN_BLOCKS = 8;        // Main blocks 数
 constexpr int N_REFINE_BLOCKS = 4;      // Refinement blocks 数
 
+constexpr int N_L0_IN_FEATS = 32;
+constexpr int N_EDGE_FEATS = 32;
+
 // 设备类型
 enum class Device { CPU, CUDA };
 

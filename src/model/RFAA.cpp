@@ -306,7 +306,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
     // ===== Step 4: str2str (SE3 Transformer) =====
     {
         // node features: msa[:,0] + state -> concat -> Linear
-        auto msa_query = msa.select(1, 0);  // (B, L, 256)
+        /* auto msa_query = msa.select(1, 0);  // (B, L, 256)
         
         // edge features: pair + rbf + seqsep -> concat -> Linear
         //auto edges = pair;  // concat with rbf, seqsep
@@ -322,7 +322,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         auto updated_coords = struct_update_->update_coords(coords, se3_out.l1);
         
         // 预测侧链扭转角
-        auto alpha = struct_update_->predict_torsion(msa_query, state);
+        auto alpha = struct_update_->predict_torsion(msa_query, state); */
     }
 }
 
@@ -435,8 +435,221 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
 
     // 3D track update
     // ===== Step 4: str2str (SE3 Transformer) =====
+    {
+        LayerNorm msa_norm(D_MSA);
+        LayerNorm pair_norm(D_PAIR);
+        TensorF32 msa_normed = msa_norm.forward(msa);
+        TensorF32 pair_normed = pair_norm.forward(pair);
 
- }
+        /* w_seq = self.encoder_seq(msa).reshape(B, L, 1, N).permute(0,3,1,2)
+        msa = w_seq*msa
+        msa = msa.sum(dim=1)
+        msa = torch.cat((msa, seq1hot), dim=-1) */
+
+        LinearLayer emb_msa(D_MSA + 21, N_L0_IN_FEATS);
+        LinearLayer emb_pair(D_PAIR, N_EDGE_FEATS);
+        TensorF32 msa_emb = emb_msa.forward(msa_normed);
+        TensorF32 pair_emb = emb_pair.forward(pair_normed);
+
+        LayerNorm node_norm(D_PAIR);
+        LayerNorm edge_norm(D_PAIR);
+        TensorF32 node_normed = node_norm.forward(msa_emb);
+        TensorF32 edge_normed = edge_norm.forward(pair_emb);
+
+        
+    }
+
+}
+
+RefineBlock::RefineBlock(const RFAAConfig& config)
+    : IterBlock(config, false)  // update_msa_pair = false, 仅更新结构
+    , norm_msa_(D_MSA)
+    , norm_pair_(D_PAIR)
+    , norm_state_(D_STATE)
+    , embed_x_(NODE_IN_DIM, NODE_OUT_DIM)
+    , norm_node_(NODE_OUT_DIM)
+    , embed_e1_(D_PAIR, N_EDGE_FEATS)
+    , norm_edge1_(N_EDGE_FEATS)
+    , embed_e2_(EDGE_IN_DIM2, N_EDGE_FEATS)
+    , norm_edge2_(N_EDGE_FEATS) {
+}
+
+void RefineBlock::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
+    seq1hot_ = seq1hot;
+    idx_     = idx;
+    has_seq_info_ = true;
+}
+
+void RefineBlock::forward(TensorF32& msa_full, 
+                          TensorF32& pair, 
+                          TensorF32& state, 
+                          const TensorF32& coords) {
+
+    // ---- 获取维度 ----
+    const auto& msa_shape = msa.shape();
+    int B = static_cast<int>(msa_shape.dims[0]);
+    int L = static_cast<int>(msa_shape.dims[2]);
+
+    // ================================================================
+    // Step 1: LayerNorm 归一化三个 track 输入
+    // ================================================================
+    // Python: node = self.norm_msa(msa); pair = self.norm_pair(pair);
+    //         state = self.norm_state(state)
+    TensorF32 node    = norm_msa_.forward(msa);       // (B, L, 256)
+    TensorF32 pair_n  = norm_pair_.forward(pair);     // (B, L, L, 128)
+    TensorF32 state_n = norm_state_.forward(state);    // (B, L, 32)
+
+    // ================================================================
+    // Step 2: 构建节点特征
+    // Python: node = cat((node, seq1hot, state), dim=-1)
+    //         node = self.norm_node(self.embed_x(node))
+    // ================================================================
+    // cat([msa_norm(B,L,256), seq1hot(B,L,21), state_norm(B,L,32)])
+    // → (B, L, 309)
+    TensorF32 node_cat = concat({node, seq1hot_, state_n}, -1);
+
+    // Linear(309 → 32) → LayerNorm → (B, L, 32)
+    TensorF32 node_emb = embed_x_.forward(node_cat);
+    TensorF32 node_out = norm_node_.forward(node_emb);
+
+    // ================================================================
+    // Step 3: 构建边特征（两阶段）
+    // ================================================================
+    // 阶段1: pair → Linear → LayerNorm
+    // Python: pair = self.norm_edge1(self.embed_e1(pair))
+    // pair (B,L,L,128) → Linear → (B,L,L,32) → LayerNorm → (B,L,L,32)
+    TensorF32 pair_emb = embed_e1_.forward(pair_n);
+    TensorF32 pair_e1  = norm_edge1_.forward(pair_emb);
+
+    // 获取辅助边特征
+    // Python: neighbor = get_bonded_neigh(idx)     → (B, L, L, 1)
+    //         rbf_feat = rbf(cdist(cas, cas))      → (B, L, L, 64)
+    TensorF32 neighbor = get_bonded_neigh(idx_);            // (B, L, L, 1)
+    TensorF32 rbf_feat = compute_rbf_feature(coords);      // (B, L, L, 64)
+
+    // 阶段2: cat + Linear + LayerNorm
+    // Python: pair = cat((pair, rbf_feat, neighbor), dim=-1)
+    //         pair = self.norm_edge2(self.embed_e2(pair))
+    // cat → (B,L,L,97) → Linear → (B,L,L,32) → LayerNorm → (B,L,L,32)
+    TensorF32 pair_cat = concat({pair_e1, rbf_feat, neighbor}, -1);
+    TensorF32 pair_e2  = embed_e2_.forward(pair_cat);
+    TensorF32 edge_out = norm_edge2_.forward(pair_e2);
+
+    // ================================================================
+    // Step 4: 构建消息传递图
+    // Python: G = make_graph_topk(xyz, pair, idx, top_k=top_k)
+    // ================================================================
+    GraphData G = make_graph(coords, edge_out, idx_,
+                             64 /* top_k */, 9 /* kmin */);
+
+    // ================================================================
+    // Step 5: 计算 l1 特征（各原子相对 CA 的位移向量）
+    // Python: l1_feats = xyz - xyz[:,:,1,:].unsqueeze(2)
+    //         l1_feats = l1_feats.reshape(B*L, -1, 3)
+    // 输出: (B*L, 3, 3)  3个原子 × 3个坐标维度
+    // ================================================================
+    TensorF32 l1_feats = compute_l1_features(coords);  // (B*L, 3, 3)
+
+    // ================================================================
+    // Step 6: SE(3) Transformer 前向传播
+    // Python: shift = self.se3(G, node.reshape(B*L, -1, 1), l1_feats)
+    //
+    // node_out: (B, L, 32) → (B*L, 32, 1) 作为 degree-0 标量特征
+    // l1_feats: (B*L, 3, 3)               作为 degree-1 向量特征
+    // ================================================================
+    // 构建 SE3Basis (预计算球谐基)
+    SE3Basis basis;
+    basis.compute(coords, TensorF32() /* orient 占位 */, config_.se3_config.num_degrees);
+
+    // TODO: SE3Transformer 当前 forward 签名为 forward(SE3Features&, positions,
+    //       orientations, edge_index, training)。
+    //       等接口完善后，此处替换为：
+    //
+    //   // 组装节点特征为 SE3Features（度0=32通道, 度1=3通道）
+    //   Fiber fiber_in({32, 3}, {0, 1});
+    //   SE3Features node_se3(fiber_in, /*prototype*/..., B*L);
+    //   // 填充 node_se3.features[0] = node_out.view({B*L, 32, 1})
+    //   // 填充 node_se3.features[1] = l1_feats
+    //
+    //   SE3Features se3_out = se3_->forward(node_se3, coords,
+    //                                       TensorF32() /* orient */,
+    //                                       G.edge_index);
+    //
+    //   // 提取输出
+    //   TensorF32 state_vec = se3_out.features[0];  // degree-0 → (B*L, C)
+    //   TensorF32 offset    = se3_out.features[1];  // degree-1 → (B*L, 3, 3)
+
+    // ================================================================
+    // Step 7: 整理输出
+    // Python: state  = shift['0'].reshape(B, L, -1)
+    //         offset = shift['1'].reshape(B, L, -1, 3)
+    // ================================================================
+    // TODO: 从 se3_out 中提取后激活以下代码:
+    //
+    // state_new_ = state_vec.view({B, L, D_STATE});        // (B, L, 32)
+    // TensorF32 offset = offset_tensor.view({B, L, 3, 3}); // (B, L, 3, 3)
+    //
+    // // ================================================================
+    // // Step 8: 更新骨架坐标
+    // // Python:
+    // //   CA_new = xyz[:,:,1] + offset[:,:,1]
+    // //   N_new  = CA_new + offset[:,:,0]
+    // //   C_new  = CA_new + offset[:,:,2]
+    // //   xyz_new = torch.stack([N_new, CA_new, C_new], dim=2)
+    // //
+    // // offset 各通道定义:
+    // //   [:, :, 0, :] = δN  (N 原子相对 CA 的位移)
+    // //   [:, :, 1, :] = δCA (CA 位移, 绝对; 即 offset[:,:,1] 直接加在 CA 上)
+    // //   [:, :, 2, :] = δC  (C 原子相对 CA 的位移)
+    // // ================================================================
+    //
+    // const float* xyz_data = coords.data();
+    // const float* off_data = offset.data();
+    //
+    // xyz_new_ = TensorF32({B, L, 3, 3}, coords.device());
+    // float* xyz_out = xyz_new_.data();
+    //
+    // for (int b = 0; b < B; ++b) {
+    //     for (int l = 0; l < L; ++l) {
+    //         // 原始 CA 坐标
+    //         int ca_idx  = (b * L + l) * 9 + 3;  // atom=1, x
+    //         float ca_x0 = xyz_data[ca_idx];
+    //         float ca_y0 = xyz_data[ca_idx + 1];
+    //         float ca_z0 = xyz_data[ca_idx + 2];
+    //
+    //         // offset 各分量
+    //         int off_base = (b * L + l) * 9;
+    //
+    //         // δCA (绝对偏移)
+    //         float dca_x = off_data[off_base + 3];
+    //         float dca_y = off_data[off_base + 4];
+    //         float dca_z = off_data[off_base + 5];
+    //
+    //         // 更新后的 CA
+    //         float ca_x_new = ca_x0 + dca_x;
+    //         float ca_y_new = ca_y0 + dca_y;
+    //         float ca_z_new = ca_z0 + dca_z;
+    //
+    //         // N = CA_new + δN
+    //         xyz_out[off_base + 0] = ca_x_new + off_data[off_base + 0];
+    //         xyz_out[off_base + 1] = ca_y_new + off_data[off_base + 1];
+    //         xyz_out[off_base + 2] = ca_z_new + off_data[off_base + 2];
+    //
+    //         // CA = CA_new (绝对位置)
+    //         xyz_out[off_base + 3] = ca_x_new;
+    //         xyz_out[off_base + 4] = ca_y_new;
+    //         xyz_out[off_base + 5] = ca_z_new;
+    //
+    //         // C = CA_new + δC
+    //         xyz_out[off_base + 6] = ca_x_new + off_data[off_base + 6];
+    //         xyz_out[off_base + 7] = ca_y_new + off_data[off_base + 7];
+    //         xyz_out[off_base + 8] = ca_z_new + off_data[off_base + 8];
+    //     }
+    // }
+    //
+    // // 回写 state (通过引用)
+    // state.copy_from(state_new_);
+}
 
 // RFAAModel 实现
 RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
@@ -448,7 +661,7 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         main_blocks_.push_back(std::make_unique<IterBlock>(config, true));
     }
     for (int i = 0; i < config.n_refine_blocks; ++i) {
-        refine_blocks_.push_back(std::make_unique<IterBlock>(config, false));
+        refine_blocks_.push_back(std::make_unique<RefineBlock>(config, false));
     }
 }
 
@@ -550,7 +763,19 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
         // stop grad
         // chiral grad
         // clash grad
+        if (block.get()) {
+        // seq1hot: 从 input.seq_tokens 生成 one-hot (B, L, 21)
+            TensorF32 seq1hot = one_hot_seq(input.seq_tokens, 21);
+            TensorI64 idx = input.seq_tokens;  // 或专门的 idx 输入
+            refine->set_seq_info(seq1hot, idx);
+        }
+
         block->forward(msa, pair, state, coords);
+
+        if (block.get()) {
+            coords.copy_from(refine->updated_coords());
+            state.copy_from(refine->updated_state());
+        }
     }
     
     // 输出头

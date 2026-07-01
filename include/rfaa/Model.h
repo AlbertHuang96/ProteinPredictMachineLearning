@@ -100,10 +100,58 @@ public:
     // a virtual dtor
     virtual ~FullBlock() = default;
 
-    void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
+    void forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
                  const TensorF32& coords) override;
 private:
     std::unique_ptr<MSAGlobalColAttention> msa_global_col_attn_;
+};
+
+class RefineBlock : public IterBlock {
+public:
+    explicit RefineBlock(const RFAAConfig& config) : RefineBlock(config, true) {}
+
+    // a virtual dtor
+    virtual ~RefineBlock() = default;
+
+    void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
+                 const TensorF32& coords) override;
+
+                 // 设置额外输入（在 forward 调用前设置）
+    void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
+
+    // 获取 SE3 更新后的坐标
+    const TensorF32& updated_coords() const { return xyz_new_; }
+    const TensorF32& updated_state()  const { return state_new_; }
+
+private:
+    // ---- LayerNorm 模块 ----
+    LayerNorm norm_msa_;      // dim = D_MSA (256)
+    LayerNorm norm_pair_;     // dim = D_PAIR (128)
+    LayerNorm norm_state_;    // dim = D_STATE (32)
+
+    // ---- Node 嵌入 (309 → 32) ----
+    static constexpr int NODE_IN_DIM  = D_MSA + 21 + D_STATE;  // 256+21+32 = 309
+    static constexpr int NODE_OUT_DIM = N_L0_IN_FEATS;          // 32
+    LinearLayer embed_x_;     // NODE_IN_DIM → NODE_OUT_DIM
+    LayerNorm  norm_node_;    // NODE_OUT_DIM
+
+    // ---- Edge 嵌入 第一阶段 (128 → 32) ----
+    LinearLayer embed_e1_;    // D_PAIR → N_EDGE_FEATS
+    LayerNorm  norm_edge1_;   // N_EDGE_FEATS
+
+    // ---- Edge 嵌入 第二阶段 (32+64+1=97 → 32) ----
+    static constexpr int EDGE_IN_DIM2 = N_EDGE_FEATS + 64 + 1;  // 97
+    LinearLayer embed_e2_;    // EDGE_IN_DIM2 → N_EDGE_FEATS
+    LayerNorm  norm_edge2_;   // N_EDGE_FEATS
+
+    // ---- 额外输入（由外部设置）----
+    TensorF32 seq1hot_;       // (B, L, 21) 序列 one-hot
+    TensorI64 idx_;           // (B, L) 残基索引
+    bool      has_seq_info_ = false;
+
+    // ---- 输出缓存 ----
+    TensorF32 xyz_new_;       // (B, L, 3, 3) 更新后的坐标
+    TensorF32 state_new_;     // (B, L, D_STATE) 更新后的 state
 };
 
 // RFAA 主模型

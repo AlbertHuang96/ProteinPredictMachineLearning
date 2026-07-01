@@ -8,6 +8,7 @@
 #include <memory>
 #include <cmath>
 #include <array>
+#include <unordered_map>
 
 namespace rfaa {
 
@@ -60,6 +61,71 @@ void cart2spher(const std::vector<float>& x,
 
 // SO(3) 不可约表示 Wigner D 矩阵 (简化版本)
 std::vector<float> irr_repr(int l, float theta, float phi, int n_angles);
+
+// ============================================================================
+// 球谐函数预计算类 (带 Legendre 多项式缓存)
+// ============================================================================
+
+class SphericalHarmonics {
+public:
+    SphericalHarmonics() { clear(); }
+
+    // 清除缓存：每次计算新 θ 时调用
+    void clear();
+
+    // 获取连带勒让德多项式 P_l^m(x), x = cos(θ)
+    // 带备忘录 (memoization), 同一 x 下低阶值被复用
+    double lpmv(int l, int m, double x);
+
+    // 获取单个 tesseral (实) 球谐函数 Y_l^m(θ, φ)
+    double get_element(int l, int m, double theta, double phi);
+
+    // 获取度数为 l 的全部球谐函数 [Y_l^{-l}, ..., Y_l^l]
+    // 返回 (2l+1) 个值, 索引为 m+l
+    std::vector<double> get(int l, double theta, double phi);
+
+private:
+    // 缓存: leg_cache_[(l,m)] = P_l^m(x) 在当前 x=cos(θ) 下的值
+    // 哈希实现: 将 (l,m) 打包为 int64_t key
+    std::unordered_map<int64_t, double> leg_cache_;
+
+    static int64_t make_key(int l, int m) {
+        return (static_cast<int64_t>(l) << 32) | static_cast<int64_t>(m + 1024);
+    }
+
+    // 辅助函数
+    double semifactorial(int x);       // x!!
+    double pochhammer(int x, int k);   // (x)_k
+    double neg_lpmv(int l, int m, double y);  // 负阶修正因子
+};
+
+
+// 图构建结果
+struct GraphData {
+    TensorI64 edge_index;  // (2, num_edges) 源节点和目标节点索引
+    TensorF32 edge_d;      // (num_edges, 3) 边距离向量 (CA坐标差)
+    TensorF32 edge_w;      // (num_edges, E) 边 pair 特征
+
+    GraphData() = default;
+};
+
+// 构建图：根据坐标、pair 特征和残基索引生成消息传递图
+// - xyz:   (B, L, 3, 3) 骨架坐标 (N, CA, C)
+// - pair:  (B, L, L, E) Trunk 输出的 pair 特征
+// - idx:   (B, L) 残基索引
+// - top_k: 每个节点的最大空间近邻数
+// - kmin:  序列相邻阈值 (|i-j| < kmin 总是连边)
+GraphData make_graph(const TensorF32& xyz,
+                     const TensorF32& pair,
+                     const TensorI64& idx,
+                     int top_k = 64,
+                     int kmin = 9);
+
+// 获取键合邻居信息
+// - idx: (B, L) 残基索引
+// - 返回: (B, L, L, 1)
+//   +1: j 是 i 的下一个残基, -1: j 是 i 的上一个残基, 0: 非键合
+TensorF32 get_bonded_neigh(const TensorI64& idx);
 
 } // namespace se3
 
