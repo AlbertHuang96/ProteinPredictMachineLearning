@@ -323,7 +323,163 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         
         // 预测侧链扭转角
         auto alpha = struct_update_->predict_torsion(msa_query, state); */
+
+            // 3D track update
+    // ===== Step 4: str2str (SE3 Transformer) =====
+    // Python:
+    //   msa = self.norm_msa(msa)
+    //   pair = self.norm_pair(pair)
+    //   w_seq = self.encoder_seq(msa).reshape(B,L,1,N).permute(0,3,1,2)
+    //   msa = w_seq * msa
+    //   msa = msa.sum(dim=1)                          ← sum over sequences
+    //   msa = torch.cat((msa, seq1hot), dim=-1)
+    //   msa = self.norm_node(self.embed_x(msa))
+    //   pair = self.norm_edge(self.embed_e(pair))
+    //   G = make_graph(xyz, pair, idx, top_k=top_k)
+    //   l1_feats = xyz - xyz[:,:,1,:].unsqueeze(2)
+    //   shift = self.se3(G, msa.reshape(B*L,-1,1), l1_feats)
+    //   state = shift['0']; offset = shift['1']
+    
+        int B = msa.shape().dims[0];
+        int N = msa.shape().dims[1];
+        int L = msa.shape().dims[2];
+
+        // ---- Step 4a: LayerNorm on msa & pair ----
+        TensorF32 msa_normed = norm_msa_3d_.forward(msa);   // (B, N, L, 256)
+        TensorF32 pair_normed = norm_pair_3d_.forward(pair); // (B, L, L, 128)
+
+        // ---- Step 4b: 序列加权求和 ----
+        // encoder_seq: 学习每条序列的权重, shape (N,) → softmax → 加权求和
+        // 简化实现: equal-weight mean over N sequences
+        // TODO: replace with learned SequenceWeight
+        TensorF32 msa_sum({B, L, D_MSA}, msa_normed.device());
+        float* sum_data = msa_sum.data();
+        const float* msa_data = msa_normed.data();
+        std::memset(sum_data, 0, B * L * D_MSA * sizeof(float));
+
+        for (int b = 0; b < B; ++b) {
+            for (int n = 0; n < N; ++n) {
+                for (int l = 0; l < L; ++l) {
+                    for (int d = 0; d < D_MSA; ++d) {
+                        int64_t src = ((b * N + n) * L + l) * D_MSA + d;
+                        int64_t dst = (b * L + l) * D_MSA + d;
+                        sum_data[dst] += msa_data[src] / static_cast<float>(N);
+                    }
+                }
+            }
+        }
+
+        // ---- Step 4c: cat(msa_sum, seq1hot) → embed → norm ----
+        // cat: (B, L, 256) + (B, L, 21) → (B, L, 277)
+        TensorF32 node_cat({B, L, NODE_3D_IN}, msa_normed.device());
+        float* cat_data = node_cat.data();
+        const float* s_data = msa_sum.data();
+        const float* onehot_data = seq1hot_.data();
+
+        for (int b = 0; b < B; ++b) {
+            for (int l = 0; l < L; ++l) {
+                // copy msa_sum
+                for (int d = 0; d < D_MSA; ++d) {
+                    cat_data[(b * L + l) * NODE_3D_IN + d] =
+                        s_data[(b * L + l) * D_MSA + d];
+                }
+                // copy seq1hot
+                for (int d = 0; d < 21; ++d) {
+                    cat_data[(b * L + l) * NODE_3D_IN + D_MSA + d] =
+                        onehot_data[(b * L + l) * 21 + d];
+                }
+            }
+        }
+
+        // Linear(277 → 32) → LayerNorm → (B, L, 32)
+        TensorF32 node_emb = embed_x_.forward(node_cat);
+        TensorF32 node_out = norm_node_3d_.forward(node_emb);
+
+        // ---- Step 4d: pair embedding ----
+        // Linear(128 → 32) → LayerNorm → (B, L, L, 32)
+        TensorF32 pair_emb = embed_e_.forward(pair_normed);
+        TensorF32 edge_out = norm_edge_3d_.forward(pair_emb);
+
+        // ---- Step 4e: 构建图 ----
+        GraphData G = make_graph(coords, edge_out, idx_, 64, 9);
+
+        // ---- Step 4f: l1 特征 (位移向量) ----
+        TensorF32 l1_feats = compute_l1_features(coords);  // (B*L, 3, 3)
+
+        // ---- Step 4g: 组装 SE3Features 输入 ----
+        // node_out: (B, L, 32) → reshape to (B*L, 32, 1) 作为 degree-0
+        // l1_feats: (B*L, 3, 3) 作为 degree-1
+        Fiber fiber_in({NODE_3D_OUT, fiber_out_.degrees[1]}, {0, 1});
+        SE3Features node_se3;
+        node_se3.features.resize(2);
+        node_se3.features[0] = node_out.view({B * L, NODE_3D_OUT, 1});
+        node_se3.features[1] = l1_feats;
+
+        // ---- Step 4h: 预计算球谐基 ----
+        SE3Basis basis;
+        basis.compute(coords, TensorF32() /*orient*/, 2 /*J_max*/);
+
+        // ---- Step 4i: SE3 Transformer forward ----
+        SE3Features se3_out = se3_->forward(
+            node_se3, G.edge_index, G.edge_d, &G.edge_w, basis);
+
+        // ---- Step 4j: 提取输出 ----
+        // state: degree-0 → (B*L, D_STATE) → (B, L, D_STATE)
+        state = se3_out.features[0].view({B, L, D_STATE});
+
+        // offset: degree-1 → (B*L, 3, 3) → (B, L, 3, 3)
+        TensorF32 offset = se3_out.features[1].view({B, L, 3, 3});
+
+        // ---- Step 4k: 坐标更新 ----
+        // CA_new = xyz[:,:,1] + offset[:,:,1]
+        // N_new  = CA_new + offset[:,:,0]
+        // C_new  = CA_new + offset[:,:,2]
+        const float* xyz_data = coords.data();
+        const float* off_data = offset.data();
+
+        TensorF32 xyz_new({B, L, 3, 3}, coords.device());
+        float* xyz_out = xyz_new.data();
+
+        for (int b = 0; b < B; ++b) {
+            for (int l = 0; l < L; ++l) {
+                int base = (b * L + l) * 9;  // 3 atoms × 3 coords = 9
+
+                // 原始 CA 坐标
+                float ca_x0 = xyz_data[base + 3];
+                float ca_y0 = xyz_data[base + 4];
+                float ca_z0 = xyz_data[base + 5];
+
+                // δCA (绝对偏移)
+                float dca_x = off_data[base + 3];
+                float dca_y = off_data[base + 4];
+                float dca_z = off_data[base + 5];
+
+                // 更新后 CA
+                float ca_x_new = ca_x0 + dca_x;
+                float ca_y_new = ca_y0 + dca_y;
+                float ca_z_new = ca_z0 + dca_z;
+
+                // N = CA_new + δN
+                xyz_out[base + 0] = ca_x_new + off_data[base + 0];
+                xyz_out[base + 1] = ca_y_new + off_data[base + 1];
+                xyz_out[base + 2] = ca_z_new + off_data[base + 2];
+
+                // CA = CA_new
+                xyz_out[base + 3] = ca_x_new;
+                xyz_out[base + 4] = ca_y_new;
+                xyz_out[base + 5] = ca_z_new;
+
+                // C = CA_new + δC
+                xyz_out[base + 6] = ca_x_new + off_data[base + 6];
+                xyz_out[base + 7] = ca_y_new + off_data[base + 7];
+                xyz_out[base + 8] = ca_z_new + off_data[base + 8];
+            }
+        }
+
+        xyz_new_ = xyz_new;
     }
+
+    
 }
 
 void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
@@ -433,30 +589,103 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         pair = pair + pair_ff.forward(pair);  // residual
     }
 
-    // 3D track update
+    // 3D track update — same logic as IterBlock, but uses msa_full
     // ===== Step 4: str2str (SE3 Transformer) =====
     {
-        LayerNorm msa_norm(D_MSA);
-        LayerNorm pair_norm(D_PAIR);
-        TensorF32 msa_normed = msa_norm.forward(msa);
-        TensorF32 pair_normed = pair_norm.forward(pair);
+        int B = msa_full.shape().dims[0];
+        int N = msa_full.shape().dims[1];
+        int L = msa_full.shape().dims[2];
 
-        /* w_seq = self.encoder_seq(msa).reshape(B, L, 1, N).permute(0,3,1,2)
-        msa = w_seq*msa
-        msa = msa.sum(dim=1)
-        msa = torch.cat((msa, seq1hot), dim=-1) */
+        TensorF32 msa_normed = norm_msa_3d_.forward(msa_full);
+        TensorF32 pair_normed = norm_pair_3d_.forward(pair);
 
-        LinearLayer emb_msa(D_MSA + 21, N_L0_IN_FEATS);
-        LinearLayer emb_pair(D_PAIR, N_EDGE_FEATS);
-        TensorF32 msa_emb = emb_msa.forward(msa_normed);
-        TensorF32 pair_emb = emb_pair.forward(pair_normed);
+        // 序列加权求和 (simplified: equal-weight mean)
+        TensorF32 msa_sum({B, L, D_MSA}, msa_normed.device());
+        float* sum_data = msa_sum.data();
+        const float* msa_data = msa_normed.data();
+        std::memset(sum_data, 0, B * L * D_MSA * sizeof(float));
+        for (int b = 0; b < B; ++b)
+            for (int n = 0; n < N; ++n)
+                for (int l = 0; l < L; ++l)
+                    for (int d = 0; d < D_MSA; ++d)
+                        sum_data[(b * L + l) * D_MSA + d] +=
+                            msa_data[((b * N + n) * L + l) * D_MSA + d] / float(N);
 
-        LayerNorm node_norm(D_PAIR);
-        LayerNorm edge_norm(D_PAIR);
-        TensorF32 node_normed = node_norm.forward(msa_emb);
-        TensorF32 edge_normed = edge_norm.forward(pair_emb);
+        // cat + embed
+        TensorF32 node_cat({B, L, NODE_3D_IN}, msa_normed.device());
+        float* cat_data = node_cat.data();
+        for (int b = 0; b < B; ++b)
+            for (int l = 0; l < L; ++l) {
+                for (int d = 0; d < D_MSA; ++d)
+                    cat_data[(b * L + l) * NODE_3D_IN + d] =
+                        sum_data[(b * L + l) * D_MSA + d];
+                for (int d = 0; d < 21; ++d)
+                    cat_data[(b * L + l) * NODE_3D_IN + D_MSA + d] =
+                        seq1hot_.data()[(b * L + l) * 21 + d];
+            }
 
-        
+        TensorF32 node_out = norm_node_3d_.forward(embed_x_.forward(node_cat));
+        TensorF32 edge_out = norm_edge_3d_.forward(embed_e_.forward(pair_normed));
+
+        GraphData G = make_graph(coords, edge_out, idx_, 64, 9);
+        TensorF32 l1_feats = compute_l1_features(coords);
+
+        Fiber fiber_in({NODE_3D_OUT, 3}, {0, 1});
+        SE3Features node_se3;
+        node_se3.features.resize(2);
+        node_se3.features[0] = node_out.view({B * L, NODE_3D_OUT, 1});
+        node_se3.features[1] = l1_feats;
+
+        SE3Basis basis;
+        basis.compute(coords, TensorF32(), 2);
+        SE3Features se3_out = se3_->forward(
+            node_se3, G.edge_index, G.edge_d, &G.edge_w, basis);
+
+        state = se3_out.features[0].view({B, L, D_STATE});
+        TensorF32 offset = se3_out.features[1].view({B, L, 3, 3});
+
+        // Coordinate update (same as IterBlock)
+        const float* xyz_data = coords.data();
+        const float* off_data = offset.data();
+
+        TensorF32 xyz_new({B, L, 3, 3}, coords.device());
+        float* xyz_out = xyz_new.data();
+        for (int b = 0; b < B; ++b) {
+            for (int l = 0; l < L; ++l) {
+                int base = (b * L + l) * 9;
+                
+                float ca_x0 = xyz_data[base + 3];
+                float ca_y0 = xyz_data[base + 4];
+                float ca_z0 = xyz_data[base + 5];
+
+                // δCA (绝对偏移)
+                float dca_x = off_data[base + 3];
+                float dca_y = off_data[base + 4];
+                float dca_z = off_data[base + 5];
+
+                // 更新后 CA
+                float ca_x_new = ca_x0 + dca_x;
+                float ca_y_new = ca_y0 + dca_y;
+                float ca_z_new = ca_z0 + dca_z;
+
+                // N = CA_new + δN
+                xyz_out[base + 0] = ca_x_new + off_data[base + 0];
+                xyz_out[base + 1] = ca_y_new + off_data[base + 1];
+                xyz_out[base + 2] = ca_z_new + off_data[base + 2];
+
+                // CA = CA_new
+                xyz_out[base + 3] = ca_x_new;
+                xyz_out[base + 4] = ca_y_new;
+                xyz_out[base + 5] = ca_z_new;
+
+                // C = CA_new + δC
+                xyz_out[base + 6] = ca_x_new + off_data[base + 6];
+                xyz_out[base + 7] = ca_y_new + off_data[base + 7];
+                xyz_out[base + 8] = ca_z_new + off_data[base + 8];
+            }
+        }
+
+        xyz_new_ = xyz_new;
     }
 
 }
@@ -749,6 +978,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     for (auto& block : extra_blocks_) {
         // stop grad
         block->forward(msa_full, pair, state, coords);
+        coords.copy_from(block->updated_coords());
     }
     
     // Main blocks
@@ -756,6 +986,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
         // stop grad
         // chiral grad
         block->forward(msa, pair, state, coords);
+        coords.copy_from(block->updated_coords());
     }
     
     // Refinement blocks (仅更新结构)

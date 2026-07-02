@@ -91,6 +91,31 @@ private:
     std::unique_ptr<SE3Transformer> se3_;
     std::unique_ptr<StructureUpdate> struct_update_;
     std::unique_ptr<PositionalEncoding> pos_enc_;
+
+    // 3D track
+    TensorF32 xyz_new_;              // (B, L, 3, 3)
+    TensorF32 state_new_;            // (B, L, D_STATE) 可选，或直接用 state 引用
+
+    LayerNorm norm_msa_3d_;          // D_MSA (256)
+    LayerNorm norm_pair_3d_;         // D_PAIR (128)
+
+    static constexpr int NODE_3D_IN  = D_MSA + 21;      // 256 + 21 = 277
+    static constexpr int NODE_3D_OUT = N_L0_IN_FEATS;   // 32
+    static constexpr int EDGE_3D_OUT = N_EDGE_FEATS;    // 32
+
+    LinearLayer embed_x_;            // NODE_3D_IN → NODE_3D_OUT
+    LinearLayer embed_e_;            // D_PAIR → EDGE_3D_OUT
+    LayerNorm  norm_node_3d_;        // NODE_3D_OUT
+    LayerNorm  norm_edge_3d_;        // EDGE_3D_OUT
+
+    // 额外输入 (由 caller 在 forward 前设置)
+    TensorF32 seq1hot_;              // (B, L, 21)
+    TensorI64 idx_;                  // (B, L)
+    bool has_seq_info_ = false;
+
+public:
+    const TensorF32& updated_coords() const { return xyz_new_; }
+    void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
 };
 
 class FullBlock : public IterBlock {
