@@ -242,6 +242,43 @@ TensorF32 one_hot(int index, int num_classes) {
     return result;
 }
 
+TensorF32 one_hot_seq(const TensorF32& seq, int num_classes) {
+    // 检查输入是否为 2D 张量
+    const auto& seq_shape = seq.shape().dims;
+    if (seq_shape.size() != 2) {
+        throw RFAAError("one_hot_seq expects 2D tensor (B, L)");
+    }
+    
+    if (num_classes <= 0) {
+        throw std::invalid_argument("num_classes must be positive");
+    }
+    
+    int64_t B = seq_shape[0];
+    int64_t L = seq_shape[1];
+    
+    // 创建输出张量 (B, L, num_classes)
+    TensorF32 result({B, L, num_classes}, seq.device());
+    result.zero_();
+    
+    const float* seq_data = seq.data();
+    float* result_data = result.data();
+    
+    // 填充 one-hot
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t l = 0; l < L; ++l) {
+            int index = static_cast<int>(seq_data[b * L + l]);
+            if (index < 0 || index >= num_classes) {
+                throw std::out_of_range("Index " + std::to_string(index) + 
+                                        " at position (" + std::to_string(b) + ", " + std::to_string(l) + ")" +
+                                        " out of range [0, " + std::to_string(num_classes-1) + "]");
+            }
+            result_data[(b * L + l) * num_classes + index] = 1.0f;
+        }
+    }
+    
+    return result;
+}
+
 TensorF32 outer_sum(const TensorF32& left, const TensorF32& right) {
     const auto& left_shape = left.shape().dims;
     const auto& right_shape = right.shape().dims;

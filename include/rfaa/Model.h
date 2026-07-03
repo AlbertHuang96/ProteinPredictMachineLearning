@@ -70,6 +70,7 @@ public:
     // 执行一个迭代块
     // 输入/输出通过引用修改
     void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
+                 const TensorF32& seq1hot,
                  const TensorF32& coords);
 
     void proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state);
@@ -109,13 +110,13 @@ private:
     LayerNorm  norm_edge_3d_;        // EDGE_3D_OUT
 
     // 额外输入 (由 caller 在 forward 前设置)
-    TensorF32 seq1hot_;              // (B, L, 21)
-    TensorI64 idx_;                  // (B, L)
-    bool has_seq_info_ = false;
+    //TensorF32 seq1hot_;              // (B, L, 21)
+    //TensorI64 idx_;                  // (B, L)
+    //bool has_seq_info_ = false;
 
 public:
     const TensorF32& updated_coords() const { return xyz_new_; }
-    void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
+    //void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
 };
 
 class FullBlock : public IterBlock {
@@ -126,6 +127,7 @@ public:
     virtual ~FullBlock() = default;
 
     void forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
+                 const TensorF32& seq1hot,
                  const TensorF32& coords) override;
 private:
     std::unique_ptr<MSAGlobalColAttention> msa_global_col_attn_;
@@ -139,10 +141,11 @@ public:
     virtual ~RefineBlock() = default;
 
     void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
+                 const TensorF32& seq1hot,
                  const TensorF32& coords) override;
 
                  // 设置额外输入（在 forward 调用前设置）
-    void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
+    //void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
 
     // 获取 SE3 更新后的坐标
     const TensorF32& updated_coords() const { return xyz_new_; }
@@ -170,9 +173,9 @@ private:
     LayerNorm  norm_edge2_;   // N_EDGE_FEATS
 
     // ---- 额外输入（由外部设置）----
-    TensorF32 seq1hot_;       // (B, L, 21) 序列 one-hot
-    TensorI64 idx_;           // (B, L) 残基索引
-    bool      has_seq_info_ = false;
+    //TensorF32 seq1hot_;       // (B, L, 21) 序列 one-hot
+    //TensorI64 idx_;           // (B, L) 残基索引
+    //bool      has_seq_info_ = false;
 
     // ---- 输出缓存 ----
     TensorF32 xyz_new_;       // (B, L, 3, 3) 更新后的坐标
@@ -184,6 +187,8 @@ class RFAAModel {
 public:
     explicit RFAAModel(const RFAAConfig& config = RFAAConfig{});
     ~RFAAModel();
+
+    void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
     
     // 前向传播
     ModelOutput forward(const ModelInput& input);
@@ -311,6 +316,10 @@ private:
     std::unique_ptr<MSATrack> msa_track_;
     std::unique_ptr<PairTrack> pair_track_;
     std::unique_ptr<StateTrack> state_track_;
+
+    TensorF32 seq1hot_;       // (B, L, 21) 序列 one-hot
+    TensorI64 idx_;           // (B, L) 残基索引
+    bool      has_seq_info_ = false;
     
     // 迭代块
     std::vector<std::unique_ptr<IterBlock>> extra_blocks_;

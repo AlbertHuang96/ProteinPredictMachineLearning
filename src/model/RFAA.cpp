@@ -169,7 +169,9 @@ TensorF32 IterBlock::compute_rbf_feature(const TensorF32& coords)
 }
 
 void IterBlock::forward(TensorF32& msa, TensorF32& pair, 
-                        TensorF32& state, const TensorF32& coords) {
+                        TensorF32& state, 
+                        const TensorF32& seq1hot,
+                        const TensorF32& coords) {
     
     if (update_msa_pair_) {
 
@@ -371,8 +373,9 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
         // ---- Step 4c: cat(msa_sum, seq1hot) → embed → norm ----
         // cat: (B, L, 256) + (B, L, 21) → (B, L, 277)
-        TensorF32 node_cat({B, L, NODE_3D_IN}, msa_normed.device());
-        float* cat_data = node_cat.data();
+        TensorF32 node_cat = concat({msa_sum, seq1hot}, -1);
+        //TensorF32 node_cat({B, L, NODE_3D_IN}, msa_normed.device());
+        /* float* cat_data = node_cat.data();
         const float* s_data = msa_sum.data();
         const float* onehot_data = seq1hot_.data();
 
@@ -389,7 +392,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
                         onehot_data[(b * L + l) * 21 + d];
                 }
             }
-        }
+        } */
 
         // Linear(277 → 32) → LayerNorm → (B, L, 32)
         TensorF32 node_emb = embed_x_.forward(node_cat);
@@ -409,7 +412,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // ---- Step 4g: 组装 SE3Features 输入 ----
         // node_out: (B, L, 32) → reshape to (B*L, 32, 1) 作为 degree-0
         // l1_feats: (B*L, 3, 3) 作为 degree-1
-        Fiber fiber_in({NODE_3D_OUT, fiber_out_.degrees[1]}, {0, 1});
+        //Fiber fiber_in({NODE_3D_OUT, fiber_out_.degrees[1]}, {0, 1});
         SE3Features node_se3;
         node_se3.features.resize(2);
         node_se3.features[0] = node_out.view({B * L, NODE_3D_OUT, 1});
@@ -417,7 +420,9 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
         // ---- Step 4h: 预计算球谐基 ----
         SE3Basis basis;
-        basis.compute(coords, TensorF32() /*orient*/, 2 /*J_max*/);
+        //basis.compute(coords, TensorF32() /*orient*/, 2 /*J_max*/);
+        basis.compute(G.edge_d, 2);  // J_max=2, 边向量来自 graph
+
 
         // ---- Step 4i: SE3 Transformer forward ----
         SE3Features se3_out = se3_->forward(
@@ -483,6 +488,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 }
 
 void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
+                        const TensorF32& seq1hot,
                         const TensorF32& coords) {
     // FullBlock 在 IterBlock 的基础上增加了 msa_full 的使用和全局 column attention
     // msa_full 需要在 forward 函数参数中传入，或者在 IterBlock 中存储为成员变量
@@ -612,8 +618,8 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
                             msa_data[((b * N + n) * L + l) * D_MSA + d] / float(N);
 
         // cat + embed
-        TensorF32 node_cat({B, L, NODE_3D_IN}, msa_normed.device());
-        float* cat_data = node_cat.data();
+        TensorF32 node_cat = concat({msa_sum, seq1hot}, -1);
+        /* float* cat_data = node_cat.data();
         for (int b = 0; b < B; ++b)
             for (int l = 0; l < L; ++l) {
                 for (int d = 0; d < D_MSA; ++d)
@@ -622,7 +628,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
                 for (int d = 0; d < 21; ++d)
                     cat_data[(b * L + l) * NODE_3D_IN + D_MSA + d] =
                         seq1hot_.data()[(b * L + l) * 21 + d];
-            }
+            } */
 
         TensorF32 node_out = norm_node_3d_.forward(embed_x_.forward(node_cat));
         TensorF32 edge_out = norm_edge_3d_.forward(embed_e_.forward(pair_normed));
@@ -630,14 +636,17 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         GraphData G = make_graph(coords, edge_out, idx_, 64, 9);
         TensorF32 l1_feats = compute_l1_features(coords);
 
-        Fiber fiber_in({NODE_3D_OUT, 3}, {0, 1});
+        //Fiber fiber_in({NODE_3D_OUT, 3}, {0, 1});
         SE3Features node_se3;
         node_se3.features.resize(2);
+        // node_out = it was actually msa input
         node_se3.features[0] = node_out.view({B * L, NODE_3D_OUT, 1});
         node_se3.features[1] = l1_feats;
 
         SE3Basis basis;
-        basis.compute(coords, TensorF32(), 2);
+        //basis.compute(coords, TensorF32(), 2);
+        basis.compute(G.edge_d, 2);  // J_max=2, 边向量来自 graph
+
         SE3Features se3_out = se3_->forward(
             node_se3, G.edge_index, G.edge_d, &G.edge_w, basis);
 
@@ -712,6 +721,7 @@ void RefineBlock::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
 void RefineBlock::forward(TensorF32& msa_full, 
                           TensorF32& pair, 
                           TensorF32& state, 
+                          const TensorF32& seq1hot,
                           const TensorF32& coords) {
 
     // ---- 获取维度 ----
@@ -735,7 +745,8 @@ void RefineBlock::forward(TensorF32& msa_full,
     // ================================================================
     // cat([msa_norm(B,L,256), seq1hot(B,L,21), state_norm(B,L,32)])
     // → (B, L, 309)
-    TensorF32 node_cat = concat({node, seq1hot_, state_n}, -1);
+    // where the seq1hot_ comes?
+    TensorF32 node_cat = concat({node, seq1hot, state_n}, -1);
 
     // Linear(309 → 32) → LayerNorm → (B, L, 32)
     TensorF32 node_emb = embed_x_.forward(node_cat);
@@ -788,8 +799,66 @@ void RefineBlock::forward(TensorF32& msa_full,
     // ================================================================
     // 构建 SE3Basis (预计算球谐基)
     SE3Basis basis;
-    basis.compute(coords, TensorF32() /* orient 占位 */, config_.se3_config.num_degrees);
+    //basis.compute(coords, TensorF32() /* orient 占位 */, config_.se3_config.num_degrees);
+    basis.compute(G.edge_d, 2);  // J_max=2, 边向量来自 graph
 
+
+    SE3Features se3_out = se3_->forward(
+            node_se3, G.edge_index, G.edge_d, &G.edge_w, basis);
+
+        // ---- Step 4j: 提取输出 ----
+        // state: degree-0 → (B*L, D_STATE) → (B, L, D_STATE)
+    state = se3_out.features[0].view({B, L, D_STATE});
+
+        // offset: degree-1 → (B*L, 3, 3) → (B, L, 3, 3)
+    TensorF32 offset = se3_out.features[1].view({B, L, 3, 3});
+
+        // ---- Step 4k: 坐标更新 ----
+        // CA_new = xyz[:,:,1] + offset[:,:,1]
+        // N_new  = CA_new + offset[:,:,0]
+        // C_new  = CA_new + offset[:,:,2]
+    const float* xyz_data = coords.data();
+    const float* off_data = offset.data();
+
+    TensorF32 xyz_new({B, L, 3, 3}, coords.device());
+    float* xyz_out = xyz_new.data();
+
+    for (int b = 0; b < B; ++b) {
+        for (int l = 0; l < L; ++l) {
+            int base = (b * L + l) * 9;
+                
+            float ca_x0 = xyz_data[base + 3];
+            float ca_y0 = xyz_data[base + 4];
+            float ca_z0 = xyz_data[base + 5];
+
+                // δCA (绝对偏移)
+            float dca_x = off_data[base + 3];
+            float dca_y = off_data[base + 4];
+            float dca_z = off_data[base + 5];
+
+                // 更新后 CA
+            float ca_x_new = ca_x0 + dca_x;
+            float ca_y_new = ca_y0 + dca_y;
+            float ca_z_new = ca_z0 + dca_z;
+
+                // N = CA_new + δN
+            xyz_out[base + 0] = ca_x_new + off_data[base + 0];
+            xyz_out[base + 1] = ca_y_new + off_data[base + 1];
+            xyz_out[base + 2] = ca_z_new + off_data[base + 2];
+
+                // CA = CA_new
+            xyz_out[base + 3] = ca_x_new;
+            xyz_out[base + 4] = ca_y_new;
+            xyz_out[base + 5] = ca_z_new;
+
+                // C = CA_new + δC
+            xyz_out[base + 6] = ca_x_new + off_data[base + 6];
+            xyz_out[base + 7] = ca_y_new + off_data[base + 7];
+            xyz_out[base + 8] = ca_z_new + off_data[base + 8];
+        }
+    }
+
+    xyz_new_ = xyz_new;
     // TODO: SE3Transformer 当前 forward 签名为 forward(SE3Features&, positions,
     //       orientations, edge_index, training)。
     //       等接口完善后，此处替换为：
@@ -896,6 +965,12 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
 
 RFAAModel::~RFAAModel() = default;
 
+void RFAAModel::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
+    seq1hot_ = seq1hot;
+    idx_     = idx;
+    has_seq_info_ = true;
+}
+
 ModelOutput RFAAModel::forward(const ModelInput& input) {
     ModelOutput output;
     
@@ -972,12 +1047,16 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // the block in the 4 full block was different from the main block
     // full/extra block use global column attention
 
+    const TensorF32& seq1hot = one_hot_seq(input.seq_tokens, 21);
+    const TensorI64& idx = input.seq_tokens; //? residue indices
+    set_seq_info(seq1hot, idx);
+
     // Extra blocks
     // need to use msa_full
     // and use global column attention as well
     for (auto& block : extra_blocks_) {
         // stop grad
-        block->forward(msa_full, pair, state, coords);
+        block->forward(msa_full, pair, state, seq1hot, coords);
         coords.copy_from(block->updated_coords());
     }
     
@@ -985,7 +1064,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     for (auto& block : main_blocks_) {
         // stop grad
         // chiral grad
-        block->forward(msa, pair, state, coords);
+        block->forward(msa, pair, state, seq1hot, coords);
         coords.copy_from(block->updated_coords());
     }
     
@@ -994,14 +1073,14 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
         // stop grad
         // chiral grad
         // clash grad
-        if (block.get()) {
+        /* if (block.get()) {
         // seq1hot: 从 input.seq_tokens 生成 one-hot (B, L, 21)
             TensorF32 seq1hot = one_hot_seq(input.seq_tokens, 21);
             TensorI64 idx = input.seq_tokens;  // 或专门的 idx 输入
             refine->set_seq_info(seq1hot, idx);
-        }
+        } */
 
-        block->forward(msa, pair, state, coords);
+        block->forward(msa, pair, state, seq1hot, coords);
 
         if (block.get()) {
             coords.copy_from(refine->updated_coords());

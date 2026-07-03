@@ -158,12 +158,35 @@ struct SE3Features {
 };
 
 // SE3 基：存储预计算的基函数
+// SE3 基：对标 Python get_basis(G, max_degree, ...)
+// 预计算每条边上的 Y_J(theta, phi) 并按需返回 CG 耦合后的 basis
 struct SE3Basis {
-    std::vector<Tensor> basis;  // 基函数列表
-    
+    // edge_Y[J]: (E, 2J+1) — 预计算的 Y_J 球谐函数, J = 0..J_max
+    std::vector<TensorF32> edge_Y;
+    int J_max_ = 0;
+
+    // get_basis 缓存: key=(d_in, d_out) → (E, 1, 2*d_out+1, 1, 2*d_in+1, num_freq)
+    std::map<std::pair<int,int>, TensorF32> cache_;
+
     SE3Basis() = default;
-    void compute(const Tensor& positions, const Tensor& orientations, int J_max);
+
+    // 对标: r_ij = get_spherical_from_cartesian_torch(edge_d)
+    //       Y   = precompute_sh(r_ij, 2*max_degree)
+    // edge_d: (E, 3) 笛卡尔相对位移向量
+    void compute(const TensorF32& edge_d, int J_max);
+
+    // 对标 Python get_basis 中的双层循环:
+    //   for d_in, d_out: K_Js = [Y[J] @ Q_J for J in range(...)]
+    //                   basis = stack(K_Js, -1).view(...)
+    // 返回: (E, 1, 2*d_out+1, 1, 2*d_in+1, 2*min(d_in,d_out)+1)
+    const TensorF32& get_basis(int d_in, int d_out);
+
+    // Clebsch-Gordan 变换矩阵 Q_J(J, d_in, d_out)
+    // 形状: (2*d_out+1, 2*d_in+1, 2*J+1)
+    // 对标 Python: _basis_transformation_Q_J(J, d_in, d_out)
+    static TensorF32 q_matrix(int J, int d_in, int d_out);
 };
+
 
 // ============================================================================
 // RadialFunc: NN 参数化的径向剖线函数

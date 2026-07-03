@@ -75,7 +75,7 @@ TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b);
 TensorF32 one_hot(const std::vector<int>& indices, int num_classes = 8);
 
 /**
- * @brief One-hot encoding for a single index
+ * @brief One-hot encoding for a single index 
  * 
  * Converts a single index to one-hot encoded vector.
  * 
@@ -85,6 +85,25 @@ TensorF32 one_hot(const std::vector<int>& indices, int num_classes = 8);
  * @throws RFAAError If index is out of range [0, num_classes-1]
  */
 TensorF32 one_hot(int index, int num_classes = 8);
+
+/**
+ * @brief One-hot encoding for sequence data
+ * 
+ * Converts a sequence of indices to one-hot encoded tensor.
+ * Equivalent to PyTorch's F.one_hot() for sequence data.
+ * 
+ * Example:
+ *   seq = [[0, 2, 1], [3, 1, 0]] with num_classes = 5
+ *   output shape = (2, 3, 5)
+ *   output[b, i, c] = 1 if seq[b, i] == c else 0
+ * 
+ * @param seq Input sequence tensor, shape (B, L) with integer indices in [0, num_classes-1]
+ * @param num_classes Number of classes (default 21 for amino acids)
+ * @return TensorF32 One-hot encoded tensor, shape (B, L, num_classes)
+ * @throws RFAAError If seq is not 2D tensor
+ * @throws RFAAError If any index is out of range [0, num_classes-1]
+ */
+TensorF32 one_hot_seq(const TensorF32& seq, int num_classes = 21);
 
 /**
  * @brief Outer sum of two tensors (via broadcasting)

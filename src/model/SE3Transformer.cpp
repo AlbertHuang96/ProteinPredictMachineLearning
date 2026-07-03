@@ -16,7 +16,7 @@ namespace se3 {
 struct GraphData;
 
 // 计算球谐基 eijk 和 R_ij (简化实现)
-void compute_basis(const std::vector<float>& positions, 
+/* void compute_basis(const std::vector<float>& positions, 
                    const std::vector<float>& orientations,
                    std::vector<float>& eijk, 
                    std::vector<float>& R_ij,
@@ -34,10 +34,10 @@ void compute_basis(const std::vector<float>& positions,
     // 2. 计算球谐函数 Y_lm
     // 3. 计算 Clebsch-Gordan 系数
     // 4. 组合得到 eijk 和 R_ij
-}
+} */
 
 // 计算向量 r 和距离 d (简化实现)
-void compute_r(const std::vector<float>& positions,
+/* void compute_r(const std::vector<float>& positions,
               std::vector<float>& r,
               std::vector<float>& d,
               int batch_size,
@@ -85,7 +85,7 @@ void get_basis_and_r(const std::vector<float>& positions,
     
     // 计算基
     compute_basis(positions, orientations, eijk, R_ij, batch_size, n_nodes);
-}
+} */
 
 // 计算矩阵 A 的零空间 (简化实现)
 std::vector<float> null_project(const std::vector<float>& A, int m, int n) {
@@ -106,7 +106,7 @@ std::vector<float> null_project(const std::vector<float>& A, int m, int n) {
 }
 
 // 生成 Q_J 矩阵 (简化实现)
-std::vector<std::vector<float>> get_Q_J(int J_max) {
+/* std::vector<std::vector<float>> get_Q_J(int J_max) {
     // 简化实现：实际应计算 Clebsch-Gordan 系数的 Q_J 矩阵
     // 这里返回空矩阵作为占位符
     
@@ -125,10 +125,10 @@ std::vector<std::vector<float>> get_Q_J(int J_max) {
     // 需要计算 Clebsch-Gordan 系数 C_{l1,m1,l2,m2}^{J,M}
     
     return Q_J;
-}
+} */
 
 // 笛卡尔坐标转球坐标 (简化实现)
-void cart2spher(const std::vector<float>& x,
+/* void cart2spher(const std::vector<float>& x,
                 std::vector<float>& rho,
                 std::vector<float>& theta,
                 std::vector<float>& phi,
@@ -160,10 +160,10 @@ void cart2spher(const std::vector<float>& x,
             phi[i] = 0.0f;
         }
     }
-}
+} */
 
 // SO(3) 不可约表示 Wigner D 矩阵 (简化实现)
-std::vector<float> irr_repr(int l, float theta, float phi, int n_angles) {
+/* std::vector<float> irr_repr(int l, float theta, float phi, int n_angles) {
     // 简化实现：实际应计算 Wigner D 矩阵 D^l(R)
     // 这里返回单位矩阵作为占位符
     
@@ -182,7 +182,7 @@ std::vector<float> irr_repr(int l, float theta, float phi, int n_angles) {
     // 其中 d^l 是小 Wigner d 矩阵
     
     return result;
-}
+} */
 
 // ============================================================================
 // SphericalHarmonics 实现：连带勒让德多项式 + 实球谐函数
@@ -613,25 +613,279 @@ SE3Features SE3Features::operator+(const SE3Features& other) const {
 }
 
 // ============================================================================
+// Q_J(d_out, d_in, J) — 对标 Python _basis_transformation_Q_J
+// 形状: (2*d_out+1, 2*d_in+1, 2*J+1)
+// Q_J[m_out, m_in, m_J] = ClebschGordan(d_out, m_out-d_out, d_in, m_in-d_in, J, m_J-J)
+// ============================================================================
+TensorF32 SE3Basis::q_matrix(int J, int d_in, int d_out) {
+    int d_o = 2 * d_out + 1;
+    int d_i = 2 * d_in  + 1;
+    int d_J = 2 * J + 1;
+
+    TensorF32 Q({d_o, d_i, d_J}, Device::CPU);
+    Q.zero_();
+    float* q = Q.data();
+
+    // 仅对常用低度数 (0, 1, 2) 提供精确 CG 系数
+    // 高阶需要完整的 3j-symbol 计算
+
+    // ---------- (d_in=0, d_out, J=d_out) ----------
+    // CG: C(J, M, 0, 0, J, M) = 1, 其他 = 0
+    if (d_in == 0 && J == d_out) {
+        for (int mo = 0; mo < d_o; ++mo) {
+            int m_J_idx = mo;  // M = m_out 对应 Y_J 的 m_J = mo
+            q[(mo * d_i + 0) * d_J + m_J_idx] = 1.0f;
+        }
+        return Q;
+    }
+
+    // ---------- (d_in, d_out=0, J=d_in) ----------
+    if (d_out == 0 && J == d_in) {
+        for (int mi = 0; mi < d_i; ++mi) {
+            int m_J_idx = mi;
+            q[(0 * d_i + mi) * d_J + m_J_idx] = 1.0f;
+        }
+        return Q;
+    }
+
+    // ---------- (d_in=1, d_out=1) ----------
+    if (d_in == 1 && d_out == 1) {
+        // CG(1,m1, 1,m2, J,M) where M = m1+m2, for J = 0, 1, 2
+        auto m_val = [](int idx) { return idx - 1; };  // idx: 0,1,2 → -1,0,1
+
+        if (J == 0) {
+            // CG(1,m, 1,-m, 0,0) = (-1)^(1-m) / √3
+            float inv_sqrt3 = 1.0f / std::sqrt(3.0f);
+            for (int mi = 0; mi < 3; ++mi) {
+                int m = m_val(mi);
+                int mo = 0 - m + 1;  // mo = -m 的存储索引
+                float sign = ((1 - m) % 2 == 0) ? 1.0f : -1.0f;
+                q[(mo * 3 + mi) * 1 + 0] = sign * inv_sqrt3;
+            }
+            return Q;
+        }
+
+        if (J == 1) {
+            // CG(1,m1, 1,m2, 1,M) with M=m1+m2
+            // C(1,m1,1,m2,1,m1+m2) = sign * √( (1+m1)(2-m1) / 6 )  when m2 = ±1, etc.
+            // 简化: 使用标准 CG 表
+            // m1=-1: C(1,-1,1,0,1,-1) = -1/√2,  C(1,-1,1,1,1,0) = 1/√2
+            // m1=0:  C(1,0,1,-1,1,-1)= 1/√2,   C(1,0,1,1,1,1) = -1/√2
+            // m1=1:  C(1,1,1,-1,1,0) = 1/√2,   C(1,1,1,0,1,1) = -1/√2
+            float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
+
+            // m1=-1, m2=0 → M=-1
+            q[(0 * 3 + 0) * 3 + 0] = -inv_sqrt2;  // mo=-1, mi=-1, m_J=-1
+            // m1=-1, m2=1 → M=0
+            q[(1 * 3 + 0) * 3 + 1] =  inv_sqrt2;  // mo=0, mi=-1, m_J=0
+            // m1=0, m2=-1 → M=-1
+            q[(0 * 3 + 1) * 3 + 0] =  inv_sqrt2;  // mo=-1, mi=0, m_J=-1
+            // m1=0, m2=1 → M=1
+            q[(2 * 3 + 1) * 3 + 2] = -inv_sqrt2;  // mo=1, mi=0, m_J=1
+            // m1=1, m2=-1 → M=0
+            q[(1 * 3 + 2) * 3 + 1] =  inv_sqrt2;  // mo=0, mi=1, m_J=0
+            // m1=1, m2=0 → M=1
+            q[(2 * 3 + 2) * 3 + 2] = -inv_sqrt2;  // mo=1, mi=1, m_J=1
+            return Q;
+        }
+
+        if (J == 2) {
+            // CG(1,m1, 1,m2, 2,M) where M=m1+m2
+            // C(1,-1,1,-1,2,-2) = 1
+            // C(1,-1,1,0,2,-1) = 1/√2
+            // C(1,-1,1,1,2,0) = 1/√6
+            // C(1,0,1,-1,2,-1) = 1/√2
+            // C(1,0,1,0,2,0) = √(2/3)
+            // C(1,0,1,1,2,1) = 1/√2
+            // C(1,1,1,-1,2,0) = 1/√6
+            // C(1,1,1,0,2,1) = 1/√2
+            // C(1,1,1,1,2,2) = 1
+            float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
+            float inv_sqrt6 = 1.0f / std::sqrt(6.0f);
+            float sqrt_2_3  = std::sqrt(2.0f / 3.0f);
+
+            q[(0 * 3 + 0) * 5 + 0] = 1.0f;       // (-1,-1)→M=-2
+            q[(1 * 3 + 0) * 5 + 1] = inv_sqrt2;   // (-1,0)→M=-1
+            q[(1 * 3 + 1) * 5 + 1] = inv_sqrt2;   // (0,-1)→M=-1
+            q[(2 * 3 + 0) * 5 + 2] = inv_sqrt6;   // (-1,1)→M=0
+            q[(2 * 3 + 1) * 5 + 2] = sqrt_2_3;    // (0,0)→M=0
+            q[(2 * 3 + 2) * 5 + 2] = inv_sqrt6;   // (1,-1)→M=0
+            q[(3 * 3 + 1) * 5 + 3] = inv_sqrt2;   // (0,1)→M=1
+            q[(3 * 3 + 2) * 5 + 3] = inv_sqrt2;   // (1,0)→M=1
+            q[(4 * 3 + 2) * 5 + 4] = 1.0f;        // (1,1)→M=2
+            return Q;
+        }
+    }
+
+    // ---- 高阶度的 fallback: 单位近似 ----
+    // TODO: 实现完整 3j-symbol 计算
+    for (int k = 0; k < std::min(d_o, std::min(d_i, d_J)); ++k) {
+        q[(k * d_i + k) * d_J + k] = 1.0f;
+    }
+    return Q;
+}
+
+const TensorF32& SE3Basis::get_basis(int d_in, int d_out) {
+    // ---- 检查缓存 ----
+    auto key = std::make_pair(d_in, d_out);
+    auto it = cache_.find(key);
+    if (it != cache_.end()) {
+        return it->second;
+    }
+
+    int64_t E = edge_Y[0].shape().dims[0];         // 边数
+    int d_out_dim = 2 * d_out + 1;                  // m_out 分量数
+    int d_in_dim  = 2 * d_in  + 1;                  // m_in  分量数
+    int num_freq  = 2 * std::min(d_in, d_out) + 1;  // J 的个数
+
+    // ---- 对标 Python: 预分配 K_Js 列表 ----
+    // 收集所有 J 对应的 K_J = Y[J] @ Q_J.J.T
+    // K_Js[j] 形状: (E, d_out_dim * d_in_dim)
+    std::vector<TensorF32> K_Js;
+    K_Js.reserve(num_freq);
+
+    for (int j = 0; j < num_freq; ++j) {
+        int J = std::abs(d_in - d_out) + j;  // J ∈ [|d_in-d_out|, d_in+d_out]
+
+        if (J > J_max_) {
+            // 超出预计算范围 → 补 0
+            TensorF32 zero_K({E, d_out_dim * d_in_dim}, edge_Y[0].device());
+            zero_K.zero_();
+            K_Js.push_back(zero_K);
+            continue;
+        }
+
+        // ---- 获取 Q_J 矩阵 ----
+        // Python: Q_J = _basis_transformation_Q_J(J, d_in, d_out).float().T.to(device)
+        // Q_J 形状: (d_out_dim, d_in_dim, 2J+1) → .T → (2J+1, d_out_dim*d_in_dim)
+        TensorF32 Q_J = q_matrix(J, d_in, d_out);  // (d_out_dim, d_in_dim, 2J+1)
+
+        // ---- 对标 Python: K_J = torch.matmul(Y[J], Q_J) ----
+        // Y[J]: (E, 2J+1)
+        // Q_J:  (2J+1, d_out_dim * d_in_dim)  [after .T and reshape]
+        // K_J:  (E, d_out_dim * d_in_dim)
+        const float* y_data = edge_Y[J].data();
+        int d_J = 2 * J + 1;
+
+        // 将 Q_J 从 (d_out_dim, d_in_dim, d_J) 转置为 (d_J, d_out_dim * d_in_dim)
+        // 然后做矩阵乘法
+        TensorF32 Q_J_T({d_J, d_out_dim * d_in_dim}, edge_Y[0].device());
+        float* q_data = Q_J_T.data();
+        const float* q_src = Q_J.data();
+        for (int mo = 0; mo < d_out_dim; ++mo) {
+            for (int mi = 0; mi < d_in_dim; ++mi) {
+                for (int m = 0; m < d_J; ++m) {
+                    // Q_J[mo, mi, m] → Q_J_T[m, mo*d_in_dim + mi]
+                    q_data[m * d_out_dim * d_in_dim + mo * d_in_dim + mi] =
+                        q_src[(mo * d_in_dim + mi) * d_J + m];
+                }
+            }
+        }
+
+        // Y[J] @ Q_J_T: (E, 2J+1) @ (2J+1, D) → (E, D)
+        int D = d_out_dim * d_in_dim;
+        TensorF32 K_J({E, D}, edge_Y[0].device());
+        float* kj_data = K_J.data();
+        for (int64_t e = 0; e < E; ++e) {
+            for (int k = 0; k < D; ++k) {
+                float val = 0.0f;
+                for (int m = 0; m < d_J; ++m) {
+                    val += y_data[e * d_J + m] * q_data[m * D + k];
+                }
+                kj_data[e * D + k] = val;
+            }
+        }
+        K_Js.push_back(K_J);
+    }
+
+    // ---- 对标 Python: torch.stack(K_Js, -1).view(*size) ----
+    // size = (-1, 1, 2*d_out+1, 1, 2*d_in+1, num_freq)
+    int D = d_out_dim * d_in_dim;
+    TensorF32 result({E, 1, d_out_dim, 1, d_in_dim, num_freq}, edge_Y[0].device());
+    float* r_data = result.data();
+
+    for (int64_t e = 0; e < E; ++e) {
+        for (int mo = 0; mo < d_out_dim; ++mo) {
+            for (int mi = 0; mi < d_in_dim; ++mi) {
+                for (int j = 0; j < num_freq; ++j) {
+                    int kj_flat_idx = mo * d_in_dim + mi;
+                    float val = K_Js[j].data()[e * D + kj_flat_idx];
+                    // result[e, 0, mo, 0, mi, j]
+                    int64_t r_idx = ((((e * 1 + 0) * d_out_dim + mo) * 1 + 0) * d_in_dim + mi) * num_freq + j;
+                    r_data[r_idx] = val;
+                }
+            }
+        }
+    }
+
+    cache_[key] = result;
+    return cache_[key];
+}
+
+// ============================================================================
 // SE3Basis 实现
+// 对标 Python:
+//   r_ij = get_spherical_from_cartesian_torch(cloned_d)
+//   Y = precompute_sh(r_ij, 2*max_degree)
 // ============================================================================
 
-void SE3Basis::compute(const Tensor& positions, const Tensor& orientations, int J_max) {
-    // TODO: 实现基函数计算
-    // 1. 调用 se3::get_basis_and_r 计算基
-    // 2. 将结果存储到 basis 张量列表中
+void SE3Basis::compute(const TensorF32& edge_d, int J_max) {
+    // edge_d: (E, 3) — 每条边的笛卡尔相对位移 (dx, dy, dz)
+    const auto& shape = edge_d.shape();
+    int64_t E = shape.dims[0];
+    int max_Y_degree = 2 * J_max;  // Python: precompute_sh(r_ij, 2*max_degree)
+    J_max_ = max_Y_degree;
 
-    SphericalHarmonics sph;
-    // double theta
-    // double phi
-    
-    // 简化：创建占位符张量
-    basis.resize(J_max + 1);
-    for (int J = 0; J <= J_max; ++J) {
-        //auto Y = sh.get(J, theta, phi);
+    const float* d_data = edge_d.data();
+    SphericalHarmonics sh;
 
+    // 预分配: edge_Y[J] = (E, 2J+1), J = 0..2*J_max
+    edge_Y.resize(max_Y_degree + 1);
+    for (int J = 0; J <= max_Y_degree; ++J) {
+        edge_Y[J] = TensorF32({E, 2 * J + 1}, edge_d.device());
     }
+
+    // ---- 逐边计算球谐函数 ----
+    // 对标: get_spherical_from_cartesian_torch + precompute_sh
+    for (int64_t e = 0; e < E; ++e) {
+        float dx = d_data[e * 3];
+        float dy = d_data[e * 3 + 1];
+        float dz = d_data[e * 3 + 2];
+
+        // ---- cart2spher: 笛卡尔 → 球坐标 ----
+        // 对标: utils_steerable.get_spherical_from_cartesian_torch(cloned_d)
+        float rho = std::sqrt(dx * dx + dy * dy + dz * dz);
+        double theta_cart = 0.0;
+        double phi_cart   = 0.0;
+
+        if (rho > 1e-8f) {
+            theta_cart = std::acos(static_cast<double>(dz) / rho);
+            phi_cart   = std::atan2(static_cast<double>(dy), static_cast<double>(dx));
+            if (phi_cart < 0.0) phi_cart += 2.0 * M_PI;
+        }
+
+        // ---- 球谐函数的 theta/phi ----
+        // Python 参考: theta = math.pi - r_ij[..., i_beta]
+        //              phi   = r_ij[..., i_alpha]
+        double theta_sh = M_PI - theta_cart;
+        double phi_sh   = phi_cart;
+
+        // ---- 计算所有 J 的 Y_J(theta, phi) ----
+        // 对标 Python: Y = precompute_sh(r_ij, 2*max_degree)
+        for (int J = 0; J <= max_Y_degree; ++J) {
+            std::vector<double> Y = sh.get(J, theta_sh, phi_sh);   // 长度 2J+1
+            float* y_data = edge_Y[J].data();
+            int d_J = 2 * J + 1;
+            for (int m = 0; m < d_J; ++m) {
+                y_data[e * d_J + m] = static_cast<float>(Y[m]);
+            }
+        }
+    }
+
+    // 清除 get_basis 缓存（数据已变）
+    cache_.clear();
 }
+
 
 G1x1SE3::G1x1SE3(const Fiber& f_in, const Fiber& f_out)
     : f_in_(f_in), f_out_(f_out) {
@@ -863,21 +1117,76 @@ TensorF32 PairwiseConv::forward(const TensorF32& feat, const TensorF32& basis) {
     // R: (E, nc_out, 1, nc_in, 1, num_freq)
     TensorF32 R = rp_.forward(feat);
 
-    // Step 2: R * basis → sum over last dim (num_freq)
-    // basis: (E, 1, 1, 1, d_out, num_freq)
-    // 广播: R(E, nc_out, 1, nc_in, 1, N_freq) * basis(E, 1, 1, 1, d_out, N_freq)
-    //    → (E, nc_out, 1, nc_in, d_out, N_freq)
-    // sum(-1) → (E, nc_out, 1, nc_in, d_out)
-
     int64_t E = R.shape().dims[0];
     int64_t N_freq = num_freq_;
 
     const float* r_data = R.data();
     const float* b_data = basis.data();
 
+    // 替换 PairwiseConv::forward 中 Step 2 的注释和索引:
+
+// Step 2: R * basis → sum over last dim (num_freq)
+// R:     (E, nc_out, 1, nc_in, 1, num_freq)
+// basis: (E, 1, d_out_dim, 1, d_in_dim, num_freq)   ← 修正: 增加 d_in_dim 维度
+// 广播:  R(E, nc_out, 1, nc_in, 1, N_freq)
+//      * basis(E, 1, d_out, 1, d_in, N_freq)
+//     → (E, nc_out, d_out, nc_in, d_in, N_freq)
+// sum(-1) → (E, nc_out, d_out, nc_in, d_in)
+
+// 重写 kernel 计算循环: kernel[e, co, mo, ci, mi] = sum_j R[...] * basis[...]
+    TensorF32 kernel({E, nc_out_, d_out_, nc_in_, d_in_}, feat.device());
+    float* k_data = kernel.data();
+    std::memset(k_data, 0, E * nc_out_ * d_out_ * nc_in_ * d_in_ * sizeof(float));
+
+    for (int64_t e = 0; e < E; ++e) {
+        for (int co = 0; co < nc_out_; ++co) {
+            for (int mo = 0; mo < d_out_; ++mo) {
+                for (int ci = 0; ci < nc_in_; ++ci) {
+                    for (int mi = 0; mi < d_in_; ++mi) {
+                        float val = 0.0f;
+                        for (int j = 0; j < N_freq; ++j) {
+                            // R[e, co, 0, ci, 0, j]
+                            int64_t r_idx = ((e * nc_out_ + co) * 1 + 0) * nc_in_ * 1 * N_freq
+                                      + (ci * 1 + 0) * N_freq + j;
+                            // basis[e, 0, mo, 0, mi, j]
+                            int64_t b_idx = ((((e * 1 + 0) * d_out_ + mo) * 1 + 0) * d_in_ + mi) * N_freq + j;
+                            val += r_data[r_idx] * b_data[b_idx];
+                        }
+                        // kernel[e, co, mo, ci, mi]
+                        k_data[(((e * nc_out_ + co) * d_out_ + mo) * nc_in_ + ci) * d_in_ + mi] = val;
+                    }
+                }
+            }
+        }
+    }
+
+// Step 3: reshape → (E, d_out*nc_out, d_in*nc_in) — 现在 d_in 直接来自 kernel
+// kernel shape: (E, nc_out, d_out, nc_in, d_in)
+// → permute and reshape: (E, d_out*nc_out, d_in*nc_in)
+    TensorF32 kernel_out({E, d_out_ * nc_out_, d_in_ * nc_in_}, feat.device());
+    float* ko_data = kernel_out.data();
+
+    for (int64_t e = 0; e < E; ++e) {
+        for (int co = 0; co < nc_out_; ++co) {
+            for (int mo = 0; mo < d_out_; ++mo) {
+                for (int ci = 0; ci < nc_in_; ++ci) {
+                    for (int mi = 0; mi < d_in_; ++mi) {
+                        int64_t k_idx = (((e * nc_out_ + co) * d_out_ + mo) * nc_in_ + ci) * d_in_ + mi;
+                        int64_t row = co * d_out_ + mo;
+                        int64_t col = ci * d_in_ + mi;
+                        ko_data[(e * d_out_ * nc_out_ + row) * d_in_ * nc_in_ + col] = k_data[k_idx];
+                    }
+                }
+            }
+        }
+    }
+
+    return kernel_out;
+
+
     // 中间结果: (E, nc_out, nc_in, d_out, num_freq)  ← 去掉维度 2,4 的 1
     // 为简化，直接计算收缩
-    TensorF32 kernel({E, nc_out_, nc_in_, d_out_}, feat.device());
+    /* TensorF32 kernel({E, nc_out_, nc_in_, d_out_}, feat.device());
     float* k_data = kernel.data();
     std::memset(k_data, 0, E * nc_out_ * nc_in_ * d_out_ * sizeof(float));
 
@@ -899,7 +1208,7 @@ TensorF32 PairwiseConv::forward(const TensorF32& feat, const TensorF32& basis) {
                 }
             }
         }
-    }
+    } */
 
     // Step 3: reshape → (E, d_out·nc_out, d_in·nc_in)
     // kernel 当前: (E, nc_out, nc_in, d_out)
@@ -921,17 +1230,17 @@ TensorF32 PairwiseConv::forward(const TensorF32& feat, const TensorF32& basis) {
 
     // TODO: 完整实现需要确认输入特征具体的 reshape 约定
     // 当前简化: 直接将 kernel reshape 为输出形状
-    int64_t out_rows = d_out_ * nc_out_;
-    int64_t out_cols = d_in_ * nc_in_;
+    //int64_t out_rows = d_out_ * nc_out_;
+    //int64_t out_cols = d_in_ * nc_in_;
 
-    TensorF32 kernel_out({E, out_rows, out_cols}, feat.device());
-    float* ko_data = kernel_out.data();
-    std::memset(ko_data, 0, E * out_rows * out_cols * sizeof(float));
+    //TensorF32 kernel_out({E, out_rows, out_cols}, feat.device());
+    //float* ko_data = kernel_out.data();
+    //std::memset(ko_data, 0, E * out_rows * out_cols * sizeof(float));
 
     // 将 kernel[e, co, ci, m] 映射到 kernel_out[e, co*m, ci*m]
     // 实际映射: kernel_out[e, co*d_out + m, ci*d_in + ?] 
     // 因为 d_in 未在 kernel 中出现, 需要从输入的 d_in 维度获得
-    for (int64_t e = 0; e < E; ++e) {
+    /* for (int64_t e = 0; e < E; ++e) {
         for (int co = 0; co < nc_out_; ++co) {
             for (int ci = 0; ci < nc_in_; ++ci) {
                 for (int m = 0; m < d_out_; ++m) {
@@ -951,7 +1260,7 @@ TensorF32 PairwiseConv::forward(const TensorF32& feat, const TensorF32& basis) {
         }
     }
 
-    return kernel_out;
+    return kernel_out; */
 }
 
 std::vector<TensorF32*> PairwiseConv::parameters() {
