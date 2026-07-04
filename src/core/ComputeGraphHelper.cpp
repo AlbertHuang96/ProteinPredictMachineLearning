@@ -154,7 +154,7 @@ TensorF32* silu(TensorF32* a) {
     Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
-    //result->op_params[0] = GGML_UNARY_OP_SILU;
+    set_unary_op(result, UNARY_OP_SILU);
     return result;
 }
 
@@ -163,7 +163,7 @@ TensorF32* gelu(TensorF32* a) {
     Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
-    //result->op_params[0] = GGML_UNARY_OP_GELU;
+    set_unary_op(result, UNARY_OP_GELU);
     return result;
 }
 
@@ -172,7 +172,7 @@ TensorF32* gelu_quick(TensorF32* a) {
     TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
-    //result->op_params[0] = GGML_UNARY_OP_GELU_QUICK;
+    set_unary_op(result, UNARY_OP_GELU_QUICK);
     return result;
 }
 
@@ -181,7 +181,7 @@ TensorF32* relu(TensorF32* a) {
     Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
-    //result->op_params[0] = GGML_UNARY_OP_RELU;
+    set_unary_op(result, UNARY_OP_RELU);
     return result;
 }
 
@@ -646,13 +646,10 @@ TensorF32* div(TensorF32* a, TensorF32* b) {
 
 TensorF32* sigmoid(TensorF32* a) {
     TensorF32* result;
-    //result = inplace ? result->view(a->shape()) : result->copy_from(a);
     // provide a inplace sigmoid
-    result = result->copy_from(a);
+    result = context().new_tensor(a->ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
-    // many unarys...
-    // sigmoid is just one of them
-    //ggml_set_op_params_i32(result, 0, (int32_t) op);
+    set_unary_op(result, UNARY_OP_SIGMOID);
     result->src[0] = a;
     return result;
 }

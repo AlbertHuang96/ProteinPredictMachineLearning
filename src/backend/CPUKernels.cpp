@@ -1,11 +1,32 @@
 
 #include "rfaa/Backend.h"
+#include "rfaa/ComputeGraph.h"
 #include <cstring>
 #include <cmath>
 
 //#include <omp.h>
 
 namespace rfaa {
+
+// ===== unary op 计算函数前向声明 =====
+static void compute_forward_abs(ComputeParams* p, Tensor* dst);
+static void compute_forward_sgn(ComputeParams* p, Tensor* dst);
+static void compute_forward_neg(ComputeParams* p, Tensor* dst);
+static void compute_forward_step(ComputeParams* p, Tensor* dst);
+static void compute_forward_relu(ComputeParams* p, Tensor* dst);
+static void compute_forward_gelu(ComputeParams* p, Tensor* dst);
+static void compute_forward_gelu_quick(ComputeParams* p, Tensor* dst);
+static void compute_forward_silu(ComputeParams* p, Tensor* dst);
+static void compute_forward_tanh(ComputeParams* p, Tensor* dst);
+static void compute_forward_elu(ComputeParams* p, Tensor* dst);
+static void compute_forward_sigmoid(ComputeParams* p, Tensor* dst);
+static void compute_forward_hardsigmoid(ComputeParams* p, Tensor* dst);
+static void compute_forward_hardswish(ComputeParams* p, Tensor* dst);
+static void compute_forward_exp(ComputeParams* p, Tensor* dst);
+static void compute_forward_log(ComputeParams* p, Tensor* dst);
+static void compute_forward_sqrt(ComputeParams* p, Tensor* dst);
+static void compute_forward_sin(ComputeParams* p, Tensor* dst);
+static void compute_forward_cos(ComputeParams* p, Tensor* dst);
 
 // ===== dispatch =====
 Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
@@ -21,12 +42,52 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_MUL_MAT:   kernel_mul_mat(node, p);  break;
         case OP_SOFT_MAX:  kernel_softmax(node, p);  break;
         case OP_RMS_NORM:  kernel_rms_norm(node, p); break;
-        //case OP_SILU:   kernel_silu(node);           break;
-        //case OP_GELU:   kernel_gelu(node);           break;
-        //case OP_RELU:   kernel_relu(node);           break;
         case OP_SUM:    kernel_sum(node, p);         break;
         case OP_MEAN:   kernel_mean(node, p);        break;
-        case OP_UNARY:  kernel_sigmoid(node, p);     break;
+        case OP_UNARY:  {
+            const unary_op uop = get_unary_op(node);
+            switch (uop) {
+                case UNARY_OP_ABS:
+                    compute_forward_abs(p, node);        break;
+                case UNARY_OP_SGN:
+                    compute_forward_sgn(p, node);        break;
+                case UNARY_OP_NEG:
+                    compute_forward_neg(p, node);        break;
+                case UNARY_OP_STEP:
+                    compute_forward_step(p, node);       break;
+                case UNARY_OP_RELU:
+                    compute_forward_relu(p, node);       break;
+                case UNARY_OP_GELU:
+                    compute_forward_gelu(p, node);       break;
+                case UNARY_OP_GELU_QUICK:
+                    compute_forward_gelu_quick(p, node); break;
+                case UNARY_OP_SILU:
+                    compute_forward_silu(p, node);       break;
+                case UNARY_OP_TANH:
+                    compute_forward_tanh(p, node);       break;
+                case UNARY_OP_ELU:
+                    compute_forward_elu(p, node);        break;
+                case UNARY_OP_SIGMOID:
+                    compute_forward_sigmoid(p, node);    break;
+                case UNARY_OP_HARDSIGMOID:
+                    compute_forward_hardsigmoid(p, node);break;
+                case UNARY_OP_HARDSWISH:
+                    compute_forward_hardswish(p, node);  break;
+                case UNARY_OP_EXP:
+                    compute_forward_exp(p, node);        break;
+                case UNARY_OP_LOG:
+                    compute_forward_log(p, node);        break;
+                case UNARY_OP_SQRT:
+                    compute_forward_sqrt(p, node);       break;
+                case UNARY_OP_SIN:
+                    compute_forward_sin(p, node);        break;
+                case UNARY_OP_COS:
+                    compute_forward_cos(p, node);        break;
+                default:
+                    p->threadpool->ec = Status::NOT_SUPPORTED;
+                    break;
+            }
+        } break;
         default:
             p->threadpool->ec = Status::NOT_SUPPORTED;
             break;
@@ -157,13 +218,207 @@ void CPUBackend::kernel_sigmoid(Tensor * node, ComputeParams * p) {
     Tensor* output = node->src[0];
     float* data = output->data();
     int64_t n = node->src[0]->numel();
-    
+
     #pragma omp parallel for
     for (int64_t i = 0; i < n; i++) {
         data[i] = 1.0f / (1.0f + std::exp(-data[i]));
     }
-    
+
     return output;
+}
+
+// ===== unary op 计算函数实现 =====
+
+static void compute_forward_abs(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = fabsf(s[i]);
+    }
+}
+
+static void compute_forward_sgn(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = (s[i] > 0.0f) ? 1.0f : ((s[i] < 0.0f) ? -1.0f : 0.0f);
+    }
+}
+
+static void compute_forward_neg(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = -s[i];
+    }
+}
+
+static void compute_forward_step(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = (s[i] > 0.0f) ? 1.0f : 0.0f;
+    }
+}
+
+static void compute_forward_relu(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = (s[i] > 0.0f) ? s[i] : 0.0f;
+    }
+}
+
+static void compute_forward_gelu(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    const float C1 = 0.044715f;
+    const float C2 = sqrtf(2.0f / M_PI);
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        float x = s[i];
+        float inner = C2 * (x + C1 * x * x * x);
+        d[i] = 0.5f * x * (1.0f + tanhf(inner));
+    }
+}
+
+static void compute_forward_gelu_quick(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        float x = s[i];
+        d[i] = x * (1.0f / (1.0f + expf(-1.702f * x)));
+    }
+}
+
+static void compute_forward_silu(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = s[i] / (1.0f + expf(-s[i]));
+    }
+}
+
+static void compute_forward_tanh(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = tanhf(s[i]);
+    }
+}
+
+static void compute_forward_elu(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        float x = s[i];
+        d[i] = (x > 0.0f) ? x : (expf(x) - 1.0f);
+    }
+}
+
+static void compute_forward_sigmoid(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = 1.0f / (1.0f + expf(-s[i]));
+    }
+}
+
+static void compute_forward_hardsigmoid(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        float x = s[i];
+        if (x <= -3.0f)       d[i] = 0.0f;
+        else if (x >= 3.0f)   d[i] = 1.0f;
+        else                    d[i] = x / 6.0f + 0.5f;
+    }
+}
+
+static void compute_forward_hardswish(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        float x = s[i];
+        if (x <= -3.0f)       d[i] = 0.0f;
+        else if (x >= 3.0f)   d[i] = x;
+        else                    d[i] = x * (x + 3.0f) / 6.0f;
+    }
+}
+
+static void compute_forward_exp(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = expf(s[i]);
+    }
+}
+
+static void compute_forward_log(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = logf(s[i]);
+    }
+}
+
+static void compute_forward_sqrt(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = sqrtf(s[i]);
+    }
+}
+
+static void compute_forward_sin(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = sinf(s[i]);
+    }
+}
+
+static void compute_forward_cos(ComputeParams* p, Tensor* dst) {
+    Tensor* src0 = dst->src[0];
+    float* d = dst->data();
+    float* s = src0->data();
+    int64_t n = dst->numel();
+    for (int64_t i = p->ith; i < n; i += p->nth) {
+        d[i] = cosf(s[i]);
+    }
 }
 
 } // namespace rfaa

@@ -248,6 +248,9 @@ public:
 
     enum tensor_type type;
 
+    // op_params: 存储 op 特定参数 (如 UNARY 的 subtype, RMS_NORM 的 eps 等)
+    int32_t op_params[GGML_MAX_OP_PARAMS] = {0};
+
     //src GGML_MAX_SRC
     std::vector<Tensor*> src;
 

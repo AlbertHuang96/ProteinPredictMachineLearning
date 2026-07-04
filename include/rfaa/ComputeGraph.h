@@ -11,6 +11,41 @@
 
 namespace rfaa {
 
+// ============================================================
+// unary op 枚举 — 对标 ggml_unary_op (去掉 ggml_ 前缀)
+// ============================================================
+enum unary_op {
+    UNARY_OP_ABS = 0,
+    UNARY_OP_SGN,
+    UNARY_OP_NEG,
+    UNARY_OP_STEP,
+    UNARY_OP_RELU,
+    UNARY_OP_GELU,
+    UNARY_OP_GELU_QUICK,
+    UNARY_OP_SILU,
+    UNARY_OP_TANH,
+    UNARY_OP_ELU,
+    UNARY_OP_SIGMOID,
+    UNARY_OP_HARDSIGMOID,
+    UNARY_OP_HARDSWISH,
+    UNARY_OP_EXP,
+    UNARY_OP_LOG,
+    UNARY_OP_SQRT,
+    UNARY_OP_SIN,
+    UNARY_OP_COS,
+    UNARY_OP_COUNT,
+};
+
+// 从 op_params[0] 读取 unary op 子类型
+inline unary_op get_unary_op(const Tensor<float>* node) {
+    return static_cast<unary_op>(node->op_params[0]);
+}
+
+// 写入 unary op 子类型到 op_params[0]
+inline void set_unary_op(Tensor<float>* node, unary_op op) {
+    node->op_params[0] = static_cast<int32_t>(op);
+}
+
     //遍历方式
 enum cgraph_eval_order {
     CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT = 0,
