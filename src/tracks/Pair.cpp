@@ -11,8 +11,8 @@ PairTrack::PairTrack(int seq_len, int dim, Device device)
 void PairTrack::init_from_embedding(const TensorF32& left, const TensorF32& right, const TensorF32& bond_feats, const TensorF32& dist_matrix) {
     // left: (B, L, D), right: (B, L, D)
     // pair = outer_product(left, right) -> Linear
-    Embedding emb_left(NAATOKENS, D_PAIR);
-    Embedding emb_right(NAATOKENS, D_PAIR);
+    EmbeddingLayer emb_left(NAATOKENS, D_PAIR);
+    EmbeddingLayer emb_right(NAATOKENS, D_PAIR);
     TensorF32 left_emb = emb_left.forward(left).unsqueeze(1);   // (B, 1, L, D_PAIR)
     TensorF32 right_emb = emb_right.forward(right).unsqueeze(2); // (B, L, 1, D_PAIR)
 

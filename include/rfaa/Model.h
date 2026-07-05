@@ -215,13 +215,14 @@ private:
 
     // ===== 所有权重（从 context 分配，FLAG_PARAM）=====
     // embedding
-    LinearLayer* msa_emb_           = nullptr;
+    LinearLayer* msa_emb_           = nullptr; // (164 → 256)
     EmbeddingLayer* state_emb_      = nullptr;
     EmbeddingLayer* pair_left_emb_  = nullptr;
     EmbeddingLayer* pair_right_emb_ = nullptr;
     LinearLayer* full_linear_       = nullptr;
     EmbeddingLayer* full_emb_       = nullptr;
     LinearLayer* bond_emb_          = nullptr;
+
     LinearLayer* emb_t1d_           = nullptr;
     LinearLayer* proj_t1d_          = nullptr;
     LinearLayer* emb_t1d_t2d_       = nullptr; //get_templ_emb

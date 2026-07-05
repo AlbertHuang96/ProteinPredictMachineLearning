@@ -5,7 +5,7 @@ Inspired by RosettaFoldAllAtom
 and 
 llama.cpp and GGML
 
-## 项目结构
+## Project Structure
 
 Main goal:
 predict the 3D structure of a protein with limited compute resources, 
@@ -47,76 +47,92 @@ mixed precision training?
 
 
 
+## Project Architecture
+
 ```
-RFAA-Cpp/
-├── CMakeLists.txt              # 主构建配置
-├── cmake/
-│   └── FindCUDA.cmake          # CUDA 查找模块
-├── include/
-│   └── rfaa/
-│       ├── Core.h              # 核心类型定义
-│       ├── Tensor.h            # 张量抽象层
-│       ├── Model.h             # 模型接口
-│       ├── Track.h             # Track 基类
-│       ├── MSA.h               # MSA Track
-│       ├── Pair.h              # Pair Track
-│       ├── State.h             # State Track
-│       ├── Attention.h         # Attention 模块
-│       ├── SE3Transformer.h    # SE3 Transformer
-│       ├── ONNXExporter.h      # ONNX 导出
-│       └── PythonBridge.h      # Python 桥接
-├── src/
-│   ├── core/
-│   │   ├── Tensor.cpp          # CPU Tensor 实现
-│   │   └── MemoryPool.cpp      # 内存池管理
-│   ├── cuda/
-│   │   ├── CudaTensor.cu       # CUDA Tensor 实现
-│   │   ├── AttentionKernel.cu  # Attention CUDA 核
-│   │   └── SE3Kernel.cu        # SE3 CUDA 核
-│   ├── model/
-│   │   ├── Embedding.cpp       # Embedding 层
-│   │   ├── IterBlock.cpp       # 迭代块
-│   │   └── RFAA.cpp            # 主模型
-│   ├── tracks/
-│   │   ├── MSA.cpp             # MSA Track 实现
-│   │   ├── Pair.cpp            # Pair Track 实现
-│   │   └── State.cpp           # State Track 实现
-│   ├── modules/
-│   │   ├── Attention.cpp       # Attention 实现
-│   │   ├── TriangleMul.cpp     # Triangle Multiplication
-│   │   └── SE3Transformer.cpp  # SE3 Transformer
-│   ├── onnx/
-│   │   └── ONNXExporter.cpp    # ONNX 导出实现
-│   └── python/
-│       └── PythonBridge.cpp    # Python C API 桥接
-├── core_lib/                   # 核心功能库 (静态/动态)
-│   ├── CMakeLists.txt
-│   └── ...
-├── gpu_backend/                # GPU 加速后端 (DLL)
-│   ├── CMakeLists.txt
-│   └── ...
-├── python_bridge/              # Python 桥接 (DLL)
-│   ├── CMakeLists.txt
-│   └── ...
-├── examples/
-│   ├── train.cpp               # 训练示例
-│   ├── infer.cpp               # 推理示例
-│   └── export_onnx.cpp         # ONNX 导出示例
-├── tests/
-│   └── ...
-└── third_party/
-    ├── pybind11/               # C++ Python 绑定
-    └── onnxruntime/            # ONNX Runtime
+RFAA-Cpp
+│
+├── Core Infrastructure ───── Tensor + Memory Pool + Compute Graph Engine
+│   ├── Tensor abstraction         GGML-style tensor, 18 quantization types (F32 → Q8_K)
+│   ├── Context memory pool       Unified allocation for all weights & intermediate tensors
+│   ├── ComputeGraph              DAG compute graph with forward expansion + reverse autograd
+│   └── Backend scheduler         Multi-backend (CPU / CUDA) automatic graph splitting & dispatch
+│
+├── Embedding ───── Input features → model representations
+│   ├── EmbeddingLayer            MSA token embedding
+│   ├── BondEmbedding             Chemical bond type embedding (8 bond types → pair)
+│   ├── LinearLayer / LayerNorm   Fully-connected + layer normalization
+│   └── PositionalEncoding        Relative positional encoding (distance + bond features)
+│
+├── Attention Modules ───── Sequence and pairwise information exchange
+│   ├── MSA Attention             Row Attention + Col Attention + Global Col Attention
+│   ├── Pair Attention            Row / Col Attention (with State bias)
+│   ├── Cross Attention           Template information injection (State ← Template)
+│   ├── TriangleMultiplication    Outgoing / Incoming (pair information propagation)
+│   ├── FeedForward               Feed-forward networks (MSA / Pair)
+│   └── TemplatePairStack         Template pair stack processing
+│
+├── Track System ───── 1D / 2D / 3D multi-pathway information flow
+│   ├── MSATrack  (1D)           MSA representations (D=256), sequence dimension
+│   ├── PairTrack  (2D)          Residue-pair representations (D=128), spatial dimension
+│   └── StateTrack (1D)          Structure state (D=32), 3D coords → structural features
+│
+├── SE(3) Equivariant Network ───── Group-theory constrained 3D GNN
+│   ├── Math utilities            Spherical harmonics / Clebsch-Gordan coeffs / Wigner D matrices
+│   ├── SE3Basis                  Precomputed spherical harmonic basis + CG coupling (cached)
+│   ├── RadialFunc                Learnable radial profile function (MLP)
+│   ├── SE3 Convolution           Partial conv → 1×1 channel mixing → multi-head self-attention
+│   └── SE3Transformer            Multi-layer equivariant residual blocks (rotation/translation invariant)
+│
+├── Model Layer ───── End-to-end prediction pipeline
+│   ├── IterBlock                Core iteration block (Attention → TriangleMul → SE3 → Structure update)
+│   ├── RefineBlock              Refinement block (complex node/edge embeddings)
+│   ├── FullBlock                Full MSA block (with global column attention)
+│   └── RFAAModel                 Main model: Embedding → Blocks ×16 → Output Heads
+│
+├── Data Pipeline ───── Input preparation
+│   ├── A3M / HHR parsing        MSA and template search result files
+│   ├── Template feature extraction   1D features + 2D features + coordinates
+│   ├── HHblits / HHsearch       External search tool wrappers
+│   └── RFAADataLoader           End-to-end preprocessing (sequence → model input)
+│
+├── Serialization & Integration
+│   ├── GGUF model format         Weight I/O + metadata + quantization type support
+│   └── Python bridge             pybind11 bidirectional interop (Python ↔ C++)
+│
+├── GPU Acceleration (CUDA)
+│   ├── CUDA Tensor               Device-side tensor implementation
+│   ├── Attention Kernel          Flash Attention and other custom kernels
+│   └── SE3 / Math Kernels        Equivariant convolution + general matrix acceleration
+│
+└── Build Artifacts
+    ├── rfaa_core                 Core library (static / shared)
+    ├── rfaa_gpu                  CUDA acceleration backend (DLL)
+    ├── rfaa_python               Python bridge library (DLL / pybind)
+    └── rfaa_train / rfaa_infer   Training + inference executables
 ```
 
-## 构建要求
+### Key Design Features
+
+| Feature | Description |
+|------|------|
+| GGML-style memory management | Context-based memory pool; all weights and intermediate tensors have controlled lifetimes, no fragmentation |
+| Compute graph + eager execution | `forward_graph` builds graph (training/autograd), `forward_exec` runs directly (inference) |
+| Multi-backend scheduling | BackendScheduler auto-assigns graph nodes to CPU / CUDA with cross-device data transfer |
+| SE(3) equivariance | Group-theoretic spherical harmonics + CG coefficients + Wigner D matrices ensure rotation/translation physical consistency |
+| Quantized inference | 18 quantization types (Q4_0~Q8_K) suitable for consumer GPUs and edge devices |
+| Track architecture | MSA (1D) / Pair (2D) / State (3D) three-pathway information flow, inspired by AlphaFold2 / RosettaFold |
+| Template-aware | Full injection of HHsearch template 1D/2D/3D features via CrossAttention + TemplatePairStack |
+| Modular iteration | IterBlock / RefineBlock / FullBlock encapsulate update logic at different granularity for flexible composition |
+
+## Build Requirements
 
 - CMake >= 3.18
 - CUDA >= 11.7
-- Python >= 3.8 (含开发头文件)
+- Python >= 3.8 (with development headers)
 - ONNX Runtime >= 1.15
 
-## 构建命令
+## Build Commands
 
 ```bash
 mkdir build && cd build
@@ -124,42 +140,41 @@ cmake .. -DCMAKE_BUILD_TYPE=Release -DUSE_CUDA=ON -DBUILD_PYTHON_BRIDGE=ON
 make -j$(nproc)
 ```
 
-todo:
-替换所有的图节点构造函数
-move modules into models
+## TODO
 
-homo-oligomers
+- Replace all graph node constructors
+- Move modules into models
+- Homo-oligomer support
 
-# resolve torsion indices
-        #  a negative index indicates the previous residue
-        # order:
-        #    omega/phi/psi: 0-2
-        #    chi_1-4(prot): 3-6
-        #    cb/cg bend: 7-9
-        #    eps(p)/zeta(p): 10-11
-        #    alpha/beta/gamma/delta: 12-15
-        #    nu2/nu1/nu0: 16-18
-        #    chi_1(na): 19
+### Torsion Indices Reference
+- Negative index indicates the previous residue
+- Order:
+  - omega/phi/psi: 0-2
+  - chi_1-4 (prot): 3-6
+  - cb/cg bend: 7-9
+  - eps(p)/zeta(p): 10-11
+  - alpha/beta/gamma/delta: 12-15
+  - nu2/nu1/nu0: 16-18
+  - chi_1 (na): 19
 
-#road map:
+## Roadmap
 
-flash attention
-
-Inference:
-KV cache
-
-ggml:
+- Flash Attention
+- Inference: KV-cache
+- GGML integration:
+```cpp
 struct ggml_context * ctx = ggml_init(params);
 
-    struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_A, rows_A);
-    struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_B, rows_B);
-    memcpy(tensor_a->data, matrix_A, ggml_nbytes(tensor_a));
-    memcpy(tensor_b->data, matrix_B, ggml_nbytes(tensor_b));
+struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_A, rows_A);
+struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_B, rows_B);
+memcpy(tensor_a->data, matrix_A, ggml_nbytes(tensor_a));
+memcpy(tensor_b->data, matrix_B, ggml_nbytes(tensor_b));
 
-    struct ggml_cgraph * gf = ggml_new_graph(ctx);
-    struct ggml_tensor *result = ggml_mul_mat(ctx, tensor_a, tensor_b);
+struct ggml_cgraph * gf = ggml_new_graph(ctx);
+struct ggml_tensor *result = ggml_mul_mat(ctx, tensor_a, tensor_b);
 
-    ggml_build_forward_expand(gf, result);
+ggml_build_forward_expand(gf, result);
 
-    int n_threads = 1;
-    ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+int n_threads = 1;
+ggml_graph_compute_with_ctx(ctx, gf, n_threads);
+```
