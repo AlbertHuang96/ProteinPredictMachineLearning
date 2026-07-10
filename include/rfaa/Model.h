@@ -90,24 +90,51 @@ private:
     std::unique_ptr<TriangleMultiplication> tri_mul_out_;
     std::unique_ptr<TriangleMultiplication> tri_mul_in_;
     std::unique_ptr<SE3Transformer> se3_;
-    std::unique_ptr<StructureUpdate> struct_update_;
+    //std::unique_ptr<StructureUpdate> struct_update_;
     std::unique_ptr<PositionalEncoding> pos_enc_;
 
     // 3D track
     TensorF32 xyz_new_;              // (B, L, 3, 3)
     TensorF32 state_new_;            // (B, L, D_STATE) 可选，或直接用 state 引用
 
-    LayerNorm norm_msa_3d_;          // D_MSA (256)
-    LayerNorm norm_pair_3d_;         // D_PAIR (128)
+    // ---- 3D SE 参数 (non-owning pointer, 由 RFAAModel 创建) ----
+    // 旧值类型 (保留注释):
+    // LayerNorm norm_msa_3d_(D_MSA);
+    // LayerNorm norm_pair_3d_(D_PAIR);
+    // static constexpr int NODE_3D_IN  = D_MSA + 21;      // 256+21 = 277  → Core.h ITER_NODE_3D_IN
+    // static constexpr int NODE_3D_OUT = N_L0_IN_FEATS;   // 32            → Core.h ITER_NODE_3D_OUT
+    // static constexpr int EDGE_3D_OUT = N_EDGE_FEATS;    // 32            → Core.h ITER_EDGE_3D_OUT
+    // LinearLayer embed_x_(NODE_3D_IN, NODE_3D_OUT);  
+    // LinearLayer embed_e_(D_PAIR, EDGE_3D_OUT);  
+    // LayerNorm  norm_node_3d_(NODE_3D_OUT);
+    // LayerNorm  norm_edge_3d_(EDGE_3D_OUT);
 
-    static constexpr int NODE_3D_IN  = D_MSA + 21;      // 256 + 21 = 277
-    static constexpr int NODE_3D_OUT = N_L0_IN_FEATS;   // 32
-    static constexpr int EDGE_3D_OUT = N_EDGE_FEATS;    // 32
+    LayerNorm*  norm_msa_3d_  = nullptr; // D_MSA (256)
+    LayerNorm*  norm_pair_3d_ = nullptr; // D_PAIR (128)
+    LinearLayer* embed_x_     = nullptr; // ITER_NODE_3D_IN (277) → ITER_NODE_3D_OUT (32)
+    LinearLayer* embed_e_     = nullptr; // D_PAIR (128) → ITER_EDGE_3D_OUT (32)
+    LayerNorm*  norm_node_3d_ = nullptr; // ITER_NODE_3D_OUT (32)
+    LayerNorm*  norm_edge_3d_ = nullptr; // ITER_EDGE_3D_OUT (32)
 
-    LinearLayer embed_x_;            // NODE_3D_IN → NODE_3D_OUT
-    LinearLayer embed_e_;            // D_PAIR → EDGE_3D_OUT
-    LayerNorm  norm_node_3d_;        // NODE_3D_OUT
-    LayerNorm  norm_edge_3d_;        // EDGE_3D_OUT
+    // ---- forward 内部参数 (non-owning pointer, 由 RFAAModel 创建) ----
+    // 旧值类型 (保留注释):
+    // LayerNorm state_norm(D_STATE);     LinearLayer linear(D_STATE, D_MSA);
+    // LayerNorm pair_layernorm(D_PAIR);
+    // LayerNorm msa_norm(D_MSA);         LinearLayer left_proj(D_MSA, 16); LinearLayer right_proj(D_MSA, 16); LinearLayer out_proj(256, D_PAIR);
+    // LinearLayer rbf_proj(D_RBF, D_PAIR); LayerNorm state_norm(D_STATE); LinearLayer left_proj(D_STATE, 16); LinearLayer right_proj(D_STATE, 16); LinearLayer gate_proj(256, D_PAIR);
+
+    LayerNorm*   state2msa_norm_        = nullptr; // D_STATE (32)
+    LinearLayer* state2msa_linear_      = nullptr; // D_STATE (32) → D_MSA (256)
+    LayerNorm*   pair2msa_norm_         = nullptr; // D_PAIR (128)
+    LayerNorm*   msa2pair_norm_         = nullptr; // D_MSA (256)
+    LinearLayer* msa2pair_left_proj_    = nullptr; // D_MSA (256) → 16
+    LinearLayer* msa2pair_right_proj_   = nullptr; // D_MSA (256) → 16
+    LinearLayer* msa2pair_out_proj_     = nullptr; // 16*16 (256) → D_PAIR (128)
+    LinearLayer* pair2pair_rbf_proj_    = nullptr; // D_RBF (64) → D_PAIR (128)
+    LayerNorm*   pair2pair_state_norm_  = nullptr; // D_STATE (32)
+    LinearLayer* pair2pair_left_proj_   = nullptr; // D_STATE (32) → 16
+    LinearLayer* pair2pair_right_proj_  = nullptr; // D_STATE (32) → 16
+    LinearLayer* pair2pair_gate_proj_   = nullptr; // 16*16 (256) → D_PAIR (128)
 
     // 额外输入 (由 caller 在 forward 前设置)
     //TensorF32 seq1hot_;              // (B, L, 21)
@@ -152,25 +179,38 @@ public:
     const TensorF32& updated_state()  const { return state_new_; }
 
 private:
-    // ---- LayerNorm 模块 ----
-    LayerNorm norm_msa_;      // dim = D_MSA (256)
-    LayerNorm norm_pair_;     // dim = D_PAIR (128)
-    LayerNorm norm_state_;    // dim = D_STATE (32)
+    // ---- LayerNorm 模块 (non-owning pointer) ----
+    // 旧值类型 (保留注释):
+    // LayerNorm norm_msa_(D_MSA);
+    // LayerNorm norm_pair_(D_PAIR);
+    // LayerNorm norm_state_(D_STATE);
+    LayerNorm* norm_msa_   = nullptr; // D_MSA (256)
+    LayerNorm* norm_pair_  = nullptr; // D_PAIR (128)
+    LayerNorm* norm_state_ = nullptr; // D_STATE (32)
 
     // ---- Node 嵌入 (309 → 32) ----
-    static constexpr int NODE_IN_DIM  = D_MSA + 21 + D_STATE;  // 256+21+32 = 309
-    static constexpr int NODE_OUT_DIM = N_L0_IN_FEATS;          // 32
-    LinearLayer embed_x_;     // NODE_IN_DIM → NODE_OUT_DIM
-    LayerNorm  norm_node_;    // NODE_OUT_DIM
+    // 旧值类型 (保留注释):
+    // static constexpr int NODE_IN_DIM  = D_MSA + 21 + D_STATE;  // → Core.h REFINE_NODE_IN_DIM
+    // static constexpr int NODE_OUT_DIM = N_L0_IN_FEATS;          // → Core.h REFINE_NODE_OUT_DIM
+    // LinearLayer embed_x_(NODE_IN_DIM, NODE_OUT_DIM);
+    // LayerNorm  norm_node_(NODE_OUT_DIM);
+    LinearLayer* embed_x_   = nullptr; // REFINE_NODE_IN_DIM (309) → REFINE_NODE_OUT_DIM (32)
+    LayerNorm*   norm_node_ = nullptr; // REFINE_NODE_OUT_DIM (32)
 
     // ---- Edge 嵌入 第一阶段 (128 → 32) ----
-    LinearLayer embed_e1_;    // D_PAIR → N_EDGE_FEATS
-    LayerNorm  norm_edge1_;   // N_EDGE_FEATS
+    // 旧值类型 (保留注释):
+    // LinearLayer embed_e1_(D_PAIR, N_EDGE_FEATS);
+    // LayerNorm  norm_edge1_(N_EDGE_FEATS);
+    LinearLayer* embed_e1_   = nullptr; // D_PAIR (128) → N_EDGE_FEATS (32)
+    LayerNorm*   norm_edge1_ = nullptr; // N_EDGE_FEATS (32)
 
     // ---- Edge 嵌入 第二阶段 (32+64+1=97 → 32) ----
-    static constexpr int EDGE_IN_DIM2 = N_EDGE_FEATS + 64 + 1;  // 97
-    LinearLayer embed_e2_;    // EDGE_IN_DIM2 → N_EDGE_FEATS
-    LayerNorm  norm_edge2_;   // N_EDGE_FEATS
+    // 旧值类型 (保留注释):
+    // static constexpr int EDGE_IN_DIM2 = N_EDGE_FEATS + 64 + 1;  // → Core.h REFINE_EDGE_IN_DIM2
+    // LinearLayer embed_e2_(EDGE_IN_DIM2, N_EDGE_FEATS);
+    // LayerNorm  norm_edge2_(N_EDGE_FEATS);
+    LinearLayer* embed_e2_   = nullptr; // REFINE_EDGE_IN_DIM2 (97) → N_EDGE_FEATS (32)
+    LayerNorm*   norm_edge2_ = nullptr; // N_EDGE_FEATS (32)
 
     // ---- 额外输入（由外部设置）----
     //TensorF32 seq1hot_;       // (B, L, 21) 序列 one-hot
@@ -216,9 +256,9 @@ private:
     // ===== 所有权重（从 context 分配，FLAG_PARAM）=====
     // embedding
     LinearLayer* msa_emb_           = nullptr; // (164 → 256)
-    EmbeddingLayer* state_emb_      = nullptr;
-    EmbeddingLayer* pair_left_emb_  = nullptr;
-    EmbeddingLayer* pair_right_emb_ = nullptr;
+    EmbeddingLayer* state_emb_      = nullptr; // (NAATOKENS, D_STATE)
+    EmbeddingLayer* pair_left_emb_  = nullptr; //(NAATOKENS, D_PAIR)
+    EmbeddingLayer* pair_right_emb_ = nullptr; //(NAATOKENS, D_PAIR)
     LinearLayer* full_linear_       = nullptr;
     EmbeddingLayer* full_emb_       = nullptr;
     LinearLayer* bond_emb_          = nullptr;
@@ -310,7 +350,50 @@ private:
     LayerNorm*   tri_mul_in_output_layernorm_  = nullptr;
     LinearLayer* tri_mul_in_out_proj_          = nullptr;
 
-    //TODO: 3D SE
+    // ===== 3D SE 参数 (per-block, 由 RFAAModel::create 统一创建后将指针注入 block) =====
+
+    // --- IterBlock 3D SE (每组 6 个, ITER_N_BLOCKS=12 组) ---
+    // 旧值类型 (保留注释):
+    // LinearLayer embed_x_;  // ITER_NODE_3D_IN → ITER_NODE_3D_OUT
+    // LinearLayer embed_e_;  // D_PAIR → ITER_EDGE_3D_OUT
+    // LayerNorm  norm_node_3d_; LayerNorm norm_edge_3d_;
+    // LayerNorm norm_msa_3d_; LayerNorm norm_pair_3d_;
+    std::vector<LinearLayer*> iter_embed_x_;       // [0..11]  ITER_NODE_3D_IN (277) → ITER_NODE_3D_OUT (32)
+    std::vector<LinearLayer*> iter_embed_e_;       // [0..11]  D_PAIR (128) → ITER_EDGE_3D_OUT (32)
+    std::vector<LayerNorm*>   iter_norm_node_3d_;  // [0..11]  ITER_NODE_3D_OUT (32)
+    std::vector<LayerNorm*>   iter_norm_edge_3d_;  // [0..11]  ITER_EDGE_3D_OUT (32)
+    std::vector<LayerNorm*>   iter_norm_msa_3d_;   // [0..11]  D_MSA (256)
+    std::vector<LayerNorm*>   iter_norm_pair_3d_;  // [0..11]  D_PAIR (128)
+
+    // --- IterBlock forward 内部参数 (每组 12 个, 12 组) ---
+    std::vector<LayerNorm*>   iter_state2msa_norm_;       // [0..11]  D_STATE (32)
+    std::vector<LinearLayer*> iter_state2msa_linear_;     // [0..11]  D_STATE (32) → D_MSA (256)
+    std::vector<LayerNorm*>   iter_pair2msa_norm_;        // [0..11]  D_PAIR (128)
+    std::vector<LayerNorm*>   iter_msa2pair_norm_;        // [0..11]  D_MSA (256)
+    std::vector<LinearLayer*> iter_msa2pair_left_proj_;   // [0..11]  D_MSA (256) → 16
+    std::vector<LinearLayer*> iter_msa2pair_right_proj_;  // [0..11]  D_MSA (256) → 16
+    std::vector<LinearLayer*> iter_msa2pair_out_proj_;    // [0..11]  256 → D_PAIR (128)
+    std::vector<LinearLayer*> iter_pair2pair_rbf_proj_;   // [0..11]  D_RBF (64) → D_PAIR (128)
+    std::vector<LayerNorm*>   iter_pair2pair_state_norm_; // [0..11]  D_STATE (32)
+    std::vector<LinearLayer*> iter_pair2pair_left_proj_;  // [0..11]  D_STATE (32) → 16
+    std::vector<LinearLayer*> iter_pair2pair_right_proj_; // [0..11]  D_STATE (32) → 16
+    std::vector<LinearLayer*> iter_pair2pair_gate_proj_;  // [0..11]  256 → D_PAIR (128)
+
+    // --- RefineBlock 3D SE (每组 10 个, N_REFINE_BLOCKS=4 组) ---
+    // 旧值类型 (保留注释):
+    // LayerNorm norm_msa_(D_MSA); LayerNorm norm_pair_(D_PAIR); LayerNorm norm_state_(D_STATE);
+    // LinearLayer embed_x_(REFINE_NODE_IN_DIM, REFINE_NODE_OUT_DIM); LayerNorm norm_node_(REFINE_NODE_OUT_DIM);
+    // LinearLayer embed_e1_(D_PAIR, N_EDGE_FEATS); LayerNorm norm_edge1_(N_EDGE_FEATS);
+    // LinearLayer embed_e2_(REFINE_EDGE_IN_DIM2, N_EDGE_FEATS); LayerNorm norm_edge2_(N_EDGE_FEATS);
+    std::vector<LayerNorm*>   refine_norm_msa_;     // [0..3]  D_MSA (256)
+    std::vector<LayerNorm*>   refine_norm_pair_;    // [0..3]  D_PAIR (128)
+    std::vector<LayerNorm*>   refine_norm_state_;   // [0..3]  D_STATE (32)
+    std::vector<LinearLayer*> refine_embed_x_;      // [0..3]  REFINE_NODE_IN_DIM (309) → REFINE_NODE_OUT_DIM (32)
+    std::vector<LayerNorm*>   refine_norm_node_;    // [0..3]  REFINE_NODE_OUT_DIM (32)
+    std::vector<LinearLayer*> refine_embed_e1_;     // [0..3]  D_PAIR (128) → N_EDGE_FEATS (32)
+    std::vector<LayerNorm*>   refine_norm_edge1_;   // [0..3]  N_EDGE_FEATS (32)
+    std::vector<LinearLayer*> refine_embed_e2_;     // [0..3]  REFINE_EDGE_IN_DIM2 (97) → N_EDGE_FEATS (32)
+    std::vector<LayerNorm*>   refine_norm_edge2_;   // [0..3]  N_EDGE_FEATS (32)
 
 
     // Tracks

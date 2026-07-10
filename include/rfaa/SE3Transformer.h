@@ -475,7 +475,8 @@ private:
     int J_max_;
     bool use_layer_norm_;
     
-    std::unique_ptr<GConvSE3> conv_;
+    //GConvSE3Partial
+    //std::unique_ptr<GConvSE3> conv_;
     std::unique_ptr<GNormSE3> norm_;
     std::unique_ptr<GNormBias> bias_;
 };

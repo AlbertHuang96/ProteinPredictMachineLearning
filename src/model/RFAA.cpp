@@ -22,6 +22,11 @@ RFAAConfig::RFAAConfig() {
 // IterBlock 实现
 IterBlock::IterBlock(const RFAAConfig& config, bool update_msa_pair)
     : config_(config), update_msa_pair_(update_msa_pair) {
+    // 旧值初始化 (保留注释):
+    // , norm_msa_3d_(D_MSA), norm_pair_3d_(D_PAIR)
+    // , embed_x_(NODE_3D_IN, NODE_3D_OUT), embed_e_(D_PAIR, EDGE_3D_OUT)
+    // , norm_node_3d_(NODE_3D_OUT), norm_edge_3d_(EDGE_3D_OUT)
+    // 以上 6 个参数现在由 RFAAModel 创建，通过指针注入
     
     // 初始化子模块
     AttnConfig msa_attn_config(config.d_msa, config.n_heads);
@@ -187,11 +192,11 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
             // the supplemental said that a layernorm and then a linear?
             // layernorm first
-            LayerNorm state_norm(D_STATE);
-            TensorF32 state_normed = state_norm.forward(state);
+            // 旧栈上变量: LayerNorm state_norm(D_STATE); → state2msa_norm_
+            TensorF32 state_normed = state2msa_norm_->forward(state);
             
-            LinearLayer linear(D_STATE, D_MSA);
-            const auto proj_state = linear.forward(state_normed);
+            // 旧栈上变量: LinearLayer linear(D_STATE, D_MSA); → state2msa_linear_
+            const auto proj_state = state2msa_linear_->forward(state_normed);
             proj_state_add_to_query_row(msa, proj_state);
         }
 
@@ -210,8 +215,8 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
             // need to get the input bond_feats, dist_matrix
             rbf_feature = rbf + pos_enc_->forward(coords, index, bond_feats, dist_matrix, same_chain);
-            LayerNorm pair_layernorm(D_PAIR);
-            pair_biased = pair_layernorm.forward(pair);
+            // 旧栈上变量: LayerNorm pair_layernorm(D_PAIR); → pair2msa_norm_
+            pair_biased = pair2msa_norm_->forward(pair);
 
             pair_biased = pair_biased + rbf_feature; 
 
@@ -240,19 +245,19 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // outer product + mean -> (B,L,L,256) -> Linear -> (B,L,L,128)
         {
             // msa2pair
-            LayerNorm msa_norm(D_MSA);
-            TensorF32 msa_normed = msa_norm.forward(msa);
-            LinearLayer left_proj(D_MSA, 16);
-            LinearLayer right_proj(D_MSA, 16);
-            TensorF32 left = left_proj.forward(msa_normed);   // (B,N,L,16)
-            TensorF32 right = right_proj.forward(msa_normed); // (B,N,L,16)
+            // 旧栈上变量: LayerNorm msa_norm(D_MSA); → msa2pair_norm_
+            TensorF32 msa_normed = msa2pair_norm_->forward(msa);
+            // 旧栈上变量: LinearLayer left_proj(D_MSA, 16); → msa2pair_left_proj_
+            // 旧栈上变量: LinearLayer right_proj(D_MSA, 16); → msa2pair_right_proj_
+            TensorF32 left = msa2pair_left_proj_->forward(msa_normed);   // (B,N,L,16)
+            TensorF32 right = msa2pair_right_proj_->forward(msa_normed); // (B,N,L,16)
             TensorF32 right_mean = right / float(N);
             // a tensor divide a scalar
             TensorF32 pair_update = outer_product(left, right_mean);  // (B,L,L,256)
             // dim of pair_update?
             // reshape to (B, L, L, 16*16) = (B, L, L, 256)?
-            LinearLayer out_proj(16 * 16, D_PAIR);
-            pair_update = out_proj.forward(pair_update);  // (B,L,L,128)
+            // 旧栈上变量: LinearLayer out_proj(16 * 16, D_PAIR); → msa2pair_out_proj_
+            pair_update = msa2pair_out_proj_->forward(pair_update);  // (B,L,L,128)
             pair = pair + pair_update;  // residual
         }
         
@@ -266,19 +271,19 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // ===== Step 3: pair2pair =====
         // state outer product -> gate
         {
-            LinearLayer rbf_proj(D_RBF, D_PAIR);
-            rbf_feature = rbf_proj.forward(rbf_feature);  // (B,L,L,128)
-            LayerNorm state_norm(D_STATE);
-            TensorF32 state_normed = state_norm.forward(state);
-            LinearLayer left_proj(D_STATE, 16);
-            LinearLayer right_proj(D_STATE, 16);
+            // 旧栈上变量: LinearLayer rbf_proj(D_RBF, D_PAIR); → pair2pair_rbf_proj_
+            rbf_feature = pair2pair_rbf_proj_->forward(rbf_feature);  // (B,L,L,128)
+            // 旧栈上变量: LayerNorm state_norm(D_STATE); → pair2pair_state_norm_
+            TensorF32 state_normed = pair2pair_state_norm_->forward(state);
+            // 旧栈上变量: LinearLayer left_proj(D_STATE, 16); → pair2pair_left_proj_
+            // 旧栈上变量: LinearLayer right_proj(D_STATE, 16); → pair2pair_right_proj_
             // different weights for left and right?
-            TensorF32 left = left_proj.forward(state_normed);   // (B,L,16)
-            TensorF32 right = right_proj.forward(state_normed); // (B,L,16)
+            TensorF32 left = pair2pair_left_proj_->forward(state_normed);   // (B,L,16)
+            TensorF32 right = pair2pair_right_proj_->forward(state_normed); // (B,L,16)
             TensorF32 gate = outer_product(left, right);  // (B,L,L,256)
-            LinearLayer gate_proj(16 * 16, D_PAIR);
+            // 旧栈上变量: LinearLayer gate_proj(16 * 16, D_PAIR); → pair2pair_gate_proj_
             // d_hidden_gate = 16
-            gate = gate_proj.forward(gate);  // (B,L,L,128)
+            gate = pair2pair_gate_proj_->forward(gate);  // (B,L,L,128)
             gate = sigmoid(gate);  // (B,L,L,128) -> (B,L,L,128) gate values between 0 and 1
             rbf_feature = rbf_feature * gate;  // element-wise multiplication, inject the rbf feature into pair with gate control
             // left = Linear(state, 32->16)
@@ -347,8 +352,8 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         int L = msa.shape().dims[2];
 
         // ---- Step 4a: LayerNorm on msa & pair ----
-        TensorF32 msa_normed = norm_msa_3d_.forward(msa);   // (B, N, L, 256)
-        TensorF32 pair_normed = norm_pair_3d_.forward(pair); // (B, L, L, 128)
+        TensorF32 msa_normed = norm_msa_3d_->forward(msa);   // (B, N, L, 256)
+        TensorF32 pair_normed = norm_pair_3d_->forward(pair); // (B, L, L, 128)
 
         // ---- Step 4b: 序列加权求和 ----
         // encoder_seq: 学习每条序列的权重, shape (N,) → softmax → 加权求和
@@ -395,13 +400,13 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         } */
 
         // Linear(277 → 32) → LayerNorm → (B, L, 32)
-        TensorF32 node_emb = embed_x_.forward(node_cat);
-        TensorF32 node_out = norm_node_3d_.forward(node_emb);
+        TensorF32 node_emb = embed_x_->forward(node_cat);
+        TensorF32 node_out = norm_node_3d_->forward(node_emb);
 
         // ---- Step 4d: pair embedding ----
         // Linear(128 → 32) → LayerNorm → (B, L, L, 32)
-        TensorF32 pair_emb = embed_e_.forward(pair_normed);
-        TensorF32 edge_out = norm_edge_3d_.forward(pair_emb);
+        TensorF32 pair_emb = embed_e_->forward(pair_normed);
+        TensorF32 edge_out = norm_edge_3d_->forward(pair_emb);
 
         // ---- Step 4e: 构建图 ----
         GraphData G = make_graph(coords, edge_out, idx_, 64, 9);
@@ -415,7 +420,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         //Fiber fiber_in({NODE_3D_OUT, fiber_out_.degrees[1]}, {0, 1});
         SE3Features node_se3;
         node_se3.features.resize(2);
-        node_se3.features[0] = node_out.view({B * L, NODE_3D_OUT, 1});
+        node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
         node_se3.features[1] = l1_feats;
 
         // ---- Step 4h: 预计算球谐基 ----
@@ -499,11 +504,11 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         //auto query_row = msa.select(1, 0);  // (B, L, 256)
         // query_row += Linear(state) ...
 
-        LayerNorm state_norm(D_STATE);
-        TensorF32 state_normed = state_norm.forward(state);
+        // 旧栈上变量: LayerNorm state_norm(D_STATE); → state2msa_norm_
+        TensorF32 state_normed = state2msa_norm_->forward(state);
             
-        LinearLayer linear(D_STATE, D_MSA);
-        const auto proj_state = linear.forward(state_normed);
+        // 旧栈上变量: LinearLayer linear(D_STATE, D_MSA); → state2msa_linear_
+        const auto proj_state = state2msa_linear_->forward(state_normed);
         proj_state_add_to_query_row(msa_full, proj_state);
     }
 
@@ -522,8 +527,8 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
 
         // need to get the input bond_feats, dist_matrix
         rbf_feature = rbf + pos_enc_->forward(coords, index, bond_feats, dist_matrix, same_chain);
-        LayerNorm pair_layernorm(D_PAIR);
-        pair_biased = pair_layernorm.forward(pair);
+        // 旧栈上变量: LayerNorm pair_layernorm(D_PAIR); → pair2msa_norm_
+        pair_biased = pair2msa_norm_->forward(pair);
 
         pair_biased = pair_biased + rbf_feature; 
 
@@ -546,19 +551,19 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
 
     // msa2pair
     {
-        LayerNorm msa_norm(D_MSA);
-        TensorF32 msa_normed = msa_norm.forward(msa);
-        LinearLayer left_proj(D_MSA, 16);
-        LinearLayer right_proj(D_MSA, 16);
-        TensorF32 left = left_proj.forward(msa_normed);   // (B,N,L,16)
-        TensorF32 right = right_proj.forward(msa_normed); // (B,N,L,16)
+        // 旧栈上变量: LayerNorm msa_norm(D_MSA); → msa2pair_norm_
+        TensorF32 msa_normed = msa2pair_norm_->forward(msa);
+        // 旧栈上变量: LinearLayer left_proj(D_MSA, 16); → msa2pair_left_proj_
+        // 旧栈上变量: LinearLayer right_proj(D_MSA, 16); → msa2pair_right_proj_
+        TensorF32 left = msa2pair_left_proj_->forward(msa_normed);   // (B,N,L,16)
+        TensorF32 right = msa2pair_right_proj_->forward(msa_normed); // (B,N,L,16)
         TensorF32 right_mean = right / float(N);
         // a tensor divide a scalar
         TensorF32 pair_update = outer_product(left, right_mean);  // (B,L,L,256)
         // dim of pair_update?
         // reshape to (B, L, L, 16*16) = (B, L, L, 256)?
-        LinearLayer out_proj(16 * 16, D_PAIR);
-        pair_update = out_proj.forward(pair_update);  // (B,L,L,128)
+        // 旧栈上变量: LinearLayer out_proj(16 * 16, D_PAIR); → msa2pair_out_proj_
+        pair_update = msa2pair_out_proj_->forward(pair_update);  // (B,L,L,128)
         pair = pair + pair_update;  // residual
     }
 
@@ -570,19 +575,19 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
     // ===== Step 3: pair2pair =====
     // state outer product -> gate
     {
-        LinearLayer rbf_proj(D_RBF, D_PAIR);
-        rbf_feature = rbf_proj.forward(rbf_feature);  // (B,L,L,128)
-        LayerNorm state_norm(D_STATE);
-        TensorF32 state_normed = state_norm.forward(state);
-        LinearLayer left_proj(D_STATE, 16);
-        LinearLayer right_proj(D_STATE, 16);
+        // 旧栈上变量: LinearLayer rbf_proj(D_RBF, D_PAIR); → pair2pair_rbf_proj_
+        rbf_feature = pair2pair_rbf_proj_->forward(rbf_feature);  // (B,L,L,128)
+        // 旧栈上变量: LayerNorm state_norm(D_STATE); → pair2pair_state_norm_
+        TensorF32 state_normed = pair2pair_state_norm_->forward(state);
+        // 旧栈上变量: LinearLayer left_proj(D_STATE, 16); → pair2pair_left_proj_
+        // 旧栈上变量: LinearLayer right_proj(D_STATE, 16); → pair2pair_right_proj_
         // different weights for left and right?
-        TensorF32 left = left_proj.forward(state_normed);   // (B,L,16)
-        TensorF32 right = right_proj.forward(state_normed); // (B,L,16)
+        TensorF32 left = pair2pair_left_proj_->forward(state_normed);   // (B,L,16)
+        TensorF32 right = pair2pair_right_proj_->forward(state_normed); // (B,L,16)
         TensorF32 gate = outer_product(left, right);  // (B,L,L,256)
-        LinearLayer gate_proj(16 * 16, D_PAIR);
+        // 旧栈上变量: LinearLayer gate_proj(16 * 16, D_PAIR); → pair2pair_gate_proj_
         // d_hidden_gate = 16
-        gate = gate_proj.forward(gate);  // (B,L,L,128)
+        gate = pair2pair_gate_proj_->forward(gate);  // (B,L,L,128)
         gate = sigmoid(gate);  // (B,L,L,128) -> (B,L,L,128) gate values between 0 and 1
         rbf_feature = rbf_feature * gate;  // element-wise multiplication, inject the rbf feature into pair with gate control
             
@@ -602,8 +607,8 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         int N = msa_full.shape().dims[1];
         int L = msa_full.shape().dims[2];
 
-        TensorF32 msa_normed = norm_msa_3d_.forward(msa_full);
-        TensorF32 pair_normed = norm_pair_3d_.forward(pair);
+        TensorF32 msa_normed = norm_msa_3d_->forward(msa_full);
+        TensorF32 pair_normed = norm_pair_3d_->forward(pair);
 
         // 序列加权求和 (simplified: equal-weight mean)
         TensorF32 msa_sum({B, L, D_MSA}, msa_normed.device());
@@ -630,8 +635,8 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
                         seq1hot_.data()[(b * L + l) * 21 + d];
             } */
 
-        TensorF32 node_out = norm_node_3d_.forward(embed_x_.forward(node_cat));
-        TensorF32 edge_out = norm_edge_3d_.forward(embed_e_.forward(pair_normed));
+        TensorF32 node_out = norm_node_3d_->forward(embed_x_->forward(node_cat));
+        TensorF32 edge_out = norm_edge_3d_->forward(embed_e_->forward(pair_normed));
 
         GraphData G = make_graph(coords, edge_out, idx_, 64, 9);
         TensorF32 l1_feats = compute_l1_features(coords);
@@ -640,7 +645,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         SE3Features node_se3;
         node_se3.features.resize(2);
         // node_out = it was actually msa input
-        node_se3.features[0] = node_out.view({B * L, NODE_3D_OUT, 1});
+        node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
         node_se3.features[1] = l1_feats;
 
         SE3Basis basis;
@@ -701,15 +706,13 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
 
 RefineBlock::RefineBlock(const RFAAConfig& config)
     : IterBlock(config, false)  // update_msa_pair = false, 仅更新结构
-    , norm_msa_(D_MSA)
-    , norm_pair_(D_PAIR)
-    , norm_state_(D_STATE)
-    , embed_x_(NODE_IN_DIM, NODE_OUT_DIM)
-    , norm_node_(NODE_OUT_DIM)
-    , embed_e1_(D_PAIR, N_EDGE_FEATS)
-    , norm_edge1_(N_EDGE_FEATS)
-    , embed_e2_(EDGE_IN_DIM2, N_EDGE_FEATS)
-    , norm_edge2_(N_EDGE_FEATS) {
+    // 旧值初始化 (保留注释):
+    // , norm_msa_(D_MSA), norm_pair_(D_PAIR), norm_state_(D_STATE)
+    // , embed_x_(NODE_IN_DIM, NODE_OUT_DIM), norm_node_(NODE_OUT_DIM)
+    // , embed_e1_(D_PAIR, N_EDGE_FEATS), norm_edge1_(N_EDGE_FEATS)
+    // , embed_e2_(EDGE_IN_DIM2, N_EDGE_FEATS), norm_edge2_(N_EDGE_FEATS)
+    // 以上 10 个参数现在由 RFAAModel 创建，通过指针注入
+{
 }
 
 void RefineBlock::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
@@ -734,9 +737,9 @@ void RefineBlock::forward(TensorF32& msa_full,
     // ================================================================
     // Python: node = self.norm_msa(msa); pair = self.norm_pair(pair);
     //         state = self.norm_state(state)
-    TensorF32 node    = norm_msa_.forward(msa);       // (B, L, 256)
-    TensorF32 pair_n  = norm_pair_.forward(pair);     // (B, L, L, 128)
-    TensorF32 state_n = norm_state_.forward(state);    // (B, L, 32)
+    TensorF32 node    = norm_msa_->forward(msa);       // (B, L, 256)
+    TensorF32 pair_n  = norm_pair_->forward(pair);     // (B, L, L, 128)
+    TensorF32 state_n = norm_state_->forward(state);    // (B, L, 32)
 
     // ================================================================
     // Step 2: 构建节点特征
@@ -749,8 +752,8 @@ void RefineBlock::forward(TensorF32& msa_full,
     TensorF32 node_cat = concat({node, seq1hot, state_n}, -1);
 
     // Linear(309 → 32) → LayerNorm → (B, L, 32)
-    TensorF32 node_emb = embed_x_.forward(node_cat);
-    TensorF32 node_out = norm_node_.forward(node_emb);
+    TensorF32 node_emb = embed_x_->forward(node_cat);
+    TensorF32 node_out = norm_node_->forward(node_emb);
 
     // ================================================================
     // Step 3: 构建边特征（两阶段）
@@ -758,8 +761,8 @@ void RefineBlock::forward(TensorF32& msa_full,
     // 阶段1: pair → Linear → LayerNorm
     // Python: pair = self.norm_edge1(self.embed_e1(pair))
     // pair (B,L,L,128) → Linear → (B,L,L,32) → LayerNorm → (B,L,L,32)
-    TensorF32 pair_emb = embed_e1_.forward(pair_n);
-    TensorF32 pair_e1  = norm_edge1_.forward(pair_emb);
+    TensorF32 pair_emb = embed_e1_->forward(pair_n);
+    TensorF32 pair_e1  = norm_edge1_->forward(pair_emb);
 
     // 获取辅助边特征
     // Python: neighbor = get_bonded_neigh(idx)     → (B, L, L, 1)
@@ -772,8 +775,8 @@ void RefineBlock::forward(TensorF32& msa_full,
     //         pair = self.norm_edge2(self.embed_e2(pair))
     // cat → (B,L,L,97) → Linear → (B,L,L,32) → LayerNorm → (B,L,L,32)
     TensorF32 pair_cat = concat({pair_e1, rbf_feat, neighbor}, -1);
-    TensorF32 pair_e2  = embed_e2_.forward(pair_cat);
-    TensorF32 edge_out = norm_edge2_.forward(pair_e2);
+    TensorF32 pair_e2  = embed_e2_->forward(pair_cat);
+    TensorF32 edge_out = norm_edge2_->forward(pair_e2);
 
     // ================================================================
     // Step 4: 构建消息传递图
@@ -951,15 +954,118 @@ void RefineBlock::forward(TensorF32& msa_full,
 
 // RFAAModel 实现
 RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
-    // 创建迭代块
-    for (int i = 0; i < config.n_extra_blocks; ++i) {
-        extra_blocks_.push_back(std::make_unique<FullBlock>(config, true));
+    int n_iter = N_EXTRA_BLOCKS + N_MAIN_BLOCKS;  // ITER_N_BLOCKS = 12
+    int n_refn = N_REFINE_BLOCKS;                  // 4
+
+    // ===== IterBlock 3D SE 参数 (每组 6 个, 共 12 组) =====
+    for (int i = 0; i < n_iter; ++i) {
+        iter_norm_msa_3d_.push_back(LayerNorm::create(D_MSA));                        // 256
+        iter_norm_pair_3d_.push_back(LayerNorm::create(D_PAIR));                      // 128
+        iter_embed_x_.push_back(LinearLayer::create(ITER_NODE_3D_IN, ITER_NODE_3D_OUT));  // 277→32
+        iter_embed_e_.push_back(LinearLayer::create(D_PAIR, ITER_EDGE_3D_OUT));       // 128→32
+        iter_norm_node_3d_.push_back(LayerNorm::create(ITER_NODE_3D_OUT));             // 32
+        iter_norm_edge_3d_.push_back(LayerNorm::create(ITER_EDGE_3D_OUT));             // 32
     }
-    for (int i = 0; i < config.n_main_blocks; ++i) {
-        main_blocks_.push_back(std::make_unique<IterBlock>(config, true));
+
+    // ===== IterBlock forward 内部参数 (每组 12 个, 共 12 组) =====
+    for (int i = 0; i < n_iter; ++i) {
+        iter_state2msa_norm_.push_back(LayerNorm::create(D_STATE));                         // 32
+        iter_state2msa_linear_.push_back(LinearLayer::create(D_STATE, D_MSA));              // 32→256
+        iter_pair2msa_norm_.push_back(LayerNorm::create(D_PAIR));                           // 128
+        iter_msa2pair_norm_.push_back(LayerNorm::create(D_MSA));                            // 256
+        iter_msa2pair_left_proj_.push_back(LinearLayer::create(D_MSA, MSA2PAIR_HIDDEN));    // 256→16
+        iter_msa2pair_right_proj_.push_back(LinearLayer::create(D_MSA, MSA2PAIR_HIDDEN));   // 256→16
+        iter_msa2pair_out_proj_.push_back(LinearLayer::create(MSA2PAIR_HIDDEN * MSA2PAIR_HIDDEN, D_PAIR)); // 256→128
+        iter_pair2pair_rbf_proj_.push_back(LinearLayer::create(D_RBF, D_PAIR));              // 64→128
+        iter_pair2pair_state_norm_.push_back(LayerNorm::create(D_STATE));                    // 32
+        iter_pair2pair_left_proj_.push_back(LinearLayer::create(D_STATE, PAIR2PAIR_GATE_HIDDEN));  // 32→16
+        iter_pair2pair_right_proj_.push_back(LinearLayer::create(D_STATE, PAIR2PAIR_GATE_HIDDEN)); // 32→16
+        iter_pair2pair_gate_proj_.push_back(LinearLayer::create(PAIR2PAIR_GATE_HIDDEN * PAIR2PAIR_GATE_HIDDEN, D_PAIR)); // 256→128
     }
-    for (int i = 0; i < config.n_refine_blocks; ++i) {
-        refine_blocks_.push_back(std::make_unique<RefineBlock>(config, false));
+
+    // ===== RefineBlock 3D SE 参数 (每组 10 个, 共 4 组) =====
+    for (int i = 0; i < n_refn; ++i) {
+        refine_norm_msa_.push_back(LayerNorm::create(D_MSA));                                 // 256
+        refine_norm_pair_.push_back(LayerNorm::create(D_PAIR));                              // 128
+        refine_norm_state_.push_back(LayerNorm::create(D_STATE));                            // 32
+        refine_embed_x_.push_back(LinearLayer::create(REFINE_NODE_IN_DIM, REFINE_NODE_OUT_DIM)); // 309→32
+        refine_norm_node_.push_back(LayerNorm::create(REFINE_NODE_OUT_DIM));                  // 32
+        refine_embed_e1_.push_back(LinearLayer::create(D_PAIR, N_EDGE_FEATS));                // 128→32
+        refine_norm_edge1_.push_back(LayerNorm::create(N_EDGE_FEATS));                        // 32
+        refine_embed_e2_.push_back(LinearLayer::create(REFINE_EDGE_IN_DIM2, N_EDGE_FEATS));   // 97→32
+        refine_norm_edge2_.push_back(LayerNorm::create(N_EDGE_FEATS));                        // 32
+    }
+
+    // ===== 创建迭代块 =====
+    // extra_blocks (4) — FullBlock with update_msa_pair=true
+    for (int i = 0; i < N_EXTRA_BLOCKS; ++i) {
+        int idx = i;  // index into iter_* vectors
+        auto block = std::make_unique<FullBlock>(config, true);
+        // 注入 3D SE 参数
+        block->norm_msa_3d_  = iter_norm_msa_3d_[idx];
+        block->norm_pair_3d_ = iter_norm_pair_3d_[idx];
+        block->embed_x_      = iter_embed_x_[idx];
+        block->embed_e_      = iter_embed_e_[idx];
+        block->norm_node_3d_ = iter_norm_node_3d_[idx];
+        block->norm_edge_3d_ = iter_norm_edge_3d_[idx];
+        // 注入 forward 内部参数
+        block->state2msa_norm_       = iter_state2msa_norm_[idx];
+        block->state2msa_linear_     = iter_state2msa_linear_[idx];
+        block->pair2msa_norm_        = iter_pair2msa_norm_[idx];
+        block->msa2pair_norm_        = iter_msa2pair_norm_[idx];
+        block->msa2pair_left_proj_   = iter_msa2pair_left_proj_[idx];
+        block->msa2pair_right_proj_  = iter_msa2pair_right_proj_[idx];
+        block->msa2pair_out_proj_    = iter_msa2pair_out_proj_[idx];
+        block->pair2pair_rbf_proj_   = iter_pair2pair_rbf_proj_[idx];
+        block->pair2pair_state_norm_ = iter_pair2pair_state_norm_[idx];
+        block->pair2pair_left_proj_  = iter_pair2pair_left_proj_[idx];
+        block->pair2pair_right_proj_ = iter_pair2pair_right_proj_[idx];
+        block->pair2pair_gate_proj_  = iter_pair2pair_gate_proj_[idx];
+        extra_blocks_.push_back(std::move(block));
+    }
+
+    // main_blocks (8) — IterBlock with update_msa_pair=true
+    for (int i = 0; i < N_MAIN_BLOCKS; ++i) {
+        int idx = N_EXTRA_BLOCKS + i;
+        auto block = std::make_unique<IterBlock>(config, true);
+        // 注入 3D SE 参数
+        block->norm_msa_3d_  = iter_norm_msa_3d_[idx];
+        block->norm_pair_3d_ = iter_norm_pair_3d_[idx];
+        block->embed_x_      = iter_embed_x_[idx];
+        block->embed_e_      = iter_embed_e_[idx];
+        block->norm_node_3d_ = iter_norm_node_3d_[idx];
+        block->norm_edge_3d_ = iter_norm_edge_3d_[idx];
+        // 注入 forward 内部参数
+        block->state2msa_norm_       = iter_state2msa_norm_[idx];
+        block->state2msa_linear_     = iter_state2msa_linear_[idx];
+        block->pair2msa_norm_        = iter_pair2msa_norm_[idx];
+        block->msa2pair_norm_        = iter_msa2pair_norm_[idx];
+        block->msa2pair_left_proj_   = iter_msa2pair_left_proj_[idx];
+        block->msa2pair_right_proj_  = iter_msa2pair_right_proj_[idx];
+        block->msa2pair_out_proj_    = iter_msa2pair_out_proj_[idx];
+        block->pair2pair_rbf_proj_   = iter_pair2pair_rbf_proj_[idx];
+        block->pair2pair_state_norm_ = iter_pair2pair_state_norm_[idx];
+        block->pair2pair_left_proj_  = iter_pair2pair_left_proj_[idx];
+        block->pair2pair_right_proj_ = iter_pair2pair_right_proj_[idx];
+        block->pair2pair_gate_proj_  = iter_pair2pair_gate_proj_[idx];
+        main_blocks_.push_back(std::move(block));
+    }
+
+    // refine_blocks (4) — RefineBlock with update_msa_pair=false
+    for (int i = 0; i < n_refn; ++i) {
+        auto block = std::make_unique<RefineBlock>(config, false);
+        // 注入 RefineBlock 专属 3D SE 参数
+        block->norm_msa_   = refine_norm_msa_[i];        // 256
+        block->norm_pair_  = refine_norm_pair_[i];       // 128
+        block->norm_state_ = refine_norm_state_[i];      // 32
+        block->embed_x_    = refine_embed_x_[i];         // 309→32
+        block->norm_node_  = refine_norm_node_[i];       // 32
+        block->embed_e1_   = refine_embed_e1_[i];        // 128→32
+        block->norm_edge1_ = refine_norm_edge1_[i];      // 32
+        block->embed_e2_   = refine_embed_e2_[i];        // 97→32
+        block->norm_edge2_ = refine_norm_edge2_[i];      // 32
+        // RefineBlock 继承 IterBlock 的 forward 内部参数不需要 (update_msa_pair=false)
+        refine_blocks_.push_back(std::move(block));
     }
 }
 
