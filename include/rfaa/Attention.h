@@ -44,102 +44,97 @@ private:
 // 带 Pair Bias 的 MSA Row Attention
 class MSARowAttention {
 public:
-    explicit MSARowAttention(const AttnConfig& config);
+    MSARowAttention() = default;
+    void set_params(const AttnConfig& config,
+                    LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
+                    LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv);
     
-    // msa: (B, N, L, D), pair: (B, L, L, n_head)
+    // msa/pair_biased 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& msa, const TensorF32& pair_biased);
     
 private:
     SelfAttention self_attn_;
-    LinearLayer to_b(D_PAIR, N_HEAD);  // 将 pair 转换为 attention bias
-    LinearLayer to_g(D_MSA, N_HEAD * D_MSA);
-    LinearLayer to_out(N_HEAD * D_MSA, D_MSA);
-    
-    LinearLayer Wq(D_MSA, N_HEAD * D_MSA); 
-    // n_head 个 head，每个 head D_MSA/n_head 维
-    LinearLayer Wk(D_MSA, N_HEAD * D_MSA);
-    LinearLayer Wv(D_MSA, N_HEAD * D_MSA);
-
+    LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
+    LinearLayer* to_g_  = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
+    LinearLayer* to_out_ = nullptr; // N_HEAD*D_MSA (2048) → D_MSA (256)
+    LinearLayer* Wq_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
+    LinearLayer* Wk_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
+    LinearLayer* Wv_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
     AttnConfig config_;
-    //struct Impl;
-    //std::unique_ptr<Impl> impl_;
 };
 
-// MSA Column Attention (在 N 维度)
+// MSA Column Attention
 class MSAColAttention {
 public:
-    explicit MSAColAttention(const AttnConfig& config);
+    MSAColAttention() = default;
+    void set_params(const AttnConfig& config,
+                    LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
+                    LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv);
     
-    // msa: (B, N, L, D)
+    // msa 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& msa);
     
-private:
+protected:
     SelfAttention self_attn_;
-    LinearLayer to_b(D_PAIR, N_HEAD);  // 将 pair 转换为 attention bias
-    LinearLayer to_g(D_MSA, N_HEAD * D_MSA);
-    LinearLayer to_out(N_HEAD * D_MSA, D_MSA);
-    
-    LinearLayer Wq(D_MSA, N_HEAD * D_MSA); 
-    // n_head 个 head，每个 head D_MSA/n_head 维
-    LinearLayer Wk(D_MSA, N_HEAD * D_MSA);
-    LinearLayer Wv(D_MSA, N_HEAD * D_MSA);
-
+    LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
+    LinearLayer* to_g_  = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
+    LinearLayer* to_out_ = nullptr; // N_HEAD*D_MSA (2048) → D_MSA (256)
+    LinearLayer* Wq_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
+    LinearLayer* Wk_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
+    LinearLayer* Wv_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
     AttnConfig config_;
-    //struct Impl;
-    //std::unique_ptr<Impl> impl_;
 };
 
 class MSAGlobalColAttention : public MSAColAttention {
-public:    explicit MSAGlobalColAttention(const AttnConfig& config) : MSAColAttention(config);
+public:
+    MSAGlobalColAttention() = default;
+    // 继承 MSAColAttention::set_params()
 
+    // msa 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& msa);
 };
 
 class PairRowAttention {
 public:
-    explicit PairRowAttention(const AttnConfig& config);
+    PairRowAttention() = default;
+    void set_params(const AttnConfig& config,
+                    LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
+                    LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv);
     
-    //
+    // pair/str_bias 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
     
 private:
     SelfAttention self_attn_;
-    LinearLayer to_b(D_PAIR, N_HEAD);  // 将 str_bias 转换为 attention bias
-    LinearLayer to_g(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
-    LinearLayer to_out(N_HEAD * D_PAIR_HIDDEN, D_PAIR);
-    
-    LinearLayer Wq(D_PAIR, N_HEAD * D_PAIR_HIDDEN); 
-    // n_head 个 head，每个 head D_MSA/n_head 维
-    LinearLayer Wk(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
-    LinearLayer Wv(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
-
+    LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
+    LinearLayer* to_g_  = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
+    LinearLayer* to_out_ = nullptr; // N_HEAD*D_PAIR_HIDDEN (256) → D_PAIR (128)
+    LinearLayer* Wq_    = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
+    LinearLayer* Wk_    = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
+    LinearLayer* Wv_    = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
     AttnConfig config_;
-    //struct Impl;
-    //std::unique_ptr<Impl> impl_;
 };
 
 
 class PairColAttention {
 public:
-    explicit PairColAttention(const AttnConfig& config);
+    PairColAttention() = default;
+    void set_params(const AttnConfig& config,
+                    LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
+                    LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv);
     
-    //
+    // pair/str_bias 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
     
 private:
     SelfAttention self_attn_;
-    LinearLayer to_b(D_PAIR, N_HEAD);  // 将 str_bias 转换为 attention bias
-    LinearLayer to_g(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
-    LinearLayer to_out(N_HEAD * D_PAIR_HIDDEN, D_PAIR);
-    
-    LinearLayer Wq(D_PAIR, N_HEAD * D_PAIR_HIDDEN); 
-    // n_head 个 head，每个 head D_MSA/n_head 维
-    LinearLayer Wk(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
-    LinearLayer Wv(D_PAIR, N_HEAD * D_PAIR_HIDDEN);
-
+    LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
+    LinearLayer* to_g_  = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
+    LinearLayer* to_out_ = nullptr; // N_HEAD*D_PAIR_HIDDEN (256) → D_PAIR (128)
+    LinearLayer* Wq_    = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
+    LinearLayer* Wk_    = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
+    LinearLayer* Wv_    = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
     AttnConfig config_;
-    //struct Impl;
-    //std::unique_ptr<Impl> impl_;
 };
 
 // Cross Attention (State ←→ Template)
@@ -161,24 +156,41 @@ class TriangleMultiplication {
 public:
     //enum class Direction { Outgoing, Incoming };
     
-    TriangleMultiplication(int dim);
+    // 旧值类型构造函数 (保留注释):
+    // TriangleMultiplication(int dim);
+    TriangleMultiplication() = default;
+    void set_params(int dim,
+                    LayerNorm*   layernorm,     LinearLayer* left_proj,
+                    LinearLayer* right_proj,    LinearLayer* left_gate,
+                    LinearLayer* right_gate,    LinearLayer* gate,
+                    LayerNorm*   output_layernorm, LinearLayer* out_proj);
     
     // pair: (B, L, L, D)
     TensorF32 forward(const TensorF32& pair, bool bOutgoing = true);
     
 private:
     static constexpr int D_HIDDEN_TRIMUL = 128;
-    LayerNorm layernorm_(D_PAIR);
-    LinearLayer left_proj_(D_PAIR, D_HIDDEN_TRIMUL);
-    LinearLayer right_proj_(D_PAIR, D_HIDDEN_TRIMUL);
-    LinearLayer left_gate_(D_PAIR, D_HIDDEN_TRIMUL);
-    LinearLayer right_gate_(D_PAIR, D_HIDDEN_TRIMUL);
-    LinearLayer gate_(D_PAIR, D_PAIR);
-    LayerNorm output_layernorm_(D_HIDDEN_TRIMUL);
-    LinearLayer out_proj_(D_HIDDEN_TRIMUL, D_PAIR);
-     //struct Impl;
-     //std::unique_ptr<Impl> impl_;
-    int dim_;
+
+    // 旧值类型 (保留注释):
+    // LayerNorm layernorm_(D_PAIR);
+    // LinearLayer left_proj_(D_PAIR, D_HIDDEN_TRIMUL);
+    // LinearLayer right_proj_(D_PAIR, D_HIDDEN_TRIMUL);
+    // LinearLayer left_gate_(D_PAIR, D_HIDDEN_TRIMUL);
+    // LinearLayer right_gate_(D_PAIR, D_HIDDEN_TRIMUL);
+    // LinearLayer gate_(D_PAIR, D_PAIR);
+    // LayerNorm output_layernorm_(D_HIDDEN_TRIMUL);
+    // LinearLayer out_proj_(D_HIDDEN_TRIMUL, D_PAIR);
+
+    LayerNorm*   layernorm_        = nullptr; // D_PAIR (128)
+    LinearLayer* left_proj_        = nullptr; // D_PAIR (128) → D_HIDDEN_TRIMUL (128)
+    LinearLayer* right_proj_       = nullptr; // D_PAIR (128) → D_HIDDEN_TRIMUL (128)
+    LinearLayer* left_gate_        = nullptr; // D_PAIR (128) → D_HIDDEN_TRIMUL (128)
+    LinearLayer* right_gate_       = nullptr; // D_PAIR (128) → D_HIDDEN_TRIMUL (128)
+    LinearLayer* gate_             = nullptr; // D_PAIR (128) → D_PAIR (128)
+    LayerNorm*   output_layernorm_ = nullptr; // D_HIDDEN_TRIMUL (128)
+    LinearLayer* out_proj_         = nullptr; // D_HIDDEN_TRIMUL (128) → D_PAIR (128)
+
+    int dim_ = 0;
     //Direction dir_;
     //struct Impl;
     //std::unique_ptr<Impl> impl_;
@@ -187,18 +199,28 @@ private:
 // FeedForward
 class FeedForward {
 public:
-    FeedForward(int dim, int hidden_dim, float dropout = 0.1f);
+    // 旧值类型构造函数 (保留注释):
+    // FeedForward(int dim, int hidden_dim, float dropout = 0.1f);
+    FeedForward() = default;
+    void set_params(int dim, int hidden_dim, float dropout,
+                    LayerNorm* layernorm, LinearLayer* linear1, LinearLayer* linear2);
     
     TensorF32 forward(const TensorF32& x);
     
 private:
-    int dim_, hidden_dim_;
-    LayerNorm layernorm_(dim_);
-    LinearLayer linear1_(dim_, dim_ * hidden_dim_); 
-    // linear1 kaiming normal initialization
-    LinearLayer linear2_(dim_ * hidden_dim_, dim_); 
-    // linear2_  zero initialization
-    Dropout dropout_(dropout_);
+    int dim_ = 0, hidden_dim_ = 0;
+    float dropout_rate_ = 0.1f;
+
+    // 旧值类型 (保留注释):
+    // LayerNorm layernorm_(dim_);
+    // LinearLayer linear1_(dim_, dim_ * hidden_dim_);  // kaiming normal init
+    // LinearLayer linear2_(dim_ * hidden_dim_, dim_);  // zero init
+
+    LayerNorm*   layernorm_ = nullptr; // dim_
+    LinearLayer* linear1_   = nullptr; // dim_ → dim_*hidden_dim_
+    LinearLayer* linear2_   = nullptr; // dim_*hidden_dim_ → dim_
+
+    Dropout dropout_;
     //struct Impl;
     //std::unique_ptr<Impl> impl_;
 };

@@ -67,6 +67,29 @@ class IterBlock {
 public:
     IterBlock(const RFAAConfig& config, bool update_msa_pair = true);
     
+    // 由 RFAAModel 注入子模块 (non-owning pointers 已在之前注入, 这里是 unique_ptr 所有权转移)
+    void set_sub_modules(
+        std::unique_ptr<MSARowAttention>          msa_row,
+        std::unique_ptr<MSAColAttention>          msa_col,
+        std::unique_ptr<FeedForward>              msa_ff,
+        std::unique_ptr<PairRowAttention>         pair_row,
+        std::unique_ptr<PairColAttention>         pair_col,
+        std::unique_ptr<FeedForward>              pair_ff,
+        std::unique_ptr<TriangleMultiplication>   tri_out,
+        std::unique_ptr<TriangleMultiplication>   tri_in,
+        std::unique_ptr<SE3Transformer>           se3
+    ) {
+        msa_row_attn_  = std::move(msa_row);
+        msa_col_attn_  = std::move(msa_col);
+        msa_ff_        = std::move(msa_ff);
+        pair_row_attn_ = std::move(pair_row);
+        pair_col_attn_ = std::move(pair_col);
+        pair_ff_       = std::move(pair_ff);
+        tri_mul_out_   = std::move(tri_out);
+        tri_mul_in_    = std::move(tri_in);
+        se3_           = std::move(se3);
+    }
+    
     // 执行一个迭代块
     // 输入/输出通过引用修改
     void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
@@ -87,6 +110,7 @@ private:
     std::unique_ptr<PairRowAttention> pair_row_attn_;
     std::unique_ptr<PairColAttention> pair_col_attn_;
     std::unique_ptr<FeedForward> msa_ff_;
+    std::unique_ptr<FeedForward> pair_ff_;
     std::unique_ptr<TriangleMultiplication> tri_mul_out_;
     std::unique_ptr<TriangleMultiplication> tri_mul_in_;
     std::unique_ptr<SE3Transformer> se3_;
@@ -152,6 +176,10 @@ public:
 
     // a virtual dtor
     virtual ~FullBlock() = default;
+
+    void set_global_col_attn(std::unique_ptr<MSAGlobalColAttention> p) {
+        msa_global_col_attn_ = std::move(p);
+    }
 
     void forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
                  const TensorF32& seq1hot,
@@ -253,102 +281,94 @@ private:
     Device device_ = Device::CPU;
     bool training_ = false;
 
-    // ===== 所有权重（从 context 分配，FLAG_PARAM）=====
-    // embedding
-    LinearLayer* msa_emb_           = nullptr; // (164 → 256)
-    EmbeddingLayer* state_emb_      = nullptr; // (NAATOKENS, D_STATE)
-    EmbeddingLayer* pair_left_emb_  = nullptr; //(NAATOKENS, D_PAIR)
-    EmbeddingLayer* pair_right_emb_ = nullptr; //(NAATOKENS, D_PAIR)
-    LinearLayer* full_linear_       = nullptr;
-    EmbeddingLayer* full_emb_       = nullptr;
-    LinearLayer* bond_emb_          = nullptr;
+    // ===== embedding / template 参数 (全局单份) =====
+    LinearLayer*     msa_emb_            = nullptr; // (164 → 256)
+    EmbeddingLayer*  state_emb_          = nullptr; // (NAATOKENS, D_STATE)
+    EmbeddingLayer*  pair_left_emb_      = nullptr; // (NAATOKENS, D_PAIR)
+    EmbeddingLayer*  pair_right_emb_     = nullptr; // (NAATOKENS, D_PAIR)
+    LinearLayer*     full_linear_        = nullptr; // (83 → D_MSA_FULL)
+    EmbeddingLayer*  full_emb_           = nullptr; // (NAATOKENS, D_MSA_FULL)
+    LinearLayer*     bond_emb_           = nullptr; // (8 → D_PAIR)
+    LinearLayer*     emb_t1d_            = nullptr; // (110 → 64)
+    LinearLayer*     proj_t1d_           = nullptr; // (64 → 64)
+    LinearLayer*     emb_t1d_t2d_        = nullptr; // (224 → 64) get_templ_emb
+    LinearLayer*     temp_stack_t1d_proj_ = nullptr; // (80 → 32) templ_stack
+    LayerNorm*       temp_stack_norm_    = nullptr; // (64)
 
-    LinearLayer* emb_t1d_           = nullptr;
-    LinearLayer* proj_t1d_          = nullptr;
-    LinearLayer* emb_t1d_t2d_       = nullptr; //get_templ_emb
-    LinearLayer* temp_stack_t1d_proj_ = nullptr; //templ_stack
-    LayerNorm* temp_stack_norm_     = nullptr;
-    //msa2msa
-    LayerNorm* msa2msa_norm_        = nullptr;
-    LinearLayer* msa2msa_linear_    = nullptr;
-    LayerNorm* pair2msa_norm_       = nullptr;
-    //msa2pair
-    LayerNorm* msa_norm_            = nullptr;
-    LinearLayer* left_proj_         = nullptr;
-    LinearLayer* right_proj_        = nullptr;
-    LinearLayer* out_proj_          = nullptr;
-    //pair2pair
-    LinearLayer* rbf_proj_         = nullptr;
-    LayerNorm* state_norm_         = nullptr;
-    LinearLayer* left_proj_        = nullptr;
-    LinearLayer* right_proj_       = nullptr;
-    LinearLayer* gate_proj_        = nullptr;
-    // sub attention block
-    //msa_ff_
-    LayerNorm* msa_ff_norm_        = nullptr;
-    LinearLayer* msa_linear_1_     = nullptr;
-    LinearLayer* msa_linear_2_     = nullptr;
-    //msa_row_attn_;
-    LayerNorm* msa_row_layernorm_   = nullptr;
-    LayerNorm* pair_row_layernorm_  = nullptr;
-    LinearLayer* msa_row_to_b_      = nullptr;
-    LinearLayer* msa_row_to_g_      = nullptr;
-    LinearLayer* msa_row_to_out_    = nullptr;
-    LinearLayer* msa_row_Wq_        = nullptr;
-    LinearLayer* msa_row_Wk_        = nullptr;
-    LinearLayer* msa_row_Wv_        = nullptr;
-    // msa_global_col_attn_;
-    LayerNorm* msa_global_col_layernorm_   = nullptr;
-    LinearLayer* msa_global_col_to_b_      = nullptr;
-    LinearLayer* msa_global_col_to_g_      = nullptr;
-    LinearLayer* msa_global_col_to_out_    = nullptr;
-    LinearLayer* msa_global_col_Wq_        = nullptr;
-    LinearLayer* msa_global_col_Wk_        = nullptr;
-    LinearLayer* msa_global_col_Wv_        = nullptr;
-    //msa_col_attn_;
-    LayerNorm* msa_col_layernorm_   = nullptr;
-    LinearLayer* msa_col_to_b_      = nullptr; 
-    LinearLayer* msa_col_to_g_      = nullptr;
-    LinearLayer* msa_col_to_out_    = nullptr;
-    LinearLayer* msa_col_Wq_        = nullptr;
-    LinearLayer* msa_col_Wk_        = nullptr;
-    LinearLayer* msa_col_Wv_        = nullptr;
-    //pair_row_attn_;
-    LayerNorm* pair_row_layernorm_       = nullptr;
-    LayerNorm* bias_row_layernorm_       = nullptr;
-    LinearLayer* pair_row_to_b_      = nullptr;
-    LinearLayer* pair_row_to_g_      = nullptr;
-    LinearLayer* pair_row_to_out_    = nullptr;
-    LinearLayer* pair_row_Wq_        = nullptr;
-    LinearLayer* pair_row_Wk_        = nullptr;
-    LinearLayer* pair_row_Wv_        = nullptr;
-    //pair_col_attn_;
-    LayerNorm* pair_col_layernorm_       = nullptr;
-    LayerNorm* bias_col_layernorm_       = nullptr;
-    LinearLayer* pair_col_to_b_      = nullptr;
-    LinearLayer* pair_col_to_g_      = nullptr;
-    LinearLayer* pair_col_to_out_    = nullptr;
-    LinearLayer* pair_col_Wq_        = nullptr;
-    LinearLayer* pair_col_Wk_        = nullptr;
-    LinearLayer* pair_col_Wv_        = nullptr;
-    //tri_mul_out_;
-    LayerNorm*   tri_mul_out_layernorm_        = nullptr;
-    LinearLayer* tri_mul_out_left_proj_        = nullptr;
-    LinearLayer* tri_mul_out_right_proj_       = nullptr;
-    LinearLayer* tri_mul_out_left_gate_        = nullptr;
-    LinearLayer* tri_mul_out_right_gate_       = nullptr;
-    LinearLayer* tri_mul_out_gate_             = nullptr;
-    LayerNorm*   tri_mul_out_output_layernorm_ = nullptr;
-    LinearLayer* tri_mul_out_out_proj_         = nullptr;
-    //tri_mul_in_;
-    LayerNorm*   tri_mul_in_layernorm_         = nullptr;
-    LinearLayer* tri_mul_in_left_proj_         = nullptr;
-    LinearLayer* tri_mul_in_right_proj_        = nullptr;
-    LinearLayer* tri_mul_in_left_gate_         = nullptr;
-    LinearLayer* tri_mul_in_right_gate_        = nullptr;
-    LinearLayer* tri_mul_in_gate_              = nullptr;
-    LayerNorm*   tri_mul_in_output_layernorm_  = nullptr;
-    LinearLayer* tri_mul_in_out_proj_          = nullptr;
+    // ===== attention / sub-module 参数 (per-block, vector) =====
+    static constexpr int N_ITER = 12;   // extra(4) + main(8)
+    static constexpr int N_GLOB = 4;    // extra_blocks (FullBlock)
+
+    // --- MSARowAttention (6 LL ×12) ---
+    // 旧: LinearLayer* msa_row_Wq_ etc.
+    std::vector<LinearLayer*> msa_row_Wq_;     // D_MSA (256) → N_HEAD*D_MSA (2048)
+    std::vector<LinearLayer*> msa_row_Wk_;     // D_MSA (256) → N_HEAD*D_MSA (2048)
+    std::vector<LinearLayer*> msa_row_Wv_;     // D_MSA (256) → N_HEAD*D_MSA (2048)
+    std::vector<LinearLayer*> msa_row_to_b_;   // D_PAIR (128) → N_HEAD (8)
+    std::vector<LinearLayer*> msa_row_to_g_;   // D_MSA (256) → N_HEAD*D_MSA (2048)
+    std::vector<LinearLayer*> msa_row_to_out_; // N_HEAD*D_MSA (2048) → D_MSA (256)
+
+    // --- MSAColAttention (6 LL ×12) ---
+    std::vector<LinearLayer*> msa_col_Wq_;     // D_MSA (256) → N_HEAD*D_MSA (2048)
+    std::vector<LinearLayer*> msa_col_Wk_;     
+    std::vector<LinearLayer*> msa_col_Wv_;     
+    std::vector<LinearLayer*> msa_col_to_b_;   // D_PAIR (128) → N_HEAD (8)
+    std::vector<LinearLayer*> msa_col_to_g_;   
+    std::vector<LinearLayer*> msa_col_to_out_; 
+
+    // --- MSAGlobalColAttention (6 LL ×4, FullBlock only) ---
+    std::vector<LinearLayer*> msa_global_col_Wq_;    // D_MSA (256) → D_MSA (256)  single-head
+    std::vector<LinearLayer*> msa_global_col_Wk_;    
+    std::vector<LinearLayer*> msa_global_col_Wv_;    
+    std::vector<LinearLayer*> msa_global_col_to_b_;  // D_PAIR (128) → N_HEAD (8)
+    std::vector<LinearLayer*> msa_global_col_to_g_;  
+    std::vector<LinearLayer*> msa_global_col_to_out_;
+
+    // --- PairRowAttention (6 LL ×12) ---
+    std::vector<LinearLayer*> pair_row_Wq_;     // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
+    std::vector<LinearLayer*> pair_row_Wk_;     
+    std::vector<LinearLayer*> pair_row_Wv_;     
+    std::vector<LinearLayer*> pair_row_to_b_;   // D_PAIR (128) → N_HEAD (8)
+    std::vector<LinearLayer*> pair_row_to_g_;   
+    std::vector<LinearLayer*> pair_row_to_out_; 
+
+    // --- PairColAttention (6 LL ×12) ---
+    std::vector<LinearLayer*> pair_col_Wq_;     
+    std::vector<LinearLayer*> pair_col_Wk_;     
+    std::vector<LinearLayer*> pair_col_Wv_;     
+    std::vector<LinearLayer*> pair_col_to_b_;   
+    std::vector<LinearLayer*> pair_col_to_g_;   
+    std::vector<LinearLayer*> pair_col_to_out_; 
+
+    // --- FeedForward msa_ff_ (1 LN + 2 LL ×12) ---
+    std::vector<LayerNorm*>   msa_ff_norm_;     // D_MSA (256)
+    std::vector<LinearLayer*> msa_ff_linear1_;  // D_MSA (256) → D_MSA*4 (1024)
+    std::vector<LinearLayer*> msa_ff_linear2_;  // D_MSA*4 (1024) → D_MSA (256)
+
+    // --- FeedForward pair_ff_ (1 LN + 2 LL ×12) ---
+    std::vector<LayerNorm*>   pair_ff_norm_;     // D_PAIR (128)
+    std::vector<LinearLayer*> pair_ff_linear1_;  // D_PAIR (128) → D_PAIR*2 (256)
+    std::vector<LinearLayer*> pair_ff_linear2_;  // D_PAIR*2 (256) → D_PAIR (128)
+
+    // --- TriangleMultiplication out (2 LN + 6 LL ×12) ---
+    std::vector<LayerNorm*>   tri_out_layernorm_;         // D_PAIR (128)
+    std::vector<LinearLayer*> tri_out_left_proj_;         // D_PAIR (128) → D_HIDDEN_TRIMUL (128)
+    std::vector<LinearLayer*> tri_out_right_proj_;        
+    std::vector<LinearLayer*> tri_out_left_gate_;         
+    std::vector<LinearLayer*> tri_out_right_gate_;        
+    std::vector<LinearLayer*> tri_out_gate_;              // D_PAIR (128) → D_PAIR (128)
+    std::vector<LayerNorm*>   tri_out_output_layernorm_;  // D_HIDDEN_TRIMUL (128)
+    std::vector<LinearLayer*> tri_out_out_proj_;          // D_HIDDEN_TRIMUL (128) → D_PAIR (128)
+
+    // --- TriangleMultiplication in (2 LN + 6 LL ×12) ---
+    std::vector<LayerNorm*>   tri_in_layernorm_;
+    std::vector<LinearLayer*> tri_in_left_proj_;
+    std::vector<LinearLayer*> tri_in_right_proj_;
+    std::vector<LinearLayer*> tri_in_left_gate_;
+    std::vector<LinearLayer*> tri_in_right_gate_;
+    std::vector<LinearLayer*> tri_in_gate_;
+    std::vector<LayerNorm*>   tri_in_output_layernorm_;
+    std::vector<LinearLayer*> tri_in_out_proj_;
 
     // ===== 3D SE 参数 (per-block, 由 RFAAModel::create 统一创建后将指针注入 block) =====
 

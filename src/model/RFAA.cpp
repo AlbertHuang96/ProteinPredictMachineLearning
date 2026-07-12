@@ -23,26 +23,9 @@ RFAAConfig::RFAAConfig() {
 IterBlock::IterBlock(const RFAAConfig& config, bool update_msa_pair)
     : config_(config), update_msa_pair_(update_msa_pair) {
     // 旧值初始化 (保留注释):
-    // , norm_msa_3d_(D_MSA), norm_pair_3d_(D_PAIR)
-    // , embed_x_(NODE_3D_IN, NODE_3D_OUT), embed_e_(D_PAIR, EDGE_3D_OUT)
-    // , norm_node_3d_(NODE_3D_OUT), norm_edge_3d_(EDGE_3D_OUT)
-    // 以上 6 个参数现在由 RFAAModel 创建，通过指针注入
+    // 所有 LinearLayer/LayerNorm 值成员已移除, 子模块现由 RFAAModel 创建后通过 set_sub_modules() 注入
     
-    // 初始化子模块
-    AttnConfig msa_attn_config(config.d_msa, config.n_heads);
-    msa_row_attn_ = std::make_unique<MSARowAttention>(msa_attn_config);
-    msa_col_attn_ = std::make_unique<MSAColAttention>(msa_attn_config);
-    msa_ff_ = std::make_unique<FeedForward>(config.d_msa, config.d_msa * 4);
-    
-    tri_mul_out_ = std::make_unique<TriangleMultiplication>(
-        config.d_pair, TriangleMultiplication::Direction::Outgoing);
-    tri_mul_in_ = std::make_unique<TriangleMultiplication>(
-        config.d_pair, TriangleMultiplication::Direction::Incoming);
-    
-    se3_ = std::make_unique<SE3Transformer>(config.se3_config);
-    struct_update_ = std::make_unique<StructureUpdate>();
-    
-    // 初始化 PositionalEncoding
+    // 初始化 PositionalEncoding (无参数模块)
     pos_enc_ = std::make_unique<PositionalEncoding>(-32, 32, 8, config.d_pair);
 }
 
@@ -996,19 +979,98 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         refine_norm_edge2_.push_back(LayerNorm::create(N_EDGE_FEATS));                        // 32
     }
 
-    // ===== 创建迭代块 =====
+    // ===== attention / sub-module 参数 (per-block create) =====
+    AttnConfig msa_ac(config.d_msa, config.n_heads);
+    AttnConfig pair_ac(config.d_pair, config.n_heads);
+
+    auto push_msa_row = [&]() {
+        msa_row_Wq_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));        // 256→2048
+        msa_row_Wk_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_row_Wv_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_row_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));                // 128→8
+        msa_row_to_g_.push_back( LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_row_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));        // 2048→256
+    };
+    auto push_msa_col = [&]() {
+        msa_col_Wq_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_col_Wk_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_col_Wv_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_col_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));
+        msa_col_to_g_.push_back( LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));
+    };
+    auto push_pair_row = [&]() {
+        pair_row_Wq_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));  // 128→256
+        pair_row_Wk_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
+        pair_row_Wv_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
+        pair_row_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));                   // 128→8
+        pair_row_to_g_.push_back( LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
+        pair_row_to_out_.push_back(LinearLayer::create(N_HEAD * D_PAIR_HIDDEN, D_PAIR));   // 256→128
+    };
+    auto push_pair_col = [&]() {
+        pair_col_Wq_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
+        pair_col_Wk_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
+        pair_col_Wv_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
+        pair_col_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));
+        pair_col_to_g_.push_back( LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
+        pair_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_PAIR_HIDDEN, D_PAIR));
+    };
+    auto push_msa_ff = [&]() {
+        msa_ff_norm_.push_back(   LayerNorm::create(D_MSA));                              // 256
+        msa_ff_linear1_.push_back(LinearLayer::create(D_MSA, D_MSA * 4));                 // 256→1024
+        msa_ff_linear2_.push_back(LinearLayer::create(D_MSA * 4, D_MSA));                 // 1024→256
+    };
+    auto push_pair_ff = [&]() {
+        pair_ff_norm_.push_back(   LayerNorm::create(D_PAIR));                            // 128
+        pair_ff_linear1_.push_back(LinearLayer::create(D_PAIR, D_PAIR * 2));              // 128→256
+        pair_ff_linear2_.push_back(LinearLayer::create(D_PAIR * 2, D_PAIR));              // 256→128
+    };
+    auto push_tri = [&](std::vector<LayerNorm*>& ln1, std::vector<LayerNorm*>& ln2,
+                         std::vector<LinearLayer*>& l1, std::vector<LinearLayer*>& r1,
+                         std::vector<LinearLayer*>& lg, std::vector<LinearLayer*>& rg,
+                         std::vector<LinearLayer*>& g,  std::vector<LinearLayer*>& op) {
+        constexpr int T = 128;  // D_HIDDEN_TRIMUL
+        ln1.push_back(LayerNorm::create(D_PAIR));                                        // 128
+        l1.push_back( LinearLayer::create(D_PAIR, T));   r1.push_back( LinearLayer::create(D_PAIR, T));
+        lg.push_back( LinearLayer::create(D_PAIR, T));   rg.push_back( LinearLayer::create(D_PAIR, T));
+        g.push_back(  LinearLayer::create(D_PAIR, D_PAIR));
+        ln2.push_back(LayerNorm::create(T));
+        op.push_back( LinearLayer::create(T, D_PAIR));
+    };
+
+    // 12 份 IterBlock 参数
+    for (int i = 0; i < N_ITER; ++i) {
+        push_msa_row(); push_msa_col(); push_pair_row(); push_pair_col();
+        push_msa_ff(); push_pair_ff();
+        push_tri(tri_out_layernorm_, tri_out_output_layernorm_,
+                 tri_out_left_proj_, tri_out_right_proj_,
+                 tri_out_left_gate_, tri_out_right_gate_,
+                 tri_out_gate_, tri_out_out_proj_);
+        push_tri(tri_in_layernorm_, tri_in_output_layernorm_,
+                 tri_in_left_proj_, tri_in_right_proj_,
+                 tri_in_left_gate_, tri_in_right_gate_,
+                 tri_in_gate_, tri_in_out_proj_);
+    }
+
+    // 4 份 GlobalColAttention 参数
+    for (int i = 0; i < N_GLOB; ++i) {
+        msa_global_col_Wq_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_global_col_Wk_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_global_col_Wv_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_global_col_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));
+        msa_global_col_to_g_.push_back( LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_global_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));
+    }
+
+    // ===== 创建迭代块 + 注入指针 =====
     // extra_blocks (4) — FullBlock with update_msa_pair=true
     for (int i = 0; i < N_EXTRA_BLOCKS; ++i) {
-        int idx = i;  // index into iter_* vectors
+        int idx = i;
         auto block = std::make_unique<FullBlock>(config, true);
-        // 注入 3D SE 参数
-        block->norm_msa_3d_  = iter_norm_msa_3d_[idx];
-        block->norm_pair_3d_ = iter_norm_pair_3d_[idx];
-        block->embed_x_      = iter_embed_x_[idx];
-        block->embed_e_      = iter_embed_e_[idx];
-        block->norm_node_3d_ = iter_norm_node_3d_[idx];
-        block->norm_edge_3d_ = iter_norm_edge_3d_[idx];
-        // 注入 forward 内部参数
+        // 注入 3D SE + forward 内部参数
+        block->norm_msa_3d_  = iter_norm_msa_3d_[idx]; block->norm_pair_3d_ = iter_norm_pair_3d_[idx];
+        block->embed_x_      = iter_embed_x_[idx];     block->embed_e_      = iter_embed_e_[idx];
+        block->norm_node_3d_ = iter_norm_node_3d_[idx]; block->norm_edge_3d_ = iter_norm_edge_3d_[idx];
         block->state2msa_norm_       = iter_state2msa_norm_[idx];
         block->state2msa_linear_     = iter_state2msa_linear_[idx];
         block->pair2msa_norm_        = iter_pair2msa_norm_[idx];
@@ -1021,6 +1083,52 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         block->pair2pair_left_proj_  = iter_pair2pair_left_proj_[idx];
         block->pair2pair_right_proj_ = iter_pair2pair_right_proj_[idx];
         block->pair2pair_gate_proj_  = iter_pair2pair_gate_proj_[idx];
+
+        // 创建并注入子模块 (layernorm 在 IterBlock::forward 外部完成)
+        auto msa_row = std::make_unique<MSARowAttention>();
+        msa_row->set_params(msa_ac,
+            msa_row_to_b_[idx], msa_row_to_g_[idx], msa_row_to_out_[idx],
+            msa_row_Wq_[idx], msa_row_Wk_[idx], msa_row_Wv_[idx]);
+        auto msa_col = std::make_unique<MSAColAttention>();
+        msa_col->set_params(msa_ac,
+            msa_col_to_b_[idx], msa_col_to_g_[idx], msa_col_to_out_[idx],
+            msa_col_Wq_[idx], msa_col_Wk_[idx], msa_col_Wv_[idx]);
+        auto msa_ff = std::make_unique<FeedForward>();
+        msa_ff->set_params(D_MSA, D_MSA * 4, 0.1f, msa_ff_norm_[idx], msa_ff_linear1_[idx], msa_ff_linear2_[idx]);
+        auto pair_row = std::make_unique<PairRowAttention>();
+        pair_row->set_params(pair_ac,
+            pair_row_to_b_[idx], pair_row_to_g_[idx], pair_row_to_out_[idx],
+            pair_row_Wq_[idx], pair_row_Wk_[idx], pair_row_Wv_[idx]);
+        auto pair_col = std::make_unique<PairColAttention>();
+        pair_col->set_params(pair_ac,
+            pair_col_to_b_[idx], pair_col_to_g_[idx], pair_col_to_out_[idx],
+            pair_col_Wq_[idx], pair_col_Wk_[idx], pair_col_Wv_[idx]);
+        auto pair_ff = std::make_unique<FeedForward>();
+        pair_ff->set_params(D_PAIR, D_PAIR * 2, 0.1f, pair_ff_norm_[idx], pair_ff_linear1_[idx], pair_ff_linear2_[idx]);
+        auto tri_out = std::make_unique<TriangleMultiplication>();
+        tri_out->set_params(D_PAIR,
+            tri_out_layernorm_[idx], tri_out_left_proj_[idx], tri_out_right_proj_[idx],
+            tri_out_left_gate_[idx], tri_out_right_gate_[idx], tri_out_gate_[idx],
+            tri_out_output_layernorm_[idx], tri_out_out_proj_[idx]);
+        auto tri_in = std::make_unique<TriangleMultiplication>();
+        tri_in->set_params(D_PAIR,
+            tri_in_layernorm_[idx], tri_in_left_proj_[idx], tri_in_right_proj_[idx],
+            tri_in_left_gate_[idx], tri_in_right_gate_[idx], tri_in_gate_[idx],
+            tri_in_output_layernorm_[idx], tri_in_out_proj_[idx]);
+        auto se3 = std::make_unique<SE3Transformer>(config.se3_config);
+
+        block->set_sub_modules(
+            std::move(msa_row), std::move(msa_col), std::move(msa_ff),
+            std::move(pair_row), std::move(pair_col), std::move(pair_ff),
+            std::move(tri_out), std::move(tri_in), std::move(se3));
+
+        // GlobalColAttention (FullBlock only)
+        auto gcol = std::make_unique<MSAGlobalColAttention>();
+        gcol->set_params(msa_ac,
+            msa_global_col_to_b_[i], msa_global_col_to_g_[i], msa_global_col_to_out_[i],
+            msa_global_col_Wq_[i], msa_global_col_Wk_[i], msa_global_col_Wv_[i]);
+        block->set_global_col_attn(std::move(gcol));
+
         extra_blocks_.push_back(std::move(block));
     }
 
@@ -1028,14 +1136,10 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
     for (int i = 0; i < N_MAIN_BLOCKS; ++i) {
         int idx = N_EXTRA_BLOCKS + i;
         auto block = std::make_unique<IterBlock>(config, true);
-        // 注入 3D SE 参数
-        block->norm_msa_3d_  = iter_norm_msa_3d_[idx];
-        block->norm_pair_3d_ = iter_norm_pair_3d_[idx];
-        block->embed_x_      = iter_embed_x_[idx];
-        block->embed_e_      = iter_embed_e_[idx];
-        block->norm_node_3d_ = iter_norm_node_3d_[idx];
-        block->norm_edge_3d_ = iter_norm_edge_3d_[idx];
-        // 注入 forward 内部参数
+        // 注入 3D SE + forward 内部参数
+        block->norm_msa_3d_  = iter_norm_msa_3d_[idx]; block->norm_pair_3d_ = iter_norm_pair_3d_[idx];
+        block->embed_x_      = iter_embed_x_[idx];     block->embed_e_      = iter_embed_e_[idx];
+        block->norm_node_3d_ = iter_norm_node_3d_[idx]; block->norm_edge_3d_ = iter_norm_edge_3d_[idx];
         block->state2msa_norm_       = iter_state2msa_norm_[idx];
         block->state2msa_linear_     = iter_state2msa_linear_[idx];
         block->pair2msa_norm_        = iter_pair2msa_norm_[idx];
@@ -1048,6 +1152,44 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         block->pair2pair_left_proj_  = iter_pair2pair_left_proj_[idx];
         block->pair2pair_right_proj_ = iter_pair2pair_right_proj_[idx];
         block->pair2pair_gate_proj_  = iter_pair2pair_gate_proj_[idx];
+
+        // 创建并注入子模块 (layernorm 在 IterBlock::forward 外部完成)
+        auto msa_row = std::make_unique<MSARowAttention>();
+        msa_row->set_params(msa_ac,
+            msa_row_to_b_[idx], msa_row_to_g_[idx], msa_row_to_out_[idx],
+            msa_row_Wq_[idx], msa_row_Wk_[idx], msa_row_Wv_[idx]);
+        auto msa_col = std::make_unique<MSAColAttention>();
+        msa_col->set_params(msa_ac,
+            msa_col_to_b_[idx], msa_col_to_g_[idx], msa_col_to_out_[idx],
+            msa_col_Wq_[idx], msa_col_Wk_[idx], msa_col_Wv_[idx]);
+        auto msa_ff = std::make_unique<FeedForward>();
+        msa_ff->set_params(D_MSA, D_MSA * 4, 0.1f, msa_ff_norm_[idx], msa_ff_linear1_[idx], msa_ff_linear2_[idx]);
+        auto pair_row = std::make_unique<PairRowAttention>();
+        pair_row->set_params(pair_ac,
+            pair_row_to_b_[idx], pair_row_to_g_[idx], pair_row_to_out_[idx],
+            pair_row_Wq_[idx], pair_row_Wk_[idx], pair_row_Wv_[idx]);
+        auto pair_col = std::make_unique<PairColAttention>();
+        pair_col->set_params(pair_ac,
+            pair_col_to_b_[idx], pair_col_to_g_[idx], pair_col_to_out_[idx],
+            pair_col_Wq_[idx], pair_col_Wk_[idx], pair_col_Wv_[idx]);
+        auto pair_ff = std::make_unique<FeedForward>();
+        pair_ff->set_params(D_PAIR, D_PAIR * 2, 0.1f, pair_ff_norm_[idx], pair_ff_linear1_[idx], pair_ff_linear2_[idx]);
+        auto tri_out = std::make_unique<TriangleMultiplication>();
+        tri_out->set_params(D_PAIR,
+            tri_out_layernorm_[idx], tri_out_left_proj_[idx], tri_out_right_proj_[idx],
+            tri_out_left_gate_[idx], tri_out_right_gate_[idx], tri_out_gate_[idx],
+            tri_out_output_layernorm_[idx], tri_out_out_proj_[idx]);
+        auto tri_in = std::make_unique<TriangleMultiplication>();
+        tri_in->set_params(D_PAIR,
+            tri_in_layernorm_[idx], tri_in_left_proj_[idx], tri_in_right_proj_[idx],
+            tri_in_left_gate_[idx], tri_in_right_gate_[idx], tri_in_gate_[idx],
+            tri_in_output_layernorm_[idx], tri_in_out_proj_[idx]);
+        auto se3 = std::make_unique<SE3Transformer>(config.se3_config);
+
+        block->set_sub_modules(
+            std::move(msa_row), std::move(msa_col), std::move(msa_ff),
+            std::move(pair_row), std::move(pair_col), std::move(pair_ff),
+            std::move(tri_out), std::move(tri_in), std::move(se3));
         main_blocks_.push_back(std::move(block));
     }
 
@@ -1067,6 +1209,14 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         // RefineBlock 继承 IterBlock 的 forward 内部参数不需要 (update_msa_pair=false)
         refine_blocks_.push_back(std::move(block));
     }
+
+    // ===== embedding 参数 =====
+    // 旧栈上变量 (保留注释):
+    // BondEmbedding bond_embed(0, D_PAIR);
+    // FullEmbedding full_emb(NAATOKENS - 1 + 4, D_MSA_FULL);
+    bond_emb_    = LinearLayer::create(8, D_PAIR);                                   // NBYTES → D_PAIR (128)
+    full_linear_ = LinearLayer::create(NAATOKENS - 1 + 4, D_MSA_FULL);              // 83 → 64
+    full_emb_    = EmbeddingLayer::create(NAATOKENS, D_MSA_FULL);                    // (80, 64)
 }
 
 RFAAModel::~RFAAModel() = default;
@@ -1104,13 +1254,17 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // msa_full was used in the full block
     TensorF32 msa_full;
     if (input.msa_full.numel() > 0) {
-        FullEmbedding full_emb(NAATOKENS - 1 + 4, D_MSA_FULL);
+        // 旧栈上变量: FullEmbedding full_emb(NAATOKENS - 1 + 4, D_MSA_FULL);
+        FullEmbedding full_emb;
+        full_emb.set_params(full_linear_, full_emb_, D_MSA_FULL);
         msa_full = full_emb.forward(input.msa_full, input.seq_tokens, TensorF32());
     }
 
     // bond embed for pair track
     // need to get the bond feats
-    BondEmbedding bond_embed(0, D_PAIR);
+    // 旧栈上变量: BondEmbedding bond_embed(0, D_PAIR);
+    BondEmbedding bond_embed;
+    bond_embed.set_params(bond_emb_, D_PAIR);
     TensorF32 pair;
     pair.copy_from(pair_track_->representation());
     pair = pair + bond_embed(input.bond_feats);

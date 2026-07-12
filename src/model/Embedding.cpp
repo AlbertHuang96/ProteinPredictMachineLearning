@@ -244,38 +244,49 @@ namespace rfaa {
 
 
 
-    BondEmbedding::BondEmbedding(int d_init, int d_pair)
-        : d_init_(d_init), d_pair_(d_pair) {
-            if (d_init_ == 0) {
-                d_init_ = NBYTES;
-            }
-            emb_ = LinearLayer(d_init_, d_pair_);
-            
-        }
+    // ===== BondEmbedding (non-owning pointer 版本) =====
+    // 旧构造函数 (保留注释):
+    // BondEmbedding::BondEmbedding(int d_init, int d_pair)
+    //     : d_init_(d_init), d_pair_(d_pair) {
+    //     if (d_init_ == 0) d_init_ = NBYTES;
+    //     emb_ = LinearLayer(d_init_, d_pair_);
+    // }
 
-        //ChemData().NBTYPES represents the number of categorical bond types the model recognizes, 
-        //and its value is 8
-        TensorF32 BondEmbedding::forward(const TensorF32& bond_feats) {
-            // bond_feats: (B, L, L, d_init)
-            // output: (B, L, L, d_pair)
-            int B = bond_feats.shape().dims[0];
-            int L = bond_feats.shape().dims[1];
-            
-            TensorF32 output;
-            TensorF32 one_hot = one_hot(bond_feats, NBYTES); // (B, L, L, d_init)
-            output = emb_.forward(one_hot); // (B, L, L, d_pair)
-            
-            return output;
-        }
+    void BondEmbedding::set_params(LinearLayer* emb, int d_pair) {
+        emb_ = emb;
+        d_pair_ = d_pair;
+    }
+
+    //ChemData().NBTYPES represents the number of categorical bond types the model recognizes, 
+    //and its value is 8
+    TensorF32 BondEmbedding::forward(const TensorF32& bond_feats) {
+        // bond_feats: (B, L, L, d_init)
+        // output: (B, L, L, d_pair)
+        int B = bond_feats.shape().dims[0];
+        int L = bond_feats.shape().dims[1];
+        
+        TensorF32 output;
+        TensorF32 one_hot = one_hot(bond_feats, NBYTES); // (B, L, L, NBYTES)
+        // 旧: output = emb_.forward(one_hot);
+        output = emb_->forward(one_hot); // (B, L, L, d_pair)
+        
+        return output;
+    }
 
 
 
-    FullEmbedding::FullEmbedding(int d_init, int d_msa) : d_init_(d_init), d_msa_(d_msa) {
-        if (d_init_ == 0) {
-            d_init_ = NAATOKENS - 1 + 4;
-        }
-        emb_ = LinearLayer(d_init_, d_msa_);
-        emb_q_ = EmbeddingLayer(NAATOKENS, d_msa_);
+    // ===== FullEmbedding (non-owning pointer 版本) =====
+    // 旧构造函数 (保留注释):
+    // FullEmbedding::FullEmbedding(int d_init, int d_msa) : d_init_(d_init), d_msa_(d_msa) {
+    //     if (d_init_ == 0) d_init_ = NAATOKENS - 1 + 4;
+    //     emb_ = LinearLayer(d_init_, d_msa_);
+    //     emb_q_ = EmbeddingLayer(NAATOKENS, d_msa_);
+    // }
+
+    void FullEmbedding::set_params(LinearLayer* emb, EmbeddingLayer* emb_q, int d_msa) {
+        emb_   = emb;
+        emb_q_ = emb_q;
+        d_msa_ = d_msa;
     }
     
     TensorF32 FullEmbedding::forward(const TensorF32& msa, const TensorF32& seq, const TensorF32& idx) {
@@ -288,10 +299,12 @@ namespace rfaa {
         int L = msa.shape().dims[2];
         
         // MSA embedding
-        TensorF32 msa_emb = emb_.forward(msa);
+        // 旧: TensorF32 msa_emb = emb_.forward(msa);
+        TensorF32 msa_emb = emb_->forward(msa);
         
         // Query embedding
-        TensorF32 seq_emb = emb_q_.forward(seq).unsqueeze(1); // (B, 1, L, d_msa_)
+        // 旧: TensorF32 seq_emb = emb_q_.forward(seq).unsqueeze(1);
+        TensorF32 seq_emb = emb_q_->forward_exec(seq).unsqueeze(1); // (B, 1, L, d_msa_)
         // unsequeeze
         //unsqueeze(1) → 在维度1插入大小为1的维度
         // expand:

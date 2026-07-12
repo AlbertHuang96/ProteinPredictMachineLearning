@@ -150,40 +150,44 @@ private:
 };
 
 class BondEmbedding {
-private:
-    LinearLayer emb_;
-    
-    int d_init_;
-    int d_pair_;
-
-    const int NBYTES = 8;
-
 public:
-    BondEmbedding(int d_init, int d_pair);
-        
+    // 旧值类型构造函数 (保留注释):
+    // BondEmbedding(int d_init, int d_pair);
+    BondEmbedding() = default;
 
-        //ChemData().NBTYPES represents the number of categorical bond types the model recognizes, 
-        //and its value is 8
-        TensorF32 forward(const TensorF32& bond_feats);
+    // 由 RFAAModel 注入已创建的参数指针
+    void set_params(LinearLayer* emb, int d_pair);
+        
+    // ChemData().NBTYPES represents the number of categorical bond types the model recognizes, 
+    // and its value is 8
+    TensorF32 forward(const TensorF32& bond_feats);
+
+private:
+    // 旧值类型 (保留注释):
+    // LinearLayer emb_;
+    LinearLayer* emb_ = nullptr;   // NBYTES (8) → d_pair_
+
+    int d_pair_ = 0;
+    static constexpr int NBYTES = 8;
 };
 
 class FullEmbedding {
-private:
-    LinearLayer emb_;
-    EmbeddingLayer emb_q_;
-    int d_init_;
-    int d_msa_;
 public:
-    FullEmbedding(int d_init, int d_msa);
+    // 旧值类型构造函数 (保留注释):
+    // FullEmbedding(int d_init, int d_msa);
+    FullEmbedding() = default;
+
+    // 由 RFAAModel 注入已创建的参数指针
+    void set_params(LinearLayer* emb, EmbeddingLayer* emb_q, int d_msa);
     
     TensorF32 forward(const TensorF32& msa, const TensorF32& seq, const TensorF32& idx);
         
-        // Query embedd
-/* if d_init==0:
+    // Query embedd
+    /* if d_init==0:
             d_init=ChemData().NAATOKENS-1+4
         self.emb = nn.Linear(d_init, d_msa) # embedding for general MSA
         self.emb_q = nn.Embedding(ChemData().NAATOKENS, d_msa) # embedding for query sequence */
-/* def forward(self, msa, seq, idx):
+    /* def forward(self, msa, seq, idx):
         # Inputs:
         #   - msa: Input MSA (B, N, L, d_init)
         #   - seq: Input Sequence (B, L)
@@ -196,6 +200,15 @@ public:
         msa = msa + seq.expand(-1, N, -1, -1) # adding query embedding to MSA
         #return self.drop(msa)
         return (msa) */
+
+private:
+    // 旧值类型 (保留注释):
+    // LinearLayer emb_;
+    // EmbeddingLayer emb_q_;
+    LinearLayer*    emb_   = nullptr; // (NAATOKENS-1+4=83) → d_msa_
+    EmbeddingLayer* emb_q_ = nullptr; // (NAATOKENS, d_msa_)
+
+    int d_msa_ = 0;
 };
 
 } // namespace rfaa
