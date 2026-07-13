@@ -49,11 +49,11 @@ public:
                     LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                     LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv);
     
-    // msa/pair_biased 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& msa, const TensorF32& pair_biased);
     
 private:
     SelfAttention self_attn_;
+
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
     LinearLayer* to_g_  = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
     LinearLayer* to_out_ = nullptr; // N_HEAD*D_MSA (2048) → D_MSA (256)

@@ -8,23 +8,21 @@
 
 namespace rfaa {
 
-PositionalEncoding::PositionalEncoding(int minpos_res, 
-                                       int maxpos_res, 
-                                       int maxpos_atom,
-                                       int d_pair)
-    : minpos_res_(minpos_res), 
-      maxpos_res_(maxpos_res), 
-      maxpos_atom_(maxpos_atom),
-      d_pair_(d_pair) {
-    
-    // Create embedding layers
-    // emb_res: size = maxpos_res - minpos_res + 2 (including padding)
-    int num_emb_res = maxpos_res - minpos_res + 2;
-    emb_res_ = std::make_unique<EmbeddingLayer>(num_emb_res, d_pair);
-    
-    // emb_atom: size = maxpos_atom + 2 (including padding)
-    int num_emb_atom = maxpos_atom + 2;
-    emb_atom_ = std::make_unique<EmbeddingLayer>(num_emb_atom, d_pair);
+// ===== PositionalEncoding (non-owning pointer 版本) =====
+// 旧构造函数 (保留注释):
+// PositionalEncoding::PositionalEncoding(int minpos_res, int maxpos_res, int maxpos_atom, int d_pair)
+//     : minpos_res_(minpos_res), maxpos_res_(maxpos_res), maxpos_atom_(maxpos_atom), d_pair_(d_pair) {
+//     emb_res_  = std::make_unique<EmbeddingLayer>(maxpos_res - minpos_res + 2, d_pair);
+//     emb_atom_ = std::make_unique<EmbeddingLayer>(maxpos_atom + 2, d_pair);
+// }
+void PositionalEncoding::set_params(int minpos_res, int maxpos_res, int maxpos_atom, int d_pair,
+                                    EmbeddingLayer* emb_res, EmbeddingLayer* emb_atom) {
+    minpos_res_  = minpos_res;
+    maxpos_res_  = maxpos_res;
+    maxpos_atom_ = maxpos_atom;
+    d_pair_      = d_pair;
+    emb_res_     = emb_res;    // (65, D_PAIR)
+    emb_atom_    = emb_atom;   // (17, D_PAIR)
 }
 
 TensorF32 PositionalEncoding::forward(const TensorF32& seq,

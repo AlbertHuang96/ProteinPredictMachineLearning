@@ -20,17 +20,11 @@ namespace rfaa {
  */
 class PositionalEncoding {
 public:
-    /**
-     * @brief Constructor
-     * @param minpos_res Minimum residue distance (default: -32)
-     * @param maxpos_res Maximum residue distance (default: 32)
-     * @param maxpos_atom Maximum atom bond distance (default: 8)
-     * @param d_pair Pair dimension for embedding (default: D_PAIR=128)
-     */
-    PositionalEncoding(int minpos_res = -32, 
-                      int maxpos_res = 32, 
-                      int maxpos_atom = 8,
-                      int d_pair = D_PAIR);
+    // 旧值类型构造函数 (保留注释):
+    // PositionalEncoding(int minpos_res = -32, int maxpos_res = 32, int maxpos_atom = 8, int d_pair = D_PAIR);
+    PositionalEncoding() = default;
+    void set_params(int minpos_res, int maxpos_res, int maxpos_atom, int d_pair,
+                    EmbeddingLayer* emb_res, EmbeddingLayer* emb_atom);
     
     ~PositionalEncoding() = default;
     
@@ -95,14 +89,16 @@ private:
     TensorF32 bucketize(const TensorF32& distances, const std::vector<int>& bins);
     
 private:
-    int minpos_res_;
-    int maxpos_res_;
-    int maxpos_atom_;
-    int d_pair_;
+    int minpos_res_ = -32;
+    int maxpos_res_ = 32;
+    int maxpos_atom_ = 8;
+    int d_pair_ = D_PAIR;
     
-    // Embedding layers
-    std::unique_ptr<class EmbeddingLayer> emb_res_;
-    std::unique_ptr<class EmbeddingLayer> emb_atom_;
+    // 旧值类型 (保留注释):
+    // std::unique_ptr<EmbeddingLayer> emb_res_;
+    // std::unique_ptr<EmbeddingLayer> emb_atom_;
+    EmbeddingLayer* emb_res_  = nullptr; // (65, D_PAIR)
+    EmbeddingLayer* emb_atom_ = nullptr; // (17, D_PAIR)
 };
 
 } // namespace rfaa

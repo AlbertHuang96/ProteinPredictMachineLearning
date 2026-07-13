@@ -24,9 +24,7 @@ IterBlock::IterBlock(const RFAAConfig& config, bool update_msa_pair)
     : config_(config), update_msa_pair_(update_msa_pair) {
     // 旧值初始化 (保留注释):
     // 所有 LinearLayer/LayerNorm 值成员已移除, 子模块现由 RFAAModel 创建后通过 set_sub_modules() 注入
-    
-    // 初始化 PositionalEncoding (无参数模块)
-    pos_enc_ = std::make_unique<PositionalEncoding>(-32, 32, 8, config.d_pair);
+    // pos_enc_ 由 RFAAModel 构造后通过 set_pos_enc() 注入
 }
 
 void IterBlock::proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state) {
@@ -984,11 +982,11 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
     AttnConfig pair_ac(config.d_pair, config.n_heads);
 
     auto push_msa_row = [&]() {
-        msa_row_Wq_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));        // 256→2048
-        msa_row_Wk_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_row_Wv_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_row_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));                // 128→8
-        msa_row_to_g_.push_back( LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_row_Wq_.push_back(    LinearLayer::create(D_MSA, N_HEAD * D_MSA));        // 256→2048
+        msa_row_Wk_.push_back(    LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_row_Wv_.push_back(    LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_row_to_b_.push_back(  LinearLayer::create(D_PAIR, N_HEAD));                // 128→8
+        msa_row_to_g_.push_back(  LinearLayer::create(D_MSA, N_HEAD * D_MSA));
         msa_row_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));        // 2048→256
     };
     auto push_msa_col = [&]() {
@@ -1122,6 +1120,11 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
             std::move(pair_row), std::move(pair_col), std::move(pair_ff),
             std::move(tri_out), std::move(tri_in), std::move(se3));
 
+        // PositionalEncoding (per block)
+        auto pos_enc = std::make_unique<PositionalEncoding>();
+        pos_enc->set_params(-32, 32, 8, config.d_pair, pos_enc_emb_res_[idx], pos_enc_emb_atom_[idx]);
+        block->set_pos_enc(std::move(pos_enc));
+
         // GlobalColAttention (FullBlock only)
         auto gcol = std::make_unique<MSAGlobalColAttention>();
         gcol->set_params(msa_ac,
@@ -1190,6 +1193,12 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
             std::move(msa_row), std::move(msa_col), std::move(msa_ff),
             std::move(pair_row), std::move(pair_col), std::move(pair_ff),
             std::move(tri_out), std::move(tri_in), std::move(se3));
+
+        // PositionalEncoding (per block)
+        auto pos_enc = std::make_unique<PositionalEncoding>();
+        pos_enc->set_params(-32, 32, 8, config.d_pair, pos_enc_emb_res_[idx], pos_enc_emb_atom_[idx]);
+        block->set_pos_enc(std::move(pos_enc));
+
         main_blocks_.push_back(std::move(block));
     }
 
@@ -1210,13 +1219,32 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         refine_blocks_.push_back(std::move(block));
     }
 
-    // ===== embedding 参数 =====
+    // ===== embedding / track / template 全局参数 =====
     // 旧栈上变量 (保留注释):
-    // BondEmbedding bond_embed(0, D_PAIR);
-    // FullEmbedding full_emb(NAATOKENS - 1 + 4, D_MSA_FULL);
+    // BondEmbedding bond_embed(0, D_PAIR); FullEmbedding full_emb(NAATOKENS-1+4, D_MSA_FULL);
+    // LinearLayer linear(feat_dim, dim_) in MSATrack
+    // EmbeddingLayer embedding(NAATOKENS, D_STATE) in StateTrack
+    // EmbeddingLayer emb_left/right(NAATOKENS, D_PAIR) in PairTrack
+    // LinearLayer emb_t1d(110,64) in StateTrack::inject_template
+    // LinearLayer t1d_proj(80,32) / LayerNorm(64) in PairTrack::templ_stack
     bond_emb_    = LinearLayer::create(8, D_PAIR);                                   // NBYTES → D_PAIR (128)
     full_linear_ = LinearLayer::create(NAATOKENS - 1 + 4, D_MSA_FULL);              // 83 → 64
     full_emb_    = EmbeddingLayer::create(NAATOKENS, D_MSA_FULL);                    // (80, 64)
+    msa_emb_              = LinearLayer::create(MSA_LATENT_DIM, D_MSA);              // 164 → 256
+    state_emb_            = EmbeddingLayer::create(NAATOKENS, D_STATE);              // (80, 32)
+    pair_left_emb_        = EmbeddingLayer::create(NAATOKENS, D_PAIR);              // (80, 128)
+    pair_right_emb_       = EmbeddingLayer::create(NAATOKENS, D_PAIR);              // (80, 128)
+    emb_t1d_              = LinearLayer::create(D_T1D + D_TOR, 64);                  // 110 → 64
+    proj_t1d_             = LinearLayer::create(64, 64);                             // 64 → 64
+    emb_t1d_t2d_          = LinearLayer::create(D_T1D * 2 + D_T2D, 64);             // 224 → 64
+    temp_stack_t1d_proj_  = LinearLayer::create(D_T1D, D_STATE);                    // 80 → 32
+    temp_stack_norm_      = LayerNorm::create(64);                                   // 64
+
+    // ===== PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer) =====
+    for (int i = 0; i < N_ITER; ++i) {
+        pos_enc_emb_res_.push_back(EmbeddingLayer::create(65, D_PAIR));     // (65, 128)  residue dist
+        pos_enc_emb_atom_.push_back(EmbeddingLayer::create(17, D_PAIR));    // (17, 128)  atom bond dist
+    }
 }
 
 RFAAModel::~RFAAModel() = default;
@@ -1239,15 +1267,17 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     pair_track_ = std::make_unique<PairTrack>(L, config_.d_pair, device_);
     state_track_ = std::make_unique<StateTrack>(L, config_.d_state, device_);
     
-    // the msa cluster embed was contained in the three track init functions below
-    // Embedding
-    msa_track_->init_from_features(input.msa_latent);
-    state_track_->init_from_embedding(input.seq_tokens);
-
-    // pair track need to be initialized as well
-    // pair track 从 seq_tokens 初始化 (left, right)
-    // (B, L)
-    pair_track_->init_from_embedding(input.seq_tokens, input.seq_tokens, input.bond_feats, input.dist_matrix);
+    // 旧: msa_track_->init_from_features(input.msa_latent); → 用 msa_emb_ 直接投影
+    msa_track_->repr() = msa_emb_->forward(input.msa_latent);                               // (B,N,L,164→256)
+    // 旧: state_track_->init_from_embedding(input.seq_tokens); → 用 state_emb_
+    state_track_->repr() = state_emb_->forward_exec(input.seq_tokens);                        // (B,L)→(B,L,32)
+    // 旧: pair_track_->init_from_embedding(...); → 用 pair_left_emb_/pair_right_emb_
+    {
+        auto left  = pair_left_emb_->forward_exec(input.seq_tokens).unsqueeze(1);            // (B,1,L,128)
+        auto right = pair_right_emb_->forward_exec(input.seq_tokens).unsqueeze(2);           // (B,L,1,128)
+        pair_track_->repr() = outer_sum(left, right);                                        // (B,L,L,128)
+        // PositionalEncoding 在 IterBlock::forward 中由 pos_enc_ 处理
+    }
 
     // msa full embed?
     // msa_full = self.full_emb(msa_full, seq, idx)
@@ -1281,12 +1311,39 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // cross attention need to reshape
     // state cross attention and pair cross attention
     if (input.t1d.numel() > 0) {
-        state_track_->inject_template(input.t1d, input.tor_feat);
-        //(B, T, L, L, 64)
-        TensorF32 templ_pair = get_templ_emb(input.t1d, input.t2d);
-        // template pair stack
-        pair_track_->templ_stack(templ_pair, rbf_feature, input.t1d);
-        pair_track_->inject_template(templ_pair);
+        // 旧: state_track_->inject_template(input.t1d, input.tor_feat);
+        // 旧栈上: LinearLayer emb_t1d(110,64), proj_t1d(64,64) → 用 emb_t1d_/proj_t1d_
+        {
+            TensorF32 t1d_tor = concat(input.t1d, input.tor_feat, -1);                // (B,T,L,110)
+            TensorF32 t1d_emb = emb_t1d_->forward(t1d_tor);                            // (B,T,L,64)
+            t1d_emb = proj_t1d_->forward(relu(t1d_emb));                               // (B,T,L,64)
+            // Cross-attention: state as Q, template as K/V
+            int B = t1d_emb.shape().dims[0], T = t1d_emb.shape().dims[1];
+            auto state_q = state_track_->representation().view({B * L, 1, D_STATE});
+            auto t1d_kv = t1d_emb.permute({0, 2, 1, 3}).view({B * L, T, 64});
+            SelfAttention cross_attn(D_STATE, 64, 8);
+            auto out = cross_attn.forward(state_q, t1d_kv, t1d_kv);
+            state_track_->repr() = state_track_->representation() + out.view({B, L, D_STATE});
+        }
+        TensorF32 templ_pair = get_templ_emb(input.t1d, input.t2d);  // (B,T,L,L,64)
+        // 旧: pair_track_->templ_stack(templ_pair, rbf_feature, input.t1d);
+        // 旧栈上: LinearLayer t1d_proj(80,32), LayerNorm(64), TemplatePairStack
+        {
+            int T = templ_pair.shape().dims[1];
+            TensorF32 t1d_2d = input.t1d;
+            t1d_2d.reshape({B*T, L, D_T1D});                                   // (B*T, L, 80)
+            templ_pair.reshape({B*T, L, L, 64});                                // (B*T, L, L, 64)
+            // 旧栈上: LinearLayer t1d_proj(D_T1D, D_STATE) → temp_stack_t1d_proj_
+            TensorF32 state_proj = temp_stack_t1d_proj_->forward(t1d_2d);      // (B*T, L, 32)
+            for (int k = 0; k < 2; ++k) {
+                TemplatePairStack tps;  // TODO: section 1.9 pointer 化
+                templ_pair = tps.forward(templ_pair, rbf_feature, state_proj);
+            }
+            // 旧栈上: LayerNorm layernorm(64) → temp_stack_norm_
+            templ_pair = temp_stack_norm_->forward(templ_pair);                 // (B*T, L, L, 64)
+            templ_pair.reshape({B, T, L, L, 64});
+            pair_track_->inject_template(templ_pair);
+        }
     }
     
     // 获取初始表示
@@ -1379,8 +1436,8 @@ TensorF32 RFAAModel::get_templ_emb(const TensorF32& t1d, const TensorF32& t2d) {
     TensorF32 templ = concat(templ_list, -1);
     // dim of templ is (B, T, L, L, d_t1d*2 + d_t2d) = (B, T, L, L, 224)
     // d_templ = 64
-    LinearLayer emb(D_T1D * 2 + D_T2D, 64);
-    return emb.forward(templ);
+    // 旧栈上变量: LinearLayer emb(D_T1D * 2 + D_T2D, 64); → emb_t1d_t2d_
+    return emb_t1d_t2d_->forward(templ);
     // (B, T, L, L, 64)
 }
 

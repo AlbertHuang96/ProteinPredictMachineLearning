@@ -89,6 +89,8 @@ public:
         tri_mul_in_    = std::move(tri_in);
         se3_           = std::move(se3);
     }
+
+    void set_pos_enc(std::unique_ptr<PositionalEncoding> p) { pos_enc_ = std::move(p); }
     
     // 执行一个迭代块
     // 输入/输出通过引用修改
@@ -369,6 +371,10 @@ private:
     std::vector<LinearLayer*> tri_in_gate_;
     std::vector<LayerNorm*>   tri_in_output_layernorm_;
     std::vector<LinearLayer*> tri_in_out_proj_;
+
+    // --- PositionalEncoding (2 EmbeddingLayer ×12, per block) ---
+    std::vector<EmbeddingLayer*> pos_enc_emb_res_;   // [0..11] (65, D_PAIR=128)  residue dist embedding
+    std::vector<EmbeddingLayer*> pos_enc_emb_atom_;  // [0..11] (17, D_PAIR=128)  atom bond dist embedding
 
     // ===== 3D SE 参数 (per-block, 由 RFAAModel::create 统一创建后将指针注入 block) =====
 
