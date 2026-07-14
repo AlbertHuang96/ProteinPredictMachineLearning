@@ -203,6 +203,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
             // TODO
             // update msa query row with state from SE3 output
+            // state → msa[:,0] 已在 Step 1 (msa2msa) 完成，无需重复
 
             // a problem: tensor reshape?
             // MSA Row Attention with bias
@@ -515,6 +516,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
 
         // TODO
         // update msa query row with state from SE3 output
+        // DONE already update in the msa2msa
 
         // a problem: tensor reshape?
         // MSA Row Attention with bias
@@ -570,6 +572,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         // d_hidden_gate = 16
         gate = pair2pair_gate_proj_->forward(gate);  // (B,L,L,128)
         gate = sigmoid(gate);  // (B,L,L,128) -> (B,L,L,128) gate values between 0 and 1
+        // need to modify?
         rbf_feature = rbf_feature * gate;  // element-wise multiplication, inject the rbf feature into pair with gate control
             
         Dropout drop_row2(1, 0.15);
@@ -1268,14 +1271,14 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     state_track_ = std::make_unique<StateTrack>(L, config_.d_state, device_);
     
     // 旧: msa_track_->init_from_features(input.msa_latent); → 用 msa_emb_ 直接投影
-    msa_track_->repr() = msa_emb_->forward(input.msa_latent);                               // (B,N,L,164→256)
+    msa_track_->representation() = msa_emb_->forward(input.msa_latent);                               // (B,N,L,164→256)
     // 旧: state_track_->init_from_embedding(input.seq_tokens); → 用 state_emb_
-    state_track_->repr() = state_emb_->forward_exec(input.seq_tokens);                        // (B,L)→(B,L,32)
+    state_track_->representation() = state_emb_->forward_exec(input.seq_tokens);                        // (B,L)→(B,L,32)
     // 旧: pair_track_->init_from_embedding(...); → 用 pair_left_emb_/pair_right_emb_
     {
         auto left  = pair_left_emb_->forward_exec(input.seq_tokens).unsqueeze(1);            // (B,1,L,128)
         auto right = pair_right_emb_->forward_exec(input.seq_tokens).unsqueeze(2);           // (B,L,1,128)
-        pair_track_->repr() = outer_sum(left, right);                                        // (B,L,L,128)
+        pair_track_->representation() = outer_sum(left, right);                                        // (B,L,L,128)
         // PositionalEncoding 在 IterBlock::forward 中由 pos_enc_ 处理
     }
 
@@ -1323,7 +1326,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
             auto t1d_kv = t1d_emb.permute({0, 2, 1, 3}).view({B * L, T, 64});
             SelfAttention cross_attn(D_STATE, 64, 8);
             auto out = cross_attn.forward(state_q, t1d_kv, t1d_kv);
-            state_track_->repr() = state_track_->representation() + out.view({B, L, D_STATE});
+            state_track_->representation() = state_track_->representation() + out.view({B, L, D_STATE});
         }
         TensorF32 templ_pair = get_templ_emb(input.t1d, input.t2d);  // (B,T,L,L,64)
         // 旧: pair_track_->templ_stack(templ_pair, rbf_feature, input.t1d);
