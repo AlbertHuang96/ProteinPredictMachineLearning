@@ -228,6 +228,12 @@ void ComputeGraph::build_backward_expand(
                     ignore_src[0] = true;
                 }
             } break;
+            case OP_NORM: {
+                // norm 节点的 src[0] 需要梯度，OP_NORM_BACK 将在 backward 时处理
+            } break;
+            case OP_NORM_BACK: {
+                // OP_NORM_BACK 由 compute_backward 主动构造，不在此标记 ignore
+            } break;
  
             // gradients in node->src[1] for one reason or another have no effect on output gradients
             case OP_CPY:           // gradients in CPY target are irrelevant
@@ -415,6 +421,28 @@ void ComputeGraph::compute_backward(
                             src0,               // [n,m,q1,r1]
                             transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
+            }
+        } break;
+        case OP_NORM: {
+            // forward: y = (x - mean) / std, 缓存了 mean(src[1]) 和 rstd(src[2])
+            // backward:
+            //   dL_dx = rstd/D * (D * dL_dy - sum(dL_dy) - y * sum(dL_dy * y))
+            if (src0_needs_grads) {
+                int D    = src0->shape().dims.back();
+                int rows = src0->numel() / D;
+
+                // 构造 OP_NORM_BACK 节点
+                int64_t dx_dims[] = {rows, D};  // 2D shape
+                TensorF32 * dx = context().new_tensor<float>(2, dx_dims);
+                dx->op     = OP_NORM_BACK;
+                dx->src[0] = grad;              // dL_dy
+                dx->src[1] = tensor->src[0];    // x (原始输入)
+                dx->src[2] = tensor->src[1];    // mean 缓存
+                dx->src[3] = tensor->src[2];    // rstd 缓存
+                reinterpret_cast<int&>(dx->op_params[0]) = D;
+                reinterpret_cast<int&>(dx->op_params[1]) = rows;
+
+                add_or_set(ctx, cgraph, isrc0, dx);
             }
         } break;
         case OP_NONE: {

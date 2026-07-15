@@ -209,10 +209,19 @@ TensorF32* rms_norm(TensorF32* a, float eps = 1e-6f) {
 
 // norm(a, eps) — Layer Normalization 沿最后一维
 TensorF32* norm(TensorF32* a, float eps = 1e-5f) {
-    Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    int D = a->shape().dims.back();
+    int rows = a->numel() / D;
+
+    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
     result->op     = OP_NORM;
     result->src[0] = a;
-    //result->op_params[0] = reinterpret_cast<int32_t&>(eps);
+    reinterpret_cast<float&>(result->op_params[0]) = eps;
+
+    // 分配 mean / rstd 缓存 (rows 个 float, 供 backward 读取)
+    int64_t cache_dims[] = {rows};
+    result->src[1] = context().new_tensor<float>(1, cache_dims);  // mean buffer
+    result->src[2] = context().new_tensor<float>(1, cache_dims);  // rstd buffer
+
     return result;
 }
 

@@ -19,6 +19,7 @@ namespace rfaa {
 class Backend;
 class CPUBackend;
 struct RFAAContext;
+struct ThreadPool;
 template<typename T> class Tensor;
 using TensorF32 = Tensor<float>;
 
@@ -297,7 +298,9 @@ private:
     static void kernel_elemwise(Tensor * node, ComputeParams * p);
     static void kernel_mul_mat (Tensor * node, ComputeParams * p);
     static void kernel_softmax (Tensor * node, ComputeParams * p);
-    static void kernel_rms_norm(Tensor * node, ComputeParams * p);
+    static void kernel_rms_norm (Tensor * node, ComputeParams * p);
+    static void kernel_norm     (Tensor * node, ComputeParams * p);
+    static void kernel_norm_back(Tensor * node, ComputeParams * p);
     static void kernel_silu    (Tensor * node);
     static void kernel_gelu    (Tensor * node);
     static void kernel_relu    (Tensor * node);
@@ -314,6 +317,53 @@ private:
     ThreadPool * threadpool_ = nullptr;
     uint8_t    * work_data_  = nullptr;
     size_t       work_size_  = 0;
+};
+
+// ==================== CUDABackend ====================
+
+class CUDABackend : public Backend {
+public:
+    CUDABackend(int device_id = 0);
+    ~CUDABackend() override;
+
+    const char * name() const override { return "CUDA"; }
+
+    Status init() override;
+    Status graph_compute(ComputeGraph * cgraph, ComputePlan * plan) override;
+    bool   supports_op(enum tensor_op op) override;
+    bool   supports_buftype(int /* buft */) override { return false; }
+
+    // 设备端 buffer 分配
+    BufferType buffer_type() const override { return BufferType::CUDA; }
+    Tensor * buffer_new(size_t nbytes);
+
+private:
+    int device_id_ = 0;
+
+    // CUDA dispatch
+    static Status dispatch_node(Tensor * node, ComputeParams * p);
+
+    // CUDA kernels
+    // elemwise op
+    static void kernel_elemwise_add_cuda(Tensor * node, ComputeParams * p);
+
+    static void kernel_mul_mat_cuda (Tensor * node, ComputeParams * p);
+    static void kernel_softmax_cuda (Tensor * node, ComputeParams * p);
+    static void kernel_norm_cuda     (Tensor * node, ComputeParams * p);
+    static void kernel_norm_back_cuda(Tensor * node, ComputeParams * p);
+    static void kernel_dup_cuda      (Tensor * node);
+    static void kernel_scale_cuda    (Tensor * node, ComputeParams * p);
+    static void kernel_add1_cuda     (Tensor * node, ComputeParams * p);
+    static void kernel_sum_cuda      (Tensor * node, ComputeParams * p);
+    static void kernel_mean_cuda     (Tensor * node, ComputeParams * p);
+
+    // CUDA unary kernels
+    static void kernel_relu_cuda   (Tensor * node);
+    static void kernel_gelu_cuda   (Tensor * node);
+    static void kernel_sigmoid_cuda(Tensor * node);
+    static void kernel_silu_cuda   (Tensor * node);
+    static void kernel_tanh_cuda   (Tensor * node);
+    static void kernel_exp_cuda    (Tensor * node);
 };
 
 } // namespace rfaa

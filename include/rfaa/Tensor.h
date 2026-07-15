@@ -65,6 +65,7 @@ enum tensor_op {
     OP_CONCAT,
     OP_SILU_BACK,
     OP_NORM, // normalize
+    OP_NORM_BACK,
     OP_RMS_NORM,
     OP_RMS_NORM_BACK,
     OP_GROUP_NORM,

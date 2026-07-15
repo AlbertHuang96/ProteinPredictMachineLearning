@@ -202,6 +202,7 @@ namespace rfaa {
     TensorF32* LayerNorm::forward(TensorF32* x) {
         // y = norm(x) * gamma + beta
         // rms_norm
+        // norm() = OP_NORM we use for layer norm
         TensorF32* normed = norm(x, eps_);  // or norm() for layernorm
         //Tensor* scaled = mul_mat(normed, gamma_);
         TensorF32* scaled = out_prod(normed, gamma_);

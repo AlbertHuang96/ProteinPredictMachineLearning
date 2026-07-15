@@ -42,6 +42,8 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_MUL_MAT:   kernel_mul_mat(node, p);  break;
         case OP_SOFT_MAX:  kernel_softmax(node, p);  break;
         case OP_RMS_NORM:  kernel_rms_norm(node, p); break;
+        case OP_NORM:      kernel_norm(node, p);     break;
+        case OP_NORM_BACK: kernel_norm_back(node, p); break;
         case OP_SUM:    kernel_sum(node, p);         break;
         case OP_MEAN:   kernel_mean(node, p);        break;
         case OP_UNARY:  {
@@ -193,6 +195,89 @@ void CPUBackend::kernel_rms_norm(Tensor * node, ComputeParams * p) {
         for (int d = 0; d < D; d++) ss += sr[d] * sr[d];
         float inv = 1.0f / sqrtf(ss / D + eps);
         for (int d = 0; d < D; d++) dr[d] = sr[d] * inv;
+    }
+}
+
+// layer norm (OP_NORM) kernel implementation
+void CPUBackend::kernel_norm(Tensor * node, ComputeParams * p) {
+    int D    = static_cast<int>(node->dims()[0]);
+    int rows = static_cast<int>(node->numel() / D);
+    int per  = (rows + p->nth - 1) / p->nth;
+    int start = p->ith * per, end = std::min(start + per, rows);
+    float * src = node->src[0]->data(), * dst = node->data();
+    float eps   = reinterpret_cast<float&>(node->op_params[0]);
+    float * mean_buf = node->src[1] ? node->src[1]->data() : nullptr;
+    float * rstd_buf = node->src[2] ? node->src[2]->data() : nullptr;
+
+    for (int r = start; r < end; r++) {
+        float * sr = src + r * D, * dr = dst + r * D;
+        float mean = 0.0f;
+        for (int d = 0; d < D; d++) mean += sr[d];
+        mean /= D;
+
+        float var = 0.0f;
+        for (int d = 0; d < D; d++) {
+            float diff = sr[d] - mean;
+            var += diff * diff;
+        }
+        var /= D;
+
+        float inv_std = 1.0f / sqrtf(var + eps);
+        for (int d = 0; d < D; d++) dr[d] = (sr[d] - mean) * inv_std;
+
+        // int rows = a->numel() / D;
+        // r = start, end 
+        // range check?
+        // cache for backward
+        if (mean_buf) mean_buf[r] = mean;
+        if (rstd_buf) rstd_buf[r] = inv_std;
+    }
+}
+
+// layer norm backward (OP_NORM_BACK) kernel
+void CPUBackend::kernel_norm_back(Tensor * node, ComputeParams * p) {
+    // dL_dx = rstd/D * (D * dL_dy - sum(dL_dy) - y_norm * sum(dL_dy * y_norm))
+    // src[0] = dL_dy (upstream gradient, aka dout)
+    // src[1] = x     (original input, aka inp)
+    // src[2] = mean  (cached during forward)
+    // src[3] = rstd  (cached during forward)
+    int C    = reinterpret_cast<int&>(node->op_params[0]);   // feature dim
+    int rows = reinterpret_cast<int&>(node->op_params[1]);   // batch * seq
+
+    float * dout = node->src[0]->data();   // dL_dy
+    float * inp  = node->src[1]->data();   // x (原始输入)
+    float * mean = node->src[2]->data();
+    float * rstd = node->src[3]->data();
+    float * dinp = node->data();           // dL_dx
+
+    for (int t = 0; t < rows; t++) {
+        // 定位 dout / inp / dinp
+        float * dout_bt  = dout + t * C;
+        float * inp_bt   = inp  + t * C;
+        float * dinp_bt  = dinp + t * C;
+        float   mean_bt  = mean[t];
+        float   rstd_bt  = rstd[t];
+
+        // norm_bt[i] = (inp[i] - mean_bt) * rstd_bt
+        // dnorm[i] = dout[i] (无 weight 的 layer norm)
+        float dnorm_mean      = 0.0f;
+        float dnorm_norm_mean = 0.0f;
+        for (int i = 0; i < C; i++) {
+            float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i  = dout_bt[i];
+            dnorm_mean      += dnorm_i;
+            dnorm_norm_mean += dnorm_i * norm_bti;
+        }
+        dnorm_mean      /= C;
+        dnorm_norm_mean /= C;
+
+        for (int i = 0; i < C; i++) {
+            float norm_bti = (inp_bt[i] - mean_bt) * rstd_bt;
+            float dnorm_i  = dout_bt[i];
+            // dinp = (dnorm - dnorm_mean - norm_bti * dnorm_norm_mean) * rstd_bt
+            float dval = dnorm_i - dnorm_mean - norm_bti * dnorm_norm_mean;
+            dinp_bt[i] = dval * rstd_bt;
+        }
     }
 }
 
