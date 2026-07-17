@@ -17,6 +17,10 @@ extern void layernorm_backward_cuda(
     int B, int T, int C, int block_size);
 
 extern void elementwise_add_cuda(float * A, float * B, float * C, int N, int block_size);
+extern void elementwise_sub_cuda(float * A, float * B, float * C, int N, int block_size);
+extern void elementwise_mul_cuda(float * A, float * B, float * C, int N, int block_size);
+extern void elementwise_div_cuda(float * A, float * B, float * C, int N, int block_size);
+extern void softmax_cuda(float * input, float * output, int M, int N, int block_size);
 
 // ============================================================
 // CUDABackend::dispatch_node
@@ -27,10 +31,16 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_NONE:   break;
 
         case OP_ADD:
-        case OP_SUB:
-        case OP_MUL:
-        case OP_DIV:
             kernel_elemwise_add_cuda(node, p);
+            break;
+        case OP_SUB:
+            kernel_elemwise_sub_cuda(node, p);
+            break;
+        case OP_MUL:
+            kernel_elemwise_mul_cuda(node, p);
+            break;
+        case OP_DIV:
+            kernel_elemwise_div_cuda(node, p);
             break;
 
         case OP_ADD1:
@@ -65,6 +75,7 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
         } break;
 
         case OP_NORM_BACK:
+        // layer norm backward
             kernel_norm_back_cuda(node, p);
             break;
 
@@ -113,13 +124,35 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
 // ============================================================
 
 void CUDABackend::kernel_elemwise_add_cuda(Tensor * node, ComputeParams * p) {
-    // A = src[0], B = src[1], C = dst
     int N = static_cast<int>(node->numel());
     float * A = node->src[0]->data();
     float * B = node->src[1]->data();
     float * C = node->data();
-    // block_size = 256
     elementwise_add_cuda(A, B, C, N, 256);
+}
+
+void CUDABackend::kernel_elemwise_sub_cuda(Tensor * node, ComputeParams * p) {
+    int N = static_cast<int>(node->numel());
+    float * A = node->src[0]->data();
+    float * B = node->src[1]->data();
+    float * C = node->data();
+    elementwise_sub_cuda(A, B, C, N, 256);
+}
+
+void CUDABackend::kernel_elemwise_mul_cuda(Tensor * node, ComputeParams * p) {
+    int N = static_cast<int>(node->numel());
+    float * A = node->src[0]->data();
+    float * B = node->src[1]->data();
+    float * C = node->data();
+    elementwise_mul_cuda(A, B, C, N, 256);
+}
+
+void CUDABackend::kernel_elemwise_div_cuda(Tensor * node, ComputeParams * p) {
+    int N = static_cast<int>(node->numel());
+    float * A = node->src[0]->data();
+    float * B = node->src[1]->data();
+    float * C = node->data();
+    elementwise_div_cuda(A, B, C, N, 256);
 }
 
 void CUDABackend::kernel_mul_mat_cuda(Tensor * node, ComputeParams * p) {
@@ -127,7 +160,13 @@ void CUDABackend::kernel_mul_mat_cuda(Tensor * node, ComputeParams * p) {
 }
 
 void CUDABackend::kernel_softmax_cuda(Tensor * node, ComputeParams * p) {
-    p->threadpool->ec = Status::NOT_SUPPORTED;
+    // node shape: (M, N) — M rows, N classes per row
+    int N = static_cast<int>(node->dims()[0]);
+    int M = static_cast<int>(node->numel() / N);
+    float * input  = node->src[0]->data();
+    float * output = node->data();
+    // block size = 256
+    softmax_cuda(input, output, M, N, 256);
 }
 
 void CUDABackend::kernel_norm_back_cuda(Tensor * node, ComputeParams * p) {

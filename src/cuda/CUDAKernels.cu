@@ -140,10 +140,9 @@ void layernorm_backward_cuda(
 }
 
 // ============================================================
-// Element-wise Add CUDA Kernel
+// Element-wise Ops CUDA Kernels (add / sub / mul / div)
 // ============================================================
 
-// llama.cpp
 __global__ void elementwise_add_kernel(float * A, float * B, float * C, int N) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid < N) {
@@ -151,9 +150,110 @@ __global__ void elementwise_add_kernel(float * A, float * B, float * C, int N) {
     }
 }
 
+__global__ void elementwise_sub_kernel(float * A, float * B, float * C, int N) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < N) {
+        C[tid] = A[tid] - B[tid];
+    }
+}
+
+__global__ void elementwise_mul_kernel(float * A, float * B, float * C, int N) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < N) {
+        C[tid] = A[tid] * B[tid];
+    }
+}
+
+__global__ void elementwise_div_kernel(float * A, float * B, float * C, int N) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid < N) {
+        C[tid] = A[tid] / B[tid];
+    }
+}
+
 void elementwise_add_cuda(float * A, float * B, float * C, int N, int block_size) {
     int grid_size = ceil_div(N, block_size);
     elementwise_add_kernel<<<grid_size, block_size>>>(A, B, C, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void elementwise_sub_cuda(float * A, float * B, float * C, int N, int block_size) {
+    int grid_size = ceil_div(N, block_size);
+    elementwise_sub_kernel<<<grid_size, block_size>>>(A, B, C, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void elementwise_mul_cuda(float * A, float * B, float * C, int N, int block_size) {
+    int grid_size = ceil_div(N, block_size);
+    elementwise_mul_kernel<<<grid_size, block_size>>>(A, B, C, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void elementwise_div_cuda(float * A, float * B, float * C, int N, int block_size) {
+    int grid_size = ceil_div(N, block_size);
+    elementwise_div_kernel<<<grid_size, block_size>>>(A, B, C, N);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// Softmax CUDA Kernel (一个 Block 处理一行)
+// ============================================================
+
+__global__ void softmax_v1_kernel(float * input, float * output, int M, int N) {
+    extern __shared__ float smem[];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    float * x = input  + row * N;
+    float * y = output + row * N;
+
+    // Pass 1: 并行求最大值
+    float max_val = -INFINITY;
+    for (int i = tid; i < N; i += blockDim.x) {
+        max_val = fmaxf(max_val, x[i]);
+    }
+    smem[tid] = max_val;
+    __syncthreads();
+
+    // Shared Memory 规约求全局最大值
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] = fmaxf(smem[tid], smem[tid + s]);
+        }
+        __syncthreads();
+    }
+    max_val = smem[0];
+    __syncthreads();
+
+    // Pass 2: 并行求指数和
+    float sum = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) {
+        sum += expf(x[i] - max_val);
+    }
+    smem[tid] = sum;
+    __syncthreads();
+
+    // Shared Memory 规约求总和
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+        }
+        __syncthreads();
+    }
+    sum = smem[0];
+    __syncthreads();
+
+    // Pass 3: 归一化写出
+    float inv_sum = 1.0f / sum;
+    for (int i = tid; i < N; i += blockDim.x) {
+        y[i] = expf(x[i] - max_val) * inv_sum;
+    }
+}
+
+void softmax_cuda(float * input, float * output, int M, int N, int block_size) {
+    int smem_size = block_size * sizeof(float);
+    softmax_v1_kernel<<<M, block_size, smem_size>>>(input, output, M, N);
     cudaCheck(cudaGetLastError());
 }
 

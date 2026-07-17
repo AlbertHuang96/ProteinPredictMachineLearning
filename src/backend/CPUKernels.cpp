@@ -40,7 +40,9 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_ADD1:   kernel_add1(node, p);        break;
         case OP_SCALE:  kernel_scale(node, p);       break;
         case OP_MUL_MAT:   kernel_mul_mat(node, p);  break;
+        // online softmax
         case OP_SOFT_MAX:  kernel_softmax(node, p);  break;
+        // softmax backward
         case OP_RMS_NORM:  kernel_rms_norm(node, p); break;
         case OP_NORM:      kernel_norm(node, p);     break;
         case OP_NORM_BACK: kernel_norm_back(node, p); break;

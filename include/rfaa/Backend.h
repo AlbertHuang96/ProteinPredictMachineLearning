@@ -346,6 +346,9 @@ private:
     // CUDA kernels
     // elemwise op
     static void kernel_elemwise_add_cuda(Tensor * node, ComputeParams * p);
+    static void kernel_elemwise_sub_cuda(Tensor * node, ComputeParams * p);
+    static void kernel_elemwise_mul_cuda(Tensor * node, ComputeParams * p);
+    static void kernel_elemwise_div_cuda(Tensor * node, ComputeParams * p);
 
     static void kernel_mul_mat_cuda (Tensor * node, ComputeParams * p);
     static void kernel_softmax_cuda (Tensor * node, ComputeParams * p);
