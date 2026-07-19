@@ -196,12 +196,19 @@ TensorF32* diag_mask_zero(TensorF32* a, int n_past);
 TensorF32* clamp(TensorF32* a, float min_val, float max_val);
 TensorF32* sqr  (TensorF32* a);
 TensorF32* sqrt (TensorF32* a);
+TensorF32* abs  (TensorF32* a);
 TensorF32* log  (TensorF32* a);
 TensorF32* sin  (TensorF32* a);
 TensorF32* cos  (TensorF32* a);
 
 // 9. 损失
 TensorF32* cross_entropy_loss(TensorF32* logits, TensorF32* targets);
+TensorF32* torsion_angle_loss(TensorF32* pred, TensorF32* gt, TensorF32* chi_mask);
+TensorF32* angle_norm_loss(TensorF32* unnormed, TensorF32* seq_mask, float eps = 1e-6f);
+TensorF32* supervised_chi_loss(
+    TensorF32* unnormed, TensorF32* gt,
+    TensorF32* chi_mask,  TensorF32* seq_mask,
+    float chi_weight = 1.0f, float angle_norm_weight = 0.01f);
 
 // 10. 位置编码
 TensorF32* rope(TensorF32* a, int n_past, int n_dims = 0);

@@ -457,6 +457,15 @@ TensorF32* sqrt(TensorF32* a) {
     return result;
 }
 
+// abs(a) — 绝对值 |a|
+TensorF32* abs(TensorF32* a) {
+    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    result->op     = OP_UNARY;
+    result->src[0] = a;
+    set_unary_op(result, UNARY_OP_ABS);
+    return result;
+}
+
 // log(a) — 自然对数
 TensorF32* log(TensorF32* a) {
     TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
@@ -484,6 +493,9 @@ TensorF32* cos(TensorF32* a) {
 // 9. 损失函数
 // ============================================================
 
+// 前向声明（make_scalar 定义在文件末尾）
+static TensorF32* make_scalar(float value);
+
 // cross_entropy_loss(logits, targets) — 交叉熵损失
 TensorF32* cross_entropy_loss(TensorF32* logits, TensorF32* targets) {
     int64_t ne[1] = {1};
@@ -492,6 +504,68 @@ TensorF32* cross_entropy_loss(TensorF32* logits, TensorF32* targets) {
     result->src[0] = logits;
     result->src[1] = targets;
     return result;
+}
+
+// torsion_angle_loss(pred, gt, chi_mask) — 二面角损失 (Algorithm 27)
+// 输入: pred [N, 7, 2] (sin,cos 预测), gt [N, 7, 2] (真值), chi_mask [N, 7]
+// 输出: scalar loss
+TensorF32* torsion_angle_loss(TensorF32* pred, TensorF32* gt, TensorF32* chi_mask) {
+    float eps = 1e-8f;
+
+    // Step 1: normalize pred to unit circle: pred_n = pred / sqrt(sum(pred², dim=-1))
+    auto sq_sum = sum_rows(sqr(pred));       // [N, 7]
+    auto r      = sqrt(sq_sum);              // [N, 7]
+    auto pred_n = div(pred, r);              // [N, 7, 2] broadcast
+
+    // Step 2: squared difference in (sin,cos) space
+    auto diff    = sub(pred_n, gt);           // [N, 7, 2]
+    auto sq_diff = sum_rows(sqr(diff));       // [N, 7]
+
+    // Step 3: masked mean
+    auto masked = mul(sq_diff, chi_mask);     // [N, 7]
+    auto loss   = div(sum(masked), add1_impl(sum(chi_mask), make_scalar(eps)));
+
+    return loss;
+}
+
+// angle_norm_loss(unnormed, seq_mask) — 角度模长正则化惩罚
+// 输入: unnormed [N, 7, 2], seq_mask [N, 1] (broadcast → [N, 7])
+// 输出: scalar loss
+TensorF32* angle_norm_loss(TensorF32* unnormed, TensorF32* seq_mask, float eps) {
+    // Step 1: angle_norm = sqrt(sum(unnormed², dim=-1) + eps)
+    auto sq     = sqr(unnormed);              // [N, 7, 2]
+    auto sum_sq = sum_rows(sq);               // [N, 7]
+    auto norm   = sqrt(add1_impl(sum_sq, make_scalar(eps))); // [N, 7]
+
+    // Step 2: norm_error = abs(norm - 1.0)
+    auto ones   = repeat(make_scalar(1.0f), norm); // broadcast 1.0 → [N, 7]
+    auto err    = abs(sub(norm, ones));        // [N, 7]
+
+    // Step 3: masked mean
+    auto masked = mul(err, seq_mask);          // [N, 7] broadcast
+    auto loss   = div(sum(masked), add1_impl(sum(seq_mask), make_scalar(eps)));
+
+    return loss;
+}
+
+// supervised_chi_loss(unnormed, gt, chi_mask, seq_mask, chi_weight, angle_norm_weight)
+// — 完整版 chi 角监督损失 (Jumper et al. 2021 Suppl. Alg. 27)
+// 输入: unnormed [N, 7, 2], gt [N, 7, 2], chi_mask [N, 7], seq_mask [N, 1]
+//       chi_weight, angle_norm_weight (标量)
+// 输出: scalar total_loss
+TensorF32* supervised_chi_loss(
+    TensorF32* unnormed, TensorF32* gt,
+    TensorF32* chi_mask,  TensorF32* seq_mask,
+    float chi_weight, float angle_norm_weight)
+{
+    auto chi_loss  = torsion_angle_loss(unnormed, gt, chi_mask);
+    auto norm_loss = angle_norm_loss(unnormed, seq_mask);
+
+    auto weighted_chi  = scale(chi_loss,  chi_weight);
+    auto weighted_norm = scale(norm_loss, angle_norm_weight);
+    auto total         = add_impl(weighted_chi, weighted_norm);
+
+    return total;
 }
 
 // ============================================================

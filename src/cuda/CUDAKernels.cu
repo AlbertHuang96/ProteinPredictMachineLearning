@@ -257,4 +257,100 @@ void softmax_cuda(float * input, float * output, int M, int N, int block_size) {
     cudaCheck(cudaGetLastError());
 }
 
+// ============================================================
+// Softmax V2 CUDA Kernel (Warp Shuffle 两级规约)
+// ============================================================
+
+__device__ float warpReduceMax(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffff, val, offset));
+    }
+    return val;
+}
+
+__device__ float warpReduceSum(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+__device__ float blockReduceMaxShuffle(float val, float * smem) {
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid  = tid >> 5;
+
+    // 第一步：Warp 内规约
+    val = warpReduceMax(val);
+
+    // 第二步：各 warp 的 lane 0 写入共享内存
+    if (lane == 0) smem[wid] = val;
+    __syncthreads();
+
+    // 第三步：Warp 0 从共享内存读取所有 warp 结果，再做一次 warp 内规约
+    int num_warps = blockDim.x / 32;
+    val = (lane < num_warps) ? smem[lane] : -INFINITY;
+    if (wid == 0) val = warpReduceMax(val);
+
+    return val;
+}
+
+__device__ float blockReduceSumShuffle(float val, float * smem) {
+    int tid = threadIdx.x;
+    int lane = tid & 31;
+    int wid  = tid >> 5;
+
+    // 第一步：Warp 内规约
+    val = warpReduceSum(val);
+
+    // 第二步：各 warp 的 lane 0 写入共享内存
+    if (lane == 0) smem[wid] = val;
+    __syncthreads();
+
+    // 第三步：Warp 0 从共享内存读取所有 warp 结果，再做一次 warp 内规约
+    int num_warps = blockDim.x / 32;
+    val = (lane < num_warps) ? smem[lane] : 0.0f;
+    if (wid == 0) val = warpReduceSum(val);
+
+    return val;
+}
+
+__global__ void softmax_v2_kernel(float * input, float * output, int M, int N) {
+    extern __shared__ float smem[];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    float * x = input  + row * N;
+    float * y = output + row * N;
+
+    // Pass 1: 并行求行最大值
+    float max_val = -INFINITY;
+    for (int i = tid; i < N; i += blockDim.x) {
+        max_val = fmaxf(max_val, x[i]);
+    }
+    max_val = blockReduceMaxShuffle(max_val, smem);
+
+    // Pass 2: 并行求指数和
+    float sum = 0.0f;
+    for (int i = tid; i < N; i += blockDim.x) {
+        sum += expf(x[i] - max_val);
+    }
+    sum = blockReduceSumShuffle(sum, smem);
+
+    // Pass 3: 归一化写出
+    float inv_sum = 1.0f / sum;
+    for (int i = tid; i < N; i += blockDim.x) {
+        y[i] = expf(x[i] - max_val) * inv_sum;
+    }
+}
+
+void softmax_v2_cuda(float * input, float * output, int M, int N, int block_size) {
+    // smem 只需存储 num_warps 个 float（每 warp 一个）
+    int num_warps = block_size / 32;
+    int smem_size = num_warps * sizeof(float);
+    softmax_v2_kernel<<<M, block_size, smem_size>>>(input, output, M, N);
+    cudaCheck(cudaGetLastError());
+}
+
 } // namespace rfaa
