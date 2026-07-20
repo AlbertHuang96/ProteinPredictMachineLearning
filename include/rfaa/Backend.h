@@ -298,6 +298,7 @@ private:
     static void kernel_elemwise(Tensor * node, ComputeParams * p);
     static void kernel_mul_mat (Tensor * node, ComputeParams * p);
     static void kernel_softmax (Tensor * node, ComputeParams * p);
+    static void kernel_softmax_back(Tensor * node, ComputeParams * p);
     static void kernel_rms_norm (Tensor * node, ComputeParams * p);
     static void kernel_norm     (Tensor * node, ComputeParams * p);
     static void kernel_norm_back(Tensor * node, ComputeParams * p);
@@ -352,6 +353,7 @@ private:
 
     static void kernel_mul_mat_cuda (Tensor * node, ComputeParams * p);
     static void kernel_softmax_cuda (Tensor * node, ComputeParams * p);
+    static void kernel_softmax_back_cuda(Tensor * node, ComputeParams * p);
     static void kernel_norm_cuda     (Tensor * node, ComputeParams * p);
     static void kernel_norm_back_cuda(Tensor * node, ComputeParams * p);
     static void kernel_dup_cuda      (Tensor * node);

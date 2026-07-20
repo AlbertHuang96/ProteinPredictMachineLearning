@@ -21,6 +21,9 @@ extern void elementwise_sub_cuda(float * A, float * B, float * C, int N, int blo
 extern void elementwise_mul_cuda(float * A, float * B, float * C, int N, int block_size);
 extern void elementwise_div_cuda(float * A, float * B, float * C, int N, int block_size);
 extern void softmax_cuda(float * input, float * output, int M, int N, int block_size);
+extern void softmax_backward_cuda(
+    const float * grad, const float * output, float * dst,
+    int M, int N, int block_size, float scale);
 
 // ============================================================
 // CUDABackend::dispatch_node
@@ -57,6 +60,10 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
 
         case OP_SOFT_MAX:
             kernel_softmax_cuda(node, p);
+            break;
+
+        case OP_SOFT_MAX_BACK:
+            kernel_softmax_back_cuda(node, p);
             break;
 
         case OP_NORM: {
@@ -167,6 +174,18 @@ void CUDABackend::kernel_softmax_cuda(Tensor * node, ComputeParams * p) {
     float * output = node->data();
     // block size = 256
     softmax_cuda(input, output, M, N, 256);
+}
+
+void CUDABackend::kernel_softmax_back_cuda(Tensor * node, ComputeParams * p) {
+    // src[0] = grad (upstream gradient dL/dy)
+    // src[1] = output (softmax forward output y)
+    int N = static_cast<int>(node->dims()[0]);
+    int M = static_cast<int>(node->numel() / N);
+    const float * grad   = node->src[0]->data();
+    const float * output = node->src[1]->data();
+    float *       dst    = node->data();
+    // scale = 1.0f (standard softmax backward, no scaling)
+    softmax_backward_cuda(grad, output, dst, M, N, 256, 1.0f);
 }
 
 void CUDABackend::kernel_norm_back_cuda(Tensor * node, ComputeParams * p) {

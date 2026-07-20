@@ -423,6 +423,25 @@ void ComputeGraph::compute_backward(
                                 grad)));        // [m,p,qq,rr]
             }
         } break;
+        case OP_SOFT_MAX: {
+            // forward: y = softmax(x), 沿最后一维
+            // backward: dL/dx_i = y_i * (dL/dy_i - sum_j(y_j * dL/dy_j))
+            if (src0_needs_grads) {
+                int D    = src0->shape().dims.back();
+                int rows = src0->numel() / D;
+
+                // 构造 OP_SOFT_MAX_BACK 节点
+                int64_t dx_dims[] = {rows, D};
+                TensorF32 * dx = context().new_tensor<float>(2, dx_dims);
+                dx->op     = OP_SOFT_MAX_BACK;
+                dx->src[0] = grad;             // dL/dy (upstream gradient)
+                dx->src[1] = tensor;           // y (forward output = softmax(x))
+                reinterpret_cast<int&>(dx->op_params[0]) = D;
+                reinterpret_cast<int&>(dx->op_params[1]) = rows;
+
+                add_or_set(ctx, cgraph, isrc0, dx);
+            }
+        } break;
         case OP_NORM: {
             // forward: y = (x - mean) / std, 缓存了 mean(src[1]) 和 rstd(src[2])
             // backward:

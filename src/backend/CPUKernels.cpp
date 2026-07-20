@@ -42,7 +42,7 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_MUL_MAT:   kernel_mul_mat(node, p);  break;
         // online softmax
         case OP_SOFT_MAX:  kernel_softmax(node, p);  break;
-        // softmax backward
+        case OP_SOFT_MAX_BACK: kernel_softmax_back(node, p); break;
         case OP_RMS_NORM:  kernel_rms_norm(node, p); break;
         case OP_NORM:      kernel_norm(node, p);     break;
         case OP_NORM_BACK: kernel_norm_back(node, p); break;
@@ -279,6 +279,40 @@ void CPUBackend::kernel_norm_back(Tensor * node, ComputeParams * p) {
             // dinp = (dnorm - dnorm_mean - norm_bti * dnorm_norm_mean) * rstd_bt
             float dval = dnorm_i - dnorm_mean - norm_bti * dnorm_norm_mean;
             dinp_bt[i] = dval * rstd_bt;
+        }
+    }
+}
+
+// softmax backward (OP_SOFT_MAX_BACK) kernel
+void CPUBackend::kernel_softmax_back(Tensor * node, ComputeParams * p) {
+    // dL/dx_i = y_i * (dL/dy_i - sum_j(y_j * dL/dy_j))
+    // src[0] = dL/dy (upstream gradient)
+    // src[1] = y     (softmax forward output)
+    int D    = reinterpret_cast<int&>(node->op_params[0]);
+    int rows = reinterpret_cast<int&>(node->op_params[1]);
+
+    int per   = (rows + p->nth - 1) / p->nth;
+    int start = p->ith * per;
+    int end   = std::min(start + per, rows);
+
+    const float * grad   = node->src[0]->data();
+    const float * output = node->src[1]->data();
+    float *       dst    = node->data();
+
+    for (int r = start; r < end; r++) {
+        const float * gr = grad   + r * D;
+        const float * yr = output + r * D;
+        float *       dr = dst    + r * D;
+
+        // Step 1: compute sum_j(y_j * dL/dy_j)
+        float dgf_dot = 0.0f;
+        for (int d = 0; d < D; d++) {
+            dgf_dot += yr[d] * gr[d];
+        }
+
+        // Step 2: dL/dx_i = y_i * (dL/dy_i - dgf_dot)
+        for (int d = 0; d < D; d++) {
+            dr[d] = yr[d] * (gr[d] - dgf_dot);
         }
     }
 }

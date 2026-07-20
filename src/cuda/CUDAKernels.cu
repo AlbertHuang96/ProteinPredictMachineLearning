@@ -1,5 +1,6 @@
 #include <cuda_runtime.h>
 #include <cmath>
+#include <cstdint>
 
 namespace rfaa {
 
@@ -350,6 +351,44 @@ void softmax_v2_cuda(float * input, float * output, int M, int N, int block_size
     int num_warps = block_size / 32;
     int smem_size = num_warps * sizeof(float);
     softmax_v2_kernel<<<M, block_size, smem_size>>>(input, output, M, N);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// Softmax Backward CUDA Kernel (Warp Shuffle 两级规约)
+// ============================================================
+
+__global__ void softmax_backward_kernel(
+    const float * grad, const float * output, float * dst, int M, int N, float scale) {
+
+    extern __shared__ float smem[];
+
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+
+    grad   += int64_t(row) * N;
+    output += int64_t(row) * N;
+    dst    += int64_t(row) * N;
+
+    // Step 1: 计算 sum(y_j * dL/dy_j) — 梯度在概率上的加权和
+    float dgf_dot = 0.0f;
+    for (int col = tid; col < N; col += blockDim.x) {
+        dgf_dot += output[col] * grad[col];
+    }
+    dgf_dot = blockReduceSumShuffle(dgf_dot, smem);
+
+    // Step 2: dL/dx_i = scale * (grad[i] - dgf_dot) * output[i]
+    for (int col = tid; col < N; col += blockDim.x) {
+        dst[col] = scale * (grad[col] - dgf_dot) * output[col];
+    }
+}
+
+void softmax_backward_cuda(
+    const float * grad, const float * output, float * dst, int M, int N, int block_size, float scale) {
+
+    int num_warps = block_size / 32;
+    int smem_size = num_warps * sizeof(float);
+    softmax_backward_kernel<<<M, block_size, smem_size>>>(grad, output, dst, M, N, scale);
     cudaCheck(cudaGetLastError());
 }
 

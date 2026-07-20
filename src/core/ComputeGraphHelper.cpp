@@ -149,6 +149,18 @@ TensorF32* softmax(TensorF32* a) {
     return result;
 }
 
+// softmax_backward(grad, output) — softmax 反向传播
+// grad: dL/dy (upstream gradient)
+// output: y = softmax(x) (forward output)
+// returns: dL/dx
+TensorF32* softmax_backward(TensorF32* grad, TensorF32* output) {
+    TensorF32* result = context().new_tensor(output->ndim(), output->shape().dims.data());
+    result->op     = OP_SOFT_MAX_BACK;
+    result->src[0] = grad;
+    result->src[1] = output;
+    return result;
+}
+
 // silu(a) — SiLU / Swish 激活
 TensorF32* silu(TensorF32* a) {
     Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());

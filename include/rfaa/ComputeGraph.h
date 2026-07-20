@@ -162,6 +162,7 @@ TensorF32* transpose(TensorF32* a);
 
 // 3. 激活
 TensorF32* softmax(TensorF32* a);
+TensorF32* softmax_backward(TensorF32* grad, TensorF32* output);
 TensorF32* silu   (TensorF32* a);
 TensorF32* gelu   (TensorF32* a);
 TensorF32* relu   (TensorF32* a);
