@@ -20,6 +20,11 @@ set(CORE_SOURCES
     ../src/ops/MathUtils.cpp
     ../src/ops/Dropout.cpp
     ../src/model/PositionalEncoding.cpp
+    ../src/data/DataLoader.cpp
+    ../src/data/AtomFrame.cpp
+    ../src/data/FAPE.cpp
+    ../src/data/DistogramBins.cpp
+    ../src/data/LDDT.cpp
 )
 
 # 静态库 (内部使用)

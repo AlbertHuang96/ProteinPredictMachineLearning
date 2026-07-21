@@ -580,6 +580,166 @@ TensorF32* supervised_chi_loss(
     return total;
 }
 
+// masked_msa_loss(logits, true_msa, bert_mask) — BERT-style MSA 掩码预测损失
+// 对应 Jumper et al. (2021) Suppl. Sec. 1.9.9 "Masked MSA prediction"
+// 输入: logits [N_seq, N_res, 23] (unnormalized log probabilities)
+//       true_msa [N_seq, N_res] (float-encoded int32 ground-truth aatype indices)
+//       bert_mask [N_seq, N_res] (1.0 at masked positions, 0.0 elsewhere)
+// 输出: scalar loss = sum(CE * bert_mask) / (sum(bert_mask) + eps)
+//
+// 流程 (用图节点分解):
+//   Step 1: softmax + log → log_softmax [N_seq, N_res, 23]
+//   Step 2: one_hot(true_msa, 23) → labels [N_seq, N_res, 23]
+//   Step 3: weighted = labels * log_softmax, then CE = -sum_rows(weighted) → [N_seq, N_res]
+//   Step 4: masked_CE = CE * bert_mask
+//   Step 5: loss = sum(masked_CE) / (sum(bert_mask) + 1e-8)
+TensorF32* masked_msa_loss(TensorF32* logits, TensorF32* true_msa, TensorF32* bert_mask) {
+    float eps = 1e-8f;
+
+    // Step 1: log_softmax = log(softmax(logits)) → [N_seq, N_res, 23]
+    auto lsm = log(softmax(logits));
+
+    // Step 2: one_hot(true_msa, 23) → [N_seq, N_res, 23]
+    // one_hot_seq 接受 const TensorF32& (值类型), 此处解引用指针
+    auto labels = one_hot_seq(*true_msa, 23);
+
+    // Step 3: CE per-position = -sum(labels * log_softmax, dim=-1) → [N_seq, N_res]
+    auto weighted = mul(labels, lsm);       // [N_seq, N_res, 23]
+    auto ce       = neg(sum_rows(weighted)); // [N_seq, N_res]
+
+    // Step 4: 应用 bert_mask
+    auto masked_ce = mul(ce, bert_mask);    // [N_seq, N_res]
+
+    // Step 5: 归一化标量 loss
+    auto sum_masked = sum(masked_ce);
+    auto sum_mask   = sum(bert_mask);
+    auto denom      = add1_impl(sum_mask, make_scalar(eps));
+    auto loss_val   = div(sum_masked, denom);
+
+    return loss_val;
+}
+
+one-hot labels 和 logits 由调用者在外部准备：
+
+//logits_* 由 4 个 Linear(pair_feat, N_bins) 产生
+//*_onehot 由外部 binning 函数从坐标计算（非均匀距离 binning + 均匀角度 binning
+//pair_mask 由 seq_mask ⊗ seq_mask 产生mul(unsqueeze(m, 1), unsqueeze(m, 0))
+
+// distogram_loss(pair_feat, coords, pair_mask) — 4-项 inter-residue 2D 结构预测损失
+// 对应 RFAA Section 2.5.4 "Distogram Loss", 基于 AF2 distogram 的通用化版本
+//
+// 输入:
+//   logits_dist [L, L, 60] — 距离直方图 logits (Linear投影自 pair features)
+//   logits_ω    [L, L, 36] — Ω 二面角直方图 logits
+//   logits_θ    [L, L, 36] — Θ 二面角直方图 logits
+//   logits_ϕ    [L, L, 18] — Φ 平面角直方图 logits
+//   D_onehot    [L, L, 60] — 距离 one-hot ground-truth (非均匀 binning)
+//   Ω_onehot    [L, L, 36] — Ω one-hot ground-truth
+//   Θ_onehot    [L, L, 36] — Θ one-hot ground-truth
+//   Φ_onehot    [L, L, 18] — Φ one-hot ground-truth
+//   pair_mask   [L, L]     — pair 有效性 mask
+//
+// 输出: scalar loss = CE_dist + CE_ω + CE_θ + CE_ϕ
+//
+// 每个 CE 实现:
+//   log_softmax = log(softmax(logits))
+//   CE = -sum(label_onehot * log_softmax, dim=-1)  → [L, L]
+//   masked_CE = CE * pair_mask
+//   loss = sum(masked_CE) / (sum(pair_mask) + eps)
+TensorF32* distogram_loss(
+    TensorF32* logits_dist, TensorF32* logits_ω,
+    TensorF32* logits_θ,    TensorF32* logits_ϕ,
+    TensorF32* D_onehot,    TensorF32* Ω_onehot,
+    TensorF32* Θ_onehot,    TensorF32* Φ_onehot,
+    TensorF32* pair_mask)
+{
+    float eps = 1e-8f;
+
+    // ================================================================
+    // 辅助 lambda: 单通道 cross-entropy (logits, label_onehot, mask) → scalar
+    // CE = sum(-label * log_softmax * mask) / (sum(mask) + eps)
+    // ================================================================
+    auto ce_channel = [&](TensorF32* logits, TensorF32* label_oh, TensorF32* mask) -> TensorF32* {
+        auto lsm     = log(softmax(logits));            // log_softmax
+        auto weighted = mul(label_oh, lsm);              // label * log_softmax
+        auto ce_per  = neg(sum_rows(weighted));          // -sum over last dim → [L, L]
+        auto masked  = mul(ce_per, mask);                // apply pair mask
+        auto sum_ce  = sum(masked);                      // scalar sum
+        auto sum_m   = sum(mask);                        // mask sum
+        auto denom   = add1_impl(sum_m, make_scalar(eps));
+        return div(sum_ce, denom);
+    };
+
+    // ================================================================
+    // 4 个 CE loss 分量
+    // ================================================================
+    auto loss_dist = ce_channel(logits_dist, D_onehot, pair_mask);  // 距离 (60 bins)
+    auto loss_ω    = ce_channel(logits_ω,    Ω_onehot, pair_mask);  // Ω (36 bins)
+    auto loss_θ    = ce_channel(logits_θ,    Θ_onehot, pair_mask);  // Θ (36 bins)
+    auto loss_ϕ    = ce_channel(logits_ϕ,    Φ_onehot, pair_mask);  // Φ (18 bins)
+
+    // 总损失 = 四者之和
+    auto loss_2d = add_impl(add_impl(loss_dist, loss_ω),
+                            add_impl(loss_θ,  loss_ϕ));
+
+    return loss_2d;
+}
+
+// total_loss(...) — 组合总损失 = 0.5*FAPE + 0.5*Chi + 0.3*Distogram + 2.0*MSA + 0.01*Conf
+// 最后一项 L_conf 尚未实现，暂不参与计算
+TensorF32* total_loss(
+    TensorF32* loss_fape,
+    TensorF32* loss_chi,
+    TensorF32* loss_distogram,
+    TensorF32* loss_msa)
+{
+    // 权重
+    const float w_fape      = 0.5f;
+    const float w_chi       = 0.5f;
+    const float w_distogram = 0.3f;
+    const float w_msa       = 2.0f;
+    // const float w_conf = 0.01f;  // TODO: 待 L_conf 实现后加入
+
+    auto w_fape_node      = scale(loss_fape,      w_fape);
+    auto w_chi_node       = scale(loss_chi,       w_chi);
+    auto w_distogram_node = scale(loss_distogram, w_distogram);
+    auto w_msa_node       = scale(loss_msa,       w_msa);
+
+    // 逐项累加
+    auto total = add_impl(add_impl(w_fape_node, w_chi_node),
+                          add_impl(w_distogram_node, w_msa_node));
+
+    return total;
+}
+
+// plddt_loss(logits, lddt_onehot, ca_mask) — pLDDT 置信度预测损失
+// 对应 Jumper et al. (2021) Suppl. Alg. 29 "predictPerResidueLDDT_Ca"
+// 输入:
+//   logits       [N_res, num_bins=50] — PredictedLDDTHead 输出
+//   lddt_onehot  [N_res, 50]          — ground-truth LDDT one-hot labels
+//   ca_mask      [N_res]              — CA 原子有效性 mask
+// 输出:
+//   scalar loss = sum(CE * ca_mask) / (sum(ca_mask) + eps)
+TensorF32* plddt_loss(TensorF32* logits, TensorF32* lddt_onehot, TensorF32* ca_mask) {
+    float eps = 1e-8f;
+
+    // Step 1: log_softmax
+    auto lsm = log(softmax(logits));                 // [N_res, 50]
+
+    // Step 2: CE per-residue = -sum(label * log_softmax, dim=-1) → [N_res]
+    auto weighted = mul(lddt_onehot, lsm);            // [N_res, 50]
+    auto ce       = neg(sum_rows(weighted));          // [N_res]
+
+    // Step 3: apply ca_mask and normalize
+    auto masked = mul(ce, ca_mask);                   // [N_res]
+    auto sum_ce = sum(masked);
+    auto sum_m  = sum(ca_mask);
+    auto denom  = add1_impl(sum_m, make_scalar(eps));
+    auto loss   = div(sum_ce, denom);
+
+    return loss;
+}
+
 // ============================================================
 // 10. 位置编码
 // ============================================================
@@ -676,7 +836,7 @@ TensorF32* loss(TensorF32* a) {
 TensorF32* arange(float start, float end, float step = 1.0f) {
     int64_t n = static_cast<int64_t>((end - start) / step + 0.5f);
     int64_t ne[1] = {n};
-    Tensor* result = context().new_tensor(1, ne);
+    TensorF32* result = context().new_tensor(1, ne);
     result->op     = OP_ARANGE;
     //result->op_params[0] = reinterpret_cast<int32_t&>(start);
     //result->op_params[1] = reinterpret_cast<int32_t&>(end);
