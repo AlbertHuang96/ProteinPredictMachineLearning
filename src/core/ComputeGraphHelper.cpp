@@ -691,23 +691,26 @@ TensorF32* total_loss(
     TensorF32* loss_fape,
     TensorF32* loss_chi,
     TensorF32* loss_distogram,
-    TensorF32* loss_msa)
+    TensorF32* loss_msa,
+    TensorF32* loss_conf
+    )
 {
     // 权重
     const float w_fape      = 0.5f;
     const float w_chi       = 0.5f;
     const float w_distogram = 0.3f;
     const float w_msa       = 2.0f;
-    // const float w_conf = 0.01f;  // TODO: 待 L_conf 实现后加入
+    const float w_conf = 0.01f;  // TODO: 待 L_conf 实现后加入
 
     auto w_fape_node      = scale(loss_fape,      w_fape);
     auto w_chi_node       = scale(loss_chi,       w_chi);
     auto w_distogram_node = scale(loss_distogram, w_distogram);
     auto w_msa_node       = scale(loss_msa,       w_msa);
-
-    // 逐项累加
-    auto total = add_impl(add_impl(w_fape_node, w_chi_node),
-                          add_impl(w_distogram_node, w_msa_node));
+    auto w_conf_node      = scale(loss_conf,      w_conf);
+    // 逐项累加: (fape+chi) + (distogram+msa) + conf
+    auto ab = add_impl(w_fape_node,      w_chi_node);
+    auto cd = add_impl(w_distogram_node, w_msa_node);
+    auto total = add_impl(add_impl(ab, cd), w_conf_node);
 
     return total;
 }

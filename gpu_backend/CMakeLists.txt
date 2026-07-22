@@ -2,6 +2,7 @@
 
 set(GPU_SOURCES
     ../src/cuda/CudaTensor.cu
+    ../src/cuda/CUDAKernels.cu
     ../src/cuda/AttentionKernel.cu
     ../src/cuda/SE3Kernel.cu
     ../src/cuda/MathKernel.cu

@@ -386,7 +386,7 @@ void ComputeGraph::compute_backward(
                 assert(grad->Shape().dims[2] == src1->Shape().dims[2]);
                 assert(grad->Shape().dims[3] == src1->Shape().dims[3]);
                 TensorF32 * tmp =
-                    ggml_out_prod(ctx, // [n,m,qq,rr]
+                    out_prod(ctx, // [n,m,qq,rr]
                         src1,          // [n,p,qq,rr]
                         grad);         // [m,p,qq,rr]
                 if (!tmp->same_shape(src0)) {
@@ -397,9 +397,9 @@ void ComputeGraph::compute_backward(
                     assert(tmp->Shape().dims[1] == src0->Shape().dims[1]);
                     assert(tmp->Shape().dims[3] == 1);
  
-                    const int64_t nr2 = tmp->Shape().dims[2] / src0->Shape().dims[2];
-                    const size_t nb2 = tmp->nb[2] * nr2;
-                    const size_t nb3 = tmp->nb[2];
+                    //const int64_t nr2 = tmp->Shape().dims[2] / src0->Shape().dims[2];
+                    //const size_t nb2 = tmp->nb[2] * nr2;
+                    //const size_t nb3 = tmp->nb[2];
  
                     //tmp = ggml_view_4d(ctx, tmp, src0->Shape().dims[0], src0->Shape().dims[1], src0->Shape().dims[2], nr2, tmp->nb[1], nb2, nb3, 0);
                     tmp = repeat_back(ctx, tmp, src0);

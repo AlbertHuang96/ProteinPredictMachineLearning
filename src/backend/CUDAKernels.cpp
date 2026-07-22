@@ -25,6 +25,8 @@ extern void softmax_backward_cuda(
     const float * grad, const float * output, float * dst,
     int M, int N, int block_size, float scale);
 
+extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
+
 // ============================================================
 // CUDABackend::dispatch_node
 // ============================================================
@@ -162,8 +164,22 @@ void CUDABackend::kernel_elemwise_div_cuda(Tensor * node, ComputeParams * p) {
     elementwise_div_cuda(A, B, C, N, 256);
 }
 
+// doublecheck:
+//原始 kernel 假设 B 是标准 row-major B[K][N]，访问 B[r * N + c]。但 RFAA-Cpp 的 CPU 版本中 B 以转置形式存储：b[j * K + k]（即 B[N][K]）。
+//因此加载 Bs 时改为：
 void CUDABackend::kernel_mul_mat_cuda(Tensor * node, ComputeParams * p) {
-    p->threadpool->ec = Status::NOT_SUPPORTED;
+    // node->dims(): output shape (N, M)  → d is (M, N) stored row-major
+    // node->src[0]: A (M × K), row-major
+    // node->src[1]: B stored transposed as (N × K), i.e. B[j * K + k]
+    int M = static_cast<int>(node->dims()[1]);
+    int N = static_cast<int>(node->dims()[0]);
+    int K = static_cast<int>(node->src[0]->dims()[0]);
+
+    float * A = node->src[0]->data();
+    float * B = node->src[1]->data();
+    float * C = node->data();
+
+    mul_mat_cuda(A, B, C, M, K, N);
 }
 
 void CUDABackend::kernel_softmax_cuda(Tensor * node, ComputeParams * p) {
