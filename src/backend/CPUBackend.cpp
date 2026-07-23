@@ -34,7 +34,7 @@ bool CPUBackend::supports_op(TensorF32* node) const {
 
     switch (node->op) {
         case OP_CPY:
-        case OP_SET_ROWs:
+        case OP_SET_ROWS:
         // ggml IQ quantize
         // now only have F32
             return true;

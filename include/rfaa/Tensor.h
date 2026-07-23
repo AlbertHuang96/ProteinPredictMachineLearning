@@ -6,6 +6,10 @@
 
 namespace rfaa {
 
+// 前向声明 — 避免循环依赖
+class Buffer;
+class TensorAllocator;
+
 enum tensor_flag {
     TENSOR_FLAG_INPUT   = 1,
     TENSOR_FLAG_OUTPUT  = 2,
@@ -255,6 +259,11 @@ public:
     //src GGML_MAX_SRC
     std::vector<Tensor*> src;
 
+    // ==== buffer 分配相关 ====
+    Buffer*     buffer_      = nullptr;  // 所属的 backend buffer
+    Tensor<T>*  view_src     = nullptr;  // view tensor 的源 tensor
+    size_t      buffer_offs_ = 0;        // 在 buffer 中的偏移量
+
     
 private:
     Shape shape_;
@@ -264,6 +273,8 @@ private:
     
     void allocate();
     void deallocate();
+
+    friend class TensorAllocator;  // 允许 TensorAllocator 直接设置 data_/buffer_/own_data_
 };
 
 // 特化常用类型

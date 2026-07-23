@@ -82,24 +82,10 @@ TensorF32* neg(TensorF32* a) {
 // ============================================================
 
 // mul_mat(a, b) — 矩阵乘法 a @ b
-// a: (..., M, K), b: (..., K, N) → (..., M, N)
+// a: (M, K), b: (K, N) → (M, N)
 TensorF32* mul_mat(TensorF32* a, TensorF32* b) {
-    int64_t ne[4] = {b->shape().dims[0], a->shape().dims[1], 1, 1};
-    // 处理 batch 维度
-    int nd = std::max(a->ndim(), b->ndim());
-    if (nd >= 3) {
-        ne[2] = std::max(
-            (a->ndim() >= 3) ? a->shape().dims[2] : 1,
-            (b->ndim() >= 3) ? b->shape().dims[2] : 1
-        );
-    }
-    if (nd >= 4) {
-        ne[3] = std::max(
-            (a->ndim() >= 4) ? a->shape().dims[3] : 1,
-            (b->ndim() >= 4) ? b->shape().dims[3] : 1
-        );
-    }
-    TensorF32* result = context().new_tensor(nd, ne);
+    int64_t ne[2] = {b->shape().dims[0], a->shape().dims[1]};
+    TensorF32* result = context().new_tensor(2, ne);
 
     result->op     = OP_MUL_MAT;
     result->src[0] = a;

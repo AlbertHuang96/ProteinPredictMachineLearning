@@ -27,6 +27,12 @@ extern void softmax_backward_cuda(
 
 extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
 
+extern void out_prod_cuda(
+    const float* src0, const float* src1, float* dst,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+    int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3);
+
 // ============================================================
 // CUDABackend::dispatch_node
 // ============================================================
@@ -58,6 +64,10 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
 
         case OP_MUL_MAT:
             kernel_mul_mat_cuda(node, p);
+            break;
+
+        case OP_OUT_PROD:
+            kernel_out_prod_cuda(node, p);
             break;
 
         case OP_SOFT_MAX:
@@ -250,5 +260,39 @@ void CUDABackend::kernel_sigmoid_cuda(Tensor * node) {}
 void CUDABackend::kernel_silu_cuda(Tensor * node) {}
 void CUDABackend::kernel_tanh_cuda(Tensor * node) {}
 void CUDABackend::kernel_exp_cuda(Tensor * node) {}
+
+void CUDABackend::kernel_out_prod_cuda(Tensor * node, ComputeParams * p) {
+    const TensorF32* src0 = node->src[0];
+    const TensorF32* src1 = node->src[1];
+
+    const int64_t ne00 = src0->dims()[0];
+    const int64_t ne01 = src0->dims()[1];
+    const int64_t ne02 = (src0->shape().ndim() > 2) ? src0->dims()[2] : 1;
+    const int64_t ne03 = (src0->shape().ndim() > 3) ? src0->dims()[3] : 1;
+
+    const int64_t ne10 = src1->dims()[0];
+    const int64_t ne11 = src1->dims()[1];
+    const int64_t ne12 = (src1->shape().ndim() > 2) ? src1->dims()[2] : 1;
+    const int64_t ne13 = (src1->shape().ndim() > 3) ? src1->dims()[3] : 1;
+
+    const int64_t ne0 = node->dims()[0];
+    const int64_t ne1 = node->dims()[1];
+    const int64_t ne2 = (node->shape().ndim() > 2) ? node->dims()[2] : 1;
+    const int64_t ne3 = (node->shape().ndim() > 3) ? node->dims()[3] : 1;
+
+    // GQA: ne2/ne02, ne3/ne03 暂不计算 dps 参数
+    // TODO: 后续实现 GQA 支持
+    // const int64_t dps2 = ne2 / ne02;
+    // const int64_t dps3 = ne3 / ne03;
+
+    // 先将 dst 清零（对标 CPU 版 thread 0 的清零逻辑）
+    cudaMemset(node->data(), 0, node->nbytes());
+
+    out_prod_cuda(
+        src0->data(), src1->data(), node->data(),
+        ne00, ne01, ne02, ne03,
+        ne10, ne11, ne12, ne13,
+        ne0,  ne1,  ne2,  ne3);
+}
 
 } // namespace rfaa

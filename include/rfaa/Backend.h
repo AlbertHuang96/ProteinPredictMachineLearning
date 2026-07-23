@@ -8,6 +8,7 @@
 #include <vector>
 #include <unordered_map>
 #include "ComputeGraph.h"
+#include "Context.h"
 
 static constexpr int SOFT_MAX_UNROLL = 32;  // SIMD unroll
 
@@ -96,9 +97,9 @@ private:
 
 // Buffer
 enum class BufferUsage {
-    WEIGHTS = 0;
-    COMPUTE = 1;
-    STORAGE = 2;
+    WEIGHTS = 0,
+    COMPUTE = 1,
+    STORAGE = 2,
 };
 
 // buffer type ggml_backend_buffer_type_t
@@ -117,7 +118,7 @@ public:
 
     virtual bool is_host() const { return false; }
     virtual ~BufferType() = default;
-}
+};
 
 // ggml_backend_buffer
 class  Buffer {
@@ -156,13 +157,158 @@ public:
         std::memset(data(), value, size_);
     }
 
+    // 对标 ggml_backend_buffer_set_usage
+    virtual void set_usage(BufferUsage usage) { usage_ = usage; }
+
 protected:
     BufferType* buft_  = nullptr;
     size_t      size_  = 0;
     BufferUsage usage_ = BufferUsage::COMPUTE;
+};
 
-}
+// ============================================================
+// DefaultBuffer — 通用 buffer 实现（对标 ggml_backend_buffer）
+// ============================================================
+class DefaultBuffer : public Buffer {
+public:
+    DefaultBuffer(BufferType* buft, size_t size, BufferUsage usage = BufferUsage::COMPUTE)
+        : Buffer(buft, size, usage) {
+        if (size > 0) {
+            ptr_ = static_cast<uint8_t*>(buft->alloc(size));
+            if (!ptr_) {
+                throw RFAAError("DefaultBuffer: allocation failed");
+            }
+            own_ptr_ = true;
+        }
+    }
 
+    // 外部已有内存的包装
+    DefaultBuffer(BufferType* buft, size_t size, void* external_ptr,
+                  BufferUsage usage = BufferUsage::COMPUTE)
+        : Buffer(buft, size, usage), ptr_(static_cast<uint8_t*>(external_ptr)), own_ptr_(false) {}
+
+    ~DefaultBuffer() override {
+        if (own_ptr_ && ptr_ && buft_) {
+            buft_->free(ptr_);
+        }
+    }
+
+    void* data() override { return ptr_; }
+
+private:
+    uint8_t* ptr_     = nullptr;
+    bool     own_ptr_ = true;
+};
+
+// ============================================================
+// MultiBuffer — 将多个 buffer 包装为一个（对标 ggml_backend_multi_buffer）
+// ============================================================
+class MultiBuffer : public Buffer {
+public:
+    explicit MultiBuffer(std::vector<Buffer*>&& buffers)
+        : Buffer(nullptr, 0, BufferUsage::COMPUTE) {
+        buffers_ = std::move(buffers);
+        for (auto* b : buffers_) {
+            size_ += b->size();
+        }
+    }
+
+    ~MultiBuffer() override {
+        for (auto* b : buffers_) delete b;
+    }
+
+    void* data() override { return buffers_.empty() ? nullptr : buffers_[0]->data(); }
+
+    // 对标 ggml_backend_multi_buffer_clear
+    void clear(uint8_t value) override {
+        for (auto* b : buffers_) {
+            b->clear(value);
+        }
+    }
+
+    // 对标 ggml_backend_multi_buffer_set_usage
+    void set_usage(BufferUsage usage) {
+        usage_ = usage;
+        for (auto* b : buffers_) {
+            b->set_usage(usage);
+        }
+    }
+
+    Buffer* get_buffer(int i) { return (i >= 0 && i < (int)buffers_.size()) ? buffers_[i] : nullptr; }
+    int     n_buffers() const { return (int)buffers_.size(); }
+
+private:
+    std::vector<Buffer*> buffers_;
+};
+
+// ============================================================
+// TensorAllocator — 对标 ggml_tallocr
+// 在单个 buffer 内按顺序切分空间给各个 tensor
+// ============================================================
+class TensorAllocator {
+public:
+    explicit TensorAllocator(Buffer* buffer)
+        : buffer_(buffer)
+        , base_(static_cast<uint8_t*>(buffer->data()))
+        , offset_(0)
+        , alignment_(buffer->type() ? buffer->type()->get_alignment() : 32) {}
+
+    // 从 buffer 中为 tensor 分配空间，返回是否成功
+    bool alloc(TensorF32* tensor) {
+        size_t alloc_size = buffer_->type()
+            ? buffer_->type()->get_alloc_size(tensor)
+            : tensor->nbytes();
+
+        // 对齐
+        size_t aligned_size   = GGML_PAD(alloc_size, alignment_);
+        size_t aligned_offset = GGML_PAD(offset_, alignment_);
+
+        if (aligned_offset + aligned_size > buffer_->size()) {
+            return false;  // buffer 空间不足
+        }
+
+        tensor->data_        = reinterpret_cast<float*>(base_ + aligned_offset);
+        tensor->buffer_      = buffer_;
+        tensor->buffer_offs_ = aligned_offset;
+        tensor->own_data_    = false;  // buffer 管理生命周期
+
+        offset_ = aligned_offset + aligned_size;
+        return true;
+    }
+
+    size_t offset() const { return offset_; }
+
+private:
+    Buffer*  buffer_;
+    uint8_t* base_;
+    size_t   offset_;
+    size_t   alignment_;
+};
+
+// ============================================================
+// 全局分配函数声明
+// ============================================================
+
+// 对标 ggml_backend_buft_alloc_buffer
+Buffer* alloc_buffer(BufferType* buft, size_t size, BufferUsage usage = BufferUsage::COMPUTE);
+
+// 对标 ggml_backend_alloc_ctx_tensors_from_buft
+// 将 graph 中所有 tensor 分配到 buft 类型的 buffer 中
+// no_alloc = true  时只计算 nbytes_total，不实际分配（阶段一）
+// no_alloc = false 时执行实际分配（阶段二）
+// 返回分配好的 buffer（可能是 DefaultBuffer 或 MultiBuffer），调用方负责释放
+Buffer* alloc_ctx_tensors_from_buft(
+    ComputeGraph* graph,
+    BufferType*   buft,
+    size_t*       nbytes_total,
+    bool          no_alloc);
+
+// 对标 ggml_backend_multi_buffer_alloc_buffer
+// 将已有的多个 buffer 包装为一个 MultiBuffer
+Buffer* alloc_multi_buffer(std::vector<Buffer*>& buffers);
+
+// 对标 ggml_backend_buffer_is_multi_buffer
+bool is_multi_buffer(const Buffer* buffer);
 
 // ==================== Backend (抽象基类) ====================
 
@@ -297,6 +443,7 @@ private:
     // ===== kernels (static: 无需 this, 仅操作张量数据) =====
     static void kernel_elemwise(Tensor * node, ComputeParams * p);
     static void kernel_mul_mat (Tensor * node, ComputeParams * p);
+    static void kernel_out_prod(Tensor * node, ComputeParams * p);
     static void kernel_softmax (Tensor * node, ComputeParams * p);
     static void kernel_softmax_back(Tensor * node, ComputeParams * p);
     static void kernel_rms_norm (Tensor * node, ComputeParams * p);
@@ -327,48 +474,48 @@ public:
     CUDABackend(int device_id = 0);
     ~CUDABackend() override;
 
-    const char * name() const override { return "CUDA"; }
+    const char * get_name() const override { return "CUDA"; }
+    Status       graph_compute(ComputeGraph * cgraph) override;
+    void         synchronize() override {}
 
-    Status init() override;
-    Status graph_compute(ComputeGraph * cgraph, ComputePlan * plan) override;
-    bool   supports_op(enum tensor_op op) override;
-    bool   supports_buftype(int /* buft */) override { return false; }
+    bool supports_op(TensorF32 * node) const override { return true; }
 
     // 设备端 buffer 分配
-    BufferType buffer_type() const override { return BufferType::CUDA; }
-    Tensor * buffer_new(size_t nbytes);
+    const BufferType* buffer_type() const override;
+
+    Buffer* buffer_new(size_t nbytes);
 
 private:
     int device_id_ = 0;
 
     // CUDA dispatch
-    static Status dispatch_node(Tensor * node, ComputeParams * p);
+    static Status dispatch_node(TensorF32 * node, ComputeParams * p);
 
     // CUDA kernels
-    // elemwise op
-    static void kernel_elemwise_add_cuda(Tensor * node, ComputeParams * p);
-    static void kernel_elemwise_sub_cuda(Tensor * node, ComputeParams * p);
-    static void kernel_elemwise_mul_cuda(Tensor * node, ComputeParams * p);
-    static void kernel_elemwise_div_cuda(Tensor * node, ComputeParams * p);
+    static void kernel_elemwise_add_cuda(TensorF32 * node, ComputeParams * p);
+    static void kernel_elemwise_sub_cuda(TensorF32 * node, ComputeParams * p);
+    static void kernel_elemwise_mul_cuda(TensorF32 * node, ComputeParams * p);
+    static void kernel_elemwise_div_cuda(TensorF32 * node, ComputeParams * p);
 
-    static void kernel_mul_mat_cuda (Tensor * node, ComputeParams * p);
-    static void kernel_softmax_cuda (Tensor * node, ComputeParams * p);
-    static void kernel_softmax_back_cuda(Tensor * node, ComputeParams * p);
-    static void kernel_norm_cuda     (Tensor * node, ComputeParams * p);
-    static void kernel_norm_back_cuda(Tensor * node, ComputeParams * p);
-    static void kernel_dup_cuda      (Tensor * node);
-    static void kernel_scale_cuda    (Tensor * node, ComputeParams * p);
-    static void kernel_add1_cuda     (Tensor * node, ComputeParams * p);
-    static void kernel_sum_cuda      (Tensor * node, ComputeParams * p);
-    static void kernel_mean_cuda     (Tensor * node, ComputeParams * p);
+    static void kernel_mul_mat_cuda (TensorF32 * node, ComputeParams * p);
+    static void kernel_out_prod_cuda(TensorF32 * node, ComputeParams * p);
+    static void kernel_softmax_cuda (TensorF32 * node, ComputeParams * p);
+    static void kernel_softmax_back_cuda(TensorF32 * node, ComputeParams * p);
+    static void kernel_norm_cuda     (TensorF32 * node, ComputeParams * p);
+    static void kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p);
+    static void kernel_dup_cuda      (TensorF32 * node);
+    static void kernel_scale_cuda    (TensorF32 * node, ComputeParams * p);
+    static void kernel_add1_cuda     (TensorF32 * node, ComputeParams * p);
+    static void kernel_sum_cuda      (TensorF32 * node, ComputeParams * p);
+    static void kernel_mean_cuda     (TensorF32 * node, ComputeParams * p);
 
     // CUDA unary kernels
-    static void kernel_relu_cuda   (Tensor * node);
-    static void kernel_gelu_cuda   (Tensor * node);
-    static void kernel_sigmoid_cuda(Tensor * node);
-    static void kernel_silu_cuda   (Tensor * node);
-    static void kernel_tanh_cuda   (Tensor * node);
-    static void kernel_exp_cuda    (Tensor * node);
+    static void kernel_relu_cuda   (TensorF32 * node);
+    static void kernel_gelu_cuda   (TensorF32 * node);
+    static void kernel_sigmoid_cuda(TensorF32 * node);
+    static void kernel_silu_cuda   (TensorF32 * node);
+    static void kernel_tanh_cuda   (TensorF32 * node);
+    static void kernel_exp_cuda    (TensorF32 * node);
 };
 
 } // namespace rfaa

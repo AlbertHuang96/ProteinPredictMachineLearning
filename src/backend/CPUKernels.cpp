@@ -40,6 +40,7 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_ADD1:   kernel_add1(node, p);        break;
         case OP_SCALE:  kernel_scale(node, p);       break;
         case OP_MUL_MAT:   kernel_mul_mat(node, p);  break;
+        case OP_OUT_PROD:  kernel_out_prod(node, p); break;
         // online softmax
         case OP_SOFT_MAX:  kernel_softmax(node, p);  break;
         case OP_SOFT_MAX_BACK: kernel_softmax_back(node, p); break;
@@ -145,6 +146,112 @@ void CPUBackend::kernel_mul_mat(Tensor * node, ComputeParams * p) {
             d[j + i * N] = sum;
         }
     }
+    tp->barrier_wait();
+}
+
+// ===== out_prod =====
+// 对标 ggml_compute_forward_out_prod_f32
+// 数学: dst[i0, i1, i2, i3] = sum_{i01} src0[i0, i01, i2, i3] * src1[i1, i01, i2, i3]
+// dst shape: (ne00, ne10, ne12, ne13)  — 实际就是 A @ B^T 在倒数第二维上收缩
+// 当前项目 4D 约定: dims = (ne0, ne1, ne2, ne3), ne0 是最内维
+void CPUBackend::kernel_out_prod(Tensor * node, ComputeParams * p) {
+    ThreadPool * tp = p->threadpool;
+
+    const Tensor * src0 = node->src[0];
+    const Tensor * src1 = node->src[1];
+
+    const int64_t ne00 = src0->dims()[0];  // src0 inner dim
+    const int64_t ne01 = src0->dims()[1];  // src0 K dim (contraction dim)
+    const int64_t ne02 = (src0->shape().ndim() > 2) ? src0->dims()[2] : 1;
+    const int64_t ne03 = (src0->shape().ndim() > 3) ? src0->dims()[3] : 1;
+
+    const int64_t ne10 = src1->dims()[0];  // src1 inner dim
+    const int64_t ne11 = src1->dims()[1];  // src1 K dim (contraction dim, == ne01)
+    const int64_t ne12 = (src1->shape().ndim() > 2) ? src1->dims()[2] : 1;
+    const int64_t ne13 = (src1->shape().ndim() > 3) ? src1->dims()[3] : 1;
+
+    // dst shape: (ne00, ne10, max(ne02,ne12), max(ne03,ne13))
+    const int64_t ne0 = node->dims()[0];  // == ne00
+    const int64_t ne1 = node->dims()[1];  // == ne10
+    const int64_t ne2 = (node->shape().ndim() > 2) ? node->dims()[2] : 1;
+    const int64_t ne3 = (node->shape().ndim() > 3) ? node->dims()[3] : 1;
+
+    float * src0_data = src0->data();
+    float * src1_data = src1->data();
+    float * dst_data  = node->data();
+
+    // ===== thread 0: 清零 dst =====
+    if (p->ith == 0) {
+        for (int64_t i = 0; i < ne0 * ne1 * ne2 * ne3; i++) {
+            dst_data[i] = 0.0f;
+        }
+    }
+    tp->barrier_wait();
+
+    // ===== 并行化: 按 dst 的 (ne1, ne2, ne3) 维分配到线程 =====
+    // total rows in dst
+    const int64_t nr = ne1 * ne2 * ne3;
+
+    // rows per thread
+    const int64_t dr = (nr + p->nth - 1) / p->nth;
+
+    // row range for this thread
+    const int64_t ir0 = dr * p->ith;
+    const int64_t ir1 = (ir0 + dr < nr) ? (ir0 + dr) : nr;
+
+    // really?  had to double check for this --- albert
+    // ===== GQA (Group Query Attention) 支持 =====
+    // dps2 = ne2 / ne02, 当 src0 的 ne02 < ne12 时, 共享 K/V heads
+    const int64_t dps2 = ne2 / ne02;
+    const int64_t dps3 = ne3 / ne03;
+
+    // ===== block-tiling 参数 (对标 ggml blck_0 / blck_1) =====
+    const int64_t blck_0 = 32;  // K 维 block 大小 (对标 GGML_VEC_MAD_UNROLL)
+    const int64_t blck_1 = 16;  // 输出行 block 大小
+
+    // ===== 主循环: 双层 block tiling =====
+    for (int64_t bir = ir0; bir < ir1; bir += blck_1) {
+        const int64_t bir1 = (bir + blck_1 < ir1) ? (bir + blck_1) : ir1;
+
+        for (int64_t bi01 = 0; bi01 < ne01; bi01 += blck_0) {
+            const int64_t bne01 = (bi01 + blck_0 < ne01) ? (bi01 + blck_0) : ne01;
+
+            for (int64_t ir = bir; ir < bir1; ir++) {
+                // 反解 dst 索引 (i1, i2, i3)
+                const int64_t i3 = ir / (ne2 * ne1);
+                const int64_t i2 = (ir - i3 * ne2 * ne1) / ne1;
+                const int64_t i1 = ir - i3 * ne2 * ne1 - i2 * ne1;
+
+                // GQA: 将 dst 的 (i2, i3) 映射回 src0 的对应 dim
+                const int64_t i02 = i2 / dps2;
+                const int64_t i03 = i3 / dps3;
+
+                // src1 的 (i2, i3) 与 dst 一致
+                const int64_t i12 = i2;
+                const int64_t i13 = i3;
+
+                // dst 行基地址
+                float * d_row = dst_data + (i1 * ne0 + i2 * ne0 * ne1 + i3 * ne0 * ne1 * ne2);
+
+                // 沿 K 维 (ne01) 累加
+                for (int64_t i01 = bi01; i01 < bne01; i01++) {
+                    // src0 行: (i01, i02, i03) → src0 的第 i01 行
+                    // 布局: src0[i01, i02, i03] 对应 data[i01*ne00 + i02*ne00*ne01 + i03*ne00*ne01*ne02]
+                    float * s0 = src0_data + (i01 * ne00 + i02 * ne00 * ne01 + i03 * ne00 * ne01 * ne02);
+
+                    // src1 元素: (i1, i01, i12, i13)
+                    float * s1_row = src1_data + (i01 * ne10 + i12 * ne10 * ne11 + i13 * ne10 * ne11 * ne12);
+                    float s1_val = s1_row[i1];  // src1[i1, i01, i12, i13]
+
+                    // d_row[i0] += s0[i0] * s1_val  for i0 in [0, ne00)
+                    for (int64_t i0 = 0; i0 < ne00; i0++) {
+                        d_row[i0] += s0[i0] * s1_val;
+                    }
+                }
+            }
+        }
+    }
+
     tp->barrier_wait();
 }
 
