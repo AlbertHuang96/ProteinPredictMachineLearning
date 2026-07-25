@@ -5,8 +5,10 @@
 #include "SE3Transformer.h"
 #include "PositionalEncoding.h"
 #include <string>
+#include <memory>
 
 #include "rfaa/Embedding.h"
+#include "rfaa/Backend.h"
 
 namespace rfaa {
 
@@ -439,6 +441,17 @@ private:
     // 输出头
     //struct OutputHeads;
     //std::unique_ptr<OutputHeads> heads_;
+
+    // ===== 后端基础设施 =====
+    std::unique_ptr<CPUBackend>       cpu_backend_;
+    std::unique_ptr<BackendScheduler> scheduler_;
+    bool backend_ready_ = false;
+
+    // 持有 backend buffer 的所有权（对标 ggml 中 backend 管理的 buffer 列表）
+    std::vector<std::unique_ptr<Buffer>> param_buffers_;
+
+    void ensure_backend_ready();
+    void transfer_params_to_backend();
 };
 
 } // namespace rfaa

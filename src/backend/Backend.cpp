@@ -35,17 +35,17 @@ bool BackendScheduler::is_view_op(int op) const {
     return op == OP_VIEW || op == OP_RESHAPE || op == OP_PERMUTE || op == OP_TRANSPOSE;
 }
 
-void BackendScheduler::set_backend_if_supported(Tensor * node, int backend_id) {
+void BackendScheduler::set_backend_if_supported(TensorF32* node, int backend_id) {
     Backend * backend = backends_[backend_id];
     if (backend->supports_op(node)) {
         backend_map_[node] = backend_id;
     }
 }
 
-int BackendScheduler::count_supported_inputs(Tensor * node, int backend_id) const {
+int BackendScheduler::count_supported_inputs(TensorF32* node, int backend_id) const {
     int count = 0;
     for (int j = 0; j < GGML_MAX_SRC; j++) {
-        Tensor * src = node->src[j];
+        TensorF32* src = node->src[j];
         if (!src) continue;
 
         // 输入已经分配了后端 且 buffer 兼容
@@ -57,7 +57,7 @@ int BackendScheduler::count_supported_inputs(Tensor * node, int backend_id) cons
     return count;
 }
 
-bool BackendScheduler::tensor_buffer_compatible(const Tensor * src, int backend_id) const {
+bool BackendScheduler::tensor_buffer_compatible(const TensorF32* src, int backend_id) const {
     auto it = backend_map_.find(src);
     if (it == backend_map_.end()) return false;
 
@@ -72,12 +72,12 @@ bool BackendScheduler::tensor_buffer_compatible(const Tensor * src, int backend_
     return target->supports_buffer_type(source->buffer_type());
 }
 
-int BackendScheduler::tensor_backend_id(Tensor * t) const {
+int BackendScheduler::tensor_backend_id(TensorF32* t) const {
     auto it = backend_map_.find(t);
     return (it != backend_map_.end()) ? it->second : -1;
 }
 
-int BackendScheduler::tensor_backend_id(Tensor * t, int default_id) const {
+int BackendScheduler::tensor_backend_id(TensorF32* t, int default_id) const {
     int id = tensor_backend_id(t);
     return (id == -1) ? default_id : id;
 }
@@ -88,27 +88,36 @@ int BackendScheduler::tensor_backend_id(Tensor * t, int default_id) const {
 // ============================================================
 
 bool BackendScheduler::alloc_splits() {
+    if (!current_graph_) return false;
+
     // ===== Step 1: 检查 backend IDs 是否发生变化 =====
+    // 设计意图：同一个 graph 多次执行时（如训练循环），
+    // 如果 split_graph 后的 backend 分配与上次一致，则复用 buffer，避免重分配。
     bool backend_ids_changed = false;
 
     // 检查节点
-    for (int i = 0; i < current_graph_->n_nodes(); i++) {
-        Tensor* node = current_graph_->node(i);
-        int cur_id = tensor_backend_id(node, 0);
-        if (cur_id != prev_node_backend_ids_[i] &&
-            bufts_[cur_id] != bufts_[prev_node_backend_ids_[i]]) {
-            backend_ids_changed = true;
-            break;
+    if (!prev_node_backend_id_.empty()) {
+        for (int i = 0; i < current_graph_->n_nodes(); i++) {
+            TensorF32* node = current_graph_->node(i);
+            // cur_id is the i-th node in the graph currently
+            int cur_id = tensor_backend_id(node, 0);
+            // prev_id is the i-th node recorded last time
+            int prev_id = (i < (int)prev_node_backend_id_.size()) ? prev_node_backend_id_[i] : -1;
+            if (cur_id != prev_id) {
+                // check the backend id of the i-th node last time and this time
+                backend_ids_changed = true;
+                break;
+            }
         }
     }
 
     // 检查叶子
-    if (!backend_ids_changed) {
+    if (!backend_ids_changed && !prev_leaf_backend_id_.empty()) {
         for (int i = 0; i < current_graph_->n_leafs(); i++) {
-            Tensor* leaf = current_graph_->leaf(i);
+            TensorF32* leaf = current_graph_->leaf(i);
             int cur_id = tensor_backend_id(leaf, 0);
-            if (cur_id != prev_leaf_backend_ids_[i] &&
-                bufts_[cur_id] != bufts_[prev_leaf_backend_ids_[i]]) {
+            int prev_id = (i < (int)prev_leaf_backend_id_.size()) ? prev_leaf_backend_id_[i] : -1;
+            if (cur_id != prev_id) {
                 backend_ids_changed = true;
                 break;
             }
@@ -124,13 +133,13 @@ bool BackendScheduler::alloc_splits() {
 
         // 根据当前 backend 分配，为每个后端预留内存
         if (!reserve_graph_memory()) {
-            // GGML_LOG_ERROR
             return false;
         }
 
         // 保存当前分配作为"上一次"快照，供下次对比
-        prev_node_backend_ids_ = node_backend_ids_;
-        prev_leaf_backend_ids_ = leaf_backend_ids_;
+        // prev_node_backend_id_ is the mapping of node -> backend id that recorded last time
+        prev_node_backend_id_ = node_backend_id_;
+        prev_leaf_backend_id_ = leaf_backend_id_;
         graph_reserved_ = true;
     }
 
@@ -345,17 +354,67 @@ bool is_multi_buffer(const Buffer* buffer) {
     return dynamic_cast<const MultiBuffer*>(buffer) != nullptr;
 }
 
-// ===== 辅助：根据 backend assignment 预留各后端内存 =====
-bool BackendScheduler::reserve_graph_memory() {
-    // 1. 更新 node_backend_ids / leaf_backend_ids
-    node_backend_ids_.resize(current_graph_->n_nodes());
-    for (int i = 0; i < current_graph_->n_nodes(); i++) {
-        node_backend_ids_[i] = tensor_backend_id(current_graph_->node(i), 0);
+// ============================================================
+// backend_tensor_copy — 对标 ggml_backend_tensor_copy
+// 将 src tensor 的数据拷贝到 dst tensor（跨后端自动处理 CPU↔GPU）
+// ============================================================
+bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
+    if (src == dst) return true;
+
+    size_t nbytes = src->nbytes();
+
+    // ===== Case 1: src 在 host buffer 上（或没有 buffer）=====
+    if (!src->buffer_ || src->buffer_->is_host()) {
+        if (dst->buffer_) {
+            dst->buffer_->set_tensor(const_cast<TensorF32*>(dst),
+                                     src->data(), dst->buffer_offs_, nbytes);
+        } else {
+            std::memcpy(dst->data(), src->data(), nbytes);
+        }
+        return true;
     }
 
-    leaf_backend_ids_.resize(current_graph_->n_leafs());
+    // ===== Case 2: dst 在 host buffer 上（或没有 buffer）=====
+    if (!dst->buffer_ || dst->buffer_->is_host()) {
+        if (src->buffer_) {
+            src->buffer_->get_tensor(src, dst->data(), src->buffer_offs_, nbytes);
+        } else {
+            std::memcpy(dst->data(), src->data(), nbytes);
+        }
+        return true;
+    }
+
+    // ===== Case 3: src 和 dst 都在 device buffer 上 =====
+    // 尝试直接 cpy_tensor（GPU→GPU cudaMemcpyDeviceToDevice）
+    if (dst->buffer_->cpy_tensor(src, const_cast<TensorF32*>(dst),
+                                  src->buffer_offs_, dst->buffer_offs_, nbytes)) {
+        return true;
+    }
+
+    // ===== Fallback: 通过 staging buffer（malloc → get → set → free）=====
+    void* staging = std::malloc(nbytes);
+    if (!staging) return false;
+
+    src->buffer_->get_tensor(src, staging, src->buffer_offs_, nbytes);
+    dst->buffer_->set_tensor(const_cast<TensorF32*>(dst), staging, dst->buffer_offs_, nbytes);
+    std::free(staging);
+    return true;
+}
+
+// ===== 辅助：根据 backend assignment 预留各后端内存 =====
+bool BackendScheduler::reserve_graph_memory() {
+    // 释放上次分配的 buffer
+    reserved_buffers_.clear();
+
+    // 1. 更新 node_backend_id_ / leaf_backend_id_
+    node_backend_id_.resize(current_graph_->n_nodes());
+    for (int i = 0; i < current_graph_->n_nodes(); i++) {
+        node_backend_id_[i] = tensor_backend_id(current_graph_->node(i), 0);
+    }
+
+    leaf_backend_id_.resize(current_graph_->n_leafs());
     for (int i = 0; i < current_graph_->n_leafs(); i++) {
-        leaf_backend_ids_[i] = tensor_backend_id(current_graph_->leaf(i), 0);
+        leaf_backend_id_[i] = tensor_backend_id(current_graph_->leaf(i), 0);
     }
 
     // 2. 更新 bufts（缓存 buffer types）
@@ -365,40 +424,61 @@ bool BackendScheduler::reserve_graph_memory() {
     }
 
     // 3. 为每个后端实际分配 buffer
-    //    收集该后端的 tensor，各自分配
     for (int b = 0; b < n_backends_; b++) {
+        const BufferType* buft = bufts_[b];
+        if (!buft) continue;
+
         size_t backend_size = 0;
+
+        // ---- 3a. 统计原始图节点 ----
         for (int i = 0; i < current_graph_->n_nodes(); i++) {
-            if (node_backend_ids_[i] == b) {
+            if (node_backend_id_[i] == b) {
                 TensorF32* t = current_graph_->node(i);
                 if (t->data() == nullptr && t->view_src == nullptr) {
                     backend_size += GGML_PAD(
-                        bufts_[b]->get_alloc_size(t),
-                        bufts_[b]->get_alignment());
+                        buft->get_alloc_size(t),
+                        buft->get_alignment());
                 }
             }
         }
 
-        // 也为 leafs 统计
+        // ---- 3b. 统计 leafs ----
         for (int i = 0; i < current_graph_->n_leafs(); i++) {
-            if (leaf_backend_ids_[i] == b) {
+            if (leaf_backend_id_[i] == b) {
                 TensorF32* t = current_graph_->leaf(i);
                 if (t->data() == nullptr && t->view_src == nullptr) {
                     backend_size += GGML_PAD(
-                        bufts_[b]->get_alloc_size(t),
-                        bufts_[b]->get_alignment());
+                        buft->get_alloc_size(t),
+                        buft->get_alignment());
+                }
+            }
+        }
+
+        // ---- 3c. 统计 copy_tensor_map_ 中的拷贝节点 ----
+        // build_splits 创建的 dup(src) 拷贝节点，需要在此分配 buffer
+        for (auto& kv : copy_tensor_map_) {
+            TensorF32* cpy = kv.second;
+            int cpy_backend_id = kv.first.second;  // target_backend_id
+            if (cpy_backend_id == b) {
+                if (cpy->data() == nullptr && cpy->view_src == nullptr) {
+                    backend_size += GGML_PAD(
+                        buft->get_alloc_size(cpy),
+                        buft->get_alignment());
                 }
             }
         }
 
         if (backend_size > 0) {
-            Buffer* buf = alloc_buffer(bufts_[b], backend_size);
+            Buffer* buf = alloc_buffer(const_cast<BufferType*>(buft), backend_size);
             if (!buf) return false;
 
-            // 子分配
+            // 持有 buffer 所有权（防止 dangling pointer）
+            reserved_buffers_.emplace_back(buf);
+
+            // ---- 子分配：原始图节点 ----
             TensorAllocator tallocr(buf);
             for (int i = 0; i < current_graph_->n_nodes(); i++) {
-                if (node_backend_ids_[i] == b) {
+                if (node_backend_id_[i] == b) {
                     TensorF32* t = current_graph_->node(i);
                     if (t->data() == nullptr && t->view_src == nullptr) {
                         if (!tallocr.alloc(t)) return false;
@@ -406,7 +486,7 @@ bool BackendScheduler::reserve_graph_memory() {
                 }
             }
             for (int i = 0; i < current_graph_->n_leafs(); i++) {
-                if (leaf_backend_ids_[i] == b) {
+                if (leaf_backend_id_[i] == b) {
                     TensorF32* t = current_graph_->leaf(i);
                     if (t->data() == nullptr && t->view_src == nullptr) {
                         if (!tallocr.alloc(t)) return false;
@@ -414,8 +494,16 @@ bool BackendScheduler::reserve_graph_memory() {
                 }
             }
 
-            // TODO: buf 生命周期由 scheduler 管理，后续需要存储到 splits 对应的 backend 中
-            // 当前简化：暂存到 bufts_ 对应位置（后续可扩展为 buffer 列表）
+            // ---- 子分配：拷贝节点 ----
+            for (auto& kv : copy_tensor_map_) {
+                TensorF32* cpy = kv.second;
+                int cpy_backend_id = kv.first.second;
+                if (cpy_backend_id == b) {
+                    if (cpy->data() == nullptr && cpy->view_src == nullptr) {
+                        if (!tallocr.alloc(cpy)) return false;
+                    }
+                }
+            }
         }
     }
 
@@ -428,45 +516,45 @@ bool BackendScheduler::reserve_graph_memory() {
 // ============================================================
 
 void BackendScheduler::split_graph(ComputeGraph * graph) {
+    current_graph_ = graph;  // 保存当前图引用，供 alloc_splits 使用
     n_splits_ = 0;
     n_graph_inputs_ = 0;
     backend_map_.clear();
+    copy_tensor_map_.clear();
 
     // ============================
     // Pass 1: 叶子节点分配
-    // 叶子节点（输入/参数）已经有数据在某个 buffer 上
-    // 把它们分配给对应的后端
     // ============================
     pass_assign_leafs(graph);
 
     // ============================
     // Pass 2: 扩展分配（向下 + 向上两遍）
-    // "向下"：高优先级后端的节点，其下游也分配同一后端
-    // "向上"：高优先级后端的节点，其上游也分配同一后端
-    // 跳过 CPU（最低优先级），确保 CPU 只在必要时被用
     // ============================
     pass_expand_assignments(graph);
 
     // ============================
     // Pass 3: 填充未分配节点
-    // 仍有未分配的节点 → 找支持最多输入的后端
-    // 已分配但 buffer 更优的 → 升级到更高优先级
     // ============================
     pass_fill_unassigned(graph);
+
+    // ============================
+    // Pass 5: 切分子图 + 创建跨后端拷贝节点
+    // ============================
+    build_splits(graph);
 }
 
 void BackendScheduler::pass_assign_leafs(ComputeGraph * graph) {
     for (int i = 0; i < graph->n_leafs(); i++) {
-        Tensor * leaf = graph->leaf(i);
-        int leaf_id = tensor_backend_id(leaf);
+        TensorF32* leaf = graph->leaf(i);
 
         // 用户已经手动指定 → 不覆盖
-        if (leaf_id != -1) continue;
+        if (tensor_backend_id(leaf) != -1) continue;
 
-        // 自动分配：找支持该 tensor buffer 的最近后端
-        // 简化实现：优先 GPU（高 priority），其次 CPU
+        // 自动分配：找支持该 tensor buffer 的后端
+        // 优先 GPU（高 priority），其次 CPU
+        // CPU backend 的 supports_buffer_type 对任何 host buffer 返回 true
         for (int b = 0; b < n_backends_; b++) {
-            if (backends_[b]->supports_buffer_type(leaf->dtype())) {
+            if (backends_[b]->supports_buffer_type(backends_[b]->buffer_type())) {
                 backend_map_[leaf] = b;
                 break;
             }
@@ -479,7 +567,7 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
     {
         int cur_backend_id = -1;
         for (int i = 0; i < graph->n_nodes(); i++) {
-            Tensor * node = graph->node(i);
+            TensorF32* node = graph->node(i);
             if (is_view_op(node->op)) continue;
 
             int node_id = tensor_backend_id(node);
@@ -503,7 +591,7 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
     {
         int cur_backend_id = -1;
         for (int i = graph->n_nodes() - 1; i >= 0; i--) {
-            Tensor * node = graph->node(i);
+            TensorF32* node = graph->node(i);
             if (is_view_op(node->op)) continue;
 
             int node_id = tensor_backend_id(node);
@@ -523,14 +611,11 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
 
 void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
     for (int i = 0; i < graph->n_nodes(); i++) {
-        Tensor * node = graph->node(i);
+        TensorF32* node = graph->node(i);
         if (is_view_op(node->op)) continue;
-
-        //int * node_id = &backend_map_[node];  // 创建条目如果不存在
 
         auto it = backend_map_.find(node);
         if (it == backend_map_.end()) {
-        //if (*node_id == -1) {
             // 未分配：找支持最多输入的后端
             int best_supported = -1;
             int best_backend   = n_backends_ - 1;  // 默认 CPU
@@ -544,7 +629,6 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                     }
                 }
             }
-            //*node_id = best_backend;
             backend_map_[node] = best_backend;
         }
         // else:
@@ -554,12 +638,178 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
 }
 
 // ============================================================
-// 获取分裂后的子图
+// build_splits — Pass 5: 按 backend 边界切分子图 + 创建跨后端拷贝节点
+// 对标 ggml_backend_sched_split_graph 的 pass 5
+// ============================================================
+void BackendScheduler::build_splits(ComputeGraph* graph) {
+    int n_nodes = graph->n_nodes();
+
+    // ===== Step 1: 跳过开头的 view op，确定第一个 split 的 backend =====
+    int i = 0;
+    for (; i < n_nodes; i++) {
+        TensorF32* node = graph->node(i);
+        if (!is_view_op(node->op)) break;
+    }
+    if (i >= n_nodes) return;  // 全是 view op
+
+    // ===== Step 2: 创建第一个 split =====
+    SplitInfo* split = &splits_[0];
+    split->backend_id = tensor_backend_id(graph->node(i), 0);
+    split->i_start    = 0;
+    split->n_inputs   = 0;
+    int cur_backend_id = split->backend_id;
+
+    // ===== Step 3: 遍历所有节点，切分 =====
+    for (; i < n_nodes; i++) {
+        TensorF32* node = graph->node(i);
+        if (is_view_op(node->op)) continue;
+
+        int node_backend_id = tensor_backend_id(node, 0);
+
+        // ---- 3a. 判断是否需要开新 split ----
+        bool need_new_split = false;
+
+        if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                TensorF32* src = node->src[j];
+                if (!src) continue;
+
+                // 条件 A: weight 在不可兼容的 backend 上
+                if (src->buffer_ != nullptr) {
+                    int src_backend_id = tensor_backend_id(src, -1);
+                    if (src_backend_id != -1 &&
+                        src_backend_id != cur_backend_id &&
+                        !tensor_buffer_compatible(src, cur_backend_id)) {
+                        need_new_split = true;
+                        break;
+                    }
+                }
+
+                // 条件 B: split 输入数达到上限
+                if (split->n_inputs >= MAX_SPLIT_INPUTS) {
+                    int src_backend_id = tensor_backend_id(src, -1);
+                    CopyKey key = {src, cur_backend_id};
+                    if (src_backend_id != cur_backend_id &&
+                        copy_tensor_map_.find(key) == copy_tensor_map_.end() &&
+                        !tensor_buffer_compatible(src, cur_backend_id)) {
+                        need_new_split = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // ---- 3b. backend 变了 或 需要新 split → 切分 ----
+        if (node_backend_id != cur_backend_id || need_new_split) {
+            split->i_end = i;
+            n_splits_++;
+
+            if (n_splits_ >= MAX_SPLITS) return;  // 超过最大 split 数
+
+            split = &splits_[n_splits_];
+            split->backend_id = node_backend_id;
+            split->i_start    = i;
+            split->n_inputs   = 0;
+            cur_backend_id    = node_backend_id;
+        }
+
+        // ---- 3c. 处理跨后端输入：创建拷贝节点 + 替换 node->src[j] ----
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            TensorF32* src = node->src[j];
+            if (!src) continue;
+
+            int src_backend_id = tensor_backend_id(src, -1);
+            if (src_backend_id == -1) continue;
+
+            if (src_backend_id != cur_backend_id &&
+                !tensor_buffer_compatible(src, cur_backend_id)) {
+
+                CopyKey key = {src, cur_backend_id};
+                auto it = copy_tensor_map_.find(key);
+                if (it == copy_tensor_map_.end()) {
+                    // 对标 ggml_dup_tensor_layout：创建同 shape 的图节点
+                    // dup() 返回 OP_DUP 节点，data_=nullptr，由 allocator 后续分配
+                    TensorF32* cpy = dup(src);
+                    copy_tensor_map_[key] = cpy;
+
+                    // 记录为 split 的输入（执行时需跨后端拷贝）
+                    if (split->n_inputs < MAX_SPLIT_INPUTS) {
+                        split->inputs[split->n_inputs++] = src;
+                    }
+                }
+
+                // 替换 node 的 src 引用为拷贝后的 tensor
+                node->src[j] = copy_tensor_map_[key];
+            }
+        }
+    }
+
+    // ===== Step 4: 最后一个 split =====
+    split->i_end = n_nodes;
+    n_splits_++;
+}
+
+// ============================================================
+// graph_compute — 遍历所有 split 执行（含跨后端拷贝）
+// 对标 ggml_backend_sched_compute_splits
+// ============================================================
+Status BackendScheduler::graph_compute() {
+    if (!current_graph_ || n_splits_ == 0) return Status::SUCCESS;
+
+    for (int si = 0; si < n_splits_; si++) {
+        SplitInfo& sp = splits_[si];
+        Backend* backend = backends_[sp.backend_id];
+
+        // ---- Step 1: 跨后端拷贝（对标 ggml_backend_tensor_copy）----
+        for (int j = 0; j < sp.n_inputs; j++) {
+            TensorF32* src = sp.inputs[j];  // 原始 tensor（在其他 backend 上）
+            CopyKey key = {src, sp.backend_id};
+            auto it = copy_tensor_map_.find(key);
+            if (it == copy_tensor_map_.end()) continue;
+
+            TensorF32* dst = it->second;  // 拷贝目标（在当前 split backend 的 buffer 上）
+
+            // 如果 src 和 dst 已经在同一 backend 则跳过
+            int src_bid = tensor_backend_id(src, -1);
+            if (src_bid == sp.backend_id) continue;
+            if (tensor_buffer_compatible(src, sp.backend_id)) continue;
+
+            backend_tensor_copy(src, dst);
+        }
+
+        // ---- Step 2: 只执行该 split 范围的节点 ----
+        // 构造一个临时子图，只包含 [i_start, i_end) 范围的节点
+        // 对标 ggml_graph_view(graph, i_start, i_end)
+        // 由于 ComputeGraph 是 placement new 的固定大小结构，
+        // 这里直接修改 nodes 指针数组的起始位置来模拟子图
+        int sub_n_nodes = sp.i_end - sp.i_start;
+        TensorF32** saved_nodes = current_graph_->nodes;
+        int saved_n_nodes = current_graph_->n_nodes_;
+
+        // 临时替换为子图范围
+        current_graph_->nodes = saved_nodes + sp.i_start;
+        current_graph_->n_nodes_ = sub_n_nodes;
+
+        Status st = backend->graph_compute(current_graph_);
+
+        // 恢复原始图状态
+        current_graph_->nodes = saved_nodes;
+        current_graph_->n_nodes_ = saved_n_nodes;
+
+        if (st != Status::SUCCESS) return st;
+    }
+
+    return Status::SUCCESS;
+}
+
+// ============================================================
+// 获取分裂后的第 i 段
 // ============================================================
 
 ComputeGraph * BackendScheduler::get_split(int i) {
     if (i < 0 || i >= n_splits_) return nullptr;
-    return splits_[i];
+    // 返回原始图（子图通过 [i_start, i_end) 范围标识）
+    return current_graph_;
 }
 
 } // namespace rfaa

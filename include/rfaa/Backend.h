@@ -149,8 +149,19 @@ public:
         const uint8_t* ptr = static_cast<const uint8_t*>(data());
         std::memcpy(data, ptr + offset, size);
     }
-    
-    // cpy_tensor  not implement yet
+
+    // 对标 ggml_backend_buffer_is_host
+    virtual bool is_host() const {
+        return buft_ ? buft_->is_host() : false;
+    }
+
+    // 对标 ggml_backend_buffer_copy_tensor
+    // 跨 buffer 直接拷贝（如 GPU→GPU cudaMemcpyDeviceToDevice）
+    // 返回 true 表示成功，false 表示需要 fallback 到 staging buffer 方式
+    virtual bool cpy_tensor(const TensorF32* src, TensorF32* dst,
+                            size_t src_offset, size_t dst_offset, size_t size) {
+        return false;  // 默认不支持
+    }
 
     // clear the whole buffer with value
     virtual void clear(uint8_t value) {
@@ -194,6 +205,54 @@ public:
     }
 
     void* data() override { return ptr_; }
+
+    // ===== 覆盖 set_tensor / get_tensor 以支持 GPU =====
+    void set_tensor(TensorF32* tensor, const void* data, size_t offset, size_t size) override {
+        if (is_host()) {
+            std::memcpy(ptr_ + offset, data, size);
+        } else {
+            // GPU buffer: cudaMemcpy HostToDevice
+            const CUDABufferType* cuda_buft = dynamic_cast<const CUDABufferType*>(buft_);
+            int device = cuda_buft ? cuda_buft->device_id() : 0;
+            cudaSetDevice(device);
+            cudaMemcpy(ptr_ + offset, data, size, cudaMemcpyHostToDevice);
+        }
+    }
+
+    void get_tensor(const TensorF32* tensor, void* data, size_t offset, size_t size) override {
+        if (is_host()) {
+            std::memcpy(data, ptr_ + offset, size);
+        } else {
+            // GPU buffer: cudaMemcpy DeviceToHost
+            const CUDABufferType* cuda_buft = dynamic_cast<const CUDABufferType*>(buft_);
+            int device = cuda_buft ? cuda_buft->device_id() : 0;
+            cudaSetDevice(device);
+            cudaMemcpy(data, ptr_ + offset, size, cudaMemcpyDeviceToHost);
+        }
+    }
+
+    // 对标 ggml_backend_buffer_copy_tensor: GPU→GPU 同 device 直接拷贝
+    bool cpy_tensor(const TensorF32* src, TensorF32* dst,
+                    size_t src_offset, size_t dst_offset, size_t size) override {
+        // 只处理 GPU buffer
+        if (is_host()) return false;
+
+        const CUDABufferType* cuda_buft = dynamic_cast<const CUDABufferType*>(buft_);
+        if (!cuda_buft) return false;
+
+        // 检查 src 是否也在 GPU buffer 上
+        if (!src->buffer_ || src->buffer_->is_host()) return false;
+
+        const CUDABufferType* src_cuda = dynamic_cast<const CUDABufferType*>(src->buffer_->type());
+        if (!src_cuda || src_cuda->device_id() != cuda_buft->device_id()) return false;
+
+        // GPU→GPU 同 device: cudaMemcpyDeviceToDevice
+        cudaSetDevice(cuda_buft->device_id());
+        cudaMemcpy(ptr_ + dst_offset,
+                   static_cast<const uint8_t*>(src->buffer_->data()) + src_offset,
+                   size, cudaMemcpyDeviceToDevice);
+        return true;
+    }
 
 private:
     uint8_t* ptr_     = nullptr;
@@ -310,6 +369,10 @@ Buffer* alloc_multi_buffer(std::vector<Buffer*>& buffers);
 // 对标 ggml_backend_buffer_is_multi_buffer
 bool is_multi_buffer(const Buffer* buffer);
 
+// 对标 ggml_backend_tensor_copy
+// 将 src tensor 的数据拷贝到 dst tensor（跨后端拷贝，自动处理 CPU↔GPU）
+bool backend_tensor_copy(const TensorF32* src, TensorF32* dst);
+
 // ==================== Backend (抽象基类) ====================
 
 class Backend {
@@ -355,8 +418,11 @@ public:
     int n_splits() const { return n_splits_; }
 
     // 获取指定 tensor 的"绑定后端"
-    int tensor_backend_id(Tensor * t) const;
-    int tensor_backend_id(Tensor * t, int default_id) const;
+    int tensor_backend_id(TensorF32* t) const;
+    int tensor_backend_id(TensorF32* t, int default_id) const;
+
+    // 执行所有 split（含跨后端拷贝）
+    Status graph_compute();
 
 private:
     // ===== 三趟扫描 =====
@@ -364,23 +430,36 @@ private:
     void pass_expand_assignments(ComputeGraph * graph);   // 第二趟：扩展分配
     void pass_fill_unassigned(ComputeGraph * graph);      // 第三趟：填充未分配节点
 
+    // ===== Pass 5: 切分 + 构建子图 =====
+    void build_splits(ComputeGraph * graph);
+
     // helper
     bool is_view_op(int op) const;
-    void set_backend_if_supported(Tensor * node, int backend_id);
-    int  count_supported_inputs(Tensor * node, int backend_id) const;
-    bool tensor_buffer_compatible(const Tensor * src, int backend_id) const;
+    void set_backend_if_supported(TensorF32* node, int backend_id);
+    int  count_supported_inputs(TensorF32* node, int backend_id) const;
+    bool tensor_buffer_compatible(const TensorF32* src, int backend_id) const;
 
     // alloc_splits invoke this function to allocate the memory
     bool reserve_graph_memory();
 
     static constexpr int MAX_SPLITS = 64;
+    static constexpr int MAX_SPLIT_INPUTS = 32;
+
+    // ===== SplitInfo =====
+    struct SplitInfo {
+        int        backend_id = 0;
+        int        i_start    = 0;
+        int        i_end      = 0;
+        int        n_inputs   = 0;
+        TensorF32* inputs[MAX_SPLIT_INPUTS];
+    };
 
     // ===== 数据成员 =====
     std::vector<Backend *> backends_;          // 按优先级排序的后端列表
     int n_backends_ = 0;
 
     // tensor → backend_id 映射
-    using BackendMap = std::unordered_map<const Tensor *, int>;
+    using BackendMap = std::unordered_map<const TensorF32*, int>;
     BackendMap backend_map_;
 
     ComputeGraph* current_graph_ = nullptr;
@@ -390,21 +469,46 @@ private:
     std::vector<int> leaf_backend_id_;
     std::vector<int> prev_leaf_backend_id_;
     
-    std::vector<int> bufts_;
+    std::vector<const BufferType*> bufts_;
 
     bool graph_reserved_ = false;
 
+    // 持有 allocated buffer 的生命周期（避免 dangling pointer）
+    std::vector<std::unique_ptr<Buffer>> reserved_buffers_;
+
     // 分裂结果
     int n_splits_ = 0;
-    ComputeGraph * splits_[MAX_SPLITS];   // 每段子图
-    int split_backend_[MAX_SPLITS];       // 每段对应的后端
+    SplitInfo splits_[MAX_SPLITS];
 
     // 图输入收集
     int n_graph_inputs_ = 0;
-    Tensor * graph_inputs_[256];
+    TensorF32* graph_inputs_[256];
+
+    // tensor 拷贝映射：(src_tensor, target_backend_id) → copied_tensor
+    using CopyKey = std::pair<const TensorF32*, int>;
+    struct CopyKeyHash {
+        size_t operator()(const CopyKey& k) const {
+            return std::hash<const TensorF32*>()(k.first) ^ (std::hash<int>()(k.second) << 1);
+        }
+    };
+    std::unordered_map<CopyKey, TensorF32*, CopyKeyHash> copy_tensor_map_;
 
     // context
     RFAAContext * ctx_ = nullptr;
+};
+
+// ============================================================
+// CPUBufferType — CPU 端 buffer 分配器
+// ============================================================
+class CPUBufferType : public BufferType {
+public:
+    const char* get_name() const override { return "CPU"; }
+    void* alloc(size_t size) override;
+    void free(void* ptr) override;
+    size_t get_alignment() const override { return 32; }
+    bool is_host() const override { return true; }
+
+    static CPUBufferType* instance();
 };
 
 // ==================== CPUBackend ====================
@@ -419,10 +523,14 @@ public:
 
     // ===== Backend 接口 =====
     virtual bool supports_op(TensorF32 * node) const override;
+    const BufferType* buffer_type() const override;
+    bool supports_buffer_type(const BufferType* buft) const override;
     
     const char * get_name() const override { return "CPU"; }
     Status       graph_compute(ComputeGraph * cgraph) override;
-    void         synchronize() override {}
+
+    void         synchronize() override {} 
+    // it is NULL for CPU backend, because CPU backend is synchronous
 
     // ===== 公开（图规划，可以被外部调用预估算资源）=====
     ComputePlan  graph_plan(ComputeGraph * cgraph) const;
@@ -469,6 +577,27 @@ private:
 
 // ==================== CUDABackend ====================
 
+// ============================================================
+// CUDABufferType — GPU 端 buffer 分配器
+// ============================================================
+class CUDABufferType : public BufferType {
+public:
+    explicit CUDABufferType(int device_id = 0) : device_id_(device_id) {}
+
+    const char* get_name() const override { return "CUDA"; }
+    void* alloc(size_t size) override;
+    void free(void* ptr) override;
+    size_t get_alignment() const override { return 128; }  // CUDA 对齐 128 bytes
+    bool is_host() const override { return false; }
+
+    int device_id() const { return device_id_; }
+
+    static CUDABufferType* instance(int device_id = 0);
+
+private:
+    int device_id_ = 0;
+};
+
 class CUDABackend : public Backend {
 public:
     CUDABackend(int device_id = 0);
@@ -476,14 +605,15 @@ public:
 
     const char * get_name() const override { return "CUDA"; }
     Status       graph_compute(ComputeGraph * cgraph) override;
-    void         synchronize() override {}
+    void         synchronize() override;
 
-    bool supports_op(TensorF32 * node) const override { return true; }
-
-    // 设备端 buffer 分配
+    bool supports_op(TensorF32 * node) const override;
     const BufferType* buffer_type() const override;
+    bool supports_buffer_type(const BufferType* buft) const override;
 
-    Buffer* buffer_new(size_t nbytes);
+    // GPU 优先级高于 CPU
+    // set it 0 when we test cpu
+    int priority() const override { return 1; }
 
 private:
     int device_id_ = 0;

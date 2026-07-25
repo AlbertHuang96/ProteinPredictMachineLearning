@@ -25,6 +25,13 @@ set(CORE_SOURCES
     ../src/data/FAPE.cpp
     ../src/data/DistogramBins.cpp
     ../src/data/LDDT.cpp
+    # Backend 基础设施
+    ../src/backend/Backend.cpp
+    ../src/backend/CPUBackend.cpp
+    ../src/backend/CUDABackend.cpp
+    ../src/backend/CUDAKernels.cpp
+    ../src/backend/CPUKernels.cpp
+    ../src/backend/ThreadPool.cpp
 )
 
 # 静态库 (内部使用)

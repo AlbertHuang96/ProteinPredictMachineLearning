@@ -138,7 +138,10 @@ public:
     TensorF32* forward(TensorF32* x);
     
     TensorF32 forward_exec(const TensorF32& x);
-            
+    
+    // 获取参数指针（加载/保存/迁移用）
+    TensorF32* gamma() { return gamma_; }
+    TensorF32* beta()  { return beta_; }
     
 private:
     int normalized_shape_;

@@ -125,7 +125,8 @@ private:
     // 构造只能通过静态工厂
     ComputeGraph() = default;  // placement new 构造
 
-    friend class RFAAContext;  // Context 可以访问私有构造
+    friend class RFAAContext;        // Context 可以访问私有构造
+    friend class BackendScheduler;   // Scheduler 可以临时修改 nodes/n_nodes_ 实现子图 view
 
     int size_;
     int n_nodes_;

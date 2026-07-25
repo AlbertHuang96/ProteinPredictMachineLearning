@@ -1,8 +1,43 @@
 
 
+
 #include "rfaa/Backend.h"
+#include <cstdlib>
 
 namespace rfaa {
+
+// ===== CPUBufferType 实现 =====
+CPUBufferType* CPUBufferType::instance() {
+    static CPUBufferType s_instance;
+    return &s_instance;
+}
+
+void* CPUBufferType::alloc(size_t size) {
+#ifdef _WIN32
+    return _aligned_malloc(size, 32);
+#else
+    return std::aligned_alloc(32, ((size + 31) / 32) * 32);
+#endif
+}
+
+void CPUBufferType::free(void* ptr) {
+#ifdef _WIN32
+    _aligned_free(ptr);
+#else
+    std::free(ptr);
+#endif
+}
+
+// ===== CPUBackend::buffer_type / supports_buffer_type =====
+const BufferType* CPUBackend::buffer_type() const {
+    return CPUBufferType::instance();
+}
+
+bool CPUBackend::supports_buffer_type(const BufferType* buft) const {
+    // CPU backend 支持所有 host 端 buffer 类型
+    if (!buft) return false;
+    return buft->is_host();
+}
 
 // ===== 构造/析构 =====
 CPUBackend::CPUBackend(int n_threads) : n_threads_(n_threads) {

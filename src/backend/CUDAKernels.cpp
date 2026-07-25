@@ -41,6 +41,7 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
     switch (node->op) {
         case OP_NONE:   break;
 
+        // ===== 有完整 .cu kernel 的 op =====
         case OP_ADD:
             kernel_elemwise_add_cuda(node, p);
             break;
@@ -52,14 +53,6 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
             break;
         case OP_DIV:
             kernel_elemwise_div_cuda(node, p);
-            break;
-
-        case OP_ADD1:
-            kernel_add1_cuda(node, p);
-            break;
-
-        case OP_SCALE:
-            kernel_scale_cuda(node, p);
             break;
 
         case OP_MUL_MAT:
@@ -79,7 +72,6 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
             break;
 
         case OP_NORM: {
-            // 复用 layernorm_forward_cuda，需把 mean/rstd 写入 node->src[1]/src[2]
             int C    = static_cast<int>(node->dims()[0]);
             int rows = static_cast<int>(node->numel() / C);
 
@@ -87,50 +79,17 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
             float * mean  = node->src[1] ? node->src[1]->data() : nullptr;
             float * rstd  = node->src[2] ? node->src[2]->data() : nullptr;
             const float * inp   = node->src[0]->data();
-            const float * weight = nullptr;  // OP_NORM 不带 affine，gamma/beta 由上层图节点处理
+            const float * weight = nullptr;
             const float * bias   = nullptr;
 
             layernorm_forward_cuda(out, mean, rstd, inp, weight, bias, rows, 1, C, 256);
         } break;
 
         case OP_NORM_BACK:
-        // layer norm backward
             kernel_norm_back_cuda(node, p);
             break;
 
-        case OP_RMS_NORM:
-            // 当前使用 rms_norm 作为简化实现，可复用 layernorm 或单独实现
-            // TODO: 实现 CUDA rms_norm kernel
-            break;
-
-        case OP_DUP:
-            kernel_dup_cuda(node);
-            break;
-
-        case OP_SUM:
-            kernel_sum_cuda(node, p);
-            break;
-
-        case OP_MEAN:
-            kernel_mean_cuda(node, p);
-            break;
-
-        case OP_UNARY: {
-            // 简化为 sigmoid/relu/gelu 等直接调用对应 kernel
-            const unary_op uop = get_unary_op(node);
-            switch (uop) {
-                case UNARY_OP_RELU:    kernel_relu_cuda(node);    break;
-                case UNARY_OP_GELU:    kernel_gelu_cuda(node);    break;
-                case UNARY_OP_SIGMOID: kernel_sigmoid_cuda(node); break;
-                case UNARY_OP_SILU:    kernel_silu_cuda(node);    break;
-                case UNARY_OP_TANH:    kernel_tanh_cuda(node);    break;
-                case UNARY_OP_EXP:     kernel_exp_cuda(node);     break;
-                default:
-                    p->threadpool->ec = Status::NOT_SUPPORTED;
-                    break;
-            }
-        } break;
-
+        // ===== 无实现的 op：统一返回 NOT_SUPPORTED =====
         default:
             p->threadpool->ec = Status::NOT_SUPPORTED;
             break;

@@ -1446,7 +1446,29 @@ TensorF32 RFAAModel::get_templ_emb(const TensorF32& t1d, const TensorF32& t2d) {
 
 void RFAAModel::to(Device device) {
     device_ = device;
-    // 转移所有参数...
+
+    // 确保后端基础设施已初始化
+    ensure_backend_ready();
+}
+
+void RFAAModel::ensure_backend_ready() {
+    if (backend_ready_) return;
+
+    // 1. 创建 CPU Backend（始终存在）
+    if (!cpu_backend_) {
+        cpu_backend_ = std::make_unique<CPUBackend>(4);  // 4 线程
+    }
+
+    // 2. 创建 BackendScheduler 并注册后端
+    if (!scheduler_) {
+        scheduler_ = std::make_unique<BackendScheduler>();
+        scheduler_->add_backend(cpu_backend_.get());
+        // 将来 device_ == CUDA 时:
+        //   cuda_backend_ = std::make_unique<CUDABackend>(0);
+        //   scheduler_->add_backend(cuda_backend_.get());
+    }
+
+    backend_ready_ = true;
 }
 
 Device RFAAModel::device() const {
@@ -1467,12 +1489,203 @@ bool RFAAModel::is_training() const {
 
 void RFAAModel::load_weights(const std::string& path) {
     std::cout << "Loading weights from: " << path << std::endl;
-    // 实现权重加载...
+
+    // 1. 确保后端已就绪
+    ensure_backend_ready();
+
+    // 2. 从文件加载权重数据到各参数 tensor 的 CPU arena
+    //    （此时参数数据仍在 context arena 中，data_ 指向 arena 地址）
+    //    TODO: 实现二进制文件读取逻辑
+    //    示例: file.read(linear->weight()->data(), linear->weight()->nbytes());
+
+    // 3. 将参数迁移到 backend buffer
+    transfer_params_to_backend();
+
+    std::cout << "Weights loaded and transferred to backend buffer." << std::endl;
+}
+
+void RFAAModel::transfer_params_to_backend() {
+    if (!scheduler_ || !cpu_backend_) return;
+
+    const BufferType* cpu_buft = cpu_backend_->buffer_type();
+
+    // ===== Step 1: 统计所有参数 tensor 的总大小（对标 ggml_backend_alloc_ctx_tensors 的 phase 1）=====
+    // 收集所有需要搬迁的参数 tensor
+    std::vector<TensorF32*> param_tensors;
+
+    // 辅助 lambda：递归收集所有 LinearLayer / LayerNorm / EmbeddingLayer 的参数
+    auto collect_linear = [&](LinearLayer* ll) {
+        if (ll && ll->weight()) param_tensors.push_back(ll->weight());
+        if (ll && ll->bias())   param_tensors.push_back(ll->bias());
+    };
+    auto collect_layernorm = [&](LayerNorm* ln) {
+        if (ln && ln->gamma()) param_tensors.push_back(ln->gamma());
+        if (ln && ln->beta())  param_tensors.push_back(ln->beta());
+    };
+    auto collect_embedding = [&](EmbeddingLayer* emb) {
+        if (emb && emb->weight()) param_tensors.push_back(emb->weight());
+    };
+
+    // embedding / template 全局参数
+    collect_linear(msa_emb_);
+    collect_embedding(state_emb_);
+    collect_embedding(pair_left_emb_);
+    collect_embedding(pair_right_emb_);
+    collect_linear(full_linear_);
+    collect_embedding(full_emb_);
+    collect_linear(bond_emb_);
+    collect_linear(emb_t1d_);
+    collect_linear(proj_t1d_);
+    collect_linear(emb_t1d_t2d_);
+    collect_linear(temp_stack_t1d_proj_);
+    collect_layernorm(temp_stack_norm_);
+
+    // attention 参数 (12 blocks × 6 LinearLayer × 6 组)
+    for (auto* ll : msa_row_Wq_)     collect_linear(ll);
+    for (auto* ll : msa_row_Wk_)     collect_linear(ll);
+    for (auto* ll : msa_row_Wv_)     collect_linear(ll);
+    for (auto* ll : msa_row_to_b_)   collect_linear(ll);
+    for (auto* ll : msa_row_to_g_)   collect_linear(ll);
+    for (auto* ll : msa_row_to_out_) collect_linear(ll);
+
+    for (auto* ll : msa_col_Wq_)     collect_linear(ll);
+    for (auto* ll : msa_col_Wk_)     collect_linear(ll);
+    for (auto* ll : msa_col_Wv_)     collect_linear(ll);
+    for (auto* ll : msa_col_to_b_)   collect_linear(ll);
+    for (auto* ll : msa_col_to_g_)   collect_linear(ll);
+    for (auto* ll : msa_col_to_out_) collect_linear(ll);
+
+    for (auto* ll : msa_global_col_Wq_)     collect_linear(ll);
+    for (auto* ll : msa_global_col_Wk_)     collect_linear(ll);
+    for (auto* ll : msa_global_col_Wv_)     collect_linear(ll);
+    for (auto* ll : msa_global_col_to_b_)   collect_linear(ll);
+    for (auto* ll : msa_global_col_to_g_)   collect_linear(ll);
+    for (auto* ll : msa_global_col_to_out_) collect_linear(ll);
+
+    for (auto* ll : pair_row_Wq_)     collect_linear(ll);
+    for (auto* ll : pair_row_Wk_)     collect_linear(ll);
+    for (auto* ll : pair_row_Wv_)     collect_linear(ll);
+    for (auto* ll : pair_row_to_b_)   collect_linear(ll);
+    for (auto* ll : pair_row_to_g_)   collect_linear(ll);
+    for (auto* ll : pair_row_to_out_) collect_linear(ll);
+
+    for (auto* ll : pair_col_Wq_)     collect_linear(ll);
+    for (auto* ll : pair_col_Wk_)     collect_linear(ll);
+    for (auto* ll : pair_col_Wv_)     collect_linear(ll);
+    for (auto* ll : pair_col_to_b_)   collect_linear(ll);
+    for (auto* ll : pair_col_to_g_)   collect_linear(ll);
+    for (auto* ll : pair_col_to_out_) collect_linear(ll);
+
+    for (auto* ln : msa_ff_norm_)     collect_layernorm(ln);
+    for (auto* ll : msa_ff_linear1_)  collect_linear(ll);
+    for (auto* ll : msa_ff_linear2_)  collect_linear(ll);
+
+    for (auto* ln : pair_ff_norm_)     collect_layernorm(ln);
+    for (auto* ll : pair_ff_linear1_)  collect_linear(ll);
+    for (auto* ll : pair_ff_linear2_)  collect_linear(ll);
+
+    // TriangleMultiplication 参数
+    for (auto* ln : tri_out_layernorm_)        collect_layernorm(ln);
+    for (auto* ll : tri_out_left_proj_)        collect_linear(ll);
+    for (auto* ll : tri_out_right_proj_)       collect_linear(ll);
+    for (auto* ll : tri_out_left_gate_)        collect_linear(ll);
+    for (auto* ll : tri_out_right_gate_)       collect_linear(ll);
+    for (auto* ll : tri_out_gate_)             collect_linear(ll);
+    for (auto* ln : tri_out_output_layernorm_) collect_layernorm(ln);
+    for (auto* ll : tri_out_out_proj_)         collect_linear(ll);
+
+    for (auto* ln : tri_in_layernorm_)        collect_layernorm(ln);
+    for (auto* ll : tri_in_left_proj_)        collect_linear(ll);
+    for (auto* ll : tri_in_right_proj_)       collect_linear(ll);
+    for (auto* ll : tri_in_left_gate_)        collect_linear(ll);
+    for (auto* ll : tri_in_right_gate_)       collect_linear(ll);
+    for (auto* ll : tri_in_gate_)             collect_linear(ll);
+    for (auto* ln : tri_in_output_layernorm_) collect_layernorm(ln);
+    for (auto* ll : tri_in_out_proj_)         collect_linear(ll);
+
+    // PositionalEncoding 参数
+    for (auto* emb : pos_enc_emb_res_)  collect_embedding(emb);
+    for (auto* emb : pos_enc_emb_atom_) collect_embedding(emb);
+
+    // IterBlock 3D SE 参数
+    for (auto* ll : iter_embed_x_)     collect_linear(ll);
+    for (auto* ll : iter_embed_e_)     collect_linear(ll);
+    for (auto* ln : iter_norm_node_3d_) collect_layernorm(ln);
+    for (auto* ln : iter_norm_edge_3d_) collect_layernorm(ln);
+    for (auto* ln : iter_norm_msa_3d_)  collect_layernorm(ln);
+    for (auto* ln : iter_norm_pair_3d_) collect_layernorm(ln);
+
+    // IterBlock forward 内部参数
+    for (auto* ln : iter_state2msa_norm_)       collect_layernorm(ln);
+    for (auto* ll : iter_state2msa_linear_)     collect_linear(ll);
+    for (auto* ln : iter_pair2msa_norm_)        collect_layernorm(ln);
+    for (auto* ln : iter_msa2pair_norm_)        collect_layernorm(ln);
+    for (auto* ll : iter_msa2pair_left_proj_)   collect_linear(ll);
+    for (auto* ll : iter_msa2pair_right_proj_)  collect_linear(ll);
+    for (auto* ll : iter_msa2pair_out_proj_)    collect_linear(ll);
+    for (auto* ll : iter_pair2pair_rbf_proj_)   collect_linear(ll);
+    for (auto* ln : iter_pair2pair_state_norm_) collect_layernorm(ln);
+    for (auto* ll : iter_pair2pair_left_proj_)  collect_linear(ll);
+    for (auto* ll : iter_pair2pair_right_proj_) collect_linear(ll);
+    for (auto* ll : iter_pair2pair_gate_proj_)  collect_linear(ll);
+
+    // RefineBlock 参数
+    for (auto* ln : refine_norm_msa_)   collect_layernorm(ln);
+    for (auto* ln : refine_norm_pair_)  collect_layernorm(ln);
+    for (auto* ln : refine_norm_state_) collect_layernorm(ln);
+    for (auto* ll : refine_embed_x_)    collect_linear(ll);
+    for (auto* ln : refine_norm_node_)  collect_layernorm(ln);
+    for (auto* ll : refine_embed_e1_)   collect_linear(ll);
+    for (auto* ln : refine_norm_edge1_) collect_layernorm(ln);
+    for (auto* ll : refine_embed_e2_)   collect_linear(ll);
+    for (auto* ln : refine_norm_edge2_) collect_layernorm(ln);
+
+    // ===== Step 2: 计算总大小并分配 CPU backend buffer =====
+    size_t total_size = 0;
+    size_t alignment = cpu_buft->get_alignment();
+
+    for (auto* t : param_tensors) {
+        if (t->data() != nullptr) {
+            total_size += GGML_PAD(t->nbytes(), alignment);
+        }
+    }
+
+    if (total_size == 0 || param_tensors.empty()) return;
+
+    // ===== Step 3: 分配 buffer 并搬迁数据（对标 ggml_backend_alloc_ctx_tensors + ggml_backend_tensor_set）=====
+    Buffer* param_buf = alloc_buffer(const_cast<BufferType*>(cpu_buft), total_size, BufferUsage::WEIGHTS);
+    if (!param_buf) return;
+
+    // 将 buffer 所有权交给 RFAAModel
+    param_buffers_.emplace_back(param_buf);
+
+    TensorAllocator tallocr(param_buf);
+
+    for (auto* t : param_tensors) {
+        if (t->data() == nullptr) continue;
+
+        // 保存旧数据指针（指向 context arena）
+        float* old_data = t->data();
+        size_t old_nbytes = t->nbytes();
+
+        // 在 backend buffer 中分配新空间（覆盖 data_）
+        if (!tallocr.alloc(t)) {
+            // buffer 空间不足（理论上不会发生）
+            continue;
+        }
+
+        // 对标 ggml_backend_tensor_set：将旧数据拷贝到新 buffer
+        param_buf->set_tensor(t, old_data, t->buffer_offs_, old_nbytes);
+
+        // 旧数据在 context arena 中，无法释放，但 data_ 已指向新 buffer
+        // 后续可通过 t->buffer_ 和 t->buffer_offs_ 访问
+    }
 }
 
 void RFAAModel::save_weights(const std::string& path) const {
     std::cout << "Saving weights to: " << path << std::endl;
     // 实现权重保存...
+    // 如果有 backend buffer，需要通过 buffer->get_tensor 读取
 }
 
 } // namespace rfaa
