@@ -315,14 +315,18 @@ void ComputeGraph::compute_backward(
     const bool src2_needs_grads = src2 && isrc2 != HASHSET_FULL && bitset_get(hash_set->used, isrc2) && grads_needed[isrc2];
  
     switch (tensor->op) {
+        case OP_DUP: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, grad);
+            }
+        } break;
         case OP_ADD: {
             if (src0_needs_grads) {
                 add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
                 TensorF32 * tmp = grad;
-                if (!src0->same_shape(src1)) {
-                    //tmp = src1->repeat_back(tmp);
+                if (!src0->same_shape(*src1)) {
                     tmp = repeat_back(tmp, src1);
                 }
                 add_or_set(ctx, cgraph, isrc1, tmp);
@@ -333,7 +337,21 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                add_or_set(ctx, cgraph, isrc1, ggml_mean(ctx, grad)); // TODO: should probably be sum instead of mean
+                add_or_set(ctx, cgraph, isrc1, mean(grad)); // TODO: should probably be sum instead of mean
+            }
+        } break;
+        case OP_ACC: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, grad);
+            }
+            if (src1_needs_grads) {
+                // TODO: extract nb1/nb2/nb3/offset from tensor->op_params and use view_4d + reshape + cont
+                // const size_t nb1    = ((int32_t *) tensor->op_params)[0];
+                // const size_t nb2    = ((int32_t *) tensor->op_params)[1];
+                // const size_t nb3    = ((int32_t *) tensor->op_params)[2];
+                // const size_t offset = ((int32_t *) tensor->op_params)[3];
+                // struct TensorF32 * tensor_grad_view = view_4d(ctx, grad, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], nb1, nb2, nb3, offset);
+                // add_or_set(ctx, cgraph, isrc1, reshape(cont(tensor_grad_view), src1));
             }
         } break;
         case OP_SUB: {
@@ -346,22 +364,87 @@ void ComputeGraph::compute_backward(
         } break;
         case OP_MUL: {
             if (src0_needs_grads) {
-                add_or_set(ctx, cgraph, isrc0, ggml_mul(ctx, grad, src1));
+                add_or_set(ctx, cgraph, isrc0, mul(grad, src1));
             }
             if (src1_needs_grads) {
-                TensorF32 * tmp = ggml_mul(ctx, src0, grad);
-                if (!tmp->same_shape(src1)) {
-                    //tmp = ggml_repeat_back(ctx, tmp, src1);
+                TensorF32 * tmp = mul(src0, grad);
+                if (!tmp->same_shape(*src1)) {
+                    tmp = repeat_back(tmp, src1);
                 }
                 add_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case OP_DIV: {
             if (src0_needs_grads) {
-                add_or_set(ctx, cgraph, isrc0, ggml_div(ctx, grad, src1));
+                add_or_set(ctx, cgraph, isrc0, div(grad, src1));
             }
             if (src1_needs_grads) {
-                sub_or_set(ctx, cgraph, isrc1, ggml_mul(ctx, grad, ggml_div(ctx, tensor, src1)));
+                sub_or_set(ctx, cgraph, isrc1, mul(grad, div(tensor, src1)));
+            }
+        } break;
+        case OP_SQR: {
+            if (src0_needs_grads) {
+                // d(x²)/dx = 2x * grad
+                add_or_set(ctx, cgraph, isrc0, scale(mul(src0, grad), 2.0f));
+            }
+        } break;
+        case OP_SQRT: {
+            if (src0_needs_grads) {
+                // d(sqrt(x))/dx = grad / (2 * sqrt(x)) = 0.5 * grad / tensor
+                add_or_set(ctx, cgraph, isrc0, scale(div(grad, tensor), 0.5f));
+            }
+        } break;
+        case OP_LOG: {
+            if (src0_needs_grads) {
+                // d(log(x))/dx = grad / x
+                add_or_set(ctx, cgraph, isrc0, div(grad, src0));
+            }
+        } break;
+        case OP_SIN: {
+            if (src0_needs_grads) {
+                // d(sin(x))/dx = cos(x) * grad
+                add_or_set(ctx, cgraph, isrc0, mul(grad, cos(src0)));
+            }
+        } break;
+        case OP_COS: {
+            if (src0_needs_grads) {
+                // d(cos(x))/dx = -sin(x) * grad
+                sub_or_set(ctx, cgraph, isrc0, mul(grad, sin(src0)));
+            }
+        } break;
+        case OP_SUM: {
+            if (src0_needs_grads) {
+                add1_or_set(ctx, cgraph, isrc0, grad);
+            }
+        } break;
+        case OP_SUM_ROWS: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, repeat(grad, src0));
+            }
+        } break;
+        case OP_MEAN: {
+            if (src0_needs_grads) {
+                // d(mean(x))/dx = grad / N, broadcast to src0 shape
+                float inv_N = 1.0f / src0->numel();
+                add1_or_set(ctx, cgraph, isrc0, scale(grad, inv_N));
+            }
+        } break;
+        case OP_REPEAT: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, repeat_back(grad, src0));
+            }
+        } break;
+        case OP_REPEAT_BACK: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, repeat(grad, src0));
+            }
+        } break;
+        case OP_RMS_NORM: {
+            if (src0_needs_grads) {
+                // TODO: needs rms_norm_back graph node and kernel
+                // float eps;
+                // memcpy(&eps, tensor->op_params, sizeof(float));
+                // add_or_set(ctx, cgraph, isrc0, rms_norm_back(grad, src0, eps));
             }
         } break;
         case OP_MUL_MAT: {
@@ -370,57 +453,141 @@ void ComputeGraph::compute_backward(
             // s0 = np.random.randn(5, 10)
             // s1 = np.random.randn(10, 3)
             // t = s0.dot(s1)
- 
+
             // # now suppose we had the gradient on t from above in the circuit
             // dt = np.random.randn(*t.shape) # same shape as t
             // ds0 = dt.dot(s1.T) #.T gives the transpose of the matrix
             // ds1 = t.T.dot(dt)
- 
+
             // tensor.shape [m,p,qq,rr]
             // src0.shape   [n,m,q1,r1]
             // src1.shape   [n,p,qq,rr]
- 
+
             if (src0_needs_grads) {
-                //GGML_ASSERT(grad->ne[2] == src1->ne[2]);
-                //GGML_ASSERT(grad->ne[3] == src1->ne[3]);
-                assert(grad->Shape().dims[2] == src1->Shape().dims[2]);
-                assert(grad->Shape().dims[3] == src1->Shape().dims[3]);
+                assert(grad->shape().dims[2] == src1->shape().dims[2]);
+                assert(grad->shape().dims[3] == src1->shape().dims[3]);
                 TensorF32 * tmp =
                     out_prod(ctx, // [n,m,qq,rr]
                         src1,          // [n,p,qq,rr]
                         grad);         // [m,p,qq,rr]
-                if (!tmp->same_shape(src0)) {
-                    //GGML_ASSERT(tmp->ne[0] == src0->ne[0]);
-                    //GGML_ASSERT(tmp->ne[1] == src0->ne[1]);
-                    //GGML_ASSERT(tmp->ne[3] == 1);
-                    assert(tmp->Shape().dims[0] == src0->Shape().dims[0]);
-                    assert(tmp->Shape().dims[1] == src0->Shape().dims[1]);
-                    assert(tmp->Shape().dims[3] == 1);
- 
-                    //const int64_t nr2 = tmp->Shape().dims[2] / src0->Shape().dims[2];
-                    //const size_t nb2 = tmp->nb[2] * nr2;
-                    //const size_t nb3 = tmp->nb[2];
- 
-                    //tmp = ggml_view_4d(ctx, tmp, src0->Shape().dims[0], src0->Shape().dims[1], src0->Shape().dims[2], nr2, tmp->nb[1], nb2, nb3, 0);
-                    tmp = repeat_back(ctx, tmp, src0);
-                    //tmp = 
+                if (!tmp->same_shape(*src0)) {
+                    assert(tmp->shape().dims[0] == src0->shape().dims[0]);
+                    assert(tmp->shape().dims[1] == src0->shape().dims[1]);
+                    assert(tmp->shape().dims[3] == 1);
+                    tmp = repeat_back(tmp, src0);
                 }
                 add_or_set(ctx, cgraph, isrc0, tmp);
             }
             if (src1_needs_grads) {
+                // when src0 is bigger than tensor->grad (this is mostly the case in llama),
+                // avoid transpose of src0, rather transpose smaller tensor->grad
+                // and then use out_prod
                 add_or_set(ctx, cgraph, isrc1,
-                        // ggml_mul_mat(ctx,                   // [n,p,qq,rr]
-                        //     ggml_cont(ctx,                  // [m,n,q1,r1]
-                        //         ggml_transpose(ctx, src0)), // [m,n,q1,r1]
-                        //     grad),                          // [m,p,qq,rr]
- 
-                        // when src0 is bigger than tensor->grad (this is mostly the case in llama),
-                        // avoid transpose of src0, rather transpose smaller tensor->grad
-                        // and then use ggml_out_prod
                         out_prod(ctx,      // [n,p,qq,rr]
                             src0,               // [n,m,q1,r1]
-                            transpose(ctx, // [p,m,qq,rr]
+                            transpose( // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
+            }
+        } break;
+        case OP_SCALE: {
+            if (src0_needs_grads) {
+                // d(s * a)/da = s * grad
+                float s;
+                memcpy(&s, tensor->op_params, sizeof(float));
+                add_or_set(ctx, cgraph, isrc0, scale(grad, s));
+            }
+        } break;
+        case OP_SET: {
+            // TODO: needs op_params for nb1/nb2/nb3/offset, view_4d, and acc_impl
+            // const size_t nb1    = ((const int32_t *) tensor->op_params)[0];
+            // const size_t nb2    = ((const int32_t *) tensor->op_params)[1];
+            // const size_t nb3    = ((const int32_t *) tensor->op_params)[2];
+            // const size_t offset = ((const int32_t *) tensor->op_params)[3];
+            // if (src0_needs_grads || src1_needs_grads) {
+            //     tensor_grad_view = view_4d(ctx, grad, src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3], nb1, nb2, nb3, offset);
+            // }
+            // if (src0_needs_grads) {
+            //     struct TensorF32 * tmp = neg(tensor_grad_view);
+            //     add_or_set(ctx, cgraph, isrc0, acc_impl(grad, tmp, nb1, nb2, nb3, offset, false));
+            // }
+            // if (src1_needs_grads) {
+            //     add_or_set(ctx, cgraph, isrc1, reshape(cont(tensor_grad_view), src1));
+            // }
+        } break;
+        case OP_CPY: {
+            // cpy overwrites value of src1 by src0 and returns view(src1)
+            // the overwriting is mathematically equivalent to:
+            // tensor = src0 * 1 + src1 * 0
+            if (src0_needs_grads) {
+                // dsrc0 = dtensor * 1
+                add_or_set(ctx, cgraph, isrc0, reshape(grad, src0->shape()));
+            }
+            if (src1_needs_grads) {
+                // dsrc1 = dtensor * 0 -> noop
+            }
+        } break;
+        case OP_CONT: {
+            // same as cpy
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0,
+                    tensor->same_shape(*src0) ? grad : reshape(grad, src0->shape()));
+            }
+        } break;
+        case OP_RESHAPE: {
+            if (src0_needs_grads) {
+                TensorF32 * grad_cont = grad->is_contiguous() ? grad : cont(grad);
+                add_or_set(ctx, cgraph, isrc0, reshape(grad_cont, src0->shape()));
+            }
+        } break;
+        case OP_VIEW: {
+            if (src0_needs_grads) {
+                // TODO: needs view_4d with offset/nb1/nb2/nb3 from op_params, then acc_or_set
+                // size_t offset;
+                // memcpy(&offset, tensor->op_params, sizeof(offset));
+                // size_t nb1 = tensor->nb[1];
+                // size_t nb2 = tensor->nb[2];
+                // size_t nb3 = tensor->nb[3];
+                // acc_or_set(ctx, cgraph, isrc0, grad, nb1, nb2, nb3, offset);
+            }
+        } break;
+        case OP_PERMUTE: {
+            if (src0_needs_grads) {
+                // TODO: needs axes stored in op_params to compute inverse permutation
+                // const int32_t * axes = (const int32_t *) tensor->op_params;
+                // const int axis0 = axes[0] & 0x3;
+                // const int axis1 = axes[1] & 0x3;
+                // const int axis2 = axes[2] & 0x3;
+                // const int axis3 = axes[3] & 0x3;
+                // int axb[4] = {0,0,0,0}; // axes backward (inverse)
+                // axb[axis0] = 0; axb[axis1] = 1; axb[axis2] = 2; axb[axis3] = 3;
+                // add_or_set(ctx, cgraph, isrc0, permute(grad, {axb[0], axb[1], axb[2], axb[3]}));
+            }
+        } break;
+        case OP_TRANSPOSE: {
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, transpose(grad));
+            }
+        } break;
+        case OP_GET_ROWS: {
+            if (src0_needs_grads) {
+                // TODO: needs get_rows_back graph node and kernel
+                // add_or_set(ctx, cgraph, isrc0, get_rows_back(grad, src1, src0));
+            }
+            if (src1_needs_grads) {
+                // noop
+            }
+        } break;
+        case OP_DIAG_MASK_INF: {
+            if (src0_needs_grads) {
+                // ref: https://github.com/ggml-org/llama.cpp/pull/4203#discussion_r1412377992
+                // const int n_past = ((const int32_t *) tensor->op_params)[0];
+                // add_or_set(ctx, cgraph, isrc0, diag_mask_zero_impl(grad, n_past, false));
+            }
+        } break;
+        case OP_DIAG_MASK_ZERO: {
+            if (src0_needs_grads) {
+                // const int n_past = ((const int32_t *) tensor->op_params)[0];
+                // add_or_set(ctx, cgraph, isrc0, diag_mask_zero_impl(grad, n_past, false));
             }
         } break;
         case OP_SOFT_MAX: {
@@ -440,6 +607,17 @@ void ComputeGraph::compute_backward(
                 reinterpret_cast<int&>(dx->op_params[1]) = rows;
 
                 add_or_set(ctx, cgraph, isrc0, dx);
+            }
+        } break;
+        case OP_ROPE: {
+            if (src0_needs_grads) {
+                // TODO: needs rope_back graph node and kernel
+                // const int n_dims     = ((const int32_t *) tensor->op_params)[1];
+                // const int mode       = ((const int32_t *) tensor->op_params)[2];
+                // const int n_ctx_orig = ((const int32_t *) tensor->op_params)[4];
+                // float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+                // ... read from op_params ...
+                // add_or_set(ctx, cgraph, isrc0, rope_back(grad, src1, src2, n_dims, mode, ...));
             }
         } break;
         case OP_NORM: {
@@ -463,6 +641,101 @@ void ComputeGraph::compute_backward(
 
                 add_or_set(ctx, cgraph, isrc0, dx);
             }
+        } break;
+        case OP_IM2COL: {
+            // TODO: needs im2col_back graph node and kernel
+            // if (src1_needs_grads) {
+            //     const int32_t s0 = ((const int32_t *) tensor->op_params)[0];
+            //     const int32_t s1 = ((const int32_t *) tensor->op_params)[1];
+            //     const int32_t p0 = ((const int32_t *) tensor->op_params)[2];
+            //     const int32_t p1 = ((const int32_t *) tensor->op_params)[3];
+            //     const int32_t d0 = ((const int32_t *) tensor->op_params)[4];
+            //     const int32_t d1 = ((const int32_t *) tensor->op_params)[5];
+            //     const bool is_2D = ((const int32_t *) tensor->op_params)[6] == 1;
+            //     add_or_set(ctx, cgraph, isrc1, im2col_back(grad, src0, src1->ne, s0, s1, p0, p1, d0, d1, is_2D));
+            // }
+        } break;
+        case OP_POOL_2D: {
+            // TODO: needs pool_2d_back graph node and kernel
+            // if (src0_needs_grads) {
+            //     const enum ggml_op_pool op = ((const int32_t *) tensor->op_params)[0];
+            //     const int32_t k0 = ((const int32_t *) tensor->op_params)[1];
+            //     const int32_t k1 = ((const int32_t *) tensor->op_params)[2];
+            //     const int32_t s0 = ((const int32_t *) tensor->op_params)[3];
+            //     const int32_t s1 = ((const int32_t *) tensor->op_params)[4];
+            //     const int32_t p0 = ((const int32_t *) tensor->op_params)[5];
+            //     const int32_t p1 = ((const int32_t *) tensor->op_params)[6];
+            //     add_or_set(ctx, cgraph, isrc0, pool_2d_back(grad, src0, op, k0, k1, s0, s1, p0, p1));
+            // }
+        } break;
+        case OP_WIN_PART:
+        case OP_WIN_UNPART:
+        case OP_UNARY: {
+            switch (get_unary_op(tensor)) {
+                case UNARY_OP_ABS: {
+                    if (src0_needs_grads) {
+                        // d(abs(x))/dx = sign(x) * grad
+                        // TODO: needs sgn() graph node; currently using step()-based approach
+                        // add_or_set(ctx, cgraph, isrc0, mul(sgn(src0), grad));
+                    }
+                } break;
+                case UNARY_OP_SGN: {
+                    // noop (gradient is zero almost everywhere)
+                } break;
+                case UNARY_OP_NEG: {
+                    if (src0_needs_grads) {
+                        sub_or_set(ctx, cgraph, isrc0, grad);
+                    }
+                } break;
+                case UNARY_OP_STEP: {
+                    // noop (gradient is zero almost everywhere)
+                } break;
+                case UNARY_OP_RELU: {
+                    if (src0_needs_grads) {
+                        // d(relu(x))/dx = step(x) * grad
+                        // TODO: needs step() graph node
+                        // add_or_set(ctx, cgraph, isrc0, mul(step(src0), grad));
+                    }
+                } break;
+                case UNARY_OP_SILU: {
+                    if (src0_needs_grads) {
+                        // TODO: needs silu_back graph node and kernel
+                        // add_or_set(ctx, cgraph, isrc0, silu_back(grad, src0));
+                    }
+                } break;
+                case UNARY_OP_GELU: {
+                    // TODO: needs gelu_back graph node and kernel
+                } break;
+                case UNARY_OP_GELU_QUICK: {
+                    // TODO: needs gelu_quick_back graph node and kernel
+                } break;
+                case UNARY_OP_TANH: {
+                    // TODO: needs tanh_back graph node and kernel
+                } break;
+                case UNARY_OP_SIGMOID: {
+                    // TODO: needs sigmoid_back graph node and kernel
+                    // d(sigmoid(x))/dx = sigmoid(x) * (1 - sigmoid(x)) * grad = tensor * (1 - tensor) * grad
+                } break;
+                default: {
+                    // unsupported unary op for backward pass
+                } break;
+            }
+        } break;
+        case OP_CROSS_ENTROPY_LOSS: {
+            if (src0_needs_grads) {
+                // TODO: needs cross_entropy_loss_back graph node and kernel
+                // add_or_set(ctx, cgraph, isrc0, cross_entropy_loss_back(grad, src0, src1));
+            }
+            // labels (src1) gradient not implemented
+        } break;
+        case OP_GLU: {
+            // TODO: needs glu op and glu_back graph nodes and kernels
+            // switch (ggml_get_glu_op(tensor)) {
+            //     case GGML_GLU_OP_SWIGLU:
+            //         if (src0_needs_grads) add_or_set(ctx, cgraph, isrc0, silu_back(mul(grad, src1), src0));
+            //         if (src1_needs_grads) add_or_set(ctx, cgraph, isrc1, mul(silu(src0), grad));
+            //         break;
+            // }
         } break;
         case OP_NONE: {
 
@@ -502,15 +775,14 @@ static void ComputeGraph::acc_or_set(
         const  size_t         nb3,
         const  size_t         offset) {
     Tensor * src = cgraph->visited_hash_set.keys[isrc];
-    //GGML_ASSERT(src);
+    assert(src);
     if (cgraph->grads[isrc]) {
-        cgraph->grads[isrc] = acc_impl(cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
+        cgraph->grads[isrc] = acc(cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset);
     } else {
-        //Tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
-        //cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
+        // FIXME this is going to produce NaN if src contains inf/NaN
+        Tensor * a_zero = scale(src, 0.0f);
+        cgraph->grads[isrc] = acc(a_zero, tensor, nb1, nb2, nb3, offset);
     }
-    //ggml_format_name(cgraph->grads[isrc], "grad for %s", cgraph->visited_hash_set.keys[isrc]->name);
-    //build_forward_expand(cgraph, cgraph->grads[isrc]);
     cgraph->build_forward_expand(cgraph->grads[isrc]);
 }
  
@@ -520,16 +792,12 @@ static void ComputeGraph::add1_or_set(
         size_t                isrc,
         Tensor  * tensor) {
     Tensor * src = cgraph->visited_hash_set.keys[isrc];
-    //GGML_ASSERT(src);
     assert(src);
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = add1_impl(cgraph->grads[isrc], tensor, cgraph->grad_accs[isrc]);
     } else {
-        //cgraph->grads[isrc] = ggml_repeat(ctx, tensor, src);
-
+        cgraph->grads[isrc] = repeat(tensor, src);
     }
-    //ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
-    //build_forward_expand(cgraph, cgraph->grads[isrc]);
     cgraph->build_forward_expand(cgraph->grads[isrc]);
 }
  
@@ -539,15 +807,12 @@ static void ComputeGraph::sub_or_set(
         size_t                isrc,
         Tensor  * tensor) {
     Tensor * src = cgraph->visited_hash_set.keys[isrc];
-    //GGML_ASSERT(src);
     assert(src);
     if (cgraph->grads[isrc]) {
-        cgraph->grads[isrc] = ggml_sub_impl(ctx, cgraph->grads[isrc], tensor, cgraph->grad_accs[isrc]);
+        cgraph->grads[isrc] = sub(cgraph->grads[isrc], tensor);
     } else {
-        cgraph->grads[isrc] = ggml_neg(ctx, tensor);
+        cgraph->grads[isrc] = neg(tensor);
     }
-    //ggml_format_name(cgraph->grads[isrc], "grad for %s", src->name);
-    //build_forward_expand(cgraph, cgraph->grads[isrc]);
     cgraph->build_forward_expand(cgraph->grads[isrc]);
 }
 

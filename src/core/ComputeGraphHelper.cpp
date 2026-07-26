@@ -8,13 +8,14 @@ namespace rfaa {
 TensorF32 * add_impl( 
         TensorF32  * a,  
         TensorF32  * b,  
-        bool                  inplace) {  
+        ) {  
     //GGML_ASSERT(ggml_can_repeat(b, a)); 
     assert(b->can_repeat(a));
   
     //struct Tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);  
     Tensor * result; 
-    result = inplace ? result.view(a->shape()) : result->copy_from(a);
+    //result = inplace ? result.view(a->shape()) : result->copy_from(a);
+    result = result->copy_from(a);
   
     result->op     = OP_ADD;  
     result->src[0] = a;  
