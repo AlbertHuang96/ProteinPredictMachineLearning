@@ -1,6 +1,7 @@
 
 #include "rfaa/Backend.h"
 #include "rfaa/ComputeGraph.h"
+#include "rfaa/FAPE.h"
 #include <cstring>
 #include <cmath>
 
@@ -27,6 +28,8 @@ static void compute_forward_log(ComputeParams* p, Tensor* dst);
 static void compute_forward_sqrt(ComputeParams* p, Tensor* dst);
 static void compute_forward_sin(ComputeParams* p, Tensor* dst);
 static void compute_forward_cos(ComputeParams* p, Tensor* dst);
+static void compute_forward_fape(ComputeParams* p, Tensor* dst);
+static void compute_forward_fape_back(ComputeParams* p, Tensor* dst);
 
 // ===== dispatch =====
 Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
@@ -49,6 +52,8 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_NORM_BACK: kernel_norm_back(node, p); break;
         case OP_SUM:    kernel_sum(node, p);         break;
         case OP_MEAN:   kernel_mean(node, p);        break;
+        case OP_FAPE:      compute_forward_fape(p, node);      break;
+        case OP_FAPE_BACK: compute_forward_fape_back(p, node); break;
         case OP_UNARY:  {
             const unary_op uop = get_unary_op(node);
             switch (uop) {
@@ -647,6 +652,429 @@ static void compute_forward_cos(ComputeParams* p, Tensor* dst) {
     for (int64_t i = p->ith; i < n; i += p->nth) {
         d[i] = cosf(s[i]);
     }
+}
+
+// ============================================================
+// OP_FAPE forward kernel — Frame Aligned Point Error
+// ============================================================
+//
+// 输入 (via dst->src[]):
+//   src[0]: pred_coords        [N_atoms, 3]      — 预测坐标
+//   src[1]: true_coords        [N_atoms, 3]      — 真实坐标
+//   src[2]: frame_atom_indices [N_frames, 3]     — 每帧 3 原子全局索引 (float-encoded ints)
+//   src[3]: frames_mask        [N_frames]        — 帧有效性 mask
+//   src[4]: positions_mask     [N_atoms]         — 原子位置 mask
+//
+// op_params:
+//   [0..1]: d_clamp (float)
+//   [2..3]: epsilon (float)
+//   [4..5]: length_scale (float)
+//
+// 输出: dst = scalar (1,) — FAPE loss
+//
+// 6 步流水线:
+//   Step 1: Gather frame atoms from coords
+//   Step 2: Gram-Schmidt → T_inv per frame
+//   Step 3: Transform all atoms to local frames
+//   Step 4: Pairwise Euclidean distances
+//   Step 5: Clamp + apply masks
+//   Step 6: Reduce to scalar
+static void compute_forward_fape(ComputeParams* p, Tensor* dst) {
+    ThreadPool* tp = p->threadpool;
+
+    // Only thread 0 does the computation (single scalar output)
+    if (p->ith != 0) {
+        tp->barrier_wait();
+        return;
+    }
+
+    Tensor* src0 = dst->src[0];  // pred_coords  [N_atoms, 3]
+    Tensor* src1 = dst->src[1];  // true_coords  [N_atoms, 3]
+    Tensor* src2 = dst->src[2];  // frame_atom_indices [N_frames, 3]
+    Tensor* src3 = dst->src[3];  // frames_mask  [N_frames]
+    Tensor* src4 = dst->src[4];  // positions_mask [N_atoms]
+
+    float d_clamp     = reinterpret_cast<float&>(dst->op_params[0]);
+    float epsilon     = reinterpret_cast<float&>(dst->op_params[2]);
+    float length_scale = reinterpret_cast<float&>(dst->op_params[4]);
+
+    float* pred_coords   = src0->data();
+    float* true_coords   = src1->data();
+    float* frame_indices = src2->data();
+    float* frames_mask   = src3->data();
+    float* positions_mask = src4->data();
+
+    int64_t N_atoms  = src0->dims()[1];   // number of rows
+    int64_t N_frames = src2->dims()[1];   // = N_frames
+
+    // Pre-compute T_inv for each frame (both pred and true)
+    // T_inv = [R^T | -R^T*A] stored as 12 floats per frame:
+    //   R^T col0 (3 floats), R^T col1 (3), R^T col2 (3), translation (3)
+    std::vector<float> T_inv_pred(N_frames * 12);
+    std::vector<float> T_inv_true(N_frames * 12);
+
+    for (int64_t n = 0; n < N_frames; n++) {
+        float fm = frames_mask[n];
+
+        // Default: identity (no rotation, zero translation)
+        for (int k = 0; k < 12; k++) {
+            T_inv_pred[n * 12 + k] = 0.0f;
+            T_inv_true[n * 12 + k] = 0.0f;
+        }
+        T_inv_pred[n * 12 + 0] = 1.0f;  // R^T col0 x
+        T_inv_pred[n * 12 + 4] = 1.0f;  // R^T col1 y
+        T_inv_pred[n * 12 + 8] = 1.0f;  // R^T col2 z
+        T_inv_true[n * 12 + 0] = 1.0f;
+        T_inv_true[n * 12 + 4] = 1.0f;
+        T_inv_true[n * 12 + 8] = 1.0f;
+
+        if (fm == 0.0f) continue;
+
+        // Gather frame atoms (Step 1)
+        int idx_A = (int)frame_indices[n * 3 + 0];
+        int idx_B = (int)frame_indices[n * 3 + 1];
+        int idx_C = (int)frame_indices[n * 3 + 2];
+
+        // pred frame atoms
+        float pAx = pred_coords[idx_A * 3 + 0], pAy = pred_coords[idx_A * 3 + 1], pAz = pred_coords[idx_A * 3 + 2];
+        float pBx = pred_coords[idx_B * 3 + 0], pBy = pred_coords[idx_B * 3 + 1], pBz = pred_coords[idx_B * 3 + 2];
+        float pCx = pred_coords[idx_C * 3 + 0], pCy = pred_coords[idx_C * 3 + 1], pCz = pred_coords[idx_C * 3 + 2];
+
+        // true frame atoms
+        float tAx = true_coords[idx_A * 3 + 0], tAy = true_coords[idx_A * 3 + 1], tAz = true_coords[idx_A * 3 + 2];
+        float tBx = true_coords[idx_B * 3 + 0], tBy = true_coords[idx_B * 3 + 1], tBz = true_coords[idx_B * 3 + 2];
+        float tCx = true_coords[idx_C * 3 + 0], tCy = true_coords[idx_C * 3 + 1], tCz = true_coords[idx_C * 3 + 2];
+
+        // Gram-Schmidt for pred (Step 2)
+        {
+            // v1 = B-A, v2 = C-A
+            float v1x = pBx - pAx, v1y = pBy - pAy, v1z = pBz - pAz;
+            float v2x = pCx - pAx, v2y = pCy - pAy, v2z = pCz - pAz;
+
+            // e1 = normalize(v1)
+            float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z);
+            float e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
+
+            // e2 = normalize(v2 - (v2·e1)*e1)
+            float dot = v2x * e1x + v2y * e1y + v2z * e1z;
+            float u2x = v2x - dot * e1x, u2y = v2y - dot * e1y, u2z = v2z - dot * e1z;
+            float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z);
+            float e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
+
+            // e3 = e1 × e2
+            float e3x = e1y * e2z - e1z * e2y;
+            float e3y = e1z * e2x - e1x * e2z;
+            float e3z = e1x * e2y - e1y * e2x;
+
+            // R^T columns = e1, e2, e3
+            T_inv_pred[n * 12 + 0] = e1x; T_inv_pred[n * 12 + 1] = e1y; T_inv_pred[n * 12 + 2] = e1z;
+            T_inv_pred[n * 12 + 3] = e2x; T_inv_pred[n * 12 + 4] = e2y; T_inv_pred[n * 12 + 5] = e2z;
+            T_inv_pred[n * 12 + 6] = e3x; T_inv_pred[n * 12 + 7] = e3y; T_inv_pred[n * 12 + 8] = e3z;
+            // translation = -R^T * A
+            T_inv_pred[n * 12 + 9]  = -(e1x * pAx + e1y * pAy + e1z * pAz);
+            T_inv_pred[n * 12 + 10] = -(e2x * pAx + e2y * pAy + e2z * pAz);
+            T_inv_pred[n * 12 + 11] = -(e3x * pAx + e3y * pAy + e3z * pAz);
+        }
+
+        // Gram-Schmidt for true
+        {
+            float v1x = tBx - tAx, v1y = tBy - tAy, v1z = tBz - tAz;
+            float v2x = tCx - tAx, v2y = tCy - tAy, v2z = tCz - tAz;
+
+            float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z);
+            float e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
+
+            float dot = v2x * e1x + v2y * e1y + v2z * e1z;
+            float u2x = v2x - dot * e1x, u2y = v2y - dot * e1y, u2z = v2z - dot * e1z;
+            float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z);
+            float e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
+
+            float e3x = e1y * e2z - e1z * e2y;
+            float e3y = e1z * e2x - e1x * e2z;
+            float e3z = e1x * e2y - e1y * e2x;
+
+            T_inv_true[n * 12 + 0] = e1x; T_inv_true[n * 12 + 1] = e1y; T_inv_true[n * 12 + 2] = e1z;
+            T_inv_true[n * 12 + 3] = e2x; T_inv_true[n * 12 + 4] = e2y; T_inv_true[n * 12 + 5] = e2z;
+            T_inv_true[n * 12 + 6] = e3x; T_inv_true[n * 12 + 7] = e3y; T_inv_true[n * 12 + 8] = e3z;
+            T_inv_true[n * 12 + 9]  = -(e1x * tAx + e1y * tAy + e1z * tAz);
+            T_inv_true[n * 12 + 10] = -(e2x * tAx + e2y * tAy + e2z * tAz);
+            T_inv_true[n * 12 + 11] = -(e3x * tAx + e3y * tAy + e3z * tAz);
+        }
+    }
+
+    // Steps 3-6: Transform + distance + clamp + mask + reduce
+    float sum_loss    = 0.0f;
+    float sum_fm      = 0.0f;  // sum of frames_mask
+    float sum_pm      = 0.0f;  // sum of positions_mask
+
+    for (int64_t n = 0; n < N_frames; n++) {
+        float fm = frames_mask[n];
+        if (fm == 0.0f) continue;
+        sum_fm += fm;
+
+        float* Tp = &T_inv_pred[n * 12];
+        float* Tt = &T_inv_true[n * 12];
+
+        for (int64_t j = 0; j < N_atoms; j++) {
+            float pm = positions_mask[j];
+            if (pm == 0.0f) continue;
+
+            // Transform pred atom j to frame n's local coords
+            float px = pred_coords[j * 3 + 0], py = pred_coords[j * 3 + 1], pz = pred_coords[j * 3 + 2];
+            float lpx = Tp[0]*px + Tp[1]*py + Tp[2]*pz  + Tp[9];
+            float lpy = Tp[3]*px + Tp[4]*py + Tp[5]*pz  + Tp[10];
+            float lpz = Tp[6]*px + Tp[7]*py + Tp[8]*pz  + Tp[11];
+
+            // Transform true atom j to frame n's local coords
+            float tx = true_coords[j * 3 + 0], ty = true_coords[j * 3 + 1], tz = true_coords[j * 3 + 2];
+            float ltx = Tt[0]*tx + Tt[1]*ty + Tt[2]*tz  + Tt[9];
+            float lty = Tt[3]*tx + Tt[4]*ty + Tt[5]*tz  + Tt[10];
+            float ltz = Tt[6]*tx + Tt[7]*ty + Tt[8]*tz  + Tt[11];
+
+            // Step 4: Euclidean distance
+            float dx = lpx - ltx, dy = lpy - lty, dz = lpz - ltz;
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz + epsilon);
+
+            // Step 5: Clamp and apply masks
+            if (dist > d_clamp) dist = d_clamp;
+            float masked = dist * fm * pm;
+
+            sum_loss += masked;
+            sum_pm += pm;
+        }
+    }
+
+    // Step 6: Normalize
+    float denom = sum_fm * sum_pm + epsilon;
+    float loss = sum_loss / denom / length_scale;
+
+    // Write scalar output
+    dst->data()[0] = loss;
+
+    tp->barrier_wait();
+}
+
+// ============================================================
+// OP_FAPE_BACK kernel — FAPE loss backward pass
+// ============================================================
+//
+// Computes dL/d(pred_coords) — gradient of FAPE loss w.r.t. predicted coordinates.
+//
+// Input (via dst->src[]):
+//   src[0]: grad              scalar (1,) — upstream gradient dL/dL_fape (= 1.0 at root)
+//   src[1]: pred_coords       [N_atoms, 3]  — forward pred_coords
+//   src[2]: true_coords       [N_atoms, 3]  — forward true_coords
+//   src[3]: frame_atom_indices[N_frames, 3] — frame atom global indices
+//   src[4]: frames_mask       [N_frames]    — frame mask
+//   src[5]: positions_mask    [N_atoms]     — position mask
+//
+// op_params: same as OP_FAPE (d_clamp, epsilon, length_scale)
+//
+// Output: dst = [N_atoms, 3] — gradient w.r.t. pred_coords
+//
+// Backward strategy (Phase 1 — simplified):
+//   Back-propagate through Steps 4-6 only:
+//   Step 6 backward: dL/dmasked = upstream / (sum_fm*sum_pm + eps) / length_scale
+//   Step 5 backward: clamp gate = (e < d_clamp); dL/de = dL/dmasked * gate * fm * pm
+//   Step 4 backward: dL/d(local_pred) = dL/de * (local_pred - local_true) / (e + eps)
+//   Step 3 backward: dL/d(global_pred) = R_pred @ dL/d(local_pred)
+//   (Gram-Schmidt backward through T_inv is deferred to Phase 2)
+static void compute_forward_fape_back(ComputeParams* p, Tensor* dst) {
+    ThreadPool* tp = p->threadpool;
+
+    if (p->ith != 0) {
+        tp->barrier_wait();
+        return;
+    }
+
+    Tensor* grad_scalar     = dst->src[0];  // upstream gradient (1,)
+    Tensor* pred_coords_t   = dst->src[1];  // [N_atoms, 3]
+    Tensor* true_coords_t   = dst->src[2];  // [N_atoms, 3]
+    Tensor* frame_indices_t = dst->src[3];  // [N_frames, 3]
+    Tensor* frames_mask_t   = dst->src[4];  // [N_frames]
+    Tensor* positions_mask_t= dst->src[5];  // [N_atoms]
+
+    float d_clamp     = reinterpret_cast<float&>(dst->op_params[0]);
+    float epsilon     = reinterpret_cast<float&>(dst->op_params[2]);
+    float length_scale = reinterpret_cast<float&>(dst->op_params[4]);
+
+    float* pred_coords   = pred_coords_t->data();
+    float* true_coords   = true_coords_t->data();
+    float* frame_indices = frame_indices_t->data();
+    float* frames_mask   = frames_mask_t->data();
+    float* positions_mask = positions_mask_t->data();
+    float* d_pred        = dst->data();  // output gradient
+
+    float upstream = grad_scalar->data()[0];  // dL/dL_fape
+
+    int64_t N_atoms  = pred_coords_t->dims()[1];
+    int64_t N_frames = frame_indices_t->dims()[1];
+
+    // Zero output gradient
+    for (int64_t i = 0; i < N_atoms * 3; i++) d_pred[i] = 0.0f;
+
+    // ---- Step 1+2: Recompute T_inv for each frame (same as forward) ----
+    std::vector<float> T_inv_pred(N_frames * 12);
+
+    for (int64_t n = 0; n < N_frames; n++) {
+        float fm = frames_mask[n];
+
+        for (int k = 0; k < 12; k++) T_inv_pred[n * 12 + k] = 0.0f;
+        T_inv_pred[n * 12 + 0] = 1.0f;
+        T_inv_pred[n * 12 + 4] = 1.0f;
+        T_inv_pred[n * 12 + 8] = 1.0f;
+
+        if (fm == 0.0f) continue;
+
+        int idx_A = (int)frame_indices[n * 3 + 0];
+        int idx_B = (int)frame_indices[n * 3 + 1];
+        int idx_C = (int)frame_indices[n * 3 + 2];
+
+        float pAx = pred_coords[idx_A * 3 + 0], pAy = pred_coords[idx_A * 3 + 1], pAz = pred_coords[idx_A * 3 + 2];
+        float pBx = pred_coords[idx_B * 3 + 0], pBy = pred_coords[idx_B * 3 + 1], pBz = pred_coords[idx_B * 3 + 2];
+        float pCx = pred_coords[idx_C * 3 + 0], pCy = pred_coords[idx_C * 3 + 1], pCz = pred_coords[idx_C * 3 + 2];
+
+        // Gram-Schmidt
+        float v1x = pBx - pAx, v1y = pBy - pAy, v1z = pBz - pAz;
+        float v2x = pCx - pAx, v2y = pCy - pAy, v2z = pCz - pAz;
+
+        float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z);
+        float e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
+
+        float dot = v2x * e1x + v2y * e1y + v2z * e1z;
+        float u2x = v2x - dot * e1x, u2y = v2y - dot * e1y, u2z = v2z - dot * e1z;
+        float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z);
+        float e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
+
+        float e3x = e1y * e2z - e1z * e2y;
+        float e3y = e1z * e2x - e1x * e2z;
+        float e3z = e1x * e2y - e1y * e2x;
+
+        // R^T (rotation transpose): columns are e1, e2, e3
+        T_inv_pred[n * 12 + 0] = e1x; T_inv_pred[n * 12 + 1] = e1y; T_inv_pred[n * 12 + 2] = e1z;
+        T_inv_pred[n * 12 + 3] = e2x; T_inv_pred[n * 12 + 4] = e2y; T_inv_pred[n * 12 + 5] = e2z;
+        T_inv_pred[n * 12 + 6] = e3x; T_inv_pred[n * 12 + 7] = e3y; T_inv_pred[n * 12 + 8] = e3z;
+        T_inv_pred[n * 12 + 9]  = -(e1x * pAx + e1y * pAy + e1z * pAz);
+        T_inv_pred[n * 12 + 10] = -(e2x * pAx + e2y * pAy + e2z * pAz);
+        T_inv_pred[n * 12 + 11] = -(e3x * pAx + e3y * pAy + e3z * pAz);
+    }
+
+    // ---- Same for true_coords ----
+    std::vector<float> T_inv_true(N_frames * 12);
+    for (int64_t n = 0; n < N_frames; n++) {
+        float fm = frames_mask[n];
+
+        for (int k = 0; k < 12; k++) T_inv_true[n * 12 + k] = 0.0f;
+        T_inv_true[n * 12 + 0] = 1.0f;
+        T_inv_true[n * 12 + 4] = 1.0f;
+        T_inv_true[n * 12 + 8] = 1.0f;
+
+        if (fm == 0.0f) continue;
+
+        int idx_A = (int)frame_indices[n * 3 + 0];
+        int idx_B = (int)frame_indices[n * 3 + 1];
+        int idx_C = (int)frame_indices[n * 3 + 2];
+
+        float tAx = true_coords[idx_A * 3 + 0], tAy = true_coords[idx_A * 3 + 1], tAz = true_coords[idx_A * 3 + 2];
+        float tBx = true_coords[idx_B * 3 + 0], tBy = true_coords[idx_B * 3 + 1], tBz = true_coords[idx_B * 3 + 2];
+        float tCx = true_coords[idx_C * 3 + 0], tCy = true_coords[idx_C * 3 + 1], tCz = true_coords[idx_C * 3 + 2];
+
+        float v1x = tBx - tAx, v1y = tBy - tAy, v1z = tBz - tAz;
+        float v2x = tCx - tAx, v2y = tCy - tAy, v2z = tCz - tAz;
+
+        float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z);
+        float e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
+
+        float dot = v2x * e1x + v2y * e1y + v2z * e1z;
+        float u2x = v2x - dot * e1x, u2y = v2y - dot * e1y, u2z = v2z - dot * e1z;
+        float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z);
+        float e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
+
+        float e3x = e1y * e2z - e1z * e2y;
+        float e3y = e1z * e2x - e1x * e2z;
+        float e3z = e1x * e2y - e1y * e2x;
+
+        T_inv_true[n * 12 + 0] = e1x; T_inv_true[n * 12 + 1] = e1y; T_inv_true[n * 12 + 2] = e1z;
+        T_inv_true[n * 12 + 3] = e2x; T_inv_true[n * 12 + 4] = e2y; T_inv_true[n * 12 + 5] = e2z;
+        T_inv_true[n * 12 + 6] = e3x; T_inv_true[n * 12 + 7] = e3y; T_inv_true[n * 12 + 8] = e3z;
+        T_inv_true[n * 12 + 9]  = -(e1x * tAx + e1y * tAy + e1z * tAz);
+        T_inv_true[n * 12 + 10] = -(e2x * tAx + e2y * tAy + e2z * tAz);
+        T_inv_true[n * 12 + 11] = -(e3x * tAx + e3y * tAy + e3z * tAz);
+    }
+
+    // ---- Step 6 backward: compute normalization denominator ----
+    float sum_fm = 0.0f, sum_pm = 0.0f;
+    for (int64_t n = 0; n < N_frames; n++) if (frames_mask[n] != 0.0f) sum_fm += frames_mask[n];
+    for (int64_t j = 0; j < N_atoms; j++)  if (positions_mask[j] != 0.0f) sum_pm += positions_mask[j];
+
+    float denom = sum_fm * sum_pm + epsilon;
+    // dL/dmasked = upstream / denom / length_scale
+    float d_masked = upstream / denom / length_scale;
+
+    // ---- Steps 5,4,3 backward: accumulate gradients ----
+    for (int64_t n = 0; n < N_frames; n++) {
+        float fm = frames_mask[n];
+        if (fm == 0.0f) continue;
+
+        float* Tp = &T_inv_pred[n * 12];  // R^T_pred, t_pred
+        float* Tt = &T_inv_true[n * 12];  // R^T_true,  t_true
+
+        // Extract rotation matrices (R_pred, R_true) from T_inv
+        // T_inv stores [R^T | -R^T*A], so:
+        //   local = R^T * global + t
+        //   R is columns 0,1,2 of R^T read row-wise
+        // For backward: d(global) = R @ d(local) = (R^T)^T @ d(local)
+        // Since R^T is stored, R is just its transpose.
+        // But R^T columns are stored contiguously, so R row i = R^T column i
+
+        for (int64_t j = 0; j < N_atoms; j++) {
+            float pm = positions_mask[j];
+            if (pm == 0.0f) continue;
+
+            // Transform pred atom j to local coords (same as forward Step 3)
+            float px = pred_coords[j * 3 + 0], py = pred_coords[j * 3 + 1], pz = pred_coords[j * 3 + 2];
+            float lpx = Tp[0]*px + Tp[1]*py + Tp[2]*pz  + Tp[9];
+            float lpy = Tp[3]*px + Tp[4]*py + Tp[5]*pz  + Tp[10];
+            float lpz = Tp[6]*px + Tp[7]*py + Tp[8]*pz  + Tp[11];
+
+            float tx = true_coords[j * 3 + 0], ty = true_coords[j * 3 + 1], tz = true_coords[j * 3 + 2];
+            float ltx = Tt[0]*tx + Tt[1]*ty + Tt[2]*tz  + Tt[9];
+            float lty = Tt[3]*tx + Tt[4]*ty + Tt[5]*tz  + Tt[10];
+            float ltz = Tt[6]*tx + Tt[7]*ty + Tt[8]*tz  + Tt[11];
+
+            // Step 4: distance
+            float dx = lpx - ltx, dy = lpy - lty, dz = lpz - ltz;
+            float dist = sqrtf(dx*dx + dy*dy + dz*dz + epsilon);
+
+            // Step 5: clamp gate
+            if (dist >= d_clamp) continue;  // gradient is 0 when clamped
+
+            // Step 4 backward: dL/d(local_pred) = dL/de * (local_pred - local_true) / (dist + eps)
+            // dL/de = d_masked * fm * pm (from Step 5)
+            float d_dist = d_masked * fm * pm;
+            float inv_dist = 1.0f / (dist + epsilon);
+            float d_lpx = d_dist * dx * inv_dist;
+            float d_lpy = d_dist * dy * inv_dist;
+            float d_lpz = d_dist * dz * inv_dist;
+
+            // Step 3 backward: d(global) = R @ d(local)
+            // R = transpose of R^T
+            // R^T is stored as: [e1x e1y e1z] [e2x e2y e2z] [e3x e3y e3z]
+            // (columns 0,1,2 stored as rows)
+            // R = [e1x e2x e3x]
+            //     [e1y e2y e3y]
+            //     [e1z e2z e3z]
+            float d_px = Tp[0]*d_lpx + Tp[3]*d_lpy + Tp[6]*d_lpz;
+            float d_py = Tp[1]*d_lpx + Tp[4]*d_lpy + Tp[7]*d_lpz;
+            float d_pz = Tp[2]*d_lpx + Tp[5]*d_lpy + Tp[8]*d_lpz;
+
+            d_pred[j * 3 + 0] += d_px;
+            d_pred[j * 3 + 1] += d_py;
+            d_pred[j * 3 + 2] += d_pz;
+        }
+    }
+
+    tp->barrier_wait();
 }
 
 } // namespace rfaa

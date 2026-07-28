@@ -142,6 +142,8 @@ enum tensor_op {
     OP_OPT_STEP_ADAMW,
     OP_OPT_STEP_SGD,
     OP_GLU,
+    OP_FAPE,
+    OP_FAPE_BACK,
     OP_COUNT,
 };
 

@@ -11,6 +11,8 @@
 
 namespace rfaa {
 
+struct FAPEConfig;
+
 // ============================================================
 // unary op 枚举 — 对标 ggml_unary_op (去掉 ggml_ 前缀)
 // ============================================================
@@ -148,7 +150,7 @@ private:
 // ============================================================
 
 // 1. 算术
-TensorF32* add_impl (TensorF32* a, TensorF32* b);
+TensorF32* add_impl (TensorF32* a, TensorF32* b, bool inplace);
 TensorF32* sub (TensorF32* a, TensorF32* b);
 TensorF32* mul (TensorF32* a, TensorF32* b);
 TensorF32* div (TensorF32* a, TensorF32* b);
@@ -224,6 +226,13 @@ TensorF32* total_loss(
     TensorF32* loss_distogram,
     TensorF32* loss_msa);
 TensorF32* plddt_loss(TensorF32* logits, TensorF32* lddt_onehot, TensorF32* ca_mask);
+TensorF32* fape_loss(
+    TensorF32* pred_coords,
+    TensorF32* true_coords,
+    TensorF32* frame_atom_indices,
+    TensorF32* frames_mask,
+    TensorF32* positions_mask,
+    const FAPEConfig& config = FAPEConfig{});
 
 // 10. 位置编码
 TensorF32* rope(TensorF32* a, int n_past, int n_dims = 0);

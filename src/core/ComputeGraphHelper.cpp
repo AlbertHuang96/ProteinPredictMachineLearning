@@ -1,5 +1,7 @@
 #include "rfaa/Tensor.h"
 #include "rfaa/Context.h"
+#include "rfaa/FAPE.h"
+#include "rfaa/SymmetryResolver.h"
 
 #include "ComputeGraph.h"
 
@@ -8,14 +10,14 @@ namespace rfaa {
 TensorF32 * add_impl( 
         TensorF32  * a,  
         TensorF32  * b,  
-        ) {  
+        bool inplace) {  
     //GGML_ASSERT(ggml_can_repeat(b, a)); 
     assert(b->can_repeat(a));
   
     //struct Tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);  
-    Tensor * result; 
-    //result = inplace ? result.view(a->shape()) : result->copy_from(a);
-    result = result->copy_from(a);
+    TensorF32 * result; 
+    result = inplace ? result->view(a->shape()) : result->copy_from(a);
+    //result = result->copy_from(a);
   
     result->op     = OP_ADD;  
     result->src[0] = a;  
@@ -728,6 +730,46 @@ TensorF32* plddt_loss(TensorF32* logits, TensorF32* lddt_onehot, TensorF32* ca_m
     auto loss   = div(sum_ce, denom);
 
     return loss;
+}
+
+// fape_loss(pred_coords, true_coords, frame_atom_indices,
+//           frames_mask, positions_mask, config)
+// — Frame Aligned Point Error 损失 (图节点版本)
+//
+// 输入:
+//   pred_coords        [N_atoms, 3]       — 预测坐标
+//   true_coords        [N_atoms, 3]       — 真实坐标
+//   frame_atom_indices [N_frames, 3]      — 每帧的 3 原子全局索引 (float-encoded ints)
+//   frames_mask        [N_frames]         — 帧有效性 mask
+//   positions_mask     [N_atoms]          — 原子位置 mask
+//   config             FAPEConfig         — d_clamp, epsilon, length_scale
+//
+// 输出: scalar (1,) TensorF32
+TensorF32* fape_loss(
+    TensorF32* pred_coords,
+    TensorF32* true_coords,
+    TensorF32* frame_atom_indices,
+    TensorF32* frames_mask,
+    TensorF32* positions_mask,
+    const FAPEConfig& config)
+{
+    int64_t ne[1] = {1};
+    TensorF32* result = context().new_tensor(1, ne);
+    result->op     = OP_FAPE;
+    result->src[0] = pred_coords;
+    result->src[1] = true_coords;
+    result->src[2] = frame_atom_indices;
+    result->src[3] = frames_mask;
+    result->src[4] = positions_mask;
+
+    // op_params[0..1]: d_clamp (float)
+    memcpy(&result->op_params[0], &config.d_clamp, sizeof(float));
+    // op_params[2..3]: epsilon (float)
+    memcpy(&result->op_params[2], &config.epsilon, sizeof(float));
+    // op_params[4..5]: length_scale (float)
+    memcpy(&result->op_params[4], &config.length_scale, sizeof(float));
+
+    return result;
 }
 
 // ============================================================

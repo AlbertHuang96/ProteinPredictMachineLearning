@@ -23,6 +23,7 @@ set(CORE_SOURCES
     ../src/data/DataLoader.cpp
     ../src/data/AtomFrame.cpp
     ../src/data/FAPE.cpp
+    ../src/core/SymmetryResolver.cpp
     ../src/data/DistogramBins.cpp
     ../src/data/LDDT.cpp
     # Backend 基础设施

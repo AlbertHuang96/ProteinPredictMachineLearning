@@ -1936,25 +1936,184 @@ TorsionResult RFAADataLoader::get_torsions(
     // ========== 4. 计算 torsions ==========
     rfaa::TensorF32 torsions({B, L, 10, 2}, 0.0f);
     
-    // omega: torsions[:,:-1,0,:] = th_dih(Ca[i], C[i], N[i+1], Ca[i+1])
+    // 辅助: 获取原子 xyz 坐标指针
+    // xyz: (B, L, 14, 3), 原子索引: 0=N, 1=CA, 2=C, 3=O, 4=CB, ...
+    const float* xyz_data = xyz.data();
+    auto get_atom = [&](int b, int l, int atom_idx) -> std::array<float, 3> {
+        int base = ((b*L + l)*14 + atom_idx)*3;
+        return {xyz_data[base], xyz_data[base+1], xyz_data[base+2]};
+    };
+
     for (int b = 0; b < B; b++) {
+        // ---- omega: torsions[b, :L-1, 0, :] ----
+        // omega[i] = dihedral(CA[i], C[i], N[i+1], CA[i+1])
         for (int l = 0; l < L-1; l++) {
-            // 需要提取 Ca[b,l], C[b,l], N[b,l+1], Ca[b,l+1]
-            // 简化：假设已有 th_dih 函数支持不同索引
-            // 这里省略具体实现...
+            auto ca0 = get_atom(b, l,   1);
+            auto c0  = get_atom(b, l,   2);
+            auto n1  = get_atom(b, l+1, 0);
+            auto ca1 = get_atom(b, l+1, 1);
+
+            float ab_x = ca0[0] - c0[0],  ab_y = ca0[1] - c0[1],  ab_z = ca0[2] - c0[2];
+            float bc_x = c0[0]  - n1[0],  bc_y = c0[1]  - n1[1],  bc_z = c0[2]  - n1[2];
+            float cd_x = n1[0]  - ca1[0], cd_y = n1[1]  - ca1[1], cd_z = n1[2]  - ca1[2];
+
+            // 法向量 n1_ = ab × bc,  n2_ = bc × cd
+            float n1_x = ab_y*bc_z - ab_z*bc_y;
+            float n1_y = ab_z*bc_x - ab_x*bc_z;
+            float n1_z = ab_x*bc_y - ab_y*bc_x;
+            float n2_x = bc_y*cd_z - bc_z*cd_y;
+            float n2_y = bc_z*cd_x - bc_x*cd_z;
+            float n2_z = bc_x*cd_y - bc_y*cd_x;
+
+            float dot = n1_x*n2_x + n1_y*n2_y + n1_z*n2_z;
+            float n1_n = std::sqrt(n1_x*n1_x + n1_y*n1_y + n1_z*n1_z);
+            float n2_n = std::sqrt(n2_x*n2_x + n2_y*n2_y + n2_z*n2_z);
+            float cos_a = std::max(-1.0f, std::min(1.0f, dot / (n1_n * n2_n + 1e-6f)));
+            float ang = std::acos(cos_a);
+            // 符号
+            float sx = n1_y*n2_z - n1_z*n2_y;
+            float sy = n1_z*n2_x - n1_x*n2_z;
+            float sz = n1_x*n2_y - n1_y*n2_x;
+            float sign = bc_x*sx + bc_y*sy + bc_z*sz;
+            if (sign < 0) ang = -ang;
+
+            int out_base = ((b*L + l)*10 + 0)*2;
+            torsions.data()[out_base + 0] = std::sin(ang);
+            torsions.data()[out_base + 1] = std::cos(ang);
+        }
+
+        // ---- phi: torsions[b, 1:, 1, :] ----
+        // phi[i] = dihedral(C[i-1], N[i], CA[i], C[i])
+        for (int l = 1; l < L; l++) {
+            auto c_prev = get_atom(b, l-1, 2);
+            auto n      = get_atom(b, l,   0);
+            auto ca     = get_atom(b, l,   1);
+            auto c      = get_atom(b, l,   2);
+
+            float ab_x = c_prev[0] - n[0],  ab_y = c_prev[1] - n[1],  ab_z = c_prev[2] - n[2];
+            float bc_x = n[0]  - ca[0],     bc_y = n[1]  - ca[1],     bc_z = n[2]  - ca[2];
+            float cd_x = ca[0] - c[0],      cd_y = ca[1] - c[1],      cd_z = ca[2] - c[2];
+
+            float n1_x = ab_y*bc_z - ab_z*bc_y;
+            float n1_y = ab_z*bc_x - ab_x*bc_z;
+            float n1_z = ab_x*bc_y - ab_y*bc_x;
+            float n2_x = bc_y*cd_z - bc_z*cd_y;
+            float n2_y = bc_z*cd_x - bc_x*cd_z;
+            float n2_z = bc_x*cd_y - bc_y*cd_x;
+
+            float dot = n1_x*n2_x + n1_y*n2_y + n1_z*n2_z;
+            float n1_n = std::sqrt(n1_x*n1_x + n1_y*n1_y + n1_z*n1_z);
+            float n2_n = std::sqrt(n2_x*n2_x + n2_y*n2_y + n2_z*n2_z);
+            float cos_a = std::max(-1.0f, std::min(1.0f, dot / (n1_n * n2_n + 1e-6f)));
+            float ang = std::acos(cos_a);
+            float sx = n1_y*n2_z - n1_z*n2_y;
+            float sy = n1_z*n2_x - n1_x*n2_z;
+            float sz = n1_x*n2_y - n1_y*n2_x;
+            float sign = bc_x*sx + bc_y*sy + bc_z*sz;
+            if (sign < 0) ang = -ang;
+
+            int out_base = ((b*L + l)*10 + 1)*2;
+            torsions.data()[out_base + 0] = std::sin(ang);
+            torsions.data()[out_base + 1] = std::cos(ang);
+        }
+
+        // ---- psi: torsions[b, :, 2, :] ----
+        // psi[i] = -dihedral(N[i], CA[i], C[i], N[i+1])  (最后一残基无 psi)
+        for (int l = 0; l < L-1; l++) {
+            auto n   = get_atom(b, l,   0);
+            auto ca  = get_atom(b, l,   1);
+            auto c   = get_atom(b, l,   2);
+            auto n_next = get_atom(b, l+1, 0);
+
+            float ab_x = n[0]  - ca[0],  ab_y = n[1]  - ca[1],  ab_z = n[2]  - ca[2];
+            float bc_x = ca[0] - c[0],   bc_y = ca[1] - c[1],   bc_z = ca[2] - c[2];
+            float cd_x = c[0]  - n_next[0], cd_y = c[1]  - n_next[1], cd_z = c[2]  - n_next[2];
+
+            float n1_x = ab_y*bc_z - ab_z*bc_y;
+            float n1_y = ab_z*bc_x - ab_x*bc_z;
+            float n1_z = ab_x*bc_y - ab_y*bc_x;
+            float n2_x = bc_y*cd_z - bc_z*cd_y;
+            float n2_y = bc_z*cd_x - bc_x*cd_z;
+            float n2_z = bc_x*cd_y - bc_y*cd_x;
+
+            float dot = n1_x*n2_x + n1_y*n2_y + n1_z*n2_z;
+            float n1_n = std::sqrt(n1_x*n1_x + n1_y*n1_y + n1_z*n1_z);
+            float n2_n = std::sqrt(n2_x*n2_x + n2_y*n2_y + n2_z*n2_z);
+            float cos_a = std::max(-1.0f, std::min(1.0f, dot / (n1_n * n2_n + 1e-6f)));
+            float ang = std::acos(cos_a);
+            float sx = n1_y*n2_z - n1_z*n2_y;
+            float sy = n1_z*n2_x - n1_x*n2_z;
+            float sz = n1_x*n2_y - n1_y*n2_x;
+            float sign = bc_x*sx + bc_y*sy + bc_z*sz;
+            if (sign < 0) ang = -ang;
+
+            // psi = -angle
+            ang = -ang;
+
+            int out_base = ((b*L + l)*10 + 2)*2;
+            torsions.data()[out_base + 0] = std::sin(ang);
+            torsions.data()[out_base + 1] = std::cos(ang);
+        }
+
+        // ---- chi1-chi4: torsions[b, :, 3:7, :] ----
+        // 从 torsion_indices[seq_val][3+j] 查表获取原子索引
+        for (int l = 0; l < L; l++) {
+            int seq_val = static_cast<int>(seq.data()[b*L + l]);
+            if (seq_val < 0 || seq_val >= static_cast<int>(torsion_indices.size())) continue;
+
+            for (int chi = 0; chi < 4; chi++) {
+                int t_idx = 3 + chi;  // torsion type index: 3=chi1, 4=chi2, 5=chi3, 6=chi4
+                const auto& idx4 = torsion_indices[seq_val][t_idx];
+
+                // 检查是否有效 (四个原子索引都 >= 0)
+                if (idx4.size() < 4) continue;
+                bool valid = true;
+                for (int k = 0; k < 4; k++) {
+                    if (idx4[k] < 0 || idx4[k] >= 14) { valid = false; break; }
+                }
+                if (!valid) continue;
+
+                auto a0 = get_atom(b, l, idx4[0]);
+                auto a1 = get_atom(b, l, idx4[1]);
+                auto a2 = get_atom(b, l, idx4[2]);
+                auto a3 = get_atom(b, l, idx4[3]);
+
+                float ab_x = a0[0] - a1[0], ab_y = a0[1] - a1[1], ab_z = a0[2] - a1[2];
+                float bc_x = a1[0] - a2[0], bc_y = a1[1] - a2[1], bc_z = a1[2] - a2[2];
+                float cd_x = a2[0] - a3[0], cd_y = a2[1] - a3[1], cd_z = a2[2] - a3[2];
+
+                float n1_x = ab_y*bc_z - ab_z*bc_y;
+                float n1_y = ab_z*bc_x - ab_x*bc_z;
+                float n1_z = ab_x*bc_y - ab_y*bc_x;
+                float n2_x = bc_y*cd_z - bc_z*cd_y;
+                float n2_y = bc_z*cd_x - bc_x*cd_z;
+                float n2_z = bc_x*cd_y - bc_y*cd_x;
+
+                float dot = n1_x*n2_x + n1_y*n2_y + n1_z*n2_z;
+                float n1_n = std::sqrt(n1_x*n1_x + n1_y*n1_y + n1_z*n1_z);
+                float n2_n = std::sqrt(n2_x*n2_x + n2_y*n2_y + n2_z*n2_z);
+                float cos_a = std::max(-1.0f, std::min(1.0f, dot / (n1_n * n2_n + 1e-6f)));
+                float ang = std::acos(cos_a);
+                float sx = n1_y*n2_z - n1_z*n2_y;
+                float sy = n1_z*n2_x - n1_x*n2_z;
+                float sz = n1_x*n2_y - n1_y*n2_x;
+                float sign = bc_x*sx + bc_y*sy + bc_z*sz;
+                if (sign < 0) ang = -ang;
+
+                int out_base = ((b*L + l)*10 + t_idx)*2;
+                torsions.data()[out_base + 0] = std::sin(ang);
+                torsions.data()[out_base + 1] = std::cos(ang);
+            }
         }
     }
-    
-    // phi: torsions[:,1:,1,:] = th_dih(C[i-1], N[i], Ca[i], C[i])
-    // psi: torsions[:,:,2,:] = -th_dih(N[i], Ca[i], C[i], N[i+1])
-    // chis: torsions[:,:,3:7,:] = th_dih(ti0, ti1, ti2, ti3)
-    // CB bend, CB twist, CG bend...
+    // CB bend, CB twist, CG bend 等 (index 7-9) 暂不计算，保持为 0
     
     // ========== 5. 处理 NaN ==========
+    // Python: alpha[torch.isnan(alpha)] = 0.0, 即 sin=0, cos=1 (角=0°)
     for (int i = 0; i < torsions.numel(); i += 2) {
         if (std::isnan(torsions.data()[i])) {
-            torsions.data()[i] = 1.0f;      // sin = 0 -> angle = 0
-            torsions.data()[i+1] = 0.0f;   // cos = 1
+            torsions.data()[i] = 0.0f;      // sin = 0
+            torsions.data()[i+1] = 1.0f;   // cos = 1 → angle = 0
         }
     }
     

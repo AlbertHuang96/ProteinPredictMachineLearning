@@ -1,4 +1,5 @@
 #include "ComputeGraph.h"
+#include "rfaa/Context.h"
 
 
 namespace rfaa {
@@ -727,6 +728,34 @@ void ComputeGraph::compute_backward(
                 // add_or_set(ctx, cgraph, isrc0, cross_entropy_loss_back(grad, src0, src1));
             }
             // labels (src1) gradient not implemented
+        } break;
+        case OP_FAPE: {
+            // OP_FAPE backward: construct OP_FAPE_BACK node that computes
+            // gradient w.r.t. pred_coords (src[0])
+            // Only src[0] (pred_coords) gets gradient;
+            // src[1] (true_coords), src[2] (frame_atom_indices),
+            // src[3] (frames_mask), src[4] (positions_mask) are fixed.
+            if (src0_needs_grads) {
+                // Create OP_FAPE_BACK node
+                // Output shape = pred_coords shape [N_atoms, 3]
+                int64_t ne[4] = {1, 1, 1, 1};
+                for (int d = 0; d < src0->ndim(); d++) ne[d] = src0->shape().dims[d];
+                TensorF32* fape_grad = ctx->new_tensor<float>(
+                    src0->ndim(), ne);
+
+                fape_grad->op     = OP_FAPE_BACK;
+                fape_grad->src[0] = grad;          // upstream gradient (scalar)
+                fape_grad->src[1] = src0;          // pred_coords (forward)
+                fape_grad->src[2] = src1;          // true_coords (forward)
+                fape_grad->src[3] = src2;          // frame_atom_indices
+                fape_grad->src[4] = src3;          // frames_mask
+                fape_grad->src[5] = src4;          // positions_mask
+
+                // Copy op_params (d_clamp, epsilon, length_scale)
+                memcpy(fape_grad->op_params, tensor->op_params, sizeof(tensor->op_params));
+
+                add_or_set(ctx, cgraph, isrc0, fape_grad);
+            }
         } break;
         case OP_GLU: {
             // TODO: needs glu op and glu_back graph nodes and kernels

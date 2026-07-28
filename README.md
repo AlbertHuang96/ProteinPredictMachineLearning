@@ -31,6 +31,11 @@ loss functions
 GGUF saving and loading
 
 ### Optimize (TODOs)
+flash attention
+kv-cache
+MoE
+LoRA fine-tuning?
+
 GPU backend i.e. CUDA node
 graph Op fuse?
 grad accumulation
