@@ -1,6 +1,7 @@
 #include "rfaa/Model.h"
 #include "rfaa/PythonBridge.h"
 #include "rfaa/ONNXExporter.h"
+#include "rfaa/GradientClipper.h"
 #include <iostream>
 #include <chrono>
 
@@ -64,6 +65,55 @@ int main(int argc, char* argv[]) {
             
             // 计算损失 (实际应通过 Python 或 C++ 实现)
             // loss = compute_loss(output, targets)
+            //
+            // ============================================================
+            // 示例：逐项损失 + 梯度裁剪 (Gradient Clipping)
+            // ============================================================
+            //
+            // 1. 分别计算各 loss 并标记为 LOSS 节点:
+            //    auto loss_fape_node      = loss(fape_loss(...));
+            //    auto loss_chi_node       = loss(supervised_chi_loss(...));
+            //    auto loss_distogram_node = loss(distogram_loss(...));
+            //    auto loss_msa_node       = loss(masked_msa_loss(...));
+            //    auto loss_conf_node      = loss(plddt_loss(...));
+            //
+            // 2. Build backward graph:
+            //    cgraph->build_backward_expand(ctx, nullptr);
+            //
+            // 3. Per-loss + global clipping config:
+            //    PerLossClipConfig clip_cfg;
+            //    clip_cfg.fape_max_norm      = 10.0f;  // Å-scale, 阈值较大
+            //    clip_cfg.chi_max_norm       = 1.0f;   // angular, 天然 bounded
+            //    clip_cfg.distogram_max_norm = 1.0f;   // CE loss
+            //    clip_cfg.msa_max_norm       = 0.5f;   // CE loss
+            //    clip_cfg.conf_max_norm      = 0.1f;   // 置信度 loss
+            //    clip_cfg.global_max_norm    = 0.1f;   // AF2 standard
+            //
+            // 4. 执行逐项 backward + clip + accumulate:
+            //    std::vector<LossGradientInfo> info;
+            //    float total_norm = apply_per_loss_clip(
+            //        cgraph, backend.get(),
+            //        loss_fape_node, loss_chi_node, loss_distogram_node,
+            //        loss_msa_node, loss_conf_node,
+            //        clip_cfg, &info);
+            //
+            // 5. 日志输出（可选）:
+            //    for (auto& inf : info) {
+            //        std::cout << "[" << inf.loss_name << "] raw_norm=" << inf.raw_norm
+            //                  << " clipped_norm=" << inf.clipped_norm
+            //                  << (inf.was_clipped ? " [CLIPPED]" : "") << std::endl;
+            //    }
+            //    std::cout << "Total grad norm after clipping: " << total_norm << std::endl;
+            //
+            // 6. Optimizer step:
+            //    optimizer->step(cgraph);
+            //
+            // 或者，仅使用全局裁剪（单次 backward）:
+            //    cgraph->build_backward_expand(ctx, nullptr);
+            //    backend->graph_compute(cgraph);
+            //    float grad_norm = clip_grad_norm(cgraph, 0.1f);
+            //
+            // ============================================================
             
             // 反向传播 (需要实现 autograd 或调用 Python)
             // loss.backward()

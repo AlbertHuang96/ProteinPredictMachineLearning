@@ -28,15 +28,24 @@ TensorF32 PairTrack::templ_stack(const TensorF32& in_templ, const TensorF32& rbf
     int T = templ.shape().dims[1];
     int B = templ.shape().dims[0];
     templ.reshape({B*T, L, L, 64});  // (B*L*L, 1, d_templ)
-    TensorF32 t1d_reshaped = t1d;
-    t1d_reshaped.reshape({B*T, L, D_T1D});
+
+    // tensor copy constructor was deleted i.e. = t1d;
+    TensorF32 t1d_reshaped = t1d.view({B*T, L, D_T1D});
+
+    //t1d_reshaped.reshape({B*T, L, D_T1D});
+
     LinearLayer t1d_proj(D_T1D, D_STATE);
     TensorF32 state_proj = t1d_proj.forward(t1d_reshaped);
     TensorF32 out;
     for (int i = 0; i < 2; i++) {
-        TensorF32 input = templ;
-        TemplatePairStack block;
-        templ = block.forward(input, rbf_feat, state_proj);
+        // TODO: section 1.9 pointer 化 — TemplatePairStack 现在需要
+        // set_params() 注入所有子层后再调用 forward()
+        // TensorF32 input = templ;
+        // TemplatePairStack block;
+        // block.set_params(rbf_proj, state_norm, left_proj, right_proj,
+        //                  gate_proj, &tri_mul_out, &tri_mul_in,
+        //                  &pair_row_attn, &pair_col_attn, &pair_ff);
+        // templ = block.forward(input, rbf_feat, state_proj);
     }
     
     // d_templ = 64

@@ -96,7 +96,7 @@ public:
     
     // 执行一个迭代块
     // 输入/输出通过引用修改
-    void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
+    virtual void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
                  const TensorF32& seq1hot,
                  const TensorF32& coords);
 

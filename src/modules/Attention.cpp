@@ -231,55 +231,67 @@ TensorF32 FeedForward::forward(const TensorF32& x) {
     return x_out;
 }
 
-TemplatePairStack::TemplatePairStack() {
-    // init all the layers
-    
-    gate_proj_.zeros_weight();
-    gate_proj_.ones_bias();
+void TemplatePairStack::set_params(
+    LinearLayer* rbf_proj,
+    LayerNorm*   state_norm,
+    LinearLayer* left_proj,   LinearLayer* right_proj,  LinearLayer* gate_proj,
+    TriangleMultiplication* tri_mul_out, TriangleMultiplication* tri_mul_in,
+    PairRowAttention* pair_row_attn, PairColAttention* pair_col_attn,
+    FeedForward* pair_ff)
+{
+    rbf_proj_   = rbf_proj;
+    state_norm_ = state_norm;
+    left_proj_  = left_proj;
+    right_proj_ = right_proj;
+    gate_proj_  = gate_proj;
+    tri_mul_out_ = tri_mul_out;
+    tri_mul_in_  = tri_mul_in;
+    pair_row_attn_ = pair_row_attn;
+    pair_col_attn_ = pair_col_attn;
+    pair_ff_       = pair_ff;
+
+    // 初始化: gate_proj 权重零初始化, bias 置 1
+    if (gate_proj_) {
+        gate_proj_->zeros_weight();
+        gate_proj_->ones_bias();
+    }
 }
 
 TensorF32 TemplatePairStack::forward(const TensorF32& pair, TensorF32& rbf_feature, const TensorF32& state) {
     
-    TensorF32 rbf_proj = rbf_proj_.forward(rbf_feature);  // (B,L,L,128)
+    TensorF32 rbf_proj = rbf_proj_->forward(rbf_feature);  // (B,L,L,128)
     
-    TensorF32 state_normed = state_norm_.forward(state);
+    TensorF32 state_normed = state_norm_->forward(state);
     
-            // different weights for left and right?
-    TensorF32 left = left_proj_.forward(state_normed);   // (B,L,16)
-    TensorF32 right = right_proj_.forward(state_normed); // (B,L,16)
-    TensorF32 gate = out_prod(left, right);  // (B,L,L,256)
-    TensorF32 gate_proj = gate_proj_.forward(gate);  // (B,L,L,128)
-    TensorF32 gate_sig = sigmoid(gate_proj);
-    //rbf_feature = rbf_feature * gate;
-    //rbf_feature = out_prod(rbf_feature, gate_sig);
+    TensorF32 left  = left_proj_->forward(state_normed);   // (B,L,16)
+    TensorF32 right = right_proj_->forward(state_normed);  // (B,L,16)
+    TensorF32 gate  = out_prod(left, right);               // (B,L,L,256)
+    TensorF32 gate_proj = gate_proj_->forward(gate);       // (B,L,L,128)
+    TensorF32 gate_sig  = sigmoid(gate_proj);
     Tensor* out_rbf_feature = out_prod(rbf_feature, gate_sig);
     rbf_feature = &(*out_rbf_feature);
 
     TensorF32 pair_tmp;
     pair_tmp.copy_from(pair);
-    // dup op?
-    /* pair_tmp = pair_tmp + drop_row_.forward(tri_mul_out_->forward(pair_tmp, true));
-    pair_tmp = pair_tmp + drop_row_.forward(tri_mul_in_->forward(pair_tmp, false));
-    pair_tmp = pair_tmp + drop_row_.forward(pair_row_attn_.forward(pair_tmp, rbf_proj));
-    pair_tmp = pair_tmp + drop_col_.forward(pair_col_attn_.forward(pair_tmp, rbf_proj));
-    pair_tmp = pair_tmp + pair_ff_.forward(pair_tmp); */
 
     Tensor* tri_out = tri_mul_out_->forward(pair_tmp, true);
     Tensor* tri_out_drop_row = drop_row_.forward(tri_out);
     Tensor* pair_tri_out = add_impl(pair_tmp, tri_out_drop_row);
 
-    Tensor* tri_in = tri_mul_in_->forward(pair_tri_out, true);
+    Tensor* tri_in = tri_mul_in_->forward(pair_tri_out, false);
     Tensor* tri_in_drop_row = drop_row_.forward(tri_in);
     Tensor* pair_tri_in = add_impl(pair_tri_out, tri_in_drop_row);
 
-    Tensor* pair_row_attn = pair_row_attn_.forward(pair_tri_in, rbf_proj);
+    Tensor* pair_row_attn = pair_row_attn_->forward(pair_tri_in, rbf_proj);
     Tensor* pair_row_attn_drop_row = drop_row_.forward(pair_row_attn);
-    Tensor* pair_row_attn = add_impl(pair_tri_in, pair_row_attn_drop_row);
+    Tensor* pair_after_row = add_impl(pair_tri_in, pair_row_attn_drop_row);
 
-    Tensor* pair_col_attn = pair_col_attn_.forward(pair_row_attn, rbf_proj);
-    Tensor* pair_col_attn_drop_col = drop_col_.forward(pair_row_attn);
-    Tensor* pair_ff = pair_ff_.forward(pair_col_attn_drop_col);
-    Tensor* pair_final = add_impl(pair_row_attn, pair_ff);
+    Tensor* pair_col_attn = pair_col_attn_->forward(pair_after_row, rbf_proj);
+    Tensor* pair_col_attn_drop_col = drop_col_.forward(pair_col_attn);
+    Tensor* pair_after_col = add_impl(pair_after_row, pair_col_attn_drop_col);
+
+    Tensor* pair_ff_out = pair_ff_->forward(pair_after_col);
+    Tensor* pair_final = add_impl(pair_after_col, pair_ff_out);
 
     return pair_final;
 }

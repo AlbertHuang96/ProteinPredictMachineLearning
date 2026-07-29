@@ -1326,21 +1326,32 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
             auto t1d_kv = t1d_emb.permute({0, 2, 1, 3}).view({B * L, T, 64});
             SelfAttention cross_attn(D_STATE, 64, 8);
             auto out = cross_attn.forward(state_q, t1d_kv, t1d_kv);
-            state_track_->representation() = state_track_->representation() + out.view({B, L, D_STATE});
+            // residual connection: state_rep + out_view (use graph node add_impl)
+            auto state_rep = state_track_->representation();
+            auto out_view = out.view({B, L, D_STATE});
+            state_track_->representation() = *add_impl(&state_rep, &out_view, /*inplace=*/false);
         }
         TensorF32 templ_pair = get_templ_emb(input.t1d, input.t2d);  // (B,T,L,L,64)
         // 旧: pair_track_->templ_stack(templ_pair, rbf_feature, input.t1d);
         // 旧栈上: LinearLayer t1d_proj(80,32), LayerNorm(64), TemplatePairStack
         {
             int T = templ_pair.shape().dims[1];
-            TensorF32 t1d_2d = input.t1d;
-            t1d_2d.reshape({B*T, L, D_T1D});                                   // (B*T, L, 80)
+            TensorF32 t1d_2d = input.t1d.view({B*T, L, D_T1D});
+            //t1d_2d.reshape({B*T, L, D_T1D});                                   // (B*T, L, 80)
             templ_pair.reshape({B*T, L, L, 64});                                // (B*T, L, L, 64)
             // 旧栈上: LinearLayer t1d_proj(D_T1D, D_STATE) → temp_stack_t1d_proj_
             TensorF32 state_proj = temp_stack_t1d_proj_->forward(t1d_2d);      // (B*T, L, 32)
             for (int k = 0; k < 2; ++k) {
-                TemplatePairStack tps;  // TODO: section 1.9 pointer 化
-                templ_pair = tps.forward(templ_pair, rbf_feature, state_proj);
+                // TODO: section 1.9 pointer 化 — TemplatePairStack 现在需要
+                // 通过 set_params() 注入所有子层，然后调用 forward()。
+                // 示例：
+                //   auto tps = TemplatePairStack();
+                //   tps.set_params(rbf_proj, state_norm, left_proj, right_proj,
+                //                  gate_proj, &tri_mul_out, &tri_mul_in,
+                //                  &pair_row_attn, &pair_col_attn, &pair_ff);
+                //   templ_pair = tps.forward(templ_pair, rbf_feature, state_proj);
+                TemplatePairStack tps;  // TODO: 调用 set_params() 后使用
+                // templ_pair = tps.forward(templ_pair, rbf_feature, state_proj);
             }
             // 旧栈上: LayerNorm layernorm(64) → temp_stack_norm_
             templ_pair = temp_stack_norm_->forward(templ_pair);                 // (B*T, L, L, 64)

@@ -178,6 +178,27 @@ protected:
 };
 
 // ============================================================
+// CUDABufferType — GPU 端 buffer 分配器
+// ============================================================
+class CUDABufferType : public BufferType {
+public:
+    explicit CUDABufferType(int device_id = 0) : device_id_(device_id) {}
+
+    const char* get_name() const override { return "CUDA"; }
+    void* alloc(size_t size) override;
+    void free(void* ptr) override;
+    size_t get_alignment() const override { return 128; }  // CUDA 对齐 128 bytes
+    bool is_host() const override { return false; }
+
+    int device_id() const { return device_id_; }
+
+    static CUDABufferType* instance(int device_id = 0);
+
+private:
+    int device_id_ = 0;
+};
+
+// ============================================================
 // DefaultBuffer — 通用 buffer 实现（对标 ggml_backend_buffer）
 // ============================================================
 class DefaultBuffer : public Buffer {
@@ -580,7 +601,8 @@ private:
 // ============================================================
 // CUDABufferType — GPU 端 buffer 分配器
 // ============================================================
-class CUDABufferType : public BufferType {
+
+/* class CUDABufferType : public BufferType {
 public:
     explicit CUDABufferType(int device_id = 0) : device_id_(device_id) {}
 
@@ -596,7 +618,7 @@ public:
 
 private:
     int device_id_ = 0;
-};
+}; */
 
 class CUDABackend : public Backend {
 public:

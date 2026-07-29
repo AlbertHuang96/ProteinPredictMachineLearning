@@ -4,6 +4,8 @@
 #include <cstring>
 #include <cuda_fp16.h>
 
+#define GGML_MAX_OP_PARAMS      64
+
 namespace rfaa {
 
 // 前向声明 — 避免循环依赖

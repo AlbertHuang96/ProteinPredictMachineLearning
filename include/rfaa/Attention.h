@@ -4,6 +4,7 @@
 #include "Tensor.h"
 #include "ComputeGraph.h"
 #include "Embedding.h"
+#include "Dropout.h"
 
 namespace rfaa {
 
@@ -227,29 +228,49 @@ private:
 
 class TemplatePairStack {
 public:
-    TemplatePairStack();
+    // 旧值类型构造函数 (保留注释):
+    // TemplatePairStack();
+    TemplatePairStack() = default;
+
+    // 由 RFAAModel 注入已创建的参数指针
+    void set_params(
+        LinearLayer* rbf_proj,
+        LayerNorm*   state_norm,
+        LinearLayer* left_proj,   LinearLayer* right_proj,  LinearLayer* gate_proj,
+        TriangleMultiplication* tri_mul_out, TriangleMultiplication* tri_mul_in,
+        PairRowAttention* pair_row_attn, PairColAttention* pair_col_attn,
+        FeedForward* pair_ff);
     
     TensorF32 forward(const TensorF32& pair, TensorF32& rbf_feature, const TensorF32& state);
     
 private:
-    LinearLayer rbf_proj_(D_RBF, D_PAIR);
+    // 旧值类型 (保留注释):
+    // LinearLayer rbf_proj_(D_RBF, D_PAIR);
+    // LayerNorm state_norm_(D_STATE);
+    // LinearLayer left_proj_(D_STATE, 16);
+    // LinearLayer right_proj_(D_STATE, 16);
+    // LinearLayer gate_proj_(16 * 16, D_PAIR);
+    // TriangleMultiplication tri_mul_out_;
+    // TriangleMultiplication tri_mul_in_;
+    // PairRowAttention pair_row_attn_;
+    // PairColAttention pair_col_attn_;
+    // FeedForward pair_ff_(D_PAIR, 2);
 
-    LayerNorm state_norm_(D_STATE);
-    
-    LinearLayer left_proj_(D_STATE, 16);
-    LinearLayer right_proj_(D_STATE, 16);
-    LinearLayer gate_proj_(16 * 16, D_PAIR);
+    LinearLayer* rbf_proj_   = nullptr; // D_RBF (64) → D_PAIR (128)
+    LayerNorm*   state_norm_ = nullptr; // D_STATE (32)
+    LinearLayer* left_proj_  = nullptr; // D_STATE (32) → 16
+    LinearLayer* right_proj_ = nullptr; // D_STATE (32) → 16
+    LinearLayer* gate_proj_  = nullptr; // 16*16 (256) → D_PAIR (128)
 
-    TriangleMultiplication tri_mul_out_;
-    TriangleMultiplication tri_mul_in_;
+    TriangleMultiplication* tri_mul_out_ = nullptr;
+    TriangleMultiplication* tri_mul_in_  = nullptr;
 
-    Dropout drop_row_(1, 0.15);
-    Dropout drop_col_(2, 0.15);
-    PairRowAttention pair_row_attn_;
-    PairColAttention pair_col_attn_;
-            // FeedForward
-    FeedForward pair_ff_(D_PAIR, 2);
+    Dropout drop_row_{1, 0.15f};
+    Dropout drop_col_{2, 0.15f};
 
-}
+    PairRowAttention* pair_row_attn_ = nullptr;
+    PairColAttention* pair_col_attn_ = nullptr;
+    FeedForward*      pair_ff_       = nullptr;
+};
 
 } // namespace rfaa

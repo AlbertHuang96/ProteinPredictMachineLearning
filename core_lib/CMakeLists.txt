@@ -33,6 +33,7 @@ set(CORE_SOURCES
     ../src/backend/CUDAKernels.cpp
     ../src/backend/CPUKernels.cpp
     ../src/backend/ThreadPool.cpp
+    ../src/core/GradientClipper.cpp
 )
 
 # 静态库 (内部使用)
