@@ -34,7 +34,7 @@ static void activate_single_loss(
 /// @brief 清空所有参数的梯度缓冲区（grad_accs）
 static void clear_param_grads(ComputeGraph* cgraph) {
     for (int i = 0; i < cgraph->n_leafs(); i++) {
-        TensorF32* param = cgraph->leafs()[i];
+        TensorF32* param = cgraph->graph_leaf(i);
         if (!(param->flag & TENSOR_FLAG_PARAM)) continue;
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (grad) {
@@ -78,7 +78,7 @@ static void scale_param_grads(const std::vector<TensorF32*>& param_list, Compute
 static std::vector<TensorF32*> collect_params(ComputeGraph* cgraph) {
     std::vector<TensorF32*> params;
     for (int i = 0; i < cgraph->n_leafs(); i++) {
-        TensorF32* leaf = cgraph->leafs()[i];
+        TensorF32* leaf = cgraph->graph_leaf(i);
         if (leaf->flag & TENSOR_FLAG_PARAM) {
             TensorF32* grad = cgraph->graph_get_grad(leaf);
             if (grad) {

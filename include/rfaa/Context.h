@@ -80,6 +80,8 @@ struct RFAAContext {
     static void         init_global(const CtxInitParams& params);
     static void         free_global();
 
+    friend class ComputeGraph;
+
 private:
     RFAAObject* new_object(enum RFAAObjectType type, size_t size);
 };

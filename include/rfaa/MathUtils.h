@@ -148,4 +148,18 @@ TensorF32 outer_sum(const TensorF32& left, const TensorF32& right);
  */
 TensorF32 outer_product(const TensorF32& left, const TensorF32& right);
 
+/**
+ * @brief Triangle multiplication for pair features
+ * 
+ * Outgoing:  einsum('bikd,bjkd->bijd', left, right/L)
+ * Incoming:  einsum('bkid,bkjd->bijd', left, right/L)
+ * 
+ * @param left     (B, I, K, D) for outgoing, (B, K, I, D) for incoming
+ * @param right    (B, J, K, D) for outgoing, (B, K, J, D) for incoming
+ * @param L        normalization factor (sequence length)
+ * @param outgoing true for outgoing, false for incoming
+ * @return         (B, I, J, D)
+ */
+TensorF32 triangle_mult(const TensorF32& left, const TensorF32& right, float L, bool outgoing);
+
 } // namespace rfaa

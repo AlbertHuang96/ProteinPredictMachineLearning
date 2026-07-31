@@ -5,6 +5,9 @@ find_package(CUDAToolkit REQUIRED)
 set(CORE_SOURCES
     ../src/core/Tensor.cpp
     ../src/core/MemoryPool.cpp
+    ../src/core/ComputeGraph.cpp
+    ../src/core/ComputeGraphHelper.cpp
+    ../src/core/ContextImpl.cpp
     ../src/model/Embedding.cpp
     ../src/model/IterBlock.cpp
     ../src/model/RFAA.cpp
@@ -34,7 +37,17 @@ set(CORE_SOURCES
     ../src/backend/CPUKernels.cpp
     ../src/backend/ThreadPool.cpp
     ../src/core/GradientClipper.cpp
+    # CUDA kernels
+    ../src/cuda/CUDAKernels.cu
+    ../src/cuda/OutProdKernel.cu
+    ../src/cuda/AttentionKernel.cu
+    ../src/cuda/SE3Kernel.cu
+    ../src/cuda/MathKernel.cu
+    ../src/cuda/CudaTensor.cu
 )
+
+# 启用 CUDA 语言
+enable_language(CUDA)
 
 # 静态库 (内部使用)
 add_library(rfaa_core_static STATIC ${CORE_SOURCES})

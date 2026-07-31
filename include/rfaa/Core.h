@@ -10,6 +10,9 @@ namespace rfaa {
 
 // 维度常量 (与 RFAA 对齐)
 constexpr int NAATOKENS = 80;           // 统一 token 空间
+constexpr int NPROTAAS = 20;            // 标准蛋白质氨基酸种类
+constexpr int NNAPROTAAS = 25;          // 蛋白质 + 核酸氨基酸种类
+constexpr int NTOTALDOFS = 20;          // 总自由度（扭转角数）
 constexpr int D_RBF = 64;
 constexpr int D_MSA_FULL = 64;
 constexpr int D_MSA = 256;              // MSA 隐层维度
@@ -46,7 +49,7 @@ constexpr int PAIR2PAIR_GATE_HIDDEN = 16;    // pair2pair gate outer product hid
 enum class Device { CPU, CUDA };
 
 // 数据类型
-enum class DType { F32, F16, BF16 };
+enum class DType { F32, F16, BF16, I64, I32, I16, I8 };
 
 // 张量形状
 struct Shape {

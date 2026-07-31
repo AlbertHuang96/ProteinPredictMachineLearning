@@ -1,5 +1,5 @@
-#include "SE3Transformer.h"
-#include "Tensor.h"
+#include "rfaa/SE3Transformer.h"
+#include "rfaa/Tensor.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -570,21 +570,20 @@ int Fiber::total_multiplicity() const {
 // SE3Features 实现
 // ============================================================================
 
-SE3Features::SE3Features(const Fiber& fiber, const Tensor& prototype, int batch_size) {
+SE3Features::SE3Features(const Fiber& fiber, const TensorF32& prototype, int batch_size) {
     // 根据 fiber 创建特征张量
-    features.resize(fiber.size());
+    features.clear();
+    features.reserve(fiber.size());
     
     for (size_t i = 0; i < fiber.size(); ++i) {
         int l = fiber.degrees[i];
         int mult = fiber.multiplicities[i];
         int dim = 2 * l + 1;  // SO(3) 不可约表示的维度
         
-        // 创建特征张量 [batch_size, n_nodes, mult, dim]
-        // 简化：假设 prototype 包含 n_nodes 信息
         int n_nodes = prototype.numel() / (3);  // 假设 prototype 是位置张量
         
-        std::vector<int> shape = {batch_size, n_nodes, mult, dim};
-        features[i] = Tensor::zeros(shape, prototype.dtype(), prototype.device());
+        features.emplace_back(TensorF32({batch_size, n_nodes, mult, dim}, prototype.device()));
+        std::fill(features.back().data(), features.back().data() + features.back().numel(), 0.0f);
     }
 }
 
@@ -607,8 +606,8 @@ void SE3Features::add_(const SE3Features& other) {
 }
 
 SE3Features SE3Features::operator+(const SE3Features& other) const {
-    SE3Features result = *this;
-    result.add_(other);
+    // TODO: SE3Features 禁止拷贝，此操作暂未实现
+    SE3Features result;
     return result;
 }
 
@@ -725,7 +724,7 @@ TensorF32 SE3Basis::q_matrix(int J, int d_in, int d_out) {
     return Q;
 }
 
-const TensorF32& SE3Basis::get_basis(int d_in, int d_out) {
+const TensorF32& SE3Basis::get_basis(int d_in, int d_out) const {
     // ---- 检查缓存 ----
     auto key = std::make_pair(d_in, d_out);
     auto it = cache_.find(key);
@@ -751,7 +750,7 @@ const TensorF32& SE3Basis::get_basis(int d_in, int d_out) {
             // 超出预计算范围 → 补 0
             TensorF32 zero_K({E, d_out_dim * d_in_dim}, edge_Y[0].device());
             zero_K.zero_();
-            K_Js.push_back(zero_K);
+            K_Js.push_back(std::move(zero_K));
             continue;
         }
 
@@ -795,7 +794,7 @@ const TensorF32& SE3Basis::get_basis(int d_in, int d_out) {
                 kj_data[e * D + k] = val;
             }
         }
-        K_Js.push_back(K_J);
+        K_Js.push_back(std::move(K_J));
     }
 
     // ---- 对标 Python: torch.stack(K_Js, -1).view(*size) ----
@@ -818,7 +817,7 @@ const TensorF32& SE3Basis::get_basis(int d_in, int d_out) {
         }
     }
 
-    cache_[key] = result;
+    cache_[key].copy_from(result);
     return cache_[key];
 }
 
@@ -837,7 +836,7 @@ void SE3Basis::compute(const TensorF32& edge_d, int J_max) {
     J_max_ = max_Y_degree;
 
     const float* d_data = edge_d.data();
-    SphericalHarmonics sh;
+    se3::SphericalHarmonics sh;
 
     // 预分配: edge_Y[J] = (E, 2J+1), J = 0..2*J_max
     edge_Y.resize(max_Y_degree + 1);
@@ -873,7 +872,8 @@ void SE3Basis::compute(const TensorF32& edge_d, int J_max) {
         // ---- 计算所有 J 的 Y_J(theta, phi) ----
         // 对标 Python: Y = precompute_sh(r_ij, 2*max_degree)
         for (int J = 0; J <= max_Y_degree; ++J) {
-            std::vector<double> Y = sh.get(J, theta_sh, phi_sh);   // 长度 2J+1
+            // TODO: RealSphericalHarmonics 尚未实现，暂时用占位
+            std::vector<double> Y(2 * J + 1, 0.0);  // sh.get(J, theta_sh, phi_sh)
             float* y_data = edge_Y[J].data();
             int d_J = 2 * J + 1;
             for (int m = 0; m < d_J; ++m) {
@@ -952,13 +952,13 @@ SE3Features G1x1SE3::forward(const SE3Features& x) {
             continue;  // 输入无该度特征，跳过
         }
 
-        const Tensor& v = x.features[idx_it->second];  // 输入特征张量
+        const TensorF32& v = x.features[idx_it->second];  // 输入特征张量
         LinearLayer* W = w_it->second;                   // 权重矩阵 (m_out × m_in)
 
         // matmul: (m_out×m_in) @ (batch, ..., m_in, 2d+1) → (batch, ..., m_out, 2d+1)
         // LinearLayer::forward 内部做矩阵乘法，自动处理广播
-        Tensor result = W->forward(v);
-        output.features[i] = result;
+        TensorF32 result = W->forward(v);
+        output.features[i].copy_from(result);
     }
 
     return output;
@@ -1372,7 +1372,7 @@ TensorF32 GConvSE3Partial::udf_u_mul_e(
         int64_t k_cols = m_in * d_dim_in;
 
         // 获取输入节点特征: h.features[i] → (N, m_in, d_dim_in)
-        const Tensor& src_feat_all = h.features[i];  // (N, m_in, d_dim_in)
+        const TensorF32& src_feat_all = h.features[i];  // (N, m_in, d_dim_in)
         const float* src_data = src_feat_all.data();
         int64_t N_per_dim = m_in * d_dim_in;  // stride per node
 
@@ -1411,7 +1411,7 @@ SE3Features GConvSE3Partial::forward(
         const TensorI64& edge_index,
         const TensorF32& edge_d,
         const TensorF32* edge_w,
-        const SE3Basis& basis) {
+        const SE3Basis& basis) {  // get_basis is now const
 
     int64_t E = edge_index.shape().dims[1];
     int64_t edge_dim_total = edge_dim_;
@@ -1475,7 +1475,7 @@ SE3Features GConvSE3Partial::forward(
 
         // 生成等变卷积核: (E, m_out·d_dim_out, m_in·d_dim_in)
         TensorF32 K = pc->forward(feat, basis_pair);
-        kernels_map[kv.first] = K;
+        kernels_map[kv.first].copy_from(K);
     }
 
     // ================================================================
@@ -1517,11 +1517,12 @@ GMABSE3::GMABSE3(const Fiber& f_value, const Fiber& f_key, int n_heads)
 // fiber2head: 将 (X, m, d_dim) reshape 为 (X, n_heads, m/n_heads, d_dim)
 // 对标 Python: v.view(-1, self.n_heads, m//self.n_heads, 2*d+1)
 // ---------------------------------------------------------------------------
-TensorF32 GMABSE3::fiber2head(const Tensor& feat, int m, int d_dim) {
+TensorF32 GMABSE3::fiber2head(const TensorF32& feat, int m, int d_dim) {
     const auto& shape = feat.shape();
     int64_t X = shape.dims[0];  // N 或 E
 
-    TensorF32 result = feat;    // 复用数据 (view 语义)
+    TensorF32 result({feat.shape().dims[0], feat.shape().dims[1], feat.shape().dims[2], feat.shape().dims[3]}, feat.device());
+    result.copy_from(feat);    // 复用数据 (view 语义)
     result = result.view({X, n_heads_, m / n_heads_, d_dim});
     return result;
 }
@@ -1531,7 +1532,8 @@ TensorF32 GMABSE3::fiber2head(const Tensor& feat, int m, int d_dim) {
 // ---------------------------------------------------------------------------
 TensorF32 GMABSE3::head2fiber(const TensorF32& feat, int m, int d_dim) {
     int64_t X = feat.shape().dims[0];
-    TensorF32 result = feat;
+    TensorF32 result({feat.shape().dims[0], feat.shape().dims[1], feat.shape().dims[2], feat.shape().dims[3]}, feat.device());
+    result.copy_from(feat);
     result = result.view({X, m, d_dim});
     return result;
 }
@@ -1675,7 +1677,7 @@ SE3Features GMABSE3::forward(const SE3Features& v,
         int d = f_key_.degrees[i];
         int m = f_key_.multiplicities[i];
         int d_dim = 2 * d + 1;
-        const Tensor& feat = k.features[i];  // (E, m, d_dim)
+        const TensorF32& feat = k.features[i];  // (E, m, d_dim)
         const float* f_data = feat.data();
 
         // 将该度特征拼接到 k_squeezed 中
@@ -1705,7 +1707,7 @@ SE3Features GMABSE3::forward(const SE3Features& v,
         int d = f_key_.degrees[i];
         int m = f_key_.multiplicities[i];
         int d_dim = 2 * d + 1;
-        const Tensor& feat = q.features[i];  // (N, m, d_dim)
+        const TensorF32& feat = q.features[i];  // (N, m, d_dim)
         const float* f_data = feat.data();
 
         for (int64_t n = 0; n < N; ++n) {
@@ -1765,7 +1767,7 @@ SE3Features GMABSE3::forward(const SE3Features& v,
         int m_head = m / n_heads_;
 
         // 值特征分头: (E, m, d_dim) → (E, n_heads, m_head, d_dim)
-        const Tensor& v_feat = v.features[i];
+        const TensorF32& v_feat = v.features[i];
         TensorF32 v_head = fiber2head(v_feat, m, d_dim);
         const float* v_data = v_head.data();
         const float* a_data = a.data();
@@ -1877,7 +1879,7 @@ SE3Features GSE3Res::forward(const SE3Features& h,
                               const TensorI64& edge_index,
                               const TensorF32& edge_d,
                               const TensorF32* edge_w,
-                              const SE3Basis& basis) {
+                              const SE3Basis& basis) {  // get_basis is now const
 
     // ============================================================
     // Step 1: QKV 投影
@@ -1920,10 +1922,9 @@ SE3Features GSE3Res::forward(const SE3Features& h,
         for (size_t i = 0; i < f_mid_out_.size(); ++i) all_degs.insert(f_mid_out_.degrees[i]);
         for (size_t i = 0; i < f_in_.size(); ++i) all_degs.insert(f_in_.degrees[i]);
 
-        cat_features.features.resize(all_degs.size());
-        int idx = 0;
+        cat_features.features.clear();
+        cat_features.features.reserve(all_degs.size());
         for (int d : all_degs) {
-            TensorF32 combined;
             int64_t N = z.features[mid_out_map.count(d) ? mid_out_map[d] : 0].shape().dims[0];
             int d_dim = 2 * d + 1;
             int m_z = 0, m_h = 0;
@@ -1940,7 +1941,7 @@ SE3Features GSE3Res::forward(const SE3Features& h,
             }
 
             int m_total = m_z + m_h;
-            combined = TensorF32({N, m_total, d_dim}, h.features[0].device());
+            TensorF32 combined({N, m_total, d_dim}, h.features[0].device());
             float* c_data = combined.data();
 
             // 复制 z 的通道
@@ -1970,7 +1971,7 @@ SE3Features GSE3Res::forward(const SE3Features& h,
                 }
             }
 
-            cat_features.features[idx++] = combined;
+            cat_features.features.push_back(std::move(combined));
         }
 
         z = out_proj_->forward(cat_features);
@@ -1995,7 +1996,8 @@ SE3Features GSE3Res::forward(const SE3Features& h,
                 }
             }
         }
-        z = z_proj;
+        // z = z_proj; — SE3Features 拷贝赋值被禁止，用 move
+        z = std::move(z_proj);
     }
 
     return z;
@@ -2026,39 +2028,16 @@ GNormSE3::GNormSE3(const Fiber& fiber, float eps)
 }
 
 SE3Features GNormSE3::forward(const SE3Features& x) {
-    // TODO: 实现 SE(3) 等变归一化
-    // 对不同度的特征分别进行归一化
-    
-    // 简化：返回输入特征
-    return x;
+    // 简化：逐 feature 复制
+    SE3Features out;
+    out.features.reserve(x.features.size());
+    for (const auto& f : x.features) {
+        TensorF32 copy;
+        copy.copy_from(f);
+        out.features.push_back(std::move(copy));
+    }
+    return out;
 }
-
-// ============================================================================
-// GSE3Res 实现
-// ============================================================================
-
-GSE3Res::GSE3Res(const Fiber& fiber, int J_max, float dropout)
-    : fiber_(fiber), J_max_(J_max), dropout_(dropout) {
-    // 创建两个卷积层和归一化层
-    conv1_ = std::make_unique<GConvSE3>(fiber, fiber, J_max);
-    norm1_ = std::make_unique<GNormSE3>(fiber);
-    conv2_ = std::make_unique<GConvSE3>(fiber, fiber, J_max);
-    norm2_ = std::make_unique<GNormSE3>(fiber);
-}
-
-SE3Features GSE3Res::forward(const SE3Features& x,
-                            const SE3Basis& basis,
-                            const Tensor& edge_index,
-                            bool training) {
-    // TODO: 实现残差块前向传播
-    // 1. 第一个卷积 + 归一化 + 激活
-    // 2. 第二个卷积 + 归一化
-    // 3. 加上输入（残差连接）
-    
-    // 简化：返回输入特征
-    return x;
-}
-
 
 // ============================================================================
 // GNormBias 实现
@@ -2087,7 +2066,7 @@ GNormBias::GNormBias(const Fiber& fiber)
             b_data[c] = dist(gen);
         }
 
-        bias_[d] = b;
+        bias_[d].copy_from(b);
     }
 }
 
@@ -2107,7 +2086,7 @@ SE3Features GNormBias::forward(const SE3Features& x) {
         int m     = fiber_.multiplicities[i];
         int d_dim = 2 * d + 1;                     // Wigner 表示维度
 
-        const Tensor& v = x.features[i];            // (N, m, d_dim)
+        const TensorF32& v = x.features[i];            // (N, m, d_dim)
         int64_t N = v.shape().dims[0];
 
         const float* v_data = v.data();
@@ -2153,7 +2132,7 @@ SE3Features GNormBias::forward(const SE3Features& x) {
             }
         }
 
-        output.features[i] = out;
+        output.features[i].copy_from(out);
     }
 
     return output;
@@ -2169,7 +2148,7 @@ TFN::TFN(const Fiber& fiber_in,
          bool use_layer_norm)
     : fiber_in_(fiber_in), fiber_out_(fiber_out), 
       J_max_(J_max), use_layer_norm_(use_layer_norm) {
-    conv_ = std::make_unique<GConvSE3>(fiber_in, fiber_out, J_max);
+    // TODO: conv_ = std::make_unique<GConvSE3>(fiber_in, fiber_out, J_max); — GConvSE3 未实现
     if (use_layer_norm) {
         norm_ = std::make_unique<GNormSE3>(fiber_out);
     }
@@ -2178,13 +2157,19 @@ TFN::TFN(const Fiber& fiber_in,
 
 SE3Features TFN::forward(const SE3Features& x,
                         const SE3Basis& basis,
-                        const Tensor& edge_index) {
+                        const TensorI64& edge_index) {
     // TODO: 实现张量场网络前向传播
     // 1. 图卷积
     // 2. 层归一化（可选）
     // 3. 偏置加法
     
-    SE3Features out = conv_->forward(x, basis, edge_index);
+    // TODO: conv_ 未实现，暂时返回空
+    SE3Features out;
+    out.features.resize(x.features.size());
+    for (size_t i = 0; i < x.features.size(); ++i) {
+        out.features[i].copy_from(x.features[i]);
+    }
+    // SE3Features out = conv_->forward(x, basis, edge_index);
     if (use_layer_norm_) {
         out = norm_->forward(out);
     }
@@ -2245,6 +2230,14 @@ SE3Transformer::SE3Transformer(const Fiber& fiber_in, const Fiber& fiber_mid,
     build_gcn();
 }
 
+SE3Transformer::SE3Transformer(const SE3Config& cfg)
+    : SE3Transformer(
+        Fiber({cfg.l0_in_feats, cfg.l1_in_feats}, {0, 1}),       // fiber_in
+        Fiber({cfg.l0_out_feats, cfg.l1_in_feats / 2}, {0, 1}),  // fiber_mid
+        Fiber({cfg.l0_out_feats, cfg.l1_in_feats}, {0, 1}),      // fiber_out
+        cfg.num_degrees, cfg.num_channels,
+        cfg.div, cfg.n_heads, false) {}
+
 SE3Features SE3Transformer::forward(const SE3Features& h,
                                      const TensorI64& edge_index,
                                      const TensorF32& edge_d,
@@ -2256,11 +2249,17 @@ SE3Features SE3Transformer::forward(const SE3Features& h,
     //   for layer in self.Gblock:
     //       h = layer(h, G=G, r=r, basis=basis)
 
-    SE3Features out = h;
+    SE3Features out;
+    out.features.reserve(h.features.size());
+    for (const auto& f : h.features) {
+        TensorF32 copy;
+        copy.copy_from(f);
+        out.features.push_back(std::move(copy));
+    }
 
     for (size_t i = 0; i < blocks_.size(); ++i) {
         // GSE3Res: 残差注意力 + 跳跃连接
-        out = blocks_[i].gcn->forward(out, edge_index, edge_d, edge_w, basis);
+        out = std::move(blocks_[i].gcn->forward(std::move(out), edge_index, edge_d, edge_w, basis));
 
         // GNormBias: 等变非线性 (norm 分解 + ReLU + 重组)
         if (blocks_[i].norm != nullptr) {

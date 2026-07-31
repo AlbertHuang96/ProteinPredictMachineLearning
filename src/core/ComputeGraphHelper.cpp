@@ -3,7 +3,9 @@
 #include "rfaa/FAPE.h"
 #include "rfaa/SymmetryResolver.h"
 
-#include "ComputeGraph.h"
+#include "rfaa/ComputeGraph.h"
+
+#include <cassert>
 
 namespace rfaa {
 
@@ -12,11 +14,15 @@ TensorF32 * add_impl(
         TensorF32  * b,  
         bool inplace) {  
     //GGML_ASSERT(ggml_can_repeat(b, a)); 
-    assert(b->can_repeat(a));
+    assert(b->can_repeat(*a));
   
     //struct Tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);  
-    TensorF32 * result; 
-    result = inplace ? result->view(a->shape()) : result->copy_from(a);
+    TensorF32 * result;
+    if (inplace) {
+        result = view(a, a->shape());
+    } else {
+        result = dup(a);
+    }
     //result = result->copy_from(a);
   
     result->op     = OP_ADD;  
@@ -30,11 +36,11 @@ TensorF32 * repeat_back(
         TensorF32  * a,  
         TensorF32  * b) {  
     //GGML_ASSERT(ggml_can_repeat(b, a));  
-    assert(b->can_repeat(a));
-  
-    Tensor* result = context().new_tensor(b->ndim(), b->shape().dims.data());  
+    assert(b->can_repeat(*a));
 
-    assert(b->can_repeat(a));
+    TensorF32* result = context().new_tensor<float>(b->shape().ndim(), b->shape().dims.data());  
+
+    assert(b->can_repeat(*a));
   
     result->op     = OP_REPEAT_BACK;  
     result->src[0] = a;  
@@ -54,8 +60,12 @@ TensorF32 * add1_impl(
     assert(a->is_contiguous());
  
     //struct Tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
-    TensorF32 * result; 
-    result = inplace ? result->view(a->shape()) : result->copy_from(a);
+    TensorF32 * result;
+    if (inplace) {
+        result = view(a, a->shape());
+    } else {
+        result = dup(a);
+    }
  
     result->op     = OP_ADD1;
     result->src[0] = a;
@@ -65,9 +75,9 @@ TensorF32 * add1_impl(
 }
 
 // scale(a, s) — a * s  (标量乘法)
-TensorF32* scale(TensTensorF32or* a, float s) {
+TensorF32* scale(TensorF32* a, float s) {
     //Tensor* result = alloc_node(a->ndim(), a->dims());
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_SCALE;
     result->src[0] = a;
     // op_params 存储 scale 因子
@@ -88,7 +98,7 @@ TensorF32* neg(TensorF32* a) {
 // a: (M, K), b: (K, N) → (M, N)
 TensorF32* mul_mat(TensorF32* a, TensorF32* b) {
     int64_t ne[2] = {b->shape().dims[0], a->shape().dims[1]};
-    TensorF32* result = context().new_tensor(2, ne);
+    TensorF32* result = context().new_tensor<float>(2, ne);
 
     result->op     = OP_MUL_MAT;
     result->src[0] = a;
@@ -102,10 +112,10 @@ TensorF32* out_prod(TensorF32* a, TensorF32* b) {
     int64_t ne[4] = {
         a->shape().dims[0],
         b->shape().dims[0],
-        std::max(a->dims()[2], b->dims()[2]), 
-        std::max(a->dims()[3], b->dims()[3])
+        std::max(a->shape().dims[2], b->shape().dims[2]), 
+        std::max(a->shape().dims[3], b->shape().dims[3])
     };
-    TensorF32* result = context().new_tensor(4, ne);
+    TensorF32* result = context().new_tensor<float>(4, ne);
 
     result->op     = OP_OUT_PROD;
     result->src[0] = a;
@@ -115,14 +125,31 @@ TensorF32* out_prod(TensorF32* a, TensorF32* b) {
 
 // transpose(a) — 转置（交换最后两维）
 TensorF32* transpose(TensorF32* a) {
-    assert(a->ndim() >= 2);
+    assert(a->shape().ndim() >= 2);
     std::vector<int64_t> new_dims = a->shape().dims;
     std::swap(new_dims[new_dims.size() - 1], new_dims[new_dims.size() - 2]);
 
     //Tensor* result = alloc_node(static_cast<int>(new_dims.size()), new_dims.data());
-    TensorF32* result = context().new_tensor(static_cast<int>(new_dims.size()), new_dims.data());
+    TensorF32* result = context().new_tensor<float>(static_cast<int>(new_dims.size()), new_dims.data());
     result->op     = OP_TRANSPOSE;
     result->src[0] = a;
+    return result;
+}
+
+// triangle_mul(left, right, L, outgoing)
+//   outgoing=true:  einsum('bikd,bjkd->bijd', left, right/L)   → result: (B, I, J, D)
+//   outgoing=false: einsum('bkid,bkjd->bijd', left, right/L)  → result: (B, I, J, D)
+TensorF32* triangle_mul(TensorF32* left, TensorF32* right, float L, bool outgoing) {
+    assert(left->shape().ndim() == 4 && right->shape().ndim() == 4);
+    // result shape: (B, I, J, D) where I=dim[1] for both
+    int64_t ne[4] = {left->shape().dims[0], left->shape().dims[1], right->shape().dims[1], left->shape().dims[3]};
+    TensorF32* result = context().new_tensor<float>(4, ne);
+    result->op      = OP_TRI_MUL;
+    result->src[0]  = left;
+    result->src[1]  = right;
+    // 用 op_params 存储 L (float) 和 outgoing (bool)
+    memcpy(result->op_params,     &L,        sizeof(float));
+    memcpy(result->op_params + 4, &outgoing, sizeof(bool));
     return result;
 }
 
@@ -132,7 +159,7 @@ TensorF32* transpose(TensorF32* a) {
 
 // softmax(a) — softmax 沿最后一维
 TensorF32* softmax(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_SOFT_MAX;
     result->src[0] = a;
     return result;
@@ -143,7 +170,7 @@ TensorF32* softmax(TensorF32* a) {
 // output: y = softmax(x) (forward output)
 // returns: dL/dx
 TensorF32* softmax_backward(TensorF32* grad, TensorF32* output) {
-    TensorF32* result = context().new_tensor(output->ndim(), output->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(output->shape().ndim(), output->shape().dims.data());
     result->op     = OP_SOFT_MAX_BACK;
     result->src[0] = grad;
     result->src[1] = output;
@@ -152,7 +179,7 @@ TensorF32* softmax_backward(TensorF32* grad, TensorF32* output) {
 
 // silu(a) — SiLU / Swish 激活
 TensorF32* silu(TensorF32* a) {
-    Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
     set_unary_op(result, UNARY_OP_SILU);
@@ -161,7 +188,7 @@ TensorF32* silu(TensorF32* a) {
 
 // gelu(a) — GELU 激活
 TensorF32* gelu(TensorF32* a) {
-    Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
     set_unary_op(result, UNARY_OP_GELU);
@@ -170,7 +197,7 @@ TensorF32* gelu(TensorF32* a) {
 
 // gelu_quick(a) — GELU 快速近似
 TensorF32* gelu_quick(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
     set_unary_op(result, UNARY_OP_GELU_QUICK);
@@ -179,7 +206,7 @@ TensorF32* gelu_quick(TensorF32* a) {
 
 // relu(a) — ReLU 激活
 TensorF32* relu(TensorF32* a) {
-    Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
     set_unary_op(result, UNARY_OP_RELU);
@@ -187,8 +214,8 @@ TensorF32* relu(TensorF32* a) {
 }
 
 // leaky_relu(a, alpha) — Leaky ReLU
-TensorF32* leaky_relu(TensorF32* a, float alpha = 0.01f) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+TensorF32* leaky_relu(TensorF32* a, float alpha) {
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_LEAKY_RELU;
     result->src[0] = a;
     //result->op_params[0] = reinterpret_cast<int32_t&>(alpha);
@@ -200,8 +227,8 @@ TensorF32* leaky_relu(TensorF32* a, float alpha = 0.01f) {
 // ============================================================
 
 // rms_norm(a, eps) — RMS Normalization 沿最后一维
-TensorF32* rms_norm(TensorF32* a, float eps = 1e-6f) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+TensorF32* rms_norm(TensorF32* a, float eps) {
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_RMS_NORM;
     result->src[0] = a;
     //result->op_params[0] = reinterpret_cast<int32_t&>(eps);
@@ -209,11 +236,11 @@ TensorF32* rms_norm(TensorF32* a, float eps = 1e-6f) {
 }
 
 // norm(a, eps) — Layer Normalization 沿最后一维
-TensorF32* norm(TensorF32* a, float eps = 1e-5f) {
+TensorF32* norm(TensorF32* a, float eps) {
     int D = a->shape().dims.back();
     int rows = a->numel() / D;
 
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_NORM;
     result->src[0] = a;
     reinterpret_cast<float&>(result->op_params[0]) = eps;
@@ -233,7 +260,7 @@ TensorF32* norm(TensorF32* a, float eps = 1e-5f) {
 // sum(a) — 所有元素求和
 TensorF32* sum(TensorF32* a) {
     int64_t ne[1] = {1};
-    TensorF32* result = context().new_tensor(1, ne);
+    TensorF32* result = context().new_tensor<float>(1, ne);
     result->op     = OP_SUM;
     result->src[0] = a;
     return result;
@@ -242,7 +269,7 @@ TensorF32* sum(TensorF32* a) {
 // mean(a, dim) — 沿指定维度求平均 (dim=-1 = 最后一维)
 TensorF32* mean(TensorF32* a) {
     int64_t ne[1] = {1};
-    TensorF32* result = context().new_tensor(1, ne);
+    TensorF32* result = context().new_tensor<float>(1, ne);
     result->op     = OP_MEAN;
     result->src[0] = a;
     return result;
@@ -250,11 +277,11 @@ TensorF32* mean(TensorF32* a) {
 
 // sum_rows(a) — 沿最后一行求和 (a: M×N → M×1)
 TensorF32* sum_rows(TensorF32* a) {
+    int nd = a->shape().ndim();
     int64_t ne[4] = {1, a->shape().dims[1], 1, 1};
-    if (a->ndim() >= 3) ne[2] = a->shape().dims[2];
-    if (a->ndim() >= 4) ne[3] = a->shape().dims[3];
-    int nd = a->ndim();
-    TensorF32* result = context().new_tensor(nd, ne);
+    if (nd >= 3) ne[2] = a->shape().dims[2];
+    if (nd >= 4) ne[3] = a->shape().dims[3];
+    TensorF32* result = context().new_tensor<float>(nd, ne);
     result->op     = OP_SUM_ROWS;
     result->src[0] = a;
     return result;
@@ -268,15 +295,14 @@ TensorF32* sum_rows(TensorF32* a) {
 TensorF32* view(TensorF32* a, const Shape& new_shape) {
     assert(new_shape.numel() == a->numel());
     // view 不分配新数据，指针复用
-    // 通过 init_from_context 创建一个非拥有的 Tensor
     int64_t ne[4] = {1, 1, 1, 1};
     for (size_t i = 0; i < new_shape.dims.size(); i++) {
         ne[i] = new_shape.dims[i];
     }
     TensorF32* result = context().new_tensor<float>(
         static_cast<int>(new_shape.dims.size()), ne);
-    // 修正：view 不分配新内存，复用 a 的数据
-    result->data_ = a->data();  // 共享数据指针
+    // view shares data with source (TODO: set via public API when available)
+    //result->set_view_src(a);
     result->op     = OP_VIEW;
     result->src[0] = a;
     return result;
@@ -289,7 +315,7 @@ TensorF32* reshape(TensorF32* a, const Shape& new_shape) {
     for (size_t i = 0; i < new_shape.dims.size(); i++) {
         ne[i] = new_shape.dims[i];
     }
-    TensorF32* result = context().new_tensor(static_cast<int>(new_shape.dims.size()), ne);
+    TensorF32* result = context().new_tensor<float>(static_cast<int>(new_shape.dims.size()), ne);
     result->op     = OP_RESHAPE;
     result->src[0] = a;
     return result;
@@ -297,13 +323,13 @@ TensorF32* reshape(TensorF32* a, const Shape& new_shape) {
 
 // permute(a, dims) — 维度重排
 TensorF32* permute(TensorF32* a, const std::vector<int>& dims) {
-    assert(dims.size() == static_cast<size_t>(a->ndim()));
+    assert(dims.size() == static_cast<size_t>(a->shape().ndim()));
 
     int64_t ne[4] = {1, 1, 1, 1};
     for (size_t i = 0; i < dims.size(); i++) {
         ne[i] = a->shape().dims[dims[i]];
     }
-    TensorF32* result = context().new_tensor(static_cast<int>(dims.size()), ne);
+    TensorF32* result = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
     result->op     = OP_PERMUTE;
     result->src[0] = a;
     // 存储 permute 的维度映射到 op_params
@@ -315,19 +341,20 @@ TensorF32* permute(TensorF32* a, const std::vector<int>& dims) {
 
 // unsqueeze(a, dim) — 在指定位置插入大小为1的维度
 TensorF32* unsqueeze(TensorF32* a, int dim) {
-    if (dim < 0) dim += a->ndim() + 1;
-    assert(dim >= 0 && dim <= a->ndim());
+    int ndim = a->shape().ndim();
+    if (dim < 0) dim += ndim + 1;
+    assert(dim >= 0 && dim <= ndim);
 
     int64_t ne[4] = {1, 1, 1, 1};
     int j = 0;
-    for (int i = 0; i < a->ndim() + 1; i++) {
+    for (int i = 0; i < ndim + 1; i++) {
         if (i == dim) {
             ne[i] = 1;
         } else {
             ne[i] = a->shape().dims[j++];
         }
     }
-    TensorF32* result = context().new_tensor(a->ndim() + 1, ne);
+    TensorF32* result = context().new_tensor<float>(ndim + 1, ne);
     result->op     = OP_RESHAPE;  // unsqueeze 本质是 reshape
     result->src[0] = a;
     return result;
@@ -335,13 +362,35 @@ TensorF32* unsqueeze(TensorF32* a, int dim) {
 
 // concat(tensors, dim) — 沿指定维度拼接
 // 返回新节点，其 src 数组存储所有输入
-TensorF32* concat(const std::vector<TensorF32*>& tensors, int dim) {
+TensorF32* concat(const std::vector<TensorF32>& tensors, int dim) {
     assert(!tensors.empty());
-    if (dim < 0) dim += tensors[0]->ndim();
+    int ndim = tensors[0].shape().ndim();
+    if (dim < 0) dim += ndim;
 
-    // 计算输出形状
     int64_t ne[4] = {1, 1, 1, 1};
-    for (int i = 0; i < tensors[0]->ndim(); i++) {
+    for (int i = 0; i < ndim; i++) {
+        ne[i] = tensors[0].shape().dims[i];
+    }
+    ne[dim] = 0;
+    for (const auto& t : tensors) {
+        ne[dim] += t.shape().dims[dim];
+    }
+
+    TensorF32* result = context().new_tensor<float>(ndim, ne);
+    result->op = OP_CONCAT;
+    for (size_t i = 0; i < tensors.size() && i < GGML_MAX_SRC; i++) {
+        result->src[i] = const_cast<TensorF32*>(&tensors[i]);
+    }
+    return result;
+}
+
+TensorF32* concat_ptr(const std::vector<TensorF32*>& tensors, int dim) {
+    assert(!tensors.empty());
+    int ndim = tensors[0]->shape().ndim();
+    if (dim < 0) dim += ndim;
+
+    int64_t ne[4] = {1, 1, 1, 1};
+    for (int i = 0; i < ndim; i++) {
         ne[i] = tensors[0]->shape().dims[i];
     }
     ne[dim] = 0;
@@ -349,36 +398,26 @@ TensorF32* concat(const std::vector<TensorF32*>& tensors, int dim) {
         ne[dim] += t->shape().dims[dim];
     }
 
-    TensorF32* result = context().new_tensor(tensors[0]->ndim(), ne);
-    result->op     = OP_CONCAT;
+    TensorF32* result = context().new_tensor<float>(tensors[0]->shape().ndim(), ne);
+    result->op = OP_CONCAT;
     for (size_t i = 0; i < tensors.size() && i < GGML_MAX_SRC; i++) {
         result->src[i] = tensors[i];
     }
-    //result->op_params[0] = dim;
     return result;
 }
 
 // repeat(a, b) — 沿各维度重复 a 以匹配 b 的形状
 TensorF32* repeat(TensorF32* a, TensorF32* b) {
-    TensorF32* result = context().new_tensor(b->ndim(), b->dims());
+    TensorF32* result = context().new_tensor<float>(b->shape().ndim(), b->shape().dims.data());
     result->op     = OP_REPEAT;
     result->src[0] = a;
     result->src[1] = b;
     return result;
 }
 
-// repeat_back(a, b) — repeat 的反向操作（梯度）
-TensorF32* repeat_back(TensorF32* a, TensorF32* b) {
-    assert(b->can_repeat(a));
-    TensorF32* result = context().new_tensor(b->ndim(), b->shape().dims.data());
-    result->op     = OP_REPEAT_BACK;
-    result->src[0] = a;
-    return result;
-}
-
 // cont(a) — 确保张量连续存储
 TensorF32* cont(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_CONT;
     result->src[0] = a;
     return result;
@@ -391,9 +430,10 @@ TensorF32* cont(TensorF32* a) {
 // get_rows(a, b) — 按索引 b 从 a 中取行
 // a: (N, M, ...), b: (K,) → (K, M, ...)
 TensorF32* get_rows(TensorF32* a, TensorF32* b) {
+    int ndim = a->shape().ndim();
     int64_t ne[4] = {b->shape().dims[0], a->shape().dims[1], 1, 1};
-    if (a->ndim() >= 3) ne[2] = a->shape().dims[2];
-    Tensor* result = context().new_tensor(a->ndim(), ne);
+    if (ndim >= 3) ne[2] = a->shape().dims[2];
+    TensorF32* result = context().new_tensor<float>(ndim, ne);
     result->op     = OP_GET_ROWS;
     result->src[0] = a;
     result->src[1] = b;
@@ -402,7 +442,7 @@ TensorF32* get_rows(TensorF32* a, TensorF32* b) {
 
 // set_rows(a, b, c) — 将 c 的值写入 a 中由 b 指定的行
 TensorF32* set_rows(TensorF32* a, TensorF32* b, TensorF32* c) {
-    Tensor* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_SET_ROWS;
     result->src[0] = a;
     result->src[1] = b;
@@ -416,7 +456,7 @@ TensorF32* set_rows(TensorF32* a, TensorF32* b, TensorF32* c) {
 
 // diag_mask_inf(a, n_past) — 对角线掩码设为 -inf（因果注意力用）
 TensorF32* diag_mask_inf(TensorF32* a, int n_past) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_DIAG_MASK_INF;
     result->src[0] = a;
     //result->op_params[0] = n_past;
@@ -424,8 +464,8 @@ TensorF32* diag_mask_inf(TensorF32* a, int n_past) {
 }
 
 // diag_mask_zero(a, n_past) — 对角线以下掩码设为 0
-TenTensorF32sor* diag_mask_zero(TensorF32* a, int n_past) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+TensorF32* diag_mask_zero(TensorF32* a, int n_past) {
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_DIAG_MASK_ZERO;
     result->src[0] = a;
     //result->op_params[0] = n_past;
@@ -434,7 +474,7 @@ TenTensorF32sor* diag_mask_zero(TensorF32* a, int n_past) {
 
 // clamp(a, min, max) — 值裁剪
 TensorF32* clamp(TensorF32* a, float min_val, float max_val) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_CLAMP;
     result->src[0] = a;
     //result->op_params[0] = reinterpret_cast<int32_t&>(min_val);
@@ -444,7 +484,7 @@ TensorF32* clamp(TensorF32* a, float min_val, float max_val) {
 
 // sqr(a) — 平方 a²
 TensorF32* sqr(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_SQR;
     result->src[0] = a;
     return result;
@@ -452,7 +492,7 @@ TensorF32* sqr(TensorF32* a) {
 
 // sqrt(a) — 开方 √a
 TensorF32* sqrt(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_SQRT;
     result->src[0] = a;
     return result;
@@ -460,7 +500,7 @@ TensorF32* sqrt(TensorF32* a) {
 
 // abs(a) — 绝对值 |a|
 TensorF32* abs(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     result->src[0] = a;
     set_unary_op(result, UNARY_OP_ABS);
@@ -469,7 +509,7 @@ TensorF32* abs(TensorF32* a) {
 
 // log(a) — 自然对数
 TensorF32* log(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_LOG;
     result->src[0] = a;
     return result;
@@ -477,14 +517,14 @@ TensorF32* log(TensorF32* a) {
 
 // sin(a), cos(a) — 三角函数
 TensorF32* sin(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_SIN;
     result->src[0] = a;
     return result;
 }
 
 TensorF32* cos(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_COS;
     result->src[0] = a;
     return result;
@@ -500,7 +540,7 @@ static TensorF32* make_scalar(float value);
 // cross_entropy_loss(logits, targets) — 交叉熵损失
 TensorF32* cross_entropy_loss(TensorF32* logits, TensorF32* targets) {
     int64_t ne[1] = {1};
-    TensorF32* result = context().new_tensor(1, ne);
+    TensorF32* result = context().new_tensor<float>(1, ne);
     result->op     = OP_CROSS_ENTROPY_LOSS;
     result->src[0] = logits;
     result->src[1] = targets;
@@ -524,7 +564,7 @@ TensorF32* torsion_angle_loss(TensorF32* pred, TensorF32* gt, TensorF32* chi_mas
 
     // Step 3: masked mean
     auto masked = mul(sq_diff, chi_mask);     // [N, 7]
-    auto loss   = div(sum(masked), add1_impl(sum(chi_mask), make_scalar(eps)));
+    auto loss   = div(sum(masked), add1_impl(sum(chi_mask), make_scalar(eps), false));
 
     return loss;
 }
@@ -536,7 +576,7 @@ TensorF32* angle_norm_loss(TensorF32* unnormed, TensorF32* seq_mask, float eps) 
     // Step 1: angle_norm = sqrt(sum(unnormed², dim=-1) + eps)
     auto sq     = sqr(unnormed);              // [N, 7, 2]
     auto sum_sq = sum_rows(sq);               // [N, 7]
-    auto norm   = sqrt(add1_impl(sum_sq, make_scalar(eps))); // [N, 7]
+    auto norm   = sqrt(add1_impl(sum_sq, make_scalar(eps), false)); // [N, 7]
 
     // Step 2: norm_error = abs(norm - 1.0)
     auto ones   = repeat(make_scalar(1.0f), norm); // broadcast 1.0 → [N, 7]
@@ -544,7 +584,7 @@ TensorF32* angle_norm_loss(TensorF32* unnormed, TensorF32* seq_mask, float eps) 
 
     // Step 3: masked mean
     auto masked = mul(err, seq_mask);          // [N, 7] broadcast
-    auto loss   = div(sum(masked), add1_impl(sum(seq_mask), make_scalar(eps)));
+    auto loss   = div(sum(masked), add1_impl(sum(seq_mask), make_scalar(eps), false));
 
     return loss;
 }
@@ -564,7 +604,7 @@ TensorF32* supervised_chi_loss(
 
     auto weighted_chi  = scale(chi_loss,  chi_weight);
     auto weighted_norm = scale(norm_loss, angle_norm_weight);
-    auto total         = add_impl(weighted_chi, weighted_norm);
+    auto total         = add_impl(weighted_chi, weighted_norm, false);
 
     return total;
 }
@@ -590,7 +630,8 @@ TensorF32* masked_msa_loss(TensorF32* logits, TensorF32* true_msa, TensorF32* be
 
     // Step 2: one_hot(true_msa, 23) → [N_seq, N_res, 23]
     // one_hot_seq 接受 const TensorF32& (值类型), 此处解引用指针
-    auto labels = one_hot_seq(*true_msa, 23);
+    // TODO: one_hot_seq not yet implemented
+    auto labels = true_msa;  // placeholder
 
     // Step 3: CE per-position = -sum(labels * log_softmax, dim=-1) → [N_seq, N_res]
     auto weighted = mul(labels, lsm);       // [N_seq, N_res, 23]
@@ -602,13 +643,13 @@ TensorF32* masked_msa_loss(TensorF32* logits, TensorF32* true_msa, TensorF32* be
     // Step 5: 归一化标量 loss
     auto sum_masked = sum(masked_ce);
     auto sum_mask   = sum(bert_mask);
-    auto denom      = add1_impl(sum_mask, make_scalar(eps));
+    auto denom      = add1_impl(sum_mask, make_scalar(eps), false);
     auto loss_val   = div(sum_masked, denom);
 
     return loss_val;
 }
 
-one-hot labels 和 logits 由调用者在外部准备：
+//one-hot labels 和 logits 由调用者在外部准备：
 
 //logits_* 由 4 个 Linear(pair_feat, N_bins) 产生
 //*_onehot 由外部 binning 函数从坐标计算（非均匀距离 binning + 均匀角度 binning
@@ -655,7 +696,7 @@ TensorF32* distogram_loss(
         auto masked  = mul(ce_per, mask);                // apply pair mask
         auto sum_ce  = sum(masked);                      // scalar sum
         auto sum_m   = sum(mask);                        // mask sum
-        auto denom   = add1_impl(sum_m, make_scalar(eps));
+        auto denom   = add1_impl(sum_m, make_scalar(eps), false);
         return div(sum_ce, denom);
     };
 
@@ -668,8 +709,8 @@ TensorF32* distogram_loss(
     auto loss_ϕ    = ce_channel(logits_ϕ,    Φ_onehot, pair_mask);  // Φ (18 bins)
 
     // 总损失 = 四者之和
-    auto loss_2d = add_impl(add_impl(loss_dist, loss_ω),
-                            add_impl(loss_θ,  loss_ϕ));
+    auto loss_2d = add_impl(add_impl(loss_dist, loss_ω, false),
+                            add_impl(loss_θ,  loss_ϕ, false), false);
 
     return loss_2d;
 }
@@ -697,9 +738,9 @@ TensorF32* total_loss(
     auto w_msa_node       = scale(loss_msa,       w_msa);
     auto w_conf_node      = scale(loss_conf,      w_conf);
     // 逐项累加: (fape+chi) + (distogram+msa) + conf
-    auto ab = add_impl(w_fape_node,      w_chi_node);
-    auto cd = add_impl(w_distogram_node, w_msa_node);
-    auto total = add_impl(add_impl(ab, cd), w_conf_node);
+    auto ab = add_impl(w_fape_node,      w_chi_node, false);
+    auto cd = add_impl(w_distogram_node, w_msa_node, false);
+    auto total = add_impl(add_impl(ab, cd, false), w_conf_node, false);
 
     return total;
 }
@@ -726,7 +767,7 @@ TensorF32* plddt_loss(TensorF32* logits, TensorF32* lddt_onehot, TensorF32* ca_m
     auto masked = mul(ce, ca_mask);                   // [N_res]
     auto sum_ce = sum(masked);
     auto sum_m  = sum(ca_mask);
-    auto denom  = add1_impl(sum_m, make_scalar(eps));
+    auto denom  = add1_impl(sum_m, make_scalar(eps), false);
     auto loss   = div(sum_ce, denom);
 
     return loss;
@@ -754,7 +795,7 @@ TensorF32* fape_loss(
     const FAPEConfig& config)
 {
     int64_t ne[1] = {1};
-    TensorF32* result = context().new_tensor(1, ne);
+    TensorF32* result = context().new_tensor<float>(1, ne);
     result->op     = OP_FAPE;
     result->src[0] = pred_coords;
     result->src[1] = true_coords;
@@ -777,8 +818,8 @@ TensorF32* fape_loss(
 // ============================================================
 
 // rope(a, n_past) — 旋转位置编码
-TensorF32* rope(TensorF32* a, int n_past, int n_dims = 0) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+TensorF32* rope(TensorF32* a, int n_past, int n_dims) {
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_ROPE;
     result->src[0] = a;
     //result->op_params[0] = n_past;
@@ -792,14 +833,15 @@ TensorF32* rope(TensorF32* a, int n_past, int n_dims = 0) {
 
 // pad(a, pad_dims) — 补零填充
 TensorF32* pad(TensorF32* a, const std::vector<int>& pad_dims) {
+    int ndim = a->shape().ndim();
     int64_t ne[4] = {1, 1, 1, 1};
-    for (int i = 0; i < a->ndim(); i++) {
+    for (int i = 0; i < ndim; i++) {
         ne[i] = a->shape().dims[i];
         if (i * 2 < static_cast<int>(pad_dims.size())) {
             ne[i] += pad_dims[i * 2] + pad_dims[i * 2 + 1];
         }
     }
-    TensorF32* result = context().new_tensor(a->ndim(), ne);
+    TensorF32* result = context().new_tensor<float>(ndim, ne);
     result->op     = OP_PAD;
     result->src[0] = a;
     //for (size_t i = 0; i < pad_dims.size() && i < 8; i++) {
@@ -814,7 +856,7 @@ TensorF32* pad(TensorF32* a, const std::vector<int>& pad_dims) {
 
 // acc(a, b, nb1, nb2, nb3, offset) — 累加 b 到 a 的指定位置
 TensorF32* acc(TensorF32* a, TensorF32* b, size_t nb1, size_t nb2, size_t nb3, size_t offset) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_ACC;
     result->src[0] = a;
     result->src[1] = b;
@@ -831,7 +873,7 @@ TensorF32* acc(TensorF32* a, TensorF32* b, size_t nb1, size_t nb2, size_t nb3, s
 
 // cpy(dst, src) — 拷贝
 TensorF32* cpy(TensorF32* dst, TensorF32* src) {
-    TensorF32* result = context().new_tensor(src->ndim(), src->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(src->shape().ndim(), src->shape().dims.data());
     result->op     = OP_CPY;
     result->src[0] = dst;
     result->src[1] = src;
@@ -842,7 +884,7 @@ TensorF32* cpy(TensorF32* dst, TensorF32* src) {
 // 13. dup — 复制张量（为计算图创建独立节点）
 // ============================================================
 TensorF32* dup(TensorF32* a) {
-    TensorF32* result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_DUP;
     result->src[0] = a;
     return result;
@@ -865,10 +907,10 @@ TensorF32* loss(TensorF32* a) {
 }
 
 // arange(start, end, step) — 创建等差数列
-TensorF32* arange(float start, float end, float step = 1.0f) {
+TensorF32* arange(float start, float end, float step) {
     int64_t n = static_cast<int64_t>((end - start) / step + 0.5f);
     int64_t ne[1] = {n};
-    TensorF32* result = context().new_tensor(1, ne);
+    TensorF32* result = context().new_tensor<float>(1, ne);
     result->op     = OP_ARANGE;
     //result->op_params[0] = reinterpret_cast<int32_t&>(start);
     //result->op_params[1] = reinterpret_cast<int32_t&>(end);
@@ -878,7 +920,7 @@ TensorF32* arange(float start, float end, float step = 1.0f) {
 
 // 计算两个形状的广播结果形状
 static Shape broadcast_shape(TensorF32* a, TensorF32* b) {
-    int na = a->ndim(), nb = b->ndim();
+    int na = a->shape().ndim(), nb = b->shape().ndim();
     int nd = std::max(na, nb);
     std::vector<int64_t> dims(nd, 1);
 
@@ -893,9 +935,7 @@ static Shape broadcast_shape(TensorF32* a, TensorF32* b) {
 // 创建常量标量节点
 static TensorF32* make_scalar(float value) {
     int64_t ne[4] = {1, 1, 1, 1};
-    // why is [4]?
-    // ne[1] = {1}
-    TensorF32* t = context().new_tensor(1, ne);
+    TensorF32* t = context().new_tensor<float>(1, ne);
     // 标量数据直接写入
     t->data()[0] = value;
     return t;
@@ -904,7 +944,7 @@ static TensorF32* make_scalar(float value) {
 // sub(a, b) — a - b
 TensorF32* sub(TensorF32* a, TensorF32* b) {
     Shape out_shape = broadcast_shape(a, b);
-    Tensor* result = context().new_tensor(out_shape.ndim(), out_shape.dims.data());
+    TensorF32* result = context().new_tensor<float>(out_shape.ndim(), out_shape.dims.data());
     result->op     = OP_SUB;
     result->src[0] = a;
     result->src[1] = b;
@@ -914,7 +954,7 @@ TensorF32* sub(TensorF32* a, TensorF32* b) {
 // mul(a, b) — a * b  (element-wise)
 TensorF32* mul(TensorF32* a, TensorF32* b) {
     Shape out_shape = broadcast_shape(a, b);
-    Tensor* result = context().new_tensor(out_shape.ndim(), out_shape.dims.data());
+    TensorF32* result = context().new_tensor<float>(out_shape.ndim(), out_shape.dims.data());
     result->op     = OP_MUL;
     result->src[0] = a;
     result->src[1] = b;
@@ -924,7 +964,7 @@ TensorF32* mul(TensorF32* a, TensorF32* b) {
 // div(a, b) — a / b
 TensorF32* div(TensorF32* a, TensorF32* b) {
     Shape out_shape = broadcast_shape(a, b);
-    TensorF32* result = context().new_tensor(out_shape.ndim(), out_shape.dims.data());
+    TensorF32* result = context().new_tensor<float>(out_shape.ndim(), out_shape.dims.data());
     result->op     = OP_DIV;
     result->src[0] = a;
     result->src[1] = b;
@@ -934,7 +974,7 @@ TensorF32* div(TensorF32* a, TensorF32* b) {
 TensorF32* sigmoid(TensorF32* a) {
     TensorF32* result;
     // provide a inplace sigmoid
-    result = context().new_tensor(a->ndim(), a->shape().dims.data());
+    result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_UNARY;
     set_unary_op(result, UNARY_OP_SIGMOID);
     result->src[0] = a;

@@ -175,10 +175,10 @@ TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b) {
     TensorF32 output({B, M, N}, a.device());
     
     // 批量矩阵乘法
-    for (int64_t b = 0; b < B; b++) {
-        float* output_slice = output.data() + b * M * N;
-        const float* a_slice = a.data() + b * M * K;
-        const float* b_slice = b.data() + b * K * N;
+    for (int64_t batch = 0; batch < B; batch++) {
+        float* output_slice = output.data() + batch * M * N;
+        const float* a_slice = a.data() + batch * M * K;
+        const float* b_slice = b.data() + batch * K * N;
         
         /* cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     M, N, K,
@@ -477,10 +477,11 @@ TensorF32 triangle_mult(
         
         return output;
     }
+}
 
     
-    //dim=-1: 沿着最后一个维度拼接（-1表示最后一个维度）
-TensorF32 concat(const std::vector<TensorF32>& tensors, int dim) {
+//dim=-1: 沿着最后一个维度拼接（-1表示最后一个维度）
+TensorF32 tensor_concat(const std::vector<TensorF32>& tensors, int dim) {
     if (tensors.empty()) {
         throw RFAAError("cat: cannot concatenate empty list of tensors");
     }

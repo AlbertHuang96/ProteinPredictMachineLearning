@@ -98,7 +98,7 @@ bool BackendScheduler::alloc_splits() {
     // 检查节点
     if (!prev_node_backend_id_.empty()) {
         for (int i = 0; i < current_graph_->n_nodes(); i++) {
-            TensorF32* node = current_graph_->node(i);
+            TensorF32* node = current_graph_->graph_node(i);
             // cur_id is the i-th node in the graph currently
             int cur_id = tensor_backend_id(node, 0);
             // prev_id is the i-th node recorded last time
@@ -114,7 +114,7 @@ bool BackendScheduler::alloc_splits() {
     // 检查叶子
     if (!backend_ids_changed && !prev_leaf_backend_id_.empty()) {
         for (int i = 0; i < current_graph_->n_leafs(); i++) {
-            TensorF32* leaf = current_graph_->leaf(i);
+            TensorF32* leaf = current_graph_->graph_leaf(i);
             int cur_id = tensor_backend_id(leaf, 0);
             int prev_id = (i < (int)prev_leaf_backend_id_.size()) ? prev_leaf_backend_id_[i] : -1;
             if (cur_id != prev_id) {
@@ -187,28 +187,30 @@ static bool alloc_tensor_range(
     // 3. 先遍历 nodes
     int n_nodes = graph->n_nodes();
     for (int i = first_idx; i < n_nodes && (last_idx < 0 || i < last_idx); i++) {
-        TensorF32* t = graph->node(i);
+        TensorF32* t = graph->graph_node(i);
 
         // 跳过已分配或有 view_src 的 tensor
         if (t->data() != nullptr) {
             if (t->view_src == nullptr) {
                 continue;  // 已独立分配
-            } else if (t->buffer_ == nullptr) {
-                // view of pre-allocated tensor → 让 view 指向源数据
-                t->data_        = t->view_src->data_;
-                t->buffer_      = t->view_src->buffer_;
-                t->buffer_offs_ = t->view_src->buffer_offs_;
             }
+            // TODO: view tensor 需要设置 data_/buffer_，但 data_ 是 private
+            // else if (t->buffer_ == nullptr) {
+            //     t->data_        = t->view_src->data_;
+            //     t->buffer_      = t->view_src->buffer_;
+            //     t->buffer_offs_ = t->view_src->buffer_offs_;
+            // }
             continue;
         }
 
         if (t->view_src != nullptr) {
             // view tensor：不需要新内存，指向源
-            if (t->buffer_ == nullptr) {
-                t->data_        = t->view_src->data_;
-                t->buffer_      = t->view_src->buffer_;
-                t->buffer_offs_ = t->view_src->buffer_offs_;
-            }
+            // TODO: data_ is private, need friend or public setter
+            // if (t->buffer_ == nullptr) {
+            //     t->data_        = t->view_src->data_;
+            //     t->buffer_      = t->view_src->buffer_;
+            //     t->buffer_offs_ = t->view_src->buffer_offs_;
+            // }
             continue;
         }
 
@@ -221,16 +223,16 @@ static bool alloc_tensor_range(
     // 4. 再遍历 leafs
     int n_leafs = graph->n_leafs();
     for (int i = 0; i < n_leafs; i++) {
-        TensorF32* t = graph->leaf(i);
+        TensorF32* t = graph->graph_leaf(i);
 
         // leaf 通常已经预分配（input/param），跳过
         if (t->data() != nullptr) continue;
         if (t->view_src != nullptr) {
-            if (t->buffer_ == nullptr) {
+            /* if (t->buffer_ == nullptr) {
                 t->data_        = t->view_src->data_;
                 t->buffer_      = t->view_src->buffer_;
                 t->buffer_offs_ = t->view_src->buffer_offs_;
-            }
+            } */
             continue;
         }
 
@@ -264,7 +266,7 @@ Buffer* alloc_ctx_tensors_from_buft(
 
     // ===== 遍历所有 node =====
     for (int i = 0; i < n_nodes; i++) {
-        TensorF32* t = graph->node(i);
+        TensorF32* t = graph->graph_node(i);
 
         // 计算此 tensor 需要的空间（对齐后）
         size_t this_size = 0;
@@ -292,7 +294,7 @@ Buffer* alloc_ctx_tensors_from_buft(
 
     // ===== 遍历所有 leaf（leafs 通常已分配，只统计大小）=====
     for (int i = 0; i < graph->n_leafs(); i++) {
-        TensorF32* t = graph->leaf(i);
+        TensorF32* t = graph->graph_leaf(i);
         if (t->data() == nullptr && t->view_src == nullptr) {
             size_t this_size = GGML_PAD(buft->get_alloc_size(t), alignment);
             cur_buf_size += this_size;  // leaf 也加入最后一批
@@ -409,12 +411,12 @@ bool BackendScheduler::reserve_graph_memory() {
     // 1. 更新 node_backend_id_ / leaf_backend_id_
     node_backend_id_.resize(current_graph_->n_nodes());
     for (int i = 0; i < current_graph_->n_nodes(); i++) {
-        node_backend_id_[i] = tensor_backend_id(current_graph_->node(i), 0);
+        node_backend_id_[i] = tensor_backend_id(current_graph_->graph_node(i), 0);
     }
 
     leaf_backend_id_.resize(current_graph_->n_leafs());
     for (int i = 0; i < current_graph_->n_leafs(); i++) {
-        leaf_backend_id_[i] = tensor_backend_id(current_graph_->leaf(i), 0);
+        leaf_backend_id_[i] = tensor_backend_id(current_graph_->graph_leaf(i), 0);
     }
 
     // 2. 更新 bufts（缓存 buffer types）
@@ -433,7 +435,7 @@ bool BackendScheduler::reserve_graph_memory() {
         // ---- 3a. 统计原始图节点 ----
         for (int i = 0; i < current_graph_->n_nodes(); i++) {
             if (node_backend_id_[i] == b) {
-                TensorF32* t = current_graph_->node(i);
+                TensorF32* t = current_graph_->graph_node(i);
                 if (t->data() == nullptr && t->view_src == nullptr) {
                     backend_size += GGML_PAD(
                         buft->get_alloc_size(t),
@@ -445,7 +447,7 @@ bool BackendScheduler::reserve_graph_memory() {
         // ---- 3b. 统计 leafs ----
         for (int i = 0; i < current_graph_->n_leafs(); i++) {
             if (leaf_backend_id_[i] == b) {
-                TensorF32* t = current_graph_->leaf(i);
+                TensorF32* t = current_graph_->graph_leaf(i);
                 if (t->data() == nullptr && t->view_src == nullptr) {
                     backend_size += GGML_PAD(
                         buft->get_alloc_size(t),
@@ -479,7 +481,7 @@ bool BackendScheduler::reserve_graph_memory() {
             TensorAllocator tallocr(buf);
             for (int i = 0; i < current_graph_->n_nodes(); i++) {
                 if (node_backend_id_[i] == b) {
-                    TensorF32* t = current_graph_->node(i);
+                    TensorF32* t = current_graph_->graph_node(i);
                     if (t->data() == nullptr && t->view_src == nullptr) {
                         if (!tallocr.alloc(t)) return false;
                     }
@@ -487,7 +489,7 @@ bool BackendScheduler::reserve_graph_memory() {
             }
             for (int i = 0; i < current_graph_->n_leafs(); i++) {
                 if (leaf_backend_id_[i] == b) {
-                    TensorF32* t = current_graph_->leaf(i);
+                    TensorF32* t = current_graph_->graph_leaf(i);
                     if (t->data() == nullptr && t->view_src == nullptr) {
                         if (!tallocr.alloc(t)) return false;
                     }
@@ -545,7 +547,7 @@ void BackendScheduler::split_graph(ComputeGraph * graph) {
 
 void BackendScheduler::pass_assign_leafs(ComputeGraph * graph) {
     for (int i = 0; i < graph->n_leafs(); i++) {
-        TensorF32* leaf = graph->leaf(i);
+        TensorF32* leaf = graph->graph_leaf(i);
 
         // 用户已经手动指定 → 不覆盖
         if (tensor_backend_id(leaf) != -1) continue;
@@ -567,7 +569,7 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
     {
         int cur_backend_id = -1;
         for (int i = 0; i < graph->n_nodes(); i++) {
-            TensorF32* node = graph->node(i);
+            TensorF32* node = graph->graph_node(i);
             if (is_view_op(node->op)) continue;
 
             int node_id = tensor_backend_id(node);
@@ -591,7 +593,7 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
     {
         int cur_backend_id = -1;
         for (int i = graph->n_nodes() - 1; i >= 0; i--) {
-            TensorF32* node = graph->node(i);
+            TensorF32* node = graph->graph_node(i);
             if (is_view_op(node->op)) continue;
 
             int node_id = tensor_backend_id(node);
@@ -611,7 +613,7 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
 
 void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
     for (int i = 0; i < graph->n_nodes(); i++) {
-        TensorF32* node = graph->node(i);
+        TensorF32* node = graph->graph_node(i);
         if (is_view_op(node->op)) continue;
 
         auto it = backend_map_.find(node);
@@ -647,21 +649,21 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
     // ===== Step 1: 跳过开头的 view op，确定第一个 split 的 backend =====
     int i = 0;
     for (; i < n_nodes; i++) {
-        TensorF32* node = graph->node(i);
+        TensorF32* node = graph->graph_node(i);
         if (!is_view_op(node->op)) break;
     }
     if (i >= n_nodes) return;  // 全是 view op
 
     // ===== Step 2: 创建第一个 split =====
     SplitInfo* split = &splits_[0];
-    split->backend_id = tensor_backend_id(graph->node(i), 0);
+    split->backend_id = tensor_backend_id(graph->graph_node(i), 0);
     split->i_start    = 0;
     split->n_inputs   = 0;
     int cur_backend_id = split->backend_id;
 
     // ===== Step 3: 遍历所有节点，切分 =====
     for (; i < n_nodes; i++) {
-        TensorF32* node = graph->node(i);
+        TensorF32* node = graph->graph_node(i);
         if (is_view_op(node->op)) continue;
 
         int node_backend_id = tensor_backend_id(node, 0);

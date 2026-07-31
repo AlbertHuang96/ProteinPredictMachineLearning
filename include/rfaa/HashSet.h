@@ -61,7 +61,7 @@ static size_t hash_find(const struct HashSet * hash_set, void * key) {
     return i;
 }
 
-void hash_set_reset(struct HashSet * hash_set) {  
+static inline void hash_set_reset(struct HashSet * hash_set) {  
     memset(hash_set->used, 0, sizeof(bitset_t) * bitset_size(hash_set->size));  
 }
 

@@ -5,7 +5,7 @@
 namespace rfaa {
 
 // ===== worker_loop：线程常驻 + sleep/wake =====
-static void worker_loop(ThreadState * state) {
+void worker_loop(ThreadState * state) {
     ThreadPool * tp = state->pool;
 
     while (true) {
@@ -64,8 +64,16 @@ void ThreadPool::barrier_wait() {
         n_barrier.fetch_add(1, std::memory_order_release);
     } else {
         int cur = n_barrier.load(std::memory_order_acquire);
-        while (n_barrier.load(std::memory_order_acquire) == cur)
+        while (n_barrier.load(std::memory_order_acquire) == cur) {
+            // CPU yield hint (cross-platform)
+#if defined(_MSC_VER)
             _mm_pause();
+#elif defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#else
+            // fallback for ARM etc.
+#endif
+        }
     }
 }
 

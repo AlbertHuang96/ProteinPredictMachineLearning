@@ -10,29 +10,29 @@
 namespace rfaa {
 
 // ===== unary op 计算函数前向声明 =====
-static void compute_forward_abs(ComputeParams* p, Tensor* dst);
-static void compute_forward_sgn(ComputeParams* p, Tensor* dst);
-static void compute_forward_neg(ComputeParams* p, Tensor* dst);
-static void compute_forward_step(ComputeParams* p, Tensor* dst);
-static void compute_forward_relu(ComputeParams* p, Tensor* dst);
-static void compute_forward_gelu(ComputeParams* p, Tensor* dst);
-static void compute_forward_gelu_quick(ComputeParams* p, Tensor* dst);
-static void compute_forward_silu(ComputeParams* p, Tensor* dst);
-static void compute_forward_tanh(ComputeParams* p, Tensor* dst);
-static void compute_forward_elu(ComputeParams* p, Tensor* dst);
-static void compute_forward_sigmoid(ComputeParams* p, Tensor* dst);
-static void compute_forward_hardsigmoid(ComputeParams* p, Tensor* dst);
-static void compute_forward_hardswish(ComputeParams* p, Tensor* dst);
-static void compute_forward_exp(ComputeParams* p, Tensor* dst);
-static void compute_forward_log(ComputeParams* p, Tensor* dst);
-static void compute_forward_sqrt(ComputeParams* p, Tensor* dst);
-static void compute_forward_sin(ComputeParams* p, Tensor* dst);
-static void compute_forward_cos(ComputeParams* p, Tensor* dst);
-static void compute_forward_fape(ComputeParams* p, Tensor* dst);
-static void compute_forward_fape_back(ComputeParams* p, Tensor* dst);
+static void compute_forward_abs(ComputeParams* p, TensorF32* dst);
+static void compute_forward_sgn(ComputeParams* p, TensorF32* dst);
+static void compute_forward_neg(ComputeParams* p, TensorF32* dst);
+static void compute_forward_step(ComputeParams* p, TensorF32* dst);
+static void compute_forward_relu(ComputeParams* p, TensorF32* dst);
+static void compute_forward_gelu(ComputeParams* p, TensorF32* dst);
+static void compute_forward_gelu_quick(ComputeParams* p, TensorF32* dst);
+static void compute_forward_silu(ComputeParams* p, TensorF32* dst);
+static void compute_forward_tanh(ComputeParams* p, TensorF32* dst);
+static void compute_forward_elu(ComputeParams* p, TensorF32* dst);
+static void compute_forward_sigmoid(ComputeParams* p, TensorF32* dst);
+static void compute_forward_hardsigmoid(ComputeParams* p, TensorF32* dst);
+static void compute_forward_hardswish(ComputeParams* p, TensorF32* dst);
+static void compute_forward_exp(ComputeParams* p, TensorF32* dst);
+static void compute_forward_log(ComputeParams* p, TensorF32* dst);
+static void compute_forward_sqrt(ComputeParams* p, TensorF32* dst);
+static void compute_forward_sin(ComputeParams* p, TensorF32* dst);
+static void compute_forward_cos(ComputeParams* p, TensorF32* dst);
+static void compute_forward_fape(ComputeParams* p, TensorF32* dst);
+static void compute_forward_fape_back(ComputeParams* p, TensorF32* dst);
 
 // ===== dispatch =====
-Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
+Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
     switch (node->op) {
         case OP_NONE:   break;
         case OP_DUP:    kernel_dup(node);            break;
@@ -54,6 +54,8 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
         case OP_MEAN:   kernel_mean(node, p);        break;
         case OP_FAPE:      compute_forward_fape(p, node);      break;
         case OP_FAPE_BACK: compute_forward_fape_back(p, node); break;
+        case OP_TRI_MUL:   kernel_tri_mul(node, p);            break;
+        case OP_TRI_MUL_BACK: kernel_tri_mul_back(node, p);    break;
         case OP_UNARY:  {
             const unary_op uop = get_unary_op(node);
             switch (uop) {
@@ -106,9 +108,9 @@ Status CPUBackend::dispatch_node(Tensor * node, ComputeParams * p) {
 }
 
 // ===== elemwise =====
-void CPUBackend::kernel_elemwise(Tensor * node, ComputeParams * p) {
-    float * a = node->src[0]->data();
-    float * b = node->src[1]->data();
+void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
+    const float * a = node->src[0]->data();
+    const float * b = node->src[1]->data();
     float * d = node->data();
     int64_t n = node->numel();
 
@@ -129,13 +131,13 @@ void CPUBackend::kernel_elemwise(Tensor * node, ComputeParams * p) {
 }
 
 // ===== mul_mat =====
-void CPUBackend::kernel_mul_mat(Tensor * node, ComputeParams * p) {
+void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
     ThreadPool * tp = p->threadpool;
-    int M = static_cast<int>(node->dims()[1]);
-    int N = static_cast<int>(node->dims()[0]);
-    int K = static_cast<int>(node->src[0]->dims()[0]);
-    float * a = node->src[0]->data();
-    float * b = node->src[1]->data();
+    int M = static_cast<int>(node->shape().dims[1]);
+    int N = static_cast<int>(node->shape().dims[0]);
+    int K = static_cast<int>(node->src[0]->shape().dims[0]);
+    const float * a = node->src[0]->data();
+    const float * b = node->src[1]->data();
     float * d = node->data();
 
     if (p->ith == 0) tp->current_chunk.store(0);
@@ -159,30 +161,31 @@ void CPUBackend::kernel_mul_mat(Tensor * node, ComputeParams * p) {
 // 数学: dst[i0, i1, i2, i3] = sum_{i01} src0[i0, i01, i2, i3] * src1[i1, i01, i2, i3]
 // dst shape: (ne00, ne10, ne12, ne13)  — 实际就是 A @ B^T 在倒数第二维上收缩
 // 当前项目 4D 约定: dims = (ne0, ne1, ne2, ne3), ne0 是最内维
-void CPUBackend::kernel_out_prod(Tensor * node, ComputeParams * p) {
+void CPUBackend::kernel_out_prod(TensorF32 * node, ComputeParams * p) {
     ThreadPool * tp = p->threadpool;
 
-    const Tensor * src0 = node->src[0];
-    const Tensor * src1 = node->src[1];
+    const TensorF32 * src0 = node->src[0];
+    const TensorF32 * src1 = node->src[1];
 
-    const int64_t ne00 = src0->dims()[0];  // src0 inner dim
-    const int64_t ne01 = src0->dims()[1];  // src0 K dim (contraction dim)
-    const int64_t ne02 = (src0->shape().ndim() > 2) ? src0->dims()[2] : 1;
-    const int64_t ne03 = (src0->shape().ndim() > 3) ? src0->dims()[3] : 1;
+    const int64_t ne00 = src0->shape().dims[0];  // src0 inner dim
+    const int64_t ne01 = src0->shape().dims[1];  // src0 K dim (contraction dim)
+    const int64_t ne02 = (src0->shape().ndim() > 2) ? src0->shape().dims[2] : 1;
+    const int64_t ne03 = (src0->shape().ndim() > 3) ? src0->shape().dims[3] : 1;
 
-    const int64_t ne10 = src1->dims()[0];  // src1 inner dim
-    const int64_t ne11 = src1->dims()[1];  // src1 K dim (contraction dim, == ne01)
-    const int64_t ne12 = (src1->shape().ndim() > 2) ? src1->dims()[2] : 1;
-    const int64_t ne13 = (src1->shape().ndim() > 3) ? src1->dims()[3] : 1;
+    const int64_t ne10 = src1->shape().dims[0];  // src1 inner dim
+    const int64_t ne11 = src1->shape().dims[1];  // src1 K dim (contraction dim, == ne01)
+    const int64_t ne12 = (src1->shape().ndim() > 2) ? src1->shape().dims[2] : 1;
+    const int64_t ne13 = (src1->shape().ndim() > 3) ? src1->shape().dims[3] : 1;
+    (void)ne02; (void)ne03; (void)ne12; (void)ne13;  // unused for now
 
     // dst shape: (ne00, ne10, max(ne02,ne12), max(ne03,ne13))
-    const int64_t ne0 = node->dims()[0];  // == ne00
-    const int64_t ne1 = node->dims()[1];  // == ne10
-    const int64_t ne2 = (node->shape().ndim() > 2) ? node->dims()[2] : 1;
-    const int64_t ne3 = (node->shape().ndim() > 3) ? node->dims()[3] : 1;
+    const int64_t ne0 = node->shape().dims[0];  // == ne00
+    const int64_t ne1 = node->shape().dims[1];  // == ne10
+    const int64_t ne2 = (node->shape().ndim() > 2) ? node->shape().dims[2] : 1;
+    const int64_t ne3 = (node->shape().ndim() > 3) ? node->shape().dims[3] : 1;
 
-    float * src0_data = src0->data();
-    float * src1_data = src1->data();
+    const float * src0_data = src0->data();
+    const float * src1_data = src1->data();
     float * dst_data  = node->data();
 
     // ===== thread 0: 清零 dst =====
@@ -242,10 +245,10 @@ void CPUBackend::kernel_out_prod(Tensor * node, ComputeParams * p) {
                 for (int64_t i01 = bi01; i01 < bne01; i01++) {
                     // src0 行: (i01, i02, i03) → src0 的第 i01 行
                     // 布局: src0[i01, i02, i03] 对应 data[i01*ne00 + i02*ne00*ne01 + i03*ne00*ne01*ne02]
-                    float * s0 = src0_data + (i01 * ne00 + i02 * ne00 * ne01 + i03 * ne00 * ne01 * ne02);
+                    const float * s0 = src0_data + (i01 * ne00 + i02 * ne00 * ne01 + i03 * ne00 * ne01 * ne02);
 
                     // src1 元素: (i1, i01, i12, i13)
-                    float * s1_row = src1_data + (i01 * ne10 + i12 * ne10 * ne11 + i13 * ne10 * ne11 * ne12);
+                    const float * s1_row = src1_data + (i01 * ne10 + i12 * ne10 * ne11 + i13 * ne10 * ne11 * ne12);
                     float s1_val = s1_row[i1];  // src1[i1, i01, i12, i13]
 
                     // d_row[i0] += s0[i0] * s1_val  for i0 in [0, ne00)
@@ -260,9 +263,158 @@ void CPUBackend::kernel_out_prod(Tensor * node, ComputeParams * p) {
     tp->barrier_wait();
 }
 
+// ===== triangle multiplication =====
+// outgoing=true:  einsum('bikd,bjkd->bijd', left, right/L)
+// outgoing=false: einsum('bkid,bkjd->bijd', left, right/L)
+// left:  (B, I, K, D) for outgoing, (B, K, I, D) for incoming
+// right: (B, J, K, D) for outgoing, (B, K, J, D) for incoming
+// dst:   (B, I, J, D)
+void CPUBackend::kernel_tri_mul(TensorF32 * node, ComputeParams * p) {
+    ThreadPool * tp = p->threadpool;
+
+    const TensorF32 * src0 = node->src[0];  // left
+    const TensorF32 * src1 = node->src[1];  // right
+    TensorF32       * dst  = node;
+
+    const int64_t B = dst->shape().dims[0];
+    const int64_t I = dst->shape().dims[1];  // = src0 dim[1]
+    const int64_t J = dst->shape().dims[2];  // = src1 dim[1]
+    const int64_t D = dst->shape().dims[3];  // inner dim
+    const int64_t K = src0->shape().dims[2]; // contraction dim
+
+    float L;
+    bool  outgoing;
+    memcpy(&L,        node->op_params,      sizeof(float));
+    memcpy(&outgoing, node->op_params + 4,  sizeof(bool));
+
+    const float * left_data  = static_cast<const float*>(src0->data());
+    const float * right_data = static_cast<const float*>(src1->data());
+    float       * dst_data   = static_cast<float*>(dst->data());
+
+    const float inv_L = 1.0f / L;
+    const int64_t total = B * I * J * D;
+    const int64_t per  = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        int64_t tmp  = idx;
+        int64_t d    = tmp % D;  tmp /= D;
+        int64_t j    = tmp % J;  tmp /= J;
+        int64_t i    = tmp % I;
+        int64_t b    = tmp / I;
+
+        float sum = 0.0f;
+        for (int64_t k = 0; k < K; k++) {
+            float lv, rv;
+            if (outgoing) {
+                // left(b,i,k,d) * right(b,j,k,d)
+                lv = left_data[((b * I + i) * K + k) * D + d];
+                rv = right_data[((b * J + j) * K + k) * D + d];
+            } else {
+                // left(b,k,i,d) * right(b,k,j,d)
+                lv = left_data[((b * K + k) * I + i) * D + d];
+                rv = right_data[((b * K + k) * J + j) * D + d];
+            }
+            sum += lv * rv;
+        }
+        dst_data[idx] = sum * inv_L;
+    }
+
+    tp->barrier_wait();
+}
+
+// backward: dL/dleft 和 dL/dright 分别对 left 和 right 求导
+void CPUBackend::kernel_tri_mul_back(TensorF32 * node, ComputeParams * p) {
+    // grad from upstream
+    const TensorF32 * grad = node->src[0];  // dL/ddst: (B, I, J, D)
+    const TensorF32 * left  = node->src[1]; // left
+    const TensorF32 * right = node->src[2]; // right
+    TensorF32 * grad_left  = node->src[3];  // dL/dleft
+    TensorF32 * grad_right = node->src[4];  // dL/dright
+
+    if (!grad_left || !grad_right) return;
+
+    const int64_t B = left->shape().dims[0];
+    const int64_t I = left->shape().dims[1];
+    const int64_t J = right->shape().dims[1];
+    const int64_t D = left->shape().dims[3];
+    const int64_t K = left->shape().dims[2];
+
+    float L;
+    bool  outgoing;
+    memcpy(&L,        node->op_params,      sizeof(float));
+    memcpy(&outgoing, node->op_params + 4,  sizeof(bool));
+
+    const float inv_L = 1.0f / L;
+    const float * grad_data = static_cast<const float*>(grad->data());
+    const float * right_data = static_cast<const float*>(right->data());
+    const float * left_data  = static_cast<const float*>(left->data());
+    float * gleft_data  = static_cast<float*>(grad_left->data());
+    float * gright_data = static_cast<float*>(grad_right->data());
+
+    ThreadPool * tp = p->threadpool;
+
+    // dL/dleft: for outgoing: einsum('bijd,bjkd->bikd', grad, right/L)
+    //           for incoming: einsum('bijd,bkjd->bkid', grad, right/L)
+    {
+        const int64_t total = B * I * K * D;
+        const int64_t per  = (total + p->nth - 1) / p->nth;
+        const int64_t start = per * p->ith;
+        const int64_t end   = (start + per < total) ? (start + per) : total;
+        for (int64_t idx = start; idx < end; idx++) {
+            int64_t tmp = idx;
+            const int64_t d = tmp % D; tmp /= D;
+            const int64_t k = tmp % K; tmp /= K;
+            const int64_t i = tmp % I;
+            const int64_t b = tmp / I;
+            float sum = 0.0f;
+            for (int64_t j = 0; j < J; j++) {
+                float gv = grad_data[((b * I + i) * J + j) * D + d];
+                float rv;
+                if (outgoing)
+                    rv = right_data[((b * J + j) * K + k) * D + d];
+                else
+                    rv = right_data[((b * K + k) * J + j) * D + d];
+                sum += gv * rv;
+            }
+            gleft_data[idx] = sum * inv_L;
+        }
+    }
+    tp->barrier_wait();
+
+    // dL/dright: for outgoing: einsum('bijd,bikd->bjkd', grad, left/L)
+    //            for incoming: einsum('bijd,bkid->bkjd', grad, left/L)
+    {
+        const int64_t total = B * J * K * D;
+        const int64_t per  = (total + p->nth - 1) / p->nth;
+        const int64_t start = per * p->ith;
+        const int64_t end   = (start + per < total) ? (start + per) : total;
+        for (int64_t idx = start; idx < end; idx++) {
+            int64_t tmp = idx;
+            const int64_t d = tmp % D; tmp /= D;
+            const int64_t k = tmp % K; tmp /= K;
+            const int64_t j = tmp % J;
+            const int64_t b = tmp / J;
+            float sum = 0.0f;
+            for (int64_t i = 0; i < I; i++) {
+                float gv = grad_data[((b * I + i) * J + j) * D + d];
+                float lv;
+                if (outgoing)
+                    lv = left_data[((b * I + i) * K + k) * D + d];
+                else
+                    lv = left_data[((b * K + k) * I + i) * D + d];
+                sum += gv * lv;
+            }
+            gright_data[idx] = sum * inv_L;
+        }
+    }
+    tp->barrier_wait();
+}
+
 // ===== softmax =====
-void CPUBackend::kernel_softmax(Tensor * node, ComputeParams * p) {
-    int D    = static_cast<int>(node->dims()[0]);
+void CPUBackend::kernel_softmax(TensorF32 * node, ComputeParams * p) {
+    int D    = static_cast<int>(node->shape().dims[0]);
     int rows = static_cast<int>(node->numel() / D);
     int per  = (rows + p->nth - 1) / p->nth;
     int start = p->ith * per;
@@ -295,8 +447,8 @@ void CPUBackend::kernel_softmax(Tensor * node, ComputeParams * p) {
 }
 
 // ===== rms_norm =====
-void CPUBackend::kernel_rms_norm(Tensor * node, ComputeParams * p) {
-    int D    = static_cast<int>(node->dims()[0]);
+void CPUBackend::kernel_rms_norm(TensorF32 * node, ComputeParams * p) {
+    int D    = static_cast<int>(node->shape().dims[0]);
     int rows = static_cast<int>(node->numel() / D);
     int per  = (rows + p->nth - 1) / p->nth;
     int start = p->ith * per, end = std::min(start + per, rows);
@@ -313,8 +465,8 @@ void CPUBackend::kernel_rms_norm(Tensor * node, ComputeParams * p) {
 }
 
 // layer norm (OP_NORM) kernel implementation
-void CPUBackend::kernel_norm(Tensor * node, ComputeParams * p) {
-    int D    = static_cast<int>(node->dims()[0]);
+void CPUBackend::kernel_norm(TensorF32 * node, ComputeParams * p) {
+    int D    = static_cast<int>(node->shape().dims[0]);
     int rows = static_cast<int>(node->numel() / D);
     int per  = (rows + p->nth - 1) / p->nth;
     int start = p->ith * per, end = std::min(start + per, rows);
@@ -349,7 +501,7 @@ void CPUBackend::kernel_norm(Tensor * node, ComputeParams * p) {
 }
 
 // layer norm backward (OP_NORM_BACK) kernel
-void CPUBackend::kernel_norm_back(Tensor * node, ComputeParams * p) {
+void CPUBackend::kernel_norm_back(TensorF32 * node, ComputeParams * p) {
     // dL_dx = rstd/D * (D * dL_dy - sum(dL_dy) - y_norm * sum(dL_dy * y_norm))
     // src[0] = dL_dy (upstream gradient, aka dout)
     // src[1] = x     (original input, aka inp)
@@ -396,7 +548,7 @@ void CPUBackend::kernel_norm_back(Tensor * node, ComputeParams * p) {
 }
 
 // softmax backward (OP_SOFT_MAX_BACK) kernel
-void CPUBackend::kernel_softmax_back(Tensor * node, ComputeParams * p) {
+void CPUBackend::kernel_softmax_back(TensorF32 * node, ComputeParams * p) {
     // dL/dx_i = y_i * (dL/dy_i - sum_j(y_j * dL/dy_j))
     // src[0] = dL/dy (upstream gradient)
     // src[1] = y     (softmax forward output)
@@ -430,40 +582,39 @@ void CPUBackend::kernel_softmax_back(Tensor * node, ComputeParams * p) {
 }
 
 // ===== unary =====
-void CPUBackend::kernel_silu(Tensor * node) {
+void CPUBackend::kernel_silu(TensorF32 * node) {
     float * s = node->src[0]->data(), * d = node->data();
     for (int64_t i = 0; i < node->numel(); i++)
         d[i] = s[i] / (1.0f + expf(-s[i]));
 }
-void CPUBackend::kernel_gelu(Tensor * node) { /* ... */ }
-void CPUBackend::kernel_relu(Tensor * node) { /* ... */ }
+void CPUBackend::kernel_gelu(TensorF32 * node) { (void)node; }
+void CPUBackend::kernel_relu(TensorF32 * node) { (void)node; }
 
-void CPUBackend::kernel_dup(Tensor * node) {
+void CPUBackend::kernel_dup(TensorF32 * node) {
     std::memcpy(node->data(), node->src[0]->data(), node->numel() * sizeof(float));
 }
 
-void CPUBackend::kernel_scale(Tensor * node, ComputeParams * p) { /* ... */ }
-void CPUBackend::kernel_add1(Tensor * node, ComputeParams * p)  { /* ... */ }
-void CPUBackend::kernel_sum(Tensor * node, ComputeParams * p)   { /* ... */ }
-void CPUBackend::kernel_mean(Tensor * node, ComputeParams * p)  { /* ... */ }
+void CPUBackend::kernel_scale(TensorF32 * node, ComputeParams * p) { (void)node; (void)p; }
+void CPUBackend::kernel_add1(TensorF32 * node, ComputeParams * p)  { (void)node; (void)p; }
+void CPUBackend::kernel_sum(TensorF32 * node, ComputeParams * p)   { (void)node; (void)p; }
+void CPUBackend::kernel_mean(TensorF32 * node, ComputeParams * p)  { (void)node; (void)p; }
 
-void CPUBackend::kernel_sigmoid(Tensor * node, ComputeParams * p) {
-    Tensor* output = node->src[0];
+void CPUBackend::kernel_sigmoid(TensorF32 * node, ComputeParams * p) {
+    TensorF32* output = node->src[0];
     float* data = output->data();
-    int64_t n = node->src[0]->numel();
+    int64_t n = output->numel();
 
     #pragma omp parallel for
     for (int64_t i = 0; i < n; i++) {
         data[i] = 1.0f / (1.0f + std::exp(-data[i]));
     }
-
-    return output;
+    (void)p;
 }
 
 // ===== unary op 计算函数实现 =====
 
-static void compute_forward_abs(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_abs(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -472,8 +623,8 @@ static void compute_forward_abs(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_sgn(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_sgn(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -482,8 +633,8 @@ static void compute_forward_sgn(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_neg(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_neg(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -492,8 +643,8 @@ static void compute_forward_neg(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_step(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_step(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -502,8 +653,8 @@ static void compute_forward_step(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_relu(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_relu(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -512,8 +663,8 @@ static void compute_forward_relu(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_gelu(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_gelu(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -526,8 +677,8 @@ static void compute_forward_gelu(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_gelu_quick(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_gelu_quick(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -537,8 +688,8 @@ static void compute_forward_gelu_quick(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_silu(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_silu(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -547,8 +698,8 @@ static void compute_forward_silu(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_tanh(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_tanh(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -557,8 +708,8 @@ static void compute_forward_tanh(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_elu(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_elu(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -568,8 +719,8 @@ static void compute_forward_elu(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_sigmoid(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_sigmoid(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -578,8 +729,8 @@ static void compute_forward_sigmoid(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_hardsigmoid(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_hardsigmoid(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -591,8 +742,8 @@ static void compute_forward_hardsigmoid(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_hardswish(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_hardswish(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -604,8 +755,8 @@ static void compute_forward_hardswish(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_exp(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_exp(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -614,8 +765,8 @@ static void compute_forward_exp(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_log(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_log(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -624,8 +775,8 @@ static void compute_forward_log(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_sqrt(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_sqrt(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -634,8 +785,8 @@ static void compute_forward_sqrt(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_sin(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_sin(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -644,8 +795,8 @@ static void compute_forward_sin(ComputeParams* p, Tensor* dst) {
     }
 }
 
-static void compute_forward_cos(ComputeParams* p, Tensor* dst) {
-    Tensor* src0 = dst->src[0];
+static void compute_forward_cos(ComputeParams* p, TensorF32* dst) {
+    TensorF32* src0 = dst->src[0];
     float* d = dst->data();
     float* s = src0->data();
     int64_t n = dst->numel();
@@ -679,7 +830,7 @@ static void compute_forward_cos(ComputeParams* p, Tensor* dst) {
 //   Step 4: Pairwise Euclidean distances
 //   Step 5: Clamp + apply masks
 //   Step 6: Reduce to scalar
-static void compute_forward_fape(ComputeParams* p, Tensor* dst) {
+static void compute_forward_fape(ComputeParams* p, TensorF32* dst) {
     ThreadPool* tp = p->threadpool;
 
     // Only thread 0 does the computation (single scalar output)
@@ -688,11 +839,11 @@ static void compute_forward_fape(ComputeParams* p, Tensor* dst) {
         return;
     }
 
-    Tensor* src0 = dst->src[0];  // pred_coords  [N_atoms, 3]
-    Tensor* src1 = dst->src[1];  // true_coords  [N_atoms, 3]
-    Tensor* src2 = dst->src[2];  // frame_atom_indices [N_frames, 3]
-    Tensor* src3 = dst->src[3];  // frames_mask  [N_frames]
-    Tensor* src4 = dst->src[4];  // positions_mask [N_atoms]
+    TensorF32* src0 = dst->src[0];  // pred_coords  [N_atoms, 3]
+    TensorF32* src1 = dst->src[1];  // true_coords  [N_atoms, 3]
+    TensorF32* src2 = dst->src[2];  // frame_atom_indices [N_frames, 3]
+    TensorF32* src3 = dst->src[3];  // frames_mask  [N_frames]
+    TensorF32* src4 = dst->src[4];  // positions_mask [N_atoms]
 
     float d_clamp     = reinterpret_cast<float&>(dst->op_params[0]);
     float epsilon     = reinterpret_cast<float&>(dst->op_params[2]);
@@ -704,8 +855,8 @@ static void compute_forward_fape(ComputeParams* p, Tensor* dst) {
     float* frames_mask   = src3->data();
     float* positions_mask = src4->data();
 
-    int64_t N_atoms  = src0->dims()[1];   // number of rows
-    int64_t N_frames = src2->dims()[1];   // = N_frames
+    int64_t N_atoms  = src0->shape().dims[1];   // number of rows
+    int64_t N_frames = src2->shape().dims[1];   // = N_frames
 
     // Pre-compute T_inv for each frame (both pred and true)
     // T_inv = [R^T | -R^T*A] stored as 12 floats per frame:
@@ -879,7 +1030,7 @@ static void compute_forward_fape(ComputeParams* p, Tensor* dst) {
 //   Step 4 backward: dL/d(local_pred) = dL/de * (local_pred - local_true) / (e + eps)
 //   Step 3 backward: dL/d(global_pred) = R_pred @ dL/d(local_pred)
 //   (Gram-Schmidt backward through T_inv is deferred to Phase 2)
-static void compute_forward_fape_back(ComputeParams* p, Tensor* dst) {
+static void compute_forward_fape_back(ComputeParams* p, TensorF32* dst) {
     ThreadPool* tp = p->threadpool;
 
     if (p->ith != 0) {
@@ -887,12 +1038,12 @@ static void compute_forward_fape_back(ComputeParams* p, Tensor* dst) {
         return;
     }
 
-    Tensor* grad_scalar     = dst->src[0];  // upstream gradient (1,)
-    Tensor* pred_coords_t   = dst->src[1];  // [N_atoms, 3]
-    Tensor* true_coords_t   = dst->src[2];  // [N_atoms, 3]
-    Tensor* frame_indices_t = dst->src[3];  // [N_frames, 3]
-    Tensor* frames_mask_t   = dst->src[4];  // [N_frames]
-    Tensor* positions_mask_t= dst->src[5];  // [N_atoms]
+    TensorF32* grad_scalar     = dst->src[0];  // upstream gradient (1,)
+    TensorF32* pred_coords_t   = dst->src[1];  // [N_atoms, 3]
+    TensorF32* true_coords_t   = dst->src[2];  // [N_atoms, 3]
+    TensorF32* frame_indices_t = dst->src[3];  // [N_frames, 3]
+    TensorF32* frames_mask_t   = dst->src[4];  // [N_frames]
+    TensorF32* positions_mask_t= dst->src[5];  // [N_atoms]
 
     float d_clamp     = reinterpret_cast<float&>(dst->op_params[0]);
     float epsilon     = reinterpret_cast<float&>(dst->op_params[2]);
@@ -907,8 +1058,8 @@ static void compute_forward_fape_back(ComputeParams* p, Tensor* dst) {
 
     float upstream = grad_scalar->data()[0];  // dL/dL_fape
 
-    int64_t N_atoms  = pred_coords_t->dims()[1];
-    int64_t N_frames = frame_indices_t->dims()[1];
+    int64_t N_atoms  = pred_coords_t->shape().dims[1];
+    int64_t N_frames = frame_indices_t->shape().dims[1];
 
     // Zero output gradient
     for (int64_t i = 0; i < N_atoms * 3; i++) d_pred[i] = 0.0f;

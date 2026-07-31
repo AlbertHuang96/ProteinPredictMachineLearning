@@ -55,9 +55,15 @@ TensorF32 PositionalEncoding::forward(const TensorF32& seq,
     // ib_res (B, L, L)
     TensorF32 ib_res = bucketize(res_dist, res_bins);
     TensorF32 ib_atom = bucketize(atom_dist, atom_bins);
-    TensorF32 emb_res = emb_res_->forward(ib_res);
-    TensorF32 emb_atom = emb_atom_->forward(ib_atom);
-    output = emb_res + emb_atom;  // (B, L, L, d_pair_)
+    TensorF32 emb_res = emb_res_->forward_exec(ib_res);
+    TensorF32 emb_atom = emb_atom_->forward_exec(ib_atom);
+    // 逐元素相加: output = emb_res + emb_atom
+    float* out_data = output.data();
+    const float* res_data = emb_res.data();
+    const float* atom_data = emb_atom.data();
+    for (int64_t i = 0; i < output.numel(); i++) {
+        out_data[i] = res_data[i] + atom_data[i];
+    }
     return output;
 }
 
@@ -318,7 +324,7 @@ std::pair<TensorF32, TensorF32> PositionalEncoding::getResAtomDist(
         }
     }
     
-    return {res_dist_batch, atom_dist_batch};
+    return std::make_pair(std::move(res_dist_batch), std::move(atom_dist_batch));
 }
 
 TensorF32 PositionalEncoding::bucketize(const TensorF32& distances, const std::vector<int>& bins) {

@@ -142,7 +142,7 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
     cudaSetDevice(device_id_);
 
     for (int node_n = 0; node_n < cgraph->n_nodes(); node_n++) {
-        TensorF32* node = cgraph->node(node_n);
+        TensorF32* node = cgraph->graph_node(node_n);
 
         // 跳过 no-op
         if (node->op == OP_NONE || node->op == OP_VIEW ||

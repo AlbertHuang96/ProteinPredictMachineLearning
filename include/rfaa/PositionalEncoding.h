@@ -7,6 +7,8 @@
 
 namespace rfaa {
 
+class EmbeddingLayer;  // 前向声明
+
 /**
  * @brief Positional Encoding module for RFAA
  * 

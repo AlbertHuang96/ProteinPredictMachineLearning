@@ -26,7 +26,9 @@ bool Dropout::is_training() const {
 TensorF32 Dropout::forward(const TensorF32& x) {
     // If not in training mode, return input directly (no dropout during evaluation)
     if (!training_) {
-        return x;  // Return copy of input
+        TensorF32 output(x.shape(), x.device());
+        output.copy_from(x);
+        return output;
     }
     
     const float* x_data = x.data();

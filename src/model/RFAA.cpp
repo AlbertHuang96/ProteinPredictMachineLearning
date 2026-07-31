@@ -94,10 +94,7 @@ TensorF32 IterBlock::compute_rbf_feature(const TensorF32& coords)
     }
 
     
-    // Ensure contiguous (select returns a view, may not be contiguous)
-    // Create a contiguous copy
-    TensorF32 cas_contig = cas;  // If already contiguous, this is just a reference
-    // Force contiguous by creating new tensor and copying
+    // Ensure contiguous: create new tensor and copy
     TensorF32 cas_copy({B, L, D}, coords.device());
     cas_copy.copy_from(cas);
     
@@ -154,6 +151,41 @@ TensorF32 IterBlock::compute_rbf_feature(const TensorF32& coords)
     return rbf_feature;
 }
 
+TensorF32 IterBlock::compute_l1_features(const TensorF32& coords) {
+    // Python: l1_feats = xyz - xyz[:,:,1,:].unsqueeze(2)
+    //         l1_feats = l1_feats.reshape(B*L, -1, 3)
+    // coords: (B, L, 3, 3)  — 3 atoms (N, CA, C) × 3 xyz
+    // output: (B*L, 3, 3)   — 各原子相对 CA 的位移向量
+
+    int B = coords.shape().dims[0];
+    int L = coords.shape().dims[1];
+    int A = coords.shape().dims[2];  // 3 atoms
+    int D = coords.shape().dims[3];  // 3 xyz
+
+    TensorF32 l1_feats({B * L, A, D}, coords.device());
+
+    const float* src = coords.data();
+    float* dst = l1_feats.data();
+
+    for (int b = 0; b < B; b++) {
+        for (int l = 0; l < L; l++) {
+            // CA 坐标 (atom index 1)
+            float ca_x = src[b * L * A * D + l * A * D + 1 * D + 0];
+            float ca_y = src[b * L * A * D + l * A * D + 1 * D + 1];
+            float ca_z = src[b * L * A * D + l * A * D + 1 * D + 2];
+
+            for (int a = 0; a < A; a++) {
+                int out_idx = (b * L + l) * A * D + a * D;
+                dst[out_idx + 0] = src[b * L * A * D + l * A * D + a * D + 0] - ca_x;
+                dst[out_idx + 1] = src[b * L * A * D + l * A * D + a * D + 1] - ca_y;
+                dst[out_idx + 2] = src[b * L * A * D + l * A * D + a * D + 2] - ca_z;
+            }
+        }
+    }
+
+    return l1_feats;
+}
+
 void IterBlock::forward(TensorF32& msa, TensorF32& pair, 
                         TensorF32& state, 
                         const TensorF32& seq1hot,
@@ -174,7 +206,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             // the supplemental said that a layernorm and then a linear?
             // layernorm first
             // 旧栈上变量: LayerNorm state_norm(D_STATE); → state2msa_norm_
-            TensorF32 state_normed = state2msa_norm_->forward(state);
+            auto& state_normed = *state2msa_norm_->forward(&state);
             
             // 旧栈上变量: LinearLayer linear(D_STATE, D_MSA); → state2msa_linear_
             const auto proj_state = state2msa_linear_->forward(state_normed);
@@ -194,12 +226,14 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             // rel_pos, bond_dist = positionalEncoding(bond feat, dist matrix)
             // bias += linear(rel_pos) + linear(bond_dist)
 
-            // need to get the input bond_feats, dist_matrix
-            rbf_feature = rbf + pos_enc_->forward(coords, index, bond_feats, dist_matrix, same_chain);
+            // TODO: residx, bond_feats, dist_matrix, same_chain 需从外部输入传入
+            TensorF32 residx, bond_feats, dist_matrix, same_chain;
+            auto pos_out = pos_enc_->forward(coords, residx, bond_feats, dist_matrix, same_chain);
+            rbf_feature.copy_from(*add_impl(&rbf, &pos_out, /*inplace=*/false));
             // 旧栈上变量: LayerNorm pair_layernorm(D_PAIR); → pair2msa_norm_
-            pair_biased = pair2msa_norm_->forward(pair);
+            pair_biased.copy_from(*pair2msa_norm_->forward(&pair));
 
-            pair_biased = pair_biased + rbf_feature; 
+            pair_biased.copy_from(*add_impl(&pair_biased, &rbf_feature, /*inplace=*/false));
 
             // TODO
             // update msa query row with state from SE3 output
@@ -227,28 +261,31 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // outer product + mean -> (B,L,L,256) -> Linear -> (B,L,L,128)
         {
             // msa2pair
+            int N = msa.shape().dims[1];
             // 旧栈上变量: LayerNorm msa_norm(D_MSA); → msa2pair_norm_
-            TensorF32 msa_normed = msa2pair_norm_->forward(msa);
+            auto& msa_normed = *msa2pair_norm_->forward(&msa);
             // 旧栈上变量: LinearLayer left_proj(D_MSA, 16); → msa2pair_left_proj_
             // 旧栈上变量: LinearLayer right_proj(D_MSA, 16); → msa2pair_right_proj_
             TensorF32 left = msa2pair_left_proj_->forward(msa_normed);   // (B,N,L,16)
             TensorF32 right = msa2pair_right_proj_->forward(msa_normed); // (B,N,L,16)
-            TensorF32 right_mean = right / float(N);
+            auto& right_mean = *scale(&right, 1.0f / float(N));  // right / N
             // a tensor divide a scalar
             TensorF32 pair_update = outer_product(left, right_mean);  // (B,L,L,256)
             // dim of pair_update?
             // reshape to (B, L, L, 16*16) = (B, L, L, 256)?
             // 旧栈上变量: LinearLayer out_proj(16 * 16, D_PAIR); → msa2pair_out_proj_
             pair_update = msa2pair_out_proj_->forward(pair_update);  // (B,L,L,128)
-            pair = pair + pair_update;  // residual
+            pair.copy_from(*add_impl(&pair, &pair_update, /*inplace=*/false));  // residual
         }
         
         // Triangle Multiplication
         //pair = pair + drop_row(tri_mul_out_->forward(pair));
         //pair = pair + drop_row(tri_mul_in_->forward(pair));
         Dropout drop_row(1, 0.15);
-        pair = pair + drop_row.forward(tri_mul_out_->forward(pair, true));
-        pair = pair + drop_row.forward(tri_mul_in_->forward(pair, false));
+        auto tri_out = drop_row.forward(tri_mul_out_->forward(pair, true));
+        pair.copy_from(*add_impl(&pair, &tri_out, /*inplace=*/false));
+        auto tri_in = drop_row.forward(tri_mul_in_->forward(pair, false));
+        pair.copy_from(*add_impl(&pair, &tri_in, /*inplace=*/false));
 
         // ===== Step 3: pair2pair =====
         // state outer product -> gate
@@ -256,7 +293,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             // 旧栈上变量: LinearLayer rbf_proj(D_RBF, D_PAIR); → pair2pair_rbf_proj_
             rbf_feature = pair2pair_rbf_proj_->forward(rbf_feature);  // (B,L,L,128)
             // 旧栈上变量: LayerNorm state_norm(D_STATE); → pair2pair_state_norm_
-            TensorF32 state_normed = pair2pair_state_norm_->forward(state);
+            auto& state_normed = *pair2pair_state_norm_->forward(&state);
             // 旧栈上变量: LinearLayer left_proj(D_STATE, 16); → pair2pair_left_proj_
             // 旧栈上变量: LinearLayer right_proj(D_STATE, 16); → pair2pair_right_proj_
             // different weights for left and right?
@@ -266,8 +303,8 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             // 旧栈上变量: LinearLayer gate_proj(16 * 16, D_PAIR); → pair2pair_gate_proj_
             // d_hidden_gate = 16
             gate = pair2pair_gate_proj_->forward(gate);  // (B,L,L,128)
-            gate = sigmoid(gate);  // (B,L,L,128) -> (B,L,L,128) gate values between 0 and 1
-            rbf_feature = rbf_feature * gate;  // element-wise multiplication, inject the rbf feature into pair with gate control
+            gate.copy_from(*sigmoid(&gate));  // (B,L,L,128) -> (B,L,L,128) gate values between 0 and 1
+            rbf_feature.copy_from(*mul(&rbf_feature, &gate));  // element-wise gating
             // left = Linear(state, 32->16)
             // right = Linear(state, 32->16)
             // gate = sigmoid(left x right -> Linear -> 128)
@@ -278,15 +315,15 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         
             // to update pair
             // Biased Axial Attention (row/col)
-            // pair = pair + drop_row(row_attn(pair, bias=rbf_feat))
-            // pair = pair + drop_col(col_attn(pair, bias=rbf_feat))
             Dropout drop_row(1, 0.15);
             Dropout drop_col(2, 0.15);
-            pair = pair + drop_row->forward(pair_row_attn_->forward(pair, rbf_feature));
-            pair = pair + drop_col->forward(pair_col_attn_->forward(pair, rbf_feature));
+            auto row_out = drop_row.forward(pair_row_attn_->forward(pair, rbf_feature));
+            pair.copy_from(*add_impl(&pair, &row_out, /*inplace=*/false));
+            auto col_out = drop_col.forward(pair_col_attn_->forward(pair, rbf_feature));
+            pair.copy_from(*add_impl(&pair, &col_out, /*inplace=*/false));
             // FeedForward
-            FeedForward pair_ff(D_PAIR, D_PAIR * 2);
-            pair = pair + pair_ff.forward(pair);  // residual
+            //FeedForward pair_ff(D_PAIR, D_PAIR * 2);
+            //pair = pair + pair_ff.forward(pair);  // residual
         }
 
     }
@@ -334,8 +371,8 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         int L = msa.shape().dims[2];
 
         // ---- Step 4a: LayerNorm on msa & pair ----
-        TensorF32 msa_normed = norm_msa_3d_->forward(msa);   // (B, N, L, 256)
-        TensorF32 pair_normed = norm_pair_3d_->forward(pair); // (B, L, L, 128)
+        auto& msa_normed  = *norm_msa_3d_->forward(&msa);   // (B, N, L, 256)
+        auto& pair_normed = *norm_pair_3d_->forward(&pair);  // (B, L, L, 128)
 
         // ---- Step 4b: 序列加权求和 ----
         // encoder_seq: 学习每条序列的权重, shape (N,) → softmax → 加权求和
@@ -359,8 +396,10 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         }
 
         // ---- Step 4c: cat(msa_sum, seq1hot) → embed → norm ----
-        // cat: (B, L, 256) + (B, L, 21) → (B, L, 277)
-        TensorF32 node_cat = concat({msa_sum, seq1hot}, -1);
+        std::vector<TensorF32*> cat_inputs;
+        cat_inputs.push_back(&msa_sum);
+        cat_inputs.push_back(const_cast<TensorF32*>(&seq1hot));
+        auto& node_cat = *concat_ptr(cat_inputs, -1);
         //TensorF32 node_cat({B, L, NODE_3D_IN}, msa_normed.device());
         /* float* cat_data = node_cat.data();
         const float* s_data = msa_sum.data();
@@ -383,15 +422,16 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
         // Linear(277 → 32) → LayerNorm → (B, L, 32)
         TensorF32 node_emb = embed_x_->forward(node_cat);
-        TensorF32 node_out = norm_node_3d_->forward(node_emb);
+        TensorF32* node_out = norm_node_3d_->forward(&node_emb);
 
         // ---- Step 4d: pair embedding ----
         // Linear(128 → 32) → LayerNorm → (B, L, L, 32)
         TensorF32 pair_emb = embed_e_->forward(pair_normed);
-        TensorF32 edge_out = norm_edge_3d_->forward(pair_emb);
+        TensorF32* edge_out = norm_edge_3d_->forward(&pair_emb);
 
         // ---- Step 4e: 构建图 ----
-        GraphData G = make_graph(coords, edge_out, idx_, 64, 9);
+        TensorI64 dummy_idx;  // TODO: 应从外部传入 idx_
+        se3::GraphData G = se3::make_graph(coords, *edge_out, dummy_idx, 64, 9);
 
         // ---- Step 4f: l1 特征 (位移向量) ----
         TensorF32 l1_feats = compute_l1_features(coords);  // (B*L, 3, 3)
@@ -402,8 +442,8 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         //Fiber fiber_in({NODE_3D_OUT, fiber_out_.degrees[1]}, {0, 1});
         SE3Features node_se3;
         node_se3.features.resize(2);
-        node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
-        node_se3.features[1] = l1_feats;
+        node_se3.features[0] = node_out->view({B * L, ITER_NODE_3D_OUT, 1});
+        node_se3.features[1].copy_from(l1_feats);
 
         // ---- Step 4h: 预计算球谐基 ----
         SE3Basis basis;
@@ -468,7 +508,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             }
         }
 
-        xyz_new_ = xyz_new;
+        xyz_new_.copy_from(xyz_new);
     }
 
     
@@ -487,7 +527,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         // query_row += Linear(state) ...
 
         // 旧栈上变量: LayerNorm state_norm(D_STATE); → state2msa_norm_
-        TensorF32 state_normed = state2msa_norm_->forward(state);
+        auto& state_normed = *state2msa_norm_->forward(&state);
             
         // 旧栈上变量: LinearLayer linear(D_STATE, D_MSA); → state2msa_linear_
         const auto proj_state = state2msa_linear_->forward(state_normed);
@@ -507,12 +547,15 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         // rel_pos, bond_dist = positionalEncoding(bond feat, dist matrix)
         // bias += linear(rel_pos) + linear(bond_dist)
 
-        // need to get the input bond_feats, dist_matrix
-        rbf_feature = rbf + pos_enc_->forward(coords, index, bond_feats, dist_matrix, same_chain);
+        // TODO: bond_feats, dist_matrix, same_chain 需从外部传入
+        // residx = residue index = index
+        TensorF32 residx, bond_feats, dist_matrix, same_chain;
+        auto pos_out = pos_enc_->forward(coords, residx, bond_feats, dist_matrix, same_chain);
+        rbf_feature.copy_from(*add_impl(&rbf, &pos_out, /*inplace=*/false));
         // 旧栈上变量: LayerNorm pair_layernorm(D_PAIR); → pair2msa_norm_
-        pair_biased = pair2msa_norm_->forward(pair);
+        pair_biased.copy_from(*pair2msa_norm_->forward(&pair));
 
-        pair_biased = pair_biased + rbf_feature; 
+        pair_biased.copy_from(*add_impl(&pair_biased, &rbf_feature, /*inplace=*/false));
 
         // TODO
         // update msa query row with state from SE3 output
@@ -534,26 +577,29 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
 
     // msa2pair
     {
+        int N = msa_full.shape().dims[1];
         // 旧栈上变量: LayerNorm msa_norm(D_MSA); → msa2pair_norm_
-        TensorF32 msa_normed = msa2pair_norm_->forward(msa);
+        auto& msa_normed = *msa2pair_norm_->forward(&msa_full);
         // 旧栈上变量: LinearLayer left_proj(D_MSA, 16); → msa2pair_left_proj_
         // 旧栈上变量: LinearLayer right_proj(D_MSA, 16); → msa2pair_right_proj_
         TensorF32 left = msa2pair_left_proj_->forward(msa_normed);   // (B,N,L,16)
         TensorF32 right = msa2pair_right_proj_->forward(msa_normed); // (B,N,L,16)
-        TensorF32 right_mean = right / float(N);
+        auto& right_mean = *scale(&right, 1.0f / float(N));  // right / N
         // a tensor divide a scalar
         TensorF32 pair_update = outer_product(left, right_mean);  // (B,L,L,256)
         // dim of pair_update?
         // reshape to (B, L, L, 16*16) = (B, L, L, 256)?
         // 旧栈上变量: LinearLayer out_proj(16 * 16, D_PAIR); → msa2pair_out_proj_
         pair_update = msa2pair_out_proj_->forward(pair_update);  // (B,L,L,128)
-        pair = pair + pair_update;  // residual
+        pair.copy_from(*add_impl(&pair, &pair_update, /*inplace=*/false));  // residual
     }
 
     // Triangle Multiplication
     Dropout drop_row(1, 0.15);
-    pair = pair + drop_row.forward(tri_mul_out_->forward(pair, true));
-    pair = pair + drop_row.forward(tri_mul_in_->forward(pair, false));
+    auto tri_out = drop_row.forward(tri_mul_out_->forward(pair, true));
+    pair.copy_from(*add_impl(&pair, &tri_out, /*inplace=*/false));
+    auto tri_in = drop_row.forward(tri_mul_in_->forward(pair, false));
+    pair.copy_from(*add_impl(&pair, &tri_in, /*inplace=*/false));
 
     // ===== Step 3: pair2pair =====
     // state outer product -> gate
@@ -561,7 +607,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         // 旧栈上变量: LinearLayer rbf_proj(D_RBF, D_PAIR); → pair2pair_rbf_proj_
         rbf_feature = pair2pair_rbf_proj_->forward(rbf_feature);  // (B,L,L,128)
         // 旧栈上变量: LayerNorm state_norm(D_STATE); → pair2pair_state_norm_
-        TensorF32 state_normed = pair2pair_state_norm_->forward(state);
+        auto& state_normed = *pair2pair_state_norm_->forward(&state);
         // 旧栈上变量: LinearLayer left_proj(D_STATE, 16); → pair2pair_left_proj_
         // 旧栈上变量: LinearLayer right_proj(D_STATE, 16); → pair2pair_right_proj_
         // different weights for left and right?
@@ -571,17 +617,18 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         // 旧栈上变量: LinearLayer gate_proj(16 * 16, D_PAIR); → pair2pair_gate_proj_
         // d_hidden_gate = 16
         gate = pair2pair_gate_proj_->forward(gate);  // (B,L,L,128)
-        gate = sigmoid(gate);  // (B,L,L,128) -> (B,L,L,128) gate values between 0 and 1
-        // need to modify?
-        rbf_feature = rbf_feature * gate;  // element-wise multiplication, inject the rbf feature into pair with gate control
+        gate.copy_from(*sigmoid(&gate));  // (B,L,L,128) -> (B,L,L,128) gate values between 0 and 1
+        rbf_feature.copy_from(*mul(&rbf_feature, &gate));  // element-wise gating
             
         Dropout drop_row2(1, 0.15);
         Dropout drop_col(2, 0.15);
-        pair = pair + drop_row2->forward(pair_row_attn_->forward(pair, rbf_feature));
-        pair = pair + drop_col->forward(pair_col_attn_->forward(pair, rbf_feature));
+        auto row_out2 = drop_row2.forward(pair_row_attn_->forward(pair, rbf_feature));
+        pair.copy_from(*add_impl(&pair, &row_out2, /*inplace=*/false));
+        auto col_out2 = drop_col.forward(pair_col_attn_->forward(pair, rbf_feature));
+        pair.copy_from(*add_impl(&pair, &col_out2, /*inplace=*/false));
         // FeedForward
-        FeedForward pair_ff(D_PAIR, D_PAIR * 2);
-        pair = pair + pair_ff.forward(pair);  // residual
+        //FeedForward pair_ff(D_PAIR, D_PAIR * 2);
+        //pair = pair + pair_ff.forward(pair);  // residual
     }
 
     // 3D track update — same logic as IterBlock, but uses msa_full
@@ -591,8 +638,8 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         int N = msa_full.shape().dims[1];
         int L = msa_full.shape().dims[2];
 
-        TensorF32 msa_normed = norm_msa_3d_->forward(msa_full);
-        TensorF32 pair_normed = norm_pair_3d_->forward(pair);
+        auto& msa_normed = *norm_msa_3d_->forward(&msa_full);
+        auto& pair_normed = *norm_pair_3d_->forward(&pair);
 
         // 序列加权求和 (simplified: equal-weight mean)
         TensorF32 msa_sum({B, L, D_MSA}, msa_normed.device());
@@ -607,7 +654,10 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
                             msa_data[((b * N + n) * L + l) * D_MSA + d] / float(N);
 
         // cat + embed
-        TensorF32 node_cat = concat({msa_sum, seq1hot}, -1);
+        std::vector<TensorF32*> cat_inputs;
+        cat_inputs.push_back(&msa_sum);
+        cat_inputs.push_back(const_cast<TensorF32*>(&seq1hot));
+        auto& node_cat = *concat_ptr(cat_inputs, -1);
         /* float* cat_data = node_cat.data();
         for (int b = 0; b < B; ++b)
             for (int l = 0; l < L; ++l) {
@@ -619,18 +669,21 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
                         seq1hot_.data()[(b * L + l) * 21 + d];
             } */
 
-        TensorF32 node_out = norm_node_3d_->forward(embed_x_->forward(node_cat));
-        TensorF32 edge_out = norm_edge_3d_->forward(embed_e_->forward(pair_normed));
+        auto node_emb = embed_x_->forward(node_cat);
+        auto node_out = norm_node_3d_->forward(&node_emb);
+        auto edge_emb = embed_e_->forward(pair_normed);
+        auto edge_out = norm_edge_3d_->forward(&edge_emb);
 
-        GraphData G = make_graph(coords, edge_out, idx_, 64, 9);
+        TensorI64 dummy_idx;  // TODO: 应从外部传入 idx_
+        se3::GraphData G = se3::make_graph(coords, *edge_out, dummy_idx, 64, 9);
         TensorF32 l1_feats = compute_l1_features(coords);
 
         //Fiber fiber_in({NODE_3D_OUT, 3}, {0, 1});
         SE3Features node_se3;
         node_se3.features.resize(2);
         // node_out = it was actually msa input
-        node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
-        node_se3.features[1] = l1_feats;
+        node_se3.features[0] = node_out->view({B * L, ITER_NODE_3D_OUT, 1});
+        node_se3.features[1].copy_from(l1_feats);  // SE3Features::features 是 Tensor 值类型
 
         SE3Basis basis;
         //basis.compute(coords, TensorF32(), 2);
@@ -683,27 +736,27 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
             }
         }
 
-        xyz_new_ = xyz_new;
+        xyz_new_.copy_from(xyz_new);
     }
 
 }
 
-RefineBlock::RefineBlock(const RFAAConfig& config)
+// RefineBlock 构造函数已在 Model.h 中 inline 定义
+/* RefineBlock::RefineBlock(const RFAAConfig& config)
     : IterBlock(config, false)  // update_msa_pair = false, 仅更新结构
-    // 旧值初始化 (保留注释):
     // , norm_msa_(D_MSA), norm_pair_(D_PAIR), norm_state_(D_STATE)
     // , embed_x_(NODE_IN_DIM, NODE_OUT_DIM), norm_node_(NODE_OUT_DIM)
     // , embed_e1_(D_PAIR, N_EDGE_FEATS), norm_edge1_(N_EDGE_FEATS)
     // , embed_e2_(EDGE_IN_DIM2, N_EDGE_FEATS), norm_edge2_(N_EDGE_FEATS)
     // 以上 10 个参数现在由 RFAAModel 创建，通过指针注入
 {
-}
+} */
 
-void RefineBlock::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
+/* void RefineBlock::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
     seq1hot_ = seq1hot;
     idx_     = idx;
     has_seq_info_ = true;
-}
+} */
 
 void RefineBlock::forward(TensorF32& msa_full, 
                           TensorF32& pair, 
@@ -712,18 +765,16 @@ void RefineBlock::forward(TensorF32& msa_full,
                           const TensorF32& coords) {
 
     // ---- 获取维度 ----
-    const auto& msa_shape = msa.shape();
+    const auto& msa_shape = msa_full.shape();
     int B = static_cast<int>(msa_shape.dims[0]);
     int L = static_cast<int>(msa_shape.dims[2]);
 
     // ================================================================
     // Step 1: LayerNorm 归一化三个 track 输入
     // ================================================================
-    // Python: node = self.norm_msa(msa); pair = self.norm_pair(pair);
-    //         state = self.norm_state(state)
-    TensorF32 node    = norm_msa_->forward(msa);       // (B, L, 256)
-    TensorF32 pair_n  = norm_pair_->forward(pair);     // (B, L, L, 128)
-    TensorF32 state_n = norm_state_->forward(state);    // (B, L, 32)
+    auto& node    = *norm_msa_->forward(&msa_full);     // (B, L, 256)
+    auto& pair_n  = *norm_pair_->forward(&pair);        // (B, L, L, 128)
+    auto& state_n = *norm_state_->forward(&state);      // (B, L, 32)
 
     // ================================================================
     // Step 2: 构建节点特征
@@ -732,12 +783,12 @@ void RefineBlock::forward(TensorF32& msa_full,
     // ================================================================
     // cat([msa_norm(B,L,256), seq1hot(B,L,21), state_norm(B,L,32)])
     // → (B, L, 309)
-    // where the seq1hot_ comes?
-    TensorF32 node_cat = concat({node, seq1hot, state_n}, -1);
+    std::vector<TensorF32*> node_parts = {&node, const_cast<TensorF32*>(&seq1hot), &state_n};
+    auto* node_cat = concat_ptr(node_parts, -1);
 
     // Linear(309 → 32) → LayerNorm → (B, L, 32)
-    TensorF32 node_emb = embed_x_->forward(node_cat);
-    TensorF32 node_out = norm_node_->forward(node_emb);
+    TensorF32* node_emb = embed_x_->forward_graph(node_cat);
+    auto& node_out = *norm_node_->forward(node_emb);
 
     // ================================================================
     // Step 3: 构建边特征（两阶段）
@@ -746,27 +797,28 @@ void RefineBlock::forward(TensorF32& msa_full,
     // Python: pair = self.norm_edge1(self.embed_e1(pair))
     // pair (B,L,L,128) → Linear → (B,L,L,32) → LayerNorm → (B,L,L,32)
     TensorF32 pair_emb = embed_e1_->forward(pair_n);
-    TensorF32 pair_e1  = norm_edge1_->forward(pair_emb);
+    auto& pair_e1 = *norm_edge1_->forward(&pair_emb);
 
     // 获取辅助边特征
-    // Python: neighbor = get_bonded_neigh(idx)     → (B, L, L, 1)
-    //         rbf_feat = rbf(cdist(cas, cas))      → (B, L, L, 64)
-    TensorF32 neighbor = get_bonded_neigh(idx_);            // (B, L, L, 1)
+    TensorI64 residx;  // TODO: 应从外部传入 idx_
+    TensorF32 neighbor = se3::get_bonded_neigh(residx);            // (B, L, L, 1)
     TensorF32 rbf_feat = compute_rbf_feature(coords);      // (B, L, L, 64)
 
-    // 阶段2: cat + Linear + LayerNorm
-    // Python: pair = cat((pair, rbf_feat, neighbor), dim=-1)
-    //         pair = self.norm_edge2(self.embed_e2(pair))
     // cat → (B,L,L,97) → Linear → (B,L,L,32) → LayerNorm → (B,L,L,32)
-    TensorF32 pair_cat = concat({pair_e1, rbf_feat, neighbor}, -1);
-    TensorF32 pair_e2  = embed_e2_->forward(pair_cat);
-    TensorF32 edge_out = norm_edge2_->forward(pair_e2);
+    std::vector<TensorF32*> cat_parts;
+    cat_parts.push_back(&pair_e1);
+    cat_parts.push_back(&rbf_feat);
+    cat_parts.push_back(&neighbor);
+    auto* pair_cat = concat_ptr(cat_parts, -1);
+    TensorF32 pair_e2  = embed_e2_->forward(*pair_cat);
+    auto* edge_out = norm_edge2_->forward(&pair_e2);
 
     // ================================================================
     // Step 4: 构建消息传递图
     // Python: G = make_graph_topk(xyz, pair, idx, top_k=top_k)
     // ================================================================
-    GraphData G = make_graph(coords, edge_out, idx_,
+    TensorI64 dummy_idx_refine;  // TODO: 应从外部传入
+    se3::GraphData G = se3::make_graph(coords, *edge_out, dummy_idx_refine,
                              64 /* top_k */, 9 /* kmin */);
 
     // ================================================================
@@ -786,9 +838,13 @@ void RefineBlock::forward(TensorF32& msa_full,
     // ================================================================
     // 构建 SE3Basis (预计算球谐基)
     SE3Basis basis;
-    //basis.compute(coords, TensorF32() /* orient 占位 */, config_.se3_config.num_degrees);
     basis.compute(G.edge_d, 2);  // J_max=2, 边向量来自 graph
 
+    // 构建 SE3Features 输入
+    SE3Features node_se3;
+    node_se3.features.resize(2);
+    node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
+    node_se3.features[1].copy_from(l1_feats);
 
     SE3Features se3_out = se3_->forward(
             node_se3, G.edge_index, G.edge_d, &G.edge_w, basis);
@@ -845,7 +901,7 @@ void RefineBlock::forward(TensorF32& msa_full,
         }
     }
 
-    xyz_new_ = xyz_new;
+    xyz_new_.copy_from(xyz_new);
     // TODO: SE3Transformer 当前 forward 签名为 forward(SE3Features&, positions,
     //       orientations, edge_index, training)。
     //       等接口完善后，此处替换为：
@@ -1237,11 +1293,85 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
     state_emb_            = EmbeddingLayer::create(NAATOKENS, D_STATE);              // (80, 32)
     pair_left_emb_        = EmbeddingLayer::create(NAATOKENS, D_PAIR);              // (80, 128)
     pair_right_emb_       = EmbeddingLayer::create(NAATOKENS, D_PAIR);              // (80, 128)
+    pair_init_pos_enc_    = new PositionalEncoding();                                 // pair 初始化 pos enc
+    pair_init_pos_enc_emb_res_  = EmbeddingLayer::create(65, D_PAIR);
+    pair_init_pos_enc_emb_atom_ = EmbeddingLayer::create(17, D_PAIR);
+    pair_init_pos_enc_->set_params(-32, 32, 8, D_PAIR,
+                                    pair_init_pos_enc_emb_res_, pair_init_pos_enc_emb_atom_);
     emb_t1d_              = LinearLayer::create(D_T1D + D_TOR, 64);                  // 110 → 64
     proj_t1d_             = LinearLayer::create(64, 64);                             // 64 → 64
     emb_t1d_t2d_          = LinearLayer::create(D_T1D * 2 + D_T2D, 64);             // 224 → 64
     temp_stack_t1d_proj_  = LinearLayer::create(D_T1D, D_STATE);                    // 80 → 32
     temp_stack_norm_      = LayerNorm::create(64);                                   // 64
+
+    // ===== TemplatePairStack 子层创建 =====
+    // 直接层
+    tps_rbf_proj_   = LinearLayer::create(D_RBF, D_PAIR);                            // 64 → 128
+    tps_state_norm_ = LayerNorm::create(D_STATE);                                     // 32
+    tps_left_proj_  = LinearLayer::create(D_STATE, 16);                               // 32 → 16
+    tps_right_proj_ = LinearLayer::create(D_STATE, 16);                               // 32 → 16
+    tps_gate_proj_  = LinearLayer::create(16 * 16, D_PAIR);                           // 256 → 128
+    // TriangleMultiplication out
+    tps_tri_out_layernorm_        = LayerNorm::create(D_PAIR);                        // 128
+    tps_tri_out_left_proj_        = LinearLayer::create(D_PAIR, 128);
+    tps_tri_out_right_proj_       = LinearLayer::create(D_PAIR, 128);
+    tps_tri_out_left_gate_        = LinearLayer::create(D_PAIR, 128);
+    tps_tri_out_right_gate_       = LinearLayer::create(D_PAIR, 128);
+    tps_tri_out_gate_             = LinearLayer::create(D_PAIR, D_PAIR);              // 128 → 128
+    tps_tri_out_output_layernorm_ = LayerNorm::create(128);
+    tps_tri_out_out_proj_         = LinearLayer::create(128, D_PAIR);
+    tps_tri_mul_out_.set_params(D_PAIR,
+        tps_tri_out_layernorm_,        tps_tri_out_left_proj_,
+        tps_tri_out_right_proj_,       tps_tri_out_left_gate_,
+        tps_tri_out_right_gate_,       tps_tri_out_gate_,
+        tps_tri_out_output_layernorm_, tps_tri_out_out_proj_);
+    // TriangleMultiplication in
+    tps_tri_in_layernorm_        = LayerNorm::create(D_PAIR);                        // 128
+    tps_tri_in_left_proj_        = LinearLayer::create(D_PAIR, 128);
+    tps_tri_in_right_proj_       = LinearLayer::create(D_PAIR, 128);
+    tps_tri_in_left_gate_        = LinearLayer::create(D_PAIR, 128);
+    tps_tri_in_right_gate_       = LinearLayer::create(D_PAIR, 128);
+    tps_tri_in_gate_             = LinearLayer::create(D_PAIR, D_PAIR);              // 128 → 128
+    tps_tri_in_output_layernorm_ = LayerNorm::create(128);
+    tps_tri_in_out_proj_         = LinearLayer::create(128, D_PAIR);
+    tps_tri_mul_in_.set_params(D_PAIR,
+        tps_tri_in_layernorm_,        tps_tri_in_left_proj_,
+        tps_tri_in_right_proj_,       tps_tri_in_left_gate_,
+        tps_tri_in_right_gate_,       tps_tri_in_gate_,
+        tps_tri_in_output_layernorm_, tps_tri_in_out_proj_);
+    // PairRowAttention
+    tps_pair_row_to_b_   = LinearLayer::create(D_PAIR, 8);                           // 128 → 8
+    tps_pair_row_to_g_   = LinearLayer::create(D_PAIR, 256);                         // 128 → 256
+    tps_pair_row_to_out_ = LinearLayer::create(256, D_PAIR);                         // 256 → 128
+    tps_pair_row_Wq_     = LinearLayer::create(D_PAIR, 256);                         // 128 → 256
+    tps_pair_row_Wk_     = LinearLayer::create(D_PAIR, 256);
+    tps_pair_row_Wv_     = LinearLayer::create(D_PAIR, 256);
+    tps_pair_row_attn_.set_params(AttnConfig(D_PAIR, 8),
+        tps_pair_row_to_b_, tps_pair_row_to_g_, tps_pair_row_to_out_,
+        tps_pair_row_Wq_,   tps_pair_row_Wk_,   tps_pair_row_Wv_);
+    // PairColAttention
+    tps_pair_col_to_b_   = LinearLayer::create(D_PAIR, 8);                           // 128 → 8
+    tps_pair_col_to_g_   = LinearLayer::create(D_PAIR, 256);                         // 128 → 256
+    tps_pair_col_to_out_ = LinearLayer::create(256, D_PAIR);                         // 256 → 128
+    tps_pair_col_Wq_     = LinearLayer::create(D_PAIR, 256);                         // 128 → 256
+    tps_pair_col_Wk_     = LinearLayer::create(D_PAIR, 256);
+    tps_pair_col_Wv_     = LinearLayer::create(D_PAIR, 256);
+    tps_pair_col_attn_.set_params(AttnConfig(D_PAIR, 8),
+        tps_pair_col_to_b_, tps_pair_col_to_g_, tps_pair_col_to_out_,
+        tps_pair_col_Wq_,   tps_pair_col_Wk_,   tps_pair_col_Wv_);
+    // FeedForward
+    tps_pair_ff_norm_    = LayerNorm::create(D_PAIR);                                // 128
+    tps_pair_ff_linear1_ = LinearLayer::create(D_PAIR, D_PAIR * 2);                  // 128 → 256
+    tps_pair_ff_linear2_ = LinearLayer::create(D_PAIR * 2, D_PAIR);                  // 256 → 128
+    tps_pair_ff_.set_params(D_PAIR, 2, 0.15f,
+        tps_pair_ff_norm_, tps_pair_ff_linear1_, tps_pair_ff_linear2_);
+    // TemplatePairStack 本身
+    tps_.set_params(
+        tps_rbf_proj_, tps_state_norm_,
+        tps_left_proj_, tps_right_proj_, tps_gate_proj_,
+        &tps_tri_mul_out_, &tps_tri_mul_in_,
+        &tps_pair_row_attn_, &tps_pair_col_attn_,
+        &tps_pair_ff_);
 
     // ===== PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer) =====
     for (int i = 0; i < N_ITER; ++i) {
@@ -1253,8 +1383,8 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
 RFAAModel::~RFAAModel() = default;
 
 void RFAAModel::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
-    seq1hot_ = seq1hot;
-    idx_     = idx;
+    seq1hot_.copy_from(seq1hot);
+    idx_.copy_from(idx);
     has_seq_info_ = true;
 }
 
@@ -1278,8 +1408,12 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     {
         auto left  = pair_left_emb_->forward_exec(input.seq_tokens).unsqueeze(1);            // (B,1,L,128)
         auto right = pair_right_emb_->forward_exec(input.seq_tokens).unsqueeze(2);           // (B,L,1,128)
-        pair_track_->representation() = outer_sum(left, right);                                        // (B,L,L,128)
-        // PositionalEncoding 在 IterBlock::forward 中由 pos_enc_ 处理
+        auto pair_repr = outer_sum(left, right);                                              // (B,L,L,128)
+        // PositionalEncoding
+        TensorF32 bond_feats, dist_matrix, same_chain;  // TODO: 从 input 传入
+        TensorF32 dummy_residx;  // TODO: 应从 input 获取
+        auto pos_out = pair_init_pos_enc_->forward(pair_repr, dummy_residx, bond_feats, dist_matrix, same_chain);
+        pair_track_->representation().copy_from(*add_impl(&pair_repr, &pos_out, /*inplace=*/false));
     }
 
     // msa full embed?
@@ -1300,7 +1434,8 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     bond_embed.set_params(bond_emb_, D_PAIR);
     TensorF32 pair;
     pair.copy_from(pair_track_->representation());
-    pair = pair + bond_embed(input.bond_feats);
+    auto bond_out = bond_embed.forward(input.bond_feats);
+    pair.copy_from(*add_impl(&pair, &bond_out, /*inplace=*/false));
     //bond_feats: (B, L, L, d_init)
     //bond embed: 
     // bond_feats = one_hot(bond_feats)
@@ -1317,45 +1452,44 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
         // 旧: state_track_->inject_template(input.t1d, input.tor_feat);
         // 旧栈上: LinearLayer emb_t1d(110,64), proj_t1d(64,64) → 用 emb_t1d_/proj_t1d_
         {
-            TensorF32 t1d_tor = concat(input.t1d, input.tor_feat, -1);                // (B,T,L,110)
-            TensorF32 t1d_emb = emb_t1d_->forward(t1d_tor);                            // (B,T,L,64)
-            t1d_emb = proj_t1d_->forward(relu(t1d_emb));                               // (B,T,L,64)
+            TensorF32 t1d_copy, tor_copy;
+            t1d_copy.copy_from(input.t1d);
+            tor_copy.copy_from(input.tor_feat);
+            std::vector<TensorF32*> t1d_parts = {&t1d_copy, &tor_copy};
+            auto& t1d_tor = *concat_ptr(t1d_parts, -1);           // (B,T,L,110)
+            TensorF32 t1d_emb = emb_t1d_->forward(t1d_tor);        // (B,T,L,64)
+            auto t1d_relu = relu(&t1d_emb);
+            t1d_emb = proj_t1d_->forward(*t1d_relu);               // (B,T,L,64)
             // Cross-attention: state as Q, template as K/V
             int B = t1d_emb.shape().dims[0], T = t1d_emb.shape().dims[1];
             auto state_q = state_track_->representation().view({B * L, 1, D_STATE});
             auto t1d_kv = t1d_emb.permute({0, 2, 1, 3}).view({B * L, T, 64});
-            SelfAttention cross_attn(D_STATE, 64, 8);
-            auto out = cross_attn.forward(state_q, t1d_kv, t1d_kv);
+            CrossAttention cross_attn(D_STATE, 64, 8);  // Q=state(32), KV=template(64)
+            auto out = cross_attn.forward(state_q, t1d_kv);  // query, key-value
             // residual connection: state_rep + out_view (use graph node add_impl)
-            auto state_rep = state_track_->representation();
+            auto& state_rep = state_track_->representation();
             auto out_view = out.view({B, L, D_STATE});
-            state_track_->representation() = *add_impl(&state_rep, &out_view, /*inplace=*/false);
+            state_track_->representation().copy_from(*add_impl(&state_rep, &out_view, /*inplace=*/false));
         }
         TensorF32 templ_pair = get_templ_emb(input.t1d, input.t2d);  // (B,T,L,L,64)
+        // TODO: rbf_feature 应从前面的 IterBlock 计算中获得
+        TensorF32 rbf_feature;  // 占位，实际从 IterBlock 获取
         // 旧: pair_track_->templ_stack(templ_pair, rbf_feature, input.t1d);
+        // templ_stack 1406-1418
         // 旧栈上: LinearLayer t1d_proj(80,32), LayerNorm(64), TemplatePairStack
         {
             int T = templ_pair.shape().dims[1];
             TensorF32 t1d_2d = input.t1d.view({B*T, L, D_T1D});
-            //t1d_2d.reshape({B*T, L, D_T1D});                                   // (B*T, L, 80)
-            templ_pair.reshape({B*T, L, L, 64});                                // (B*T, L, L, 64)
+            // (B*T, L, 80) — already a view above, no reshape needed
+            templ_pair = templ_pair.view({B*T, L, L, 64});                     // (B*T, L, L, 64)
             // 旧栈上: LinearLayer t1d_proj(D_T1D, D_STATE) → temp_stack_t1d_proj_
             TensorF32 state_proj = temp_stack_t1d_proj_->forward(t1d_2d);      // (B*T, L, 32)
             for (int k = 0; k < 2; ++k) {
-                // TODO: section 1.9 pointer 化 — TemplatePairStack 现在需要
-                // 通过 set_params() 注入所有子层，然后调用 forward()。
-                // 示例：
-                //   auto tps = TemplatePairStack();
-                //   tps.set_params(rbf_proj, state_norm, left_proj, right_proj,
-                //                  gate_proj, &tri_mul_out, &tri_mul_in,
-                //                  &pair_row_attn, &pair_col_attn, &pair_ff);
-                //   templ_pair = tps.forward(templ_pair, rbf_feature, state_proj);
-                TemplatePairStack tps;  // TODO: 调用 set_params() 后使用
-                // templ_pair = tps.forward(templ_pair, rbf_feature, state_proj);
+                templ_pair = tps_.forward(templ_pair, rbf_feature, state_proj);  // rbf_feature from outer scope
             }
             // 旧栈上: LayerNorm layernorm(64) → temp_stack_norm_
-            templ_pair = temp_stack_norm_->forward(templ_pair);                 // (B*T, L, L, 64)
-            templ_pair.reshape({B, T, L, L, 64});
+            templ_pair.copy_from(*temp_stack_norm_->forward(&templ_pair));      // (B*T, L, L, 64)
+            templ_pair = templ_pair.view({B, T, L, L, 64});
             pair_track_->inject_template(templ_pair);
         }
     }
@@ -1367,6 +1501,8 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     //auto pair = pair_track_->representation();
     //TensorF32 pair;
     pair.copy_from(pair_track_->representation());
+    // pair 初始化 (embedding + outer_sum) 已在 1398-1404 完成
+    // PositionalEncoding 在 IterBlock::forward 中由 pos_enc_ 处理
     //auto state = state_track_->representation();
     TensorF32 state;
     state.copy_from(state_track_->representation());
@@ -1379,7 +1515,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // full/extra block use global column attention
 
     const TensorF32& seq1hot = one_hot_seq(input.seq_tokens, 21);
-    const TensorI64& idx = input.seq_tokens; //? residue indices
+    TensorI64 idx;  // TODO: 应从 input 获取 residue indices
     set_seq_info(seq1hot, idx);
 
     // Extra blocks
@@ -1414,8 +1550,8 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
         block->forward(msa, pair, state, seq1hot, coords);
 
         if (block.get()) {
-            coords.copy_from(refine->updated_coords());
-            state.copy_from(refine->updated_state());
+            coords.copy_from(block->updated_coords());
+            // state 通过 track 更新，不需要 updated_state()
         }
     }
     
@@ -1436,23 +1572,29 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
 // T is number of templates, L is sequence length, 
 //and d_t1d is the feature dimension that varies by model configuration
 TensorF32 RFAAModel::get_templ_emb(const TensorF32& t1d, const TensorF32& t2d) {
+    int B = t1d.shape().dims[0];
+    int T = t1d.shape().dims[1];
     int L = t1d.shape().dims[2];
-    // src t1d[b, l, t, d] the l-th residue's t-th template's t1d feature
-    // left[b, l, t, l2, d] for every target residue l2, make a copy of t1d[b, l, t, d]
-    TensorF32 left = t1d.unsqueeze(3);//.expand({-1, -1, -1, L, -1});  // (B, T, L, L, 80)
-    TensorF32 right = t1d.unsqueeze(2);//.expand({-1, -1, L, -1, -1}); 
-    // (B, T, L, d_t1d) (B, T, 1, L, d_t1d) (B, T, L, L, d_t1d)
-    // expand the certain dimension of a tensor
-    left.shape.dims[3] = L;
-    right.shape.dims[3] = L;
-    
-    std::vector<TensorF32> templ_list = {t2d, left, right};
-    TensorF32 templ = concat(templ_list, -1);
-    // dim of templ is (B, T, L, L, d_t1d*2 + d_t2d) = (B, T, L, L, 224)
+    int D = t1d.shape().dims[3];
+
+    // left:  (B, T, L, 1, D) → repeat → (B, T, L, L, D)
+    // right: (B, T, 1, L, D) → repeat → (B, T, L, L, D)
+    auto left_unsq  = t1d.unsqueeze(3);   // (B, T, L, 1, D)
+    auto right_unsq = t1d.unsqueeze(2);   // (B, T, 1, L, D)
+
+    // 创建 target shape 张量用于 repeat (数据为空，只取 shape)
+    TensorF32 target({B, T, L, L, D}, t1d.device());
+    auto* left_exp  = repeat(&left_unsq,  &target);  // (B, T, L, L, D)
+    auto* right_exp = repeat(&right_unsq, &target);  // (B, T, L, L, D)
+
+    // concat: t2d(B,T,L,L,64) + left(B,T,L,L,D) + right(B,T,L,L,D) → (B,T,L,L,64+2D)
+    std::vector<TensorF32*> templ_parts;
+    templ_parts.push_back(const_cast<TensorF32*>(&t2d));
+    templ_parts.push_back(left_exp);
+    templ_parts.push_back(right_exp);
+    auto* templ = concat_ptr(templ_parts, -1);
     // d_templ = 64
-    // 旧栈上变量: LinearLayer emb(D_T1D * 2 + D_T2D, 64); → emb_t1d_t2d_
-    return emb_t1d_t2d_->forward(templ);
-    // (B, T, L, L, 64)
+    return emb_t1d_t2d_->forward(*templ);
 }
 
 void RFAAModel::to(Device device) {
@@ -1550,6 +1692,49 @@ void RFAAModel::transfer_params_to_backend() {
     collect_linear(emb_t1d_t2d_);
     collect_linear(temp_stack_t1d_proj_);
     collect_layernorm(temp_stack_norm_);
+
+    // ===== TemplatePairStack 参数 =====
+    collect_linear(tps_rbf_proj_);
+    collect_layernorm(tps_state_norm_);
+    collect_linear(tps_left_proj_);
+    collect_linear(tps_right_proj_);
+    collect_linear(tps_gate_proj_);
+    // tri_mul_out
+    collect_layernorm(tps_tri_out_layernorm_);
+    collect_linear(tps_tri_out_left_proj_);
+    collect_linear(tps_tri_out_right_proj_);
+    collect_linear(tps_tri_out_left_gate_);
+    collect_linear(tps_tri_out_right_gate_);
+    collect_linear(tps_tri_out_gate_);
+    collect_layernorm(tps_tri_out_output_layernorm_);
+    collect_linear(tps_tri_out_out_proj_);
+    // tri_mul_in
+    collect_layernorm(tps_tri_in_layernorm_);
+    collect_linear(tps_tri_in_left_proj_);
+    collect_linear(tps_tri_in_right_proj_);
+    collect_linear(tps_tri_in_left_gate_);
+    collect_linear(tps_tri_in_right_gate_);
+    collect_linear(tps_tri_in_gate_);
+    collect_layernorm(tps_tri_in_output_layernorm_);
+    collect_linear(tps_tri_in_out_proj_);
+    // pair_row_attn
+    collect_linear(tps_pair_row_to_b_);
+    collect_linear(tps_pair_row_to_g_);
+    collect_linear(tps_pair_row_to_out_);
+    collect_linear(tps_pair_row_Wq_);
+    collect_linear(tps_pair_row_Wk_);
+    collect_linear(tps_pair_row_Wv_);
+    // pair_col_attn
+    collect_linear(tps_pair_col_to_b_);
+    collect_linear(tps_pair_col_to_g_);
+    collect_linear(tps_pair_col_to_out_);
+    collect_linear(tps_pair_col_Wq_);
+    collect_linear(tps_pair_col_Wk_);
+    collect_linear(tps_pair_col_Wv_);
+    // pair_ff
+    collect_layernorm(tps_pair_ff_norm_);
+    collect_linear(tps_pair_ff_linear1_);
+    collect_linear(tps_pair_ff_linear2_);
 
     // attention 参数 (12 blocks × 6 LinearLayer × 6 组)
     for (auto* ll : msa_row_Wq_)     collect_linear(ll);

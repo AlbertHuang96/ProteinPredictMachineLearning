@@ -1,4 +1,5 @@
 #include "rfaa/Attention.h"
+#include "rfaa/Embedding.h"
 
 namespace rfaa {
 
@@ -10,36 +11,29 @@ SelfAttention::~SelfAttention() = default;
 
 TensorF32 SelfAttention::forward(const TensorF32& Q, const TensorF32& K, const TensorF32& V, const TensorF32* bias) {
     // ===== 1. K^T: 交换最后两维 =====
-    // permute op
-    Tensor* K_T = permute(K, {0, 1, 3, 2});  // (B, H, D_head, L)
+    auto K_T = permute(const_cast<TensorF32*>(&K), {0, 1, 3, 2});  // (B, H, D_head, L)
 
-    // tensor multiply out_prod
     // ===== 2. scores = Q @ K^T =====
-    Tensor* scores = out_prod(Q, K_T);         // (B, H, L, L)
+    auto scores = out_prod(const_cast<TensorF32*>(&Q), K_T);  // (B, H, L, L)
 
-    // sqrt op
     // ===== 3. scale = 1/sqrt(d_head) =====
-    //float scale_val = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
-    // test for Q.shape()[3] before make a tensor
-    Tensor* dim_head = make_scalar(Q.shape()[3]);
-    float scale_val = 1.0f / sqrt(dim_head);
-    Tensor* scaled = scale(scores, scale_val);
+    float scale_val = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
+    auto scaled = scale(scores, scale_val);
 
-    // elementwise tensor add
     // ===== 4. add bias =====
     if (bias != nullptr) {
-        scaled = add_impl(scaled, bias);           // broadcast (B,1,L,L) → (B,H,L,L)
+        scaled = add_impl(scaled, const_cast<TensorF32*>(bias), /*inplace=*/false);
     }
 
-    // softmax op
     // ===== 5. softmax =====
-    Tensor* attn = softmax(scaled);
+    auto attn = softmax(scaled);
 
     // ===== 6. out = attn @ V =====
-    // mul_mat
-    Tensor* output = out_prod(attn, V);        // (B, H, L, D_head)
+    auto output = out_prod(attn, const_cast<TensorF32*>(&V));
 
-    return output;
+    TensorF32 result;
+    result.copy_from(*output);
+    return result;
 }
 
 // ===== MSARowAttention (non-owning pointer 版本) =====
@@ -49,107 +43,99 @@ void MSARowAttention::set_params(const AttnConfig& config,
                                  LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                                  LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv) {
     config_ = config;
+    self_attn_ = std::make_unique<SelfAttention>(config);
     to_b_   = to_b;   to_g_   = to_g;   to_out_ = to_out;
     Wq_     = Wq;     Wk_     = Wk;     Wv_     = Wv;
 }
 
 TensorF32 MSARowAttention::forward(const TensorF32& msa, const TensorF32& pair_biased) {
-    // 输入已由调用方做 layernorm
-    TensorF32 Q = Wq_->forward(msa);
-    TensorF32 K = Wk_->forward(msa);
-    TensorF32 V = Wv_->forward(msa);
-    TensorF32 bias = to_b_->forward(pair_biased);
-    TensorF32 gate = sigmoid(to_g_->forward(msa));
-    TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
-    TensorF32 gated_attn_out = out_prod(gate, attn_out);
-    return to_out_->forward(gated_attn_out);
+    auto Q    = Wq_->forward(msa);
+    auto K    = Wk_->forward(msa);
+    auto V    = Wv_->forward(msa);
+    auto bias = to_b_->forward(pair_biased);
+    auto gv   = to_g_->forward(msa);
+    auto gate = sigmoid(&gv);
+    auto attn_out = self_attn_->forward(Q, K, V, &bias);
+    auto gated_attn_out = out_prod(gate, &attn_out);
+    return to_out_->forward(*gated_attn_out);
 }
 
 // ===== MSAColAttention (non-owning pointer 版本) =====
-// 旧构造函数 (保留注释):
-// MSAColAttention::MSAColAttention(const AttnConfig& config) : config_(config) {}
 void MSAColAttention::set_params(const AttnConfig& config,
                                  LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                                  LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv) {
     config_ = config;
+    self_attn_ = std::make_unique<SelfAttention>(config);
     to_b_   = to_b;   to_g_   = to_g;   to_out_ = to_out;
     Wq_     = Wq;     Wk_     = Wk;     Wv_     = Wv;
 }
 
 TensorF32 MSAColAttention::forward(const TensorF32& msa) {
-    // 输入已由调用方做 layernorm
-    TensorF32 Q = Wq_->forward(msa);
-    TensorF32 K = Wk_->forward(msa);
-    TensorF32 V = Wv_->forward(msa);
-    TensorF32 gate = sigmoid(to_g_->forward(msa));
-    TensorF32 attn_out = self_attn_.forward(Q, K, V);
-    TensorF32 gated_attn_out = out_prod(gate, attn_out);
-    return to_out_->forward(gated_attn_out);
+    auto Q    = Wq_->forward(msa);
+    auto K    = Wk_->forward(msa);
+    auto V    = Wv_->forward(msa);
+    auto gv   = to_g_->forward(msa);
+    auto gate = sigmoid(&gv);
+    auto attn_out = self_attn_->forward(Q, K, V);
+    auto gated_attn_out = out_prod(gate, &attn_out);
+    return to_out_->forward(*gated_attn_out);
 }
 
-// ===== MSAGlobalColAttention (non-owning pointer 版本) =====
-// 旧构造函数 (保留注释):
-// MSAGlobalColAttention::MSAGlobalColAttention(const AttnConfig& config) : MSAColAttention(config) { ... }
-// 父类 MSAColAttention::set_params() 注入参数, 子类无额外成员
-
+// ===== MSAGlobalColAttention =====
 TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
-    // 输入已由调用方做 layernorm
-    TensorF32 Q = Wq_->forward(msa);
+    auto Q = Wq_->forward(msa);
     Q = mean(Q, 1);
-    TensorF32 K = Wk_->forward(msa);
-    TensorF32 V = Wv_->forward(msa);
-    TensorF32 gate = sigmoid(to_g_->forward(msa));
-    TensorF32 attn_out = self_attn_.forward(Q, K, V);
-    TensorF32 gated_attn_out = out_prod(gate, attn_out);
-    return to_out_->forward(gated_attn_out);
+    auto K    = Wk_->forward(msa);
+    auto V    = Wv_->forward(msa);
+    auto gv   = to_g_->forward(msa);
+    auto gate = sigmoid(&gv);
+    auto attn_out = self_attn_->forward(Q, K, V);
+    auto gated_attn_out = out_prod(gate, &attn_out);
+    return to_out_->forward(*gated_attn_out);
 }
 
-
-// ===== PairRowAttention (non-owning pointer 版本) =====
-// 旧构造函数 (保留注释):
-// PairRowAttention::PairRowAttention(const AttnConfig& config) : config_(config) { ... }
+// ===== PairRowAttention =====
 void PairRowAttention::set_params(const AttnConfig& config,
                                   LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                                   LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv) {
     config_ = config;
+    self_attn_ = std::make_unique<SelfAttention>(config);
     to_b_   = to_b;   to_g_   = to_g;   to_out_ = to_out;
     Wq_     = Wq;     Wk_     = Wk;     Wv_     = Wv;
 }
 
 TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_bias) {
-    // 输入已由调用方做 layernorm + permute
-    TensorF32 Q = Wq_->forward(pair);
-    TensorF32 K = Wk_->forward(pair);
-    TensorF32 V = Wv_->forward(pair);
-    TensorF32 bias = to_b_->forward(str_bias);
-    TensorF32 gate = sigmoid(to_g_->forward(pair));
-    TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
-    TensorF32 gated_attn_out = out_prod(gate, attn_out);
-    TensorF32 attn_out_proj = to_out_->forward(gated_attn_out);
-    return attn_out_proj;
+    auto Q    = Wq_->forward(pair);
+    auto K    = Wk_->forward(pair);
+    auto V    = Wv_->forward(pair);
+    auto bias = to_b_->forward(str_bias);
+    auto gv   = to_g_->forward(pair);
+    auto gate = sigmoid(&gv);
+    auto attn_out = self_attn_->forward(Q, K, V, &bias);
+    auto gated_attn_out = out_prod(gate, &attn_out);
+    return to_out_->forward(*gated_attn_out);
 }
 
-// ===== PairColAttention (non-owning pointer 版本) =====
-// 旧构造函数 (保留注释):
-// PairColAttention::PairColAttention(const AttnConfig& config) : config_(config) { ... }
+// ===== PairColAttention =====
 void PairColAttention::set_params(const AttnConfig& config,
                                   LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                                   LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv) {
     config_ = config;
+    self_attn_ = std::make_unique<SelfAttention>(config);
     to_b_   = to_b;   to_g_   = to_g;   to_out_ = to_out;
     Wq_     = Wq;     Wk_     = Wk;     Wv_     = Wv;
 }
 
 TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_bias) {
-    // 输入已由调用方做 layernorm
-    TensorF32 Q = Wq_->forward(pair);
-    TensorF32 K = Wk_->forward(pair);
-    TensorF32 V = Wv_->forward(pair);
-    TensorF32 bias = to_b_->forward(str_bias);
-    TensorF32 gate = sigmoid(to_g_->forward(pair));
-    TensorF32 attn_out = self_attn_.forward(Q, K, V, bias);
-    TensorF32 gated_attn_out = out_prod(gate, attn_out);
-    return to_out_->forward(gated_attn_out);
+    auto Q    = Wq_->forward(pair);
+    auto K    = Wk_->forward(pair);
+    auto V    = Wv_->forward(pair);
+    auto bias = to_b_->forward(str_bias);
+    auto gv   = to_g_->forward(pair);
+    auto gate = sigmoid(&gv);
+    auto attn_out = self_attn_->forward(Q, K, V, &bias);
+    auto gated_attn_out = out_prod(gate, &attn_out);
+    return to_out_->forward(*gated_attn_out);
 }
 
 CrossAttention::CrossAttention(int q_dim, int kv_dim, int n_head)
@@ -182,30 +168,28 @@ void TriangleMultiplication::set_params(int dim,
 }
 
 TensorF32 TriangleMultiplication::forward(const TensorF32& pair, bool bOutgoing) {
-    TensorF32 pair_norm = layernorm_->forward(pair);
-    TensorF32 left = left_proj_->forward(pair_norm); //(B, L, L,D_HIDDEN_TRIMUL)
-    TensorF32 right = right_proj_->forward(pair_norm);
-    TensorF32 left_gate = sigmoid(left_gate_->forward(pair_norm));
-    TensorF32 right_gate = sigmoid(right_gate_->forward(pair_norm));
-    TensorF32 left_gated = out_prod(left, left_gate);
-    TensorF32 right_gated = out_prod(right, right_gate);
+    auto pair_norm = layernorm_->forward(const_cast<TensorF32*>(&pair));  // TensorF32*
+    auto left  = left_proj_->forward(*pair_norm);   // 解引用传引用
+    auto right = right_proj_->forward(*pair_norm);
+    auto lgv   = left_gate_->forward(*pair_norm);
+    auto rgv   = right_gate_->forward(*pair_norm);
+    auto left_gate  = sigmoid(&lgv);
+    auto right_gate = sigmoid(&rgv);
+    auto left_gated  = out_prod(&left, left_gate);
+    auto right_gated = out_prod(&right, right_gate);
 
-    // outer product for outgoing and incoming
-    TensorF32 tri_mul_forward;
-    if (bOutgoing) {
-        tri_mul_forward = triangle_mult(left_gated, right_gated, float(pair.shape().dims[1]), true);  
-    } else {
-        tri_mul_forward = triangle_mult(left_gated, right_gated, float(pair.shape().dims[1]), false);  
-    }
-    TensorF32 tri_mul_forward_norm = output_layernorm_->forward(tri_mul_forward);
-    TensorF32 tri_mul_forward_proj = out_proj_->forward(tri_mul_forward_norm);
+    auto tri_mul_forward = triangle_mul(left_gated, right_gated, float(pair.shape().dims[1]), bOutgoing);
 
-    TensorF32 gate = sigmoid(gate_->forward(pair_norm));
-    TensorF32 tri_mul_forward_gated = out_prod(gate, tri_mul_forward_proj);
+    auto tri_mul_forward_norm  = output_layernorm_->forward(tri_mul_forward);
+    auto tri_mul_forward_proj  = out_proj_->forward(*tri_mul_forward_norm);
 
-    return tri_mul_forward;
+    auto gv = gate_->forward(*pair_norm);
+    auto gate_out = sigmoid(&gv);
+    auto tri_mul_forward_gated = out_prod(gate_out, &tri_mul_forward_proj);
+
+    return std::move(*tri_mul_forward_gated);
 }
-}
+
 
 // ===== FeedForward (non-owning pointer 版本) =====
 // 旧构造函数 (保留注释):
@@ -222,12 +206,11 @@ void FeedForward::set_params(int dim, int hidden_dim, float dropout,
 }
 
 TensorF32 FeedForward::forward(const TensorF32& x) {
-    // 旧: x_layernorm.forward(x); → layernorm_->forward(x)
-    TensorF32 x_norm = layernorm_->forward(x);
-    TensorF32 x_hidden = linear1_->forward(x_norm);
-    x_hidden = relu(x_hidden);
-    x_hidden = dropout_.forward(x_hidden);
-    TensorF32 x_out = linear2_->forward(x_hidden);
+    auto x_norm   = layernorm_->forward(const_cast<TensorF32*>(&x));  // 返回 TensorF32*
+    auto x_hidden = linear1_->forward(*x_norm);                      // 解引用后传引用
+    auto* x_relu  = relu(&x_hidden);                                   // relu 接受指针，返回指针
+    auto x_dropped = dropout_.forward(*x_relu);                        // dropout 接受值引用
+    auto x_out = linear2_->forward(x_dropped);                        // 传引用
     return x_out;
 }
 
@@ -261,39 +244,41 @@ TensorF32 TemplatePairStack::forward(const TensorF32& pair, TensorF32& rbf_featu
     
     TensorF32 rbf_proj = rbf_proj_->forward(rbf_feature);  // (B,L,L,128)
     
-    TensorF32 state_normed = state_norm_->forward(state);
+    auto& state_normed = *state_norm_->forward(const_cast<TensorF32*>(&state));
     
     TensorF32 left  = left_proj_->forward(state_normed);   // (B,L,16)
     TensorF32 right = right_proj_->forward(state_normed);  // (B,L,16)
-    TensorF32 gate  = out_prod(left, right);               // (B,L,L,256)
-    TensorF32 gate_proj = gate_proj_->forward(gate);       // (B,L,L,128)
-    TensorF32 gate_sig  = sigmoid(gate_proj);
-    Tensor* out_rbf_feature = out_prod(rbf_feature, gate_sig);
-    rbf_feature = &(*out_rbf_feature);
+    auto gate  = out_prod(&left, &right);                   // (B,L,L,256)
+    TensorF32 gate_proj = gate_proj_->forward(*gate);       // (B,L,L,128)
+    auto gate_sig  = sigmoid(&gate_proj);
+    auto out_rbf_feature = out_prod(&rbf_feature, gate_sig);
+    rbf_feature.copy_from(*out_rbf_feature);
 
     TensorF32 pair_tmp;
     pair_tmp.copy_from(pair);
 
-    Tensor* tri_out = tri_mul_out_->forward(pair_tmp, true);
-    Tensor* tri_out_drop_row = drop_row_.forward(tri_out);
-    Tensor* pair_tri_out = add_impl(pair_tmp, tri_out_drop_row);
+    auto tri_out = tri_mul_out_->forward(pair_tmp, true);
+    auto tri_out_drop = drop_row_.forward(tri_out);
+    auto pair_tri_out = add_impl(&pair_tmp, &tri_out_drop, /*inplace=*/false);
 
-    Tensor* tri_in = tri_mul_in_->forward(pair_tri_out, false);
-    Tensor* tri_in_drop_row = drop_row_.forward(tri_in);
-    Tensor* pair_tri_in = add_impl(pair_tri_out, tri_in_drop_row);
+    auto tri_in = tri_mul_in_->forward(*pair_tri_out, false);
+    auto tri_in_drop = drop_row_.forward(tri_in);
+    auto pair_tri_in = add_impl(pair_tri_out, &tri_in_drop, /*inplace=*/false);
 
-    Tensor* pair_row_attn = pair_row_attn_->forward(pair_tri_in, rbf_proj);
-    Tensor* pair_row_attn_drop_row = drop_row_.forward(pair_row_attn);
-    Tensor* pair_after_row = add_impl(pair_tri_in, pair_row_attn_drop_row);
+    auto pair_row_attn = pair_row_attn_->forward(*pair_tri_in, rbf_proj);
+    auto row_drop = drop_row_.forward(pair_row_attn);
+    auto pair_after_row = add_impl(pair_tri_in, &row_drop, /*inplace=*/false);
 
-    Tensor* pair_col_attn = pair_col_attn_->forward(pair_after_row, rbf_proj);
-    Tensor* pair_col_attn_drop_col = drop_col_.forward(pair_col_attn);
-    Tensor* pair_after_col = add_impl(pair_after_row, pair_col_attn_drop_col);
+    auto pair_col_attn = pair_col_attn_->forward(*pair_after_row, rbf_proj);
+    auto col_drop = drop_col_.forward(pair_col_attn);
+    auto pair_after_col = add_impl(pair_after_row, &col_drop, /*inplace=*/false);
 
-    Tensor* pair_ff_out = pair_ff_->forward(pair_after_col);
-    Tensor* pair_final = add_impl(pair_after_col, pair_ff_out);
+    auto pair_ff_out = pair_ff_->forward(*pair_after_col);
+    auto pair_final = add_impl(pair_after_col, &pair_ff_out, /*inplace=*/false);
 
-    return pair_final;
+    TensorF32 result;
+    result.copy_from(*pair_final);
+    return result;
 }
 
 } // namespace rfaa

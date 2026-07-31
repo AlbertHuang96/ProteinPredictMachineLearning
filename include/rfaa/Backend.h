@@ -1,4 +1,5 @@
 
+
 #pragma once
 #include <atomic>
 #include <mutex>
@@ -7,6 +8,7 @@
 #include <memory>
 #include <vector>
 #include <unordered_map>
+#include <cuda_runtime.h>
 #include "ComputeGraph.h"
 #include "Context.h"
 
@@ -91,6 +93,8 @@ struct alignas(64) ThreadPool {
     void submit(ComputeGraph * g, ComputePlan * p);
     void barrier_wait();
 
+    friend void worker_loop(ThreadState * state);
+
 private:
     void (*worker_fn_)(ThreadState *) = nullptr;   // 由 CPUBackend 注入
 };
@@ -135,19 +139,19 @@ public:
     // ggml_backend_buffer_i.get_base
     virtual void* data() = 0;
     virtual void memset_tensor(TensorF32* tensor, uint8_t value, size_t offset, size_t size) {
-        uint8_t ptr = static_cast<uint8_t*>(data());
+        uint8_t* ptr = static_cast<uint8_t*>(data());
         std::memset(ptr + offset, value, size);
     }
 
-    virtual void set_tensor(TensorF32* tensor, const void* data, size_t offset, size_t size) {
+    virtual void set_tensor(TensorF32* tensor, const void* src, size_t offset, size_t size) {
         uint8_t* ptr = static_cast<uint8_t*>(data());
-        std::memcpy(ptr + offset, data, size);
+        std::memcpy(ptr + offset, src, size);
     }
 
     virtual void get_tensor(const TensorF32* tensor,
-                            void* data, size_t offset, size_t size) {
+                            void* dst, size_t offset, size_t size) {
         const uint8_t* ptr = static_cast<const uint8_t*>(data());
-        std::memcpy(data, ptr + offset, size);
+        std::memcpy(dst, ptr + offset, size);
     }
 
     // 对标 ggml_backend_buffer_is_host
@@ -561,33 +565,35 @@ private:
     static void compute_thread(ThreadState * state);
 
     // ===== op 分发 =====
-    static Status  dispatch_node(Tensor * node, ComputeParams * p);
+    static Status  dispatch_node(TensorF32 * node, ComputeParams * p);
 
-    static int get_n_tasks(Tensor * node, int n_threads);
-    static size_t estimate_work_size(Tensor * node, int n_threads, int n_tasks = -1);
+    static int get_n_tasks(TensorF32 * node, int n_threads);
+    static size_t estimate_work_size(TensorF32 * node, int n_threads, int n_tasks = -1);
     static constexpr int64_t align_up(int64_t n, int64_t align) {
         return (n + align - 1) / align * align;
     }
 
     // ===== kernels (static: 无需 this, 仅操作张量数据) =====
-    static void kernel_elemwise(Tensor * node, ComputeParams * p);
-    static void kernel_mul_mat (Tensor * node, ComputeParams * p);
-    static void kernel_out_prod(Tensor * node, ComputeParams * p);
-    static void kernel_softmax (Tensor * node, ComputeParams * p);
-    static void kernel_softmax_back(Tensor * node, ComputeParams * p);
-    static void kernel_rms_norm (Tensor * node, ComputeParams * p);
-    static void kernel_norm     (Tensor * node, ComputeParams * p);
-    static void kernel_norm_back(Tensor * node, ComputeParams * p);
-    static void kernel_silu    (Tensor * node);
-    static void kernel_gelu    (Tensor * node);
-    static void kernel_relu    (Tensor * node);
-    static void kernel_dup     (Tensor * node);
-    static void kernel_scale   (Tensor * node, ComputeParams * p);
-    static void kernel_add1    (Tensor * node, ComputeParams * p);
-    static void kernel_sum     (Tensor * node, ComputeParams * p);
-    static void kernel_mean    (Tensor * node, ComputeParams * p);
+    static void kernel_elemwise(TensorF32 * node, ComputeParams * p);
+    static void kernel_mul_mat (TensorF32 * node, ComputeParams * p);
+    static void kernel_out_prod(TensorF32 * node, ComputeParams * p);
+    static void kernel_tri_mul (TensorF32 * node, ComputeParams * p);
+    static void kernel_tri_mul_back(TensorF32 * node, ComputeParams * p);
+    static void kernel_softmax (TensorF32 * node, ComputeParams * p);
+    static void kernel_softmax_back(TensorF32 * node, ComputeParams * p);
+    static void kernel_rms_norm (TensorF32 * node, ComputeParams * p);
+    static void kernel_norm     (TensorF32 * node, ComputeParams * p);
+    static void kernel_norm_back(TensorF32 * node, ComputeParams * p);
+    static void kernel_silu    (TensorF32 * node);
+    static void kernel_gelu    (TensorF32 * node);
+    static void kernel_relu    (TensorF32 * node);
+    static void kernel_dup     (TensorF32 * node);
+    static void kernel_scale   (TensorF32 * node, ComputeParams * p);
+    static void kernel_add1    (TensorF32 * node, ComputeParams * p);
+    static void kernel_sum     (TensorF32 * node, ComputeParams * p);
+    static void kernel_mean    (TensorF32 * node, ComputeParams * p);
 
-    static void kernel_sigmoid (Tensor * node, ComputeParams * p);
+    static void kernel_sigmoid (TensorF32 * node, ComputeParams * p);
 
     // ===== 数据成员 =====
     int          n_threads_;

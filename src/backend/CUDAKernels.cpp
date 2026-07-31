@@ -37,7 +37,7 @@ extern void out_prod_cuda(
 // CUDABackend::dispatch_node
 // ============================================================
 
-Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
+Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
     switch (node->op) {
         case OP_NONE:   break;
 
@@ -72,7 +72,7 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
             break;
 
         case OP_NORM: {
-            int C    = static_cast<int>(node->dims()[0]);
+            int C    = static_cast<int>(node->shape().dims[0]);
             int rows = static_cast<int>(node->numel() / C);
 
             float * out   = node->data();
@@ -101,7 +101,7 @@ Status CUDABackend::dispatch_node(Tensor * node, ComputeParams * p) {
 // CUDA kernel stubs (待 src/cuda/*.cu 实现后替换)
 // ============================================================
 
-void CUDABackend::kernel_elemwise_add_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_elemwise_add_cuda(TensorF32 * node, ComputeParams * p) {
     int N = static_cast<int>(node->numel());
     float * A = node->src[0]->data();
     float * B = node->src[1]->data();
@@ -109,7 +109,7 @@ void CUDABackend::kernel_elemwise_add_cuda(Tensor * node, ComputeParams * p) {
     elementwise_add_cuda(A, B, C, N, 256);
 }
 
-void CUDABackend::kernel_elemwise_sub_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_elemwise_sub_cuda(TensorF32 * node, ComputeParams * p) {
     int N = static_cast<int>(node->numel());
     float * A = node->src[0]->data();
     float * B = node->src[1]->data();
@@ -117,7 +117,7 @@ void CUDABackend::kernel_elemwise_sub_cuda(Tensor * node, ComputeParams * p) {
     elementwise_sub_cuda(A, B, C, N, 256);
 }
 
-void CUDABackend::kernel_elemwise_mul_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_elemwise_mul_cuda(TensorF32 * node, ComputeParams * p) {
     int N = static_cast<int>(node->numel());
     float * A = node->src[0]->data();
     float * B = node->src[1]->data();
@@ -125,7 +125,7 @@ void CUDABackend::kernel_elemwise_mul_cuda(Tensor * node, ComputeParams * p) {
     elementwise_mul_cuda(A, B, C, N, 256);
 }
 
-void CUDABackend::kernel_elemwise_div_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_elemwise_div_cuda(TensorF32 * node, ComputeParams * p) {
     int N = static_cast<int>(node->numel());
     float * A = node->src[0]->data();
     float * B = node->src[1]->data();
@@ -136,13 +136,13 @@ void CUDABackend::kernel_elemwise_div_cuda(Tensor * node, ComputeParams * p) {
 // doublecheck:
 //原始 kernel 假设 B 是标准 row-major B[K][N]，访问 B[r * N + c]。但 RFAA-Cpp 的 CPU 版本中 B 以转置形式存储：b[j * K + k]（即 B[N][K]）。
 //因此加载 Bs 时改为：
-void CUDABackend::kernel_mul_mat_cuda(Tensor * node, ComputeParams * p) {
-    // node->dims(): output shape (N, M)  → d is (M, N) stored row-major
+void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
+    // node->shape().dims: output shape (N, M)  → d is (M, N) stored row-major
     // node->src[0]: A (M × K), row-major
     // node->src[1]: B stored transposed as (N × K), i.e. B[j * K + k]
-    int M = static_cast<int>(node->dims()[1]);
-    int N = static_cast<int>(node->dims()[0]);
-    int K = static_cast<int>(node->src[0]->dims()[0]);
+    int M = static_cast<int>(node->shape().dims[1]);
+    int N = static_cast<int>(node->shape().dims[0]);
+    int K = static_cast<int>(node->src[0]->shape().dims[0]);
 
     float * A = node->src[0]->data();
     float * B = node->src[1]->data();
@@ -151,9 +151,9 @@ void CUDABackend::kernel_mul_mat_cuda(Tensor * node, ComputeParams * p) {
     mul_mat_cuda(A, B, C, M, K, N);
 }
 
-void CUDABackend::kernel_softmax_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_softmax_cuda(TensorF32 * node, ComputeParams * p) {
     // node shape: (M, N) — M rows, N classes per row
-    int N = static_cast<int>(node->dims()[0]);
+    int N = static_cast<int>(node->shape().dims[0]);
     int M = static_cast<int>(node->numel() / N);
     float * input  = node->src[0]->data();
     float * output = node->data();
@@ -161,10 +161,10 @@ void CUDABackend::kernel_softmax_cuda(Tensor * node, ComputeParams * p) {
     softmax_cuda(input, output, M, N, 256);
 }
 
-void CUDABackend::kernel_softmax_back_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_softmax_back_cuda(TensorF32 * node, ComputeParams * p) {
     // src[0] = grad (upstream gradient dL/dy)
     // src[1] = output (softmax forward output y)
-    int N = static_cast<int>(node->dims()[0]);
+    int N = static_cast<int>(node->shape().dims[0]);
     int M = static_cast<int>(node->numel() / N);
     const float * grad   = node->src[0]->data();
     const float * output = node->src[1]->data();
@@ -173,7 +173,7 @@ void CUDABackend::kernel_softmax_back_cuda(Tensor * node, ComputeParams * p) {
     softmax_backward_cuda(grad, output, dst, M, N, 256, 1.0f);
 }
 
-void CUDABackend::kernel_norm_back_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p) {
     // src[0] = dout (upstream grad), src[1] = inp (original input)
     // src[2] = mean (cached), src[3] = rstd (cached)
     int C    = reinterpret_cast<int&>(node->op_params[0]);
@@ -193,51 +193,50 @@ void CUDABackend::kernel_norm_back_cuda(Tensor * node, ComputeParams * p) {
         rows, 1, C, 256);
 }
 
-void CUDABackend::kernel_dup_cuda(Tensor * node) {
-    // 简单 memcpy 到 device
+void CUDABackend::kernel_dup_cuda(TensorF32 * node) {
+    (void)node;
 }
 
-void CUDABackend::kernel_scale_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_scale_cuda(TensorF32 * node, ComputeParams * p) {
     p->threadpool->ec = Status::NOT_SUPPORTED;
 }
 
-void CUDABackend::kernel_add1_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_add1_cuda(TensorF32 * node, ComputeParams * p) {
     p->threadpool->ec = Status::NOT_SUPPORTED;
 }
 
-void CUDABackend::kernel_sum_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_sum_cuda(TensorF32 * node, ComputeParams * p) {
     p->threadpool->ec = Status::NOT_SUPPORTED;
 }
 
-void CUDABackend::kernel_mean_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_mean_cuda(TensorF32 * node, ComputeParams * p) {
     p->threadpool->ec = Status::NOT_SUPPORTED;
 }
 
-void CUDABackend::kernel_relu_cuda(Tensor * node) {}
-void CUDABackend::kernel_gelu_cuda(Tensor * node) {}
-void CUDABackend::kernel_sigmoid_cuda(Tensor * node) {}
-void CUDABackend::kernel_silu_cuda(Tensor * node) {}
-void CUDABackend::kernel_tanh_cuda(Tensor * node) {}
-void CUDABackend::kernel_exp_cuda(Tensor * node) {}
+void CUDABackend::kernel_relu_cuda(TensorF32 * node) { (void)node; }
+void CUDABackend::kernel_sigmoid_cuda(TensorF32 * node) { (void)node; }
+void CUDABackend::kernel_silu_cuda(TensorF32 * node) { (void)node; }
+void CUDABackend::kernel_tanh_cuda(TensorF32 * node) { (void)node; }
+void CUDABackend::kernel_exp_cuda(TensorF32 * node) { (void)node; }
 
-void CUDABackend::kernel_out_prod_cuda(Tensor * node, ComputeParams * p) {
+void CUDABackend::kernel_out_prod_cuda(TensorF32 * node, ComputeParams * p) {
     const TensorF32* src0 = node->src[0];
     const TensorF32* src1 = node->src[1];
 
-    const int64_t ne00 = src0->dims()[0];
-    const int64_t ne01 = src0->dims()[1];
-    const int64_t ne02 = (src0->shape().ndim() > 2) ? src0->dims()[2] : 1;
-    const int64_t ne03 = (src0->shape().ndim() > 3) ? src0->dims()[3] : 1;
+    const int64_t ne00 = src0->shape().dims[0];
+    const int64_t ne01 = src0->shape().dims[1];
+    const int64_t ne02 = (src0->shape().ndim() > 2) ? src0->shape().dims[2] : 1;
+    const int64_t ne03 = (src0->shape().ndim() > 3) ? src0->shape().dims[3] : 1;
 
-    const int64_t ne10 = src1->dims()[0];
-    const int64_t ne11 = src1->dims()[1];
-    const int64_t ne12 = (src1->shape().ndim() > 2) ? src1->dims()[2] : 1;
-    const int64_t ne13 = (src1->shape().ndim() > 3) ? src1->dims()[3] : 1;
+    const int64_t ne10 = src1->shape().dims[0];
+    const int64_t ne11 = src1->shape().dims[1];
+    const int64_t ne12 = (src1->shape().ndim() > 2) ? src1->shape().dims[2] : 1;
+    const int64_t ne13 = (src1->shape().ndim() > 3) ? src1->shape().dims[3] : 1;
 
-    const int64_t ne0 = node->dims()[0];
-    const int64_t ne1 = node->dims()[1];
-    const int64_t ne2 = (node->shape().ndim() > 2) ? node->dims()[2] : 1;
-    const int64_t ne3 = (node->shape().ndim() > 3) ? node->dims()[3] : 1;
+    const int64_t ne0 = node->shape().dims[0];
+    const int64_t ne1 = node->shape().dims[1];
+    const int64_t ne2 = (node->shape().ndim() > 2) ? node->shape().dims[2] : 1;
+    const int64_t ne3 = (node->shape().ndim() > 3) ? node->shape().dims[3] : 1;
 
     // GQA: ne2/ne02, ne3/ne03 暂不计算 dps 参数
     // TODO: 后续实现 GQA 支持

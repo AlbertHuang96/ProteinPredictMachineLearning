@@ -69,7 +69,7 @@ namespace rfaa {
                     // implement the position emb outside of this function
                     std::memcpy(
                         output.data() + (b * L + l) * embedding_dim_,
-                        weights_.data() + idx * embedding_dim_,
+                        weights_->data() + idx * embedding_dim_,
                         embedding_dim_ * sizeof(float)
                     );
                 }
@@ -80,14 +80,13 @@ namespace rfaa {
         return output;
     }
 
-    TensorF32* EmbeddingLayer::weight() { return weights_; }
-    
+    // weight() 已在 Embedding.h 中 inline 定义
 
 
 
 
     // 工厂函数：从 context 分配权重
-    LinearLayer* LinearLayer::create(int in_features, int out_features, bool bias = true) {
+    LinearLayer* LinearLayer::create(int in_features, int out_features, bool bias) {
         LinearLayer* layer = new LinearLayer();
         layer->in_features_  = in_features;
         layer->out_features_ = out_features;
@@ -109,24 +108,13 @@ namespace rfaa {
         return layer;
     }
 
-    void LinearLayer::zeros_weight() {
-        std::memset(weight_.data(), 0, weight_.shape().numel() * sizeof(float));
-    }
+    // zeros_weight / ones_bias 已在 Embedding.h 中 inline 定义，此处不重复
 
-    void LinearLayer::ones_bias() {
-        std::memset(bias_.data(), 1, bias_.shape().numel() * sizeof(float));
-    }
-    
     // ===== 图模式前向（训练用）=====
-    // x: 输入 Tensor* (图节点), 返回输出 Tensor* (图节点)
     TensorF32* LinearLayer::forward_graph(TensorF32* x) {
-        // Linear: y = x @ weight^T + bias
-        // weight: (in, out), x: (..., in)
-        // transpose: weight^T: (in, out) → (out, in)?
-        // mul_mat: x (..., in) @ weight (in, out) → y (..., out)
         TensorF32* y = mul_mat(x, weight_);
         if (has_bias_) {
-            y = add_impl(y, bias_);  // broadcast bias
+            y = add_impl(y, bias_, /*inplace=*/false);  // broadcast bias
         }
         return y;
     }
@@ -141,10 +129,10 @@ namespace rfaa {
         // 简化的矩阵乘法 (实际应使用 cuBLAS)
         for (int b = 0; b < batch; ++b) {
             for (int o = 0; o < out_features_; ++o) {
-                float sum = has_bias_ ? bias_.data()[o] : 0.0f;
+                float sum = has_bias_ ? bias_->data()[o] : 0.0f;
                 // dim of weights: (out_features, in_features)
                 for (int i = 0; i < in_features_; ++i) {
-                    sum += x.data()[b * in_features_ + i] * weight_.data()[o * in_features_ + i];
+                    sum += x.data()[b * in_features_ + i] * weight_->data()[o * in_features_ + i];
                 }
                 // dim of output: (batch, out_features)
                 output.data()[b * out_features_ + o] = sum;
@@ -157,9 +145,7 @@ namespace rfaa {
         return output.view(out_shape);
     }
 
-    // 获取权重指针（加载/保存用）
-    TensorF32* LinearLayer::weight() { return weight_; }
-    TensorF32* LinearLayer::bias()   { return bias_; }
+    // weight() / bias() 已在 Embedding.h 中 inline 定义
     
 
     void LinearLayer::init_weights() {
@@ -180,7 +166,7 @@ namespace rfaa {
 // LayerNorm
 
 
-    LayerNorm* LayerNorm::create(int normalized_shape, float eps = 1e-5) {
+    LayerNorm* LayerNorm::create(int normalized_shape, float eps) {
         auto* layer = new LayerNorm();
         layer->normalized_shape_ = normalized_shape;
         layer->eps_ = eps;
@@ -206,7 +192,7 @@ namespace rfaa {
         TensorF32* normed = norm(x, eps_);  // or norm() for layernorm
         //Tensor* scaled = mul_mat(normed, gamma_);
         TensorF32* scaled = out_prod(normed, gamma_);
-        return add_impl(scaled, beta_);
+        return add_impl(scaled, beta_, /*inplace=*/false);
     }
     
     TensorF32 LayerNorm::forward_exec(const TensorF32& x) {
@@ -235,7 +221,7 @@ namespace rfaa {
             for (int i = 0; i < normalized_shape_; ++i) {
                 float normalized = (x.data()[b * normalized_shape_ + i] - mean) * inv_std;
                 output.data()[b * normalized_shape_ + i] = 
-                    normalized * gamma_.data()[i] + beta_.data()[i];
+                    normalized * gamma_->data()[i] + beta_->data()[i];
             }
         }
         
@@ -267,9 +253,9 @@ namespace rfaa {
         int L = bond_feats.shape().dims[1];
         
         TensorF32 output;
-        TensorF32 one_hot = one_hot(bond_feats, NBYTES); // (B, L, L, NBYTES)
+        TensorF32 bond_onehot = one_hot_seq(bond_feats, NBYTES); // (B, L, L, NBYTES)
         // 旧: output = emb_.forward(one_hot);
-        output = emb_->forward(one_hot); // (B, L, L, d_pair)
+        output = emb_->forward(bond_onehot); // (B, L, L, d_pair)
         
         return output;
     }

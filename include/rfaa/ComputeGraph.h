@@ -1,6 +1,7 @@
 #pragma once
 #include "Tensor.h"
 #include "HashSet.h"
+#include "FAPE.h"
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
@@ -74,6 +75,7 @@ public:
     // or TensorF32
     // fixme: quantize case?
     TensorF32 * graph_node(int i);
+    TensorF32 * graph_leaf(int i);
     TensorF32 ** graph_nodes();
     TensorF32 * graph_get_grad(const TensorF32 * node);
 
@@ -163,6 +165,10 @@ TensorF32* mul_mat  (TensorF32* a, TensorF32* b);
 TensorF32* out_prod (TensorF32* a, TensorF32* b);
 TensorF32* transpose(TensorF32* a);
 
+// Triangle Multiplication: left (B,I,K,D) × right (B,J,K,D) → (B,I,J,D)
+// outgoing=true: einsum('bikd,bjkd->bijd'), false: einsum('bkid,bkjd->bijd')
+TensorF32* triangle_mul(TensorF32* left, TensorF32* right, float L, bool outgoing);
+
 // 3. 激活
 TensorF32* softmax(TensorF32* a);
 TensorF32* softmax_backward(TensorF32* grad, TensorF32* output);
@@ -170,6 +176,7 @@ TensorF32* silu   (TensorF32* a);
 TensorF32* gelu   (TensorF32* a);
 TensorF32* relu   (TensorF32* a);
 TensorF32* leaky_relu(TensorF32* a, float alpha = 0.01f);
+TensorF32* sigmoid(TensorF32* a);
 
 // 4. 归一化
 TensorF32* rms_norm(TensorF32* a, float eps = 1e-6f);
@@ -185,7 +192,8 @@ TensorF32* view     (TensorF32* a, const Shape& new_shape);
 TensorF32* reshape  (TensorF32* a, const Shape& new_shape);
 TensorF32* permute  (TensorF32* a, const std::vector<int>& dims);
 TensorF32* unsqueeze(TensorF32* a, int dim);
-TensorF32* concat   (const std::vector<TensorF32*>& tensors, int dim);
+TensorF32* concat     (const std::vector<TensorF32>& tensors, int dim);
+TensorF32* concat_ptr (const std::vector<TensorF32*>& tensors, int dim);
 TensorF32* repeat   (TensorF32* a, TensorF32* b);
 TensorF32* repeat_back(TensorF32* a, TensorF32* b);
 TensorF32* cont     (TensorF32* a);

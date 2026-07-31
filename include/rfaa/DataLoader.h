@@ -30,24 +30,28 @@ struct A3MData {
  * 
  * 包含从 HHR 文件中解析出的模板搜索结果
  */
+
+struct TemplateHit {
+    std::string name;                      // 模板名称
+    std::string pdb_id;                   // PDB ID
+    std::string chain_id;                 // 链 ID
+    float probability;                    // 概率/得分
+    float evalue;                       // E-value
+    int query_start;                    // 查询起始位置
+    int query_end;                      // 查询结束位置
+    int template_start;                 // 模板起始位置
+    int template_end;                   // 模板结束位置
+    std::string alignment;              // 比对字符串
+    std::vector<float> stats;           // 统计数据 (Probab, E-value, Score, ...)
+};
+
 struct HHRData {
-    struct TemplateHit {
-        std::string name;                      // 模板名称
-        std::string pdb_id;                   // PDB ID
-        std::string chain_id;                 // 链 ID
-        float probability;                    // 概率/得分
-        float evalue;                       // E-value
-        int query_start;                    // 查询起始位置
-        int query_end;                      // 查询结束位置
-        int template_start;                 // 模板起始位置
-        int template_end;                   // 模板结束位置
-        std::string alignment;              // 比对字符串
-    };
-    
     std::vector<TemplateHit> hits;           // 模板命中列表
     int num_templates;                      // 模板数量
     std::string query_sequence;              // 查询序列
 };
+
+struct FFindexDB;  // 前向声明，实现在 DataLoader.cpp
 
 struct TemplateDataInternal {
     rfaa::TensorF32 xyz;      // (total_atoms, 3)
@@ -204,7 +208,7 @@ public:
     int n_templ = 10               // 最大模板数
     );
 
-    TemplateData parse_templates(
+    TemplateDataInternal parse_templates(
     const std::string& db_prefix,  // e.g., "pdb100_2021Mar03/pdb100_2021Mar03"
     const std::string& hhr_fn,
     const std::string& atab_fn,
@@ -267,6 +271,14 @@ private:
     std::vector<std::vector<std::vector<std::string>>> torsions;
 
     TensorF32 get_protein_bond_feats(int protein_L);
+    TensorF32 get_bond_distances(const TensorF32& bond_feats);
+    
+    TorsionResult get_torsions(
+        const TensorF32& xyz_in,
+        const TensorF32& seq,
+        const std::vector<std::vector<std::vector<int>>>& torsion_indices,
+        const std::vector<std::vector<bool>>& torsion_can_flip,
+        const std::vector<std::vector<std::array<float, 2>>>& ref_angles);
     
     // 内部辅助函数
     TensorF32 prepare_msa_latent(const A3MData& a3m_data);

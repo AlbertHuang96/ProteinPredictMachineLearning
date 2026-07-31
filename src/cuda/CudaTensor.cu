@@ -82,5 +82,6 @@ private:
 
 // 显式实例化模板 (CUDA 侧)
 template class Tensor<float>;
+template class Tensor<int64_t>;
 
 } // namespace rfaa

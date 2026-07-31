@@ -90,7 +90,7 @@ bool CPUBackend::supports_op(TensorF32* node) const {
         }
 
         case OP_GET_ROWS_BACK:
-            if (!src) return true;
+            if (!src0) return true;
             return src0->type == TENSOR_TYPE_F32 ||
                    src0->type == TENSOR_TYPE_F16;
         case OP_OUT_PROD:
@@ -113,7 +113,7 @@ ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
 
     int max_tasks = 1;
     for (int i = 0; i < cgraph->n_nodes(); i++) {
-        Tensor * node = cgraph->node(i);
+        TensorF32 * node = cgraph->graph_node(i);
         int n_tasks   = get_n_tasks(node, n_threads_);
         max_tasks     = std::max(max_tasks, n_tasks);
 
@@ -173,7 +173,7 @@ void CPUBackend::compute_thread(ThreadState * state) {
          tp->abort.load(std::memory_order_relaxed) != node_n;
          node_n++) {
 
-        Tensor * node = cgraph->node(node_n);
+        TensorF32 * node = cgraph->graph_node(node_n);
 
         dispatch_node(node, &params);
 
@@ -190,24 +190,22 @@ void CPUBackend::compute_thread(ThreadState * state) {
     tp->barrier_wait();
 }
 
-int CPUBackend::get_n_tasks(Tensor * node, int n_threads) {
+int CPUBackend::get_n_tasks(TensorF32 * node, int n_threads) {
     switch (node->op) {
         case OP_MUL_MAT: {
             // 矩阵乘法：按行并行
-            // 总行数 = dims[1]，每线程至少处理 32 行
-            int64_t rows = node->dims()[1];  // M
+            int64_t rows = node->shape().dims[1];  // M
             int max_tasks = static_cast<int>(rows / 32);
             return std::max(1, std::min(max_tasks, n_threads));
         }
         case OP_SOFT_MAX: {
-            // ggml ne[1] * ne[2] * ne[3]
             // softmax：沿最后一维，每个"行"是一个任务
-            int64_t outer = node->numel() / node->dims()[0];
+            int64_t outer = node->numel() / node->shape().dims[0];
             int max_tasks = static_cast<int>(outer);
-            return std::clamp(max_tasks, 1, n_threads);
+            return std::max(1, std::min(max_tasks, n_threads));
         }
         case OP_RMS_NORM: {
-            int64_t rows = node->numel() / node->dims()[0];
+            int64_t rows = node->numel() / node->shape().dims[0];
             return std::min(static_cast<int>(rows / 16), n_threads);
         }
         case OP_FLASH_ATTN_BACK:
@@ -229,7 +227,7 @@ int CPUBackend::get_n_tasks(Tensor * node, int n_threads) {
 
     return -1;
 }
-size_t CPUBackend::estimate_work_size(Tensor * node, int n_threads, int n_tasks) {
+size_t CPUBackend::estimate_work_size(TensorF32 * node, int n_threads, int n_tasks) {
     size_t cur = 0;
 
     switch (node->op) {
@@ -255,7 +253,7 @@ size_t CPUBackend::estimate_work_size(Tensor * node, int n_threads, int n_tasks)
             // shape: (B, H, L, L) 或类似
             //int n_tasks = get_n_tasks(node, n_threads);
             // 保守估计：attn weights 的中间存储
-            cur = sizeof(float) * node->dims()[2] * node->dims()[3] * n_tasks;
+            cur = sizeof(float) * node->shape().dims[2] * node->shape().dims[3] * n_tasks;
             // TODO: further need to change to tiled version
 
         } break;
@@ -263,10 +261,10 @@ size_t CPUBackend::estimate_work_size(Tensor * node, int n_threads, int n_tasks)
             // 反向还需要存储 dS
             // D = head dim (如 64 or 128)
             // Q's head dim
-            const int64_t D = node->src[0]->dims()[0];
+            const int64_t D = node->src[0]->shape().dims[0];
 
             // Lkv = K 的序列长度，对齐到 UNROLL
-            const int64_t ne11 = align_up(node->src[1]->dims()[1], SOFT_MAX_UNROLL);
+            const int64_t ne11 = align_up(node->src[1]->shape().dims[1], SOFT_MAX_UNROLL);
 
             // mxDn: 取 max 是为了用较大的维度兜底，×2 因为 S + SM 两份
             const int64_t mxDn = std::max(D, ne11) * 2;
@@ -279,7 +277,7 @@ size_t CPUBackend::estimate_work_size(Tensor * node, int n_threads, int n_tasks)
         // ===== 交叉熵 =====
         case OP_CROSS_ENTROPY_LOSS: {
             //int n_tasks = get_n_tasks(node, n_threads);
-            cur = sizeof(float) * (n_tasks + node->dims()[0] * n_tasks);
+            cur = sizeof(float) * (n_tasks + node->shape().dims[0] * n_tasks);
         } break;
 
         // ===== 归一化 =====
@@ -287,7 +285,7 @@ size_t CPUBackend::estimate_work_size(Tensor * node, int n_threads, int n_tasks)
         case OP_NORM: {
             // 每线程需要均值和方差的暂存空间
             //int n_tasks = get_n_tasks(node, n_threads);
-            int64_t rows = node->numel() / node->dims()[0];
+            int64_t rows = node->numel() / node->shape().dims[0];
             int rows_per_task = static_cast<int>(rows / n_tasks + 1);
             cur = sizeof(float) * rows_per_task;
         } break;
@@ -304,6 +302,7 @@ size_t CPUBackend::estimate_work_size(Tensor * node, int n_threads, int n_tasks)
         case OP_RESHAPE:
         case OP_PERMUTE:
         case OP_TRANSPOSE:
+        case OP_TRI_MUL:
         case OP_SQR:
         case OP_SQRT:
         case OP_SCALE:

@@ -146,6 +146,8 @@ enum tensor_op {
     OP_GLU,
     OP_FAPE,
     OP_FAPE_BACK,
+    OP_TRI_MUL,
+    OP_TRI_MUL_BACK,
     OP_COUNT,
 };
 
@@ -279,6 +281,7 @@ private:
     void deallocate();
 
     friend class TensorAllocator;  // 允许 TensorAllocator 直接设置 data_/buffer_/own_data_
+    //friend class BackendManager;   // 允许 BackendManager 设置 view tensor 的 data_
 };
 
 // 特化常用类型

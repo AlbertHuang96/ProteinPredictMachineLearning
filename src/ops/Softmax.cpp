@@ -7,10 +7,11 @@
 namespace rfaa {
 
 TensorF32 softmax(const TensorF32& input, int dim) {
-    if (dim < 0) dim += input.shape().ndim;
+    if (dim < 0) dim += input.shape().ndim();
     
     // 创建输出张量
-    TensorF32 output = input;
+    TensorF32 output({input.shape().dims[0], input.shape().dims[1], input.shape().dims[2], input.shape().dims[3]}, input.device());
+    output.copy_from(input);
     const auto& shape = input.shape().dims;
     
     // 计算 stride
@@ -68,7 +69,7 @@ TensorF32 softmax_forward(const TensorF32& input, int dim) {
 
 void softmax_backward(const TensorF32& grad_output, const TensorF32& output, 
                       TensorF32& grad_input, int dim) {
-    if (dim < 0) dim += grad_output.shape().ndim;
+    if (dim < 0) dim += grad_output.shape().ndim();
     
     const auto& shape = grad_output.shape().dims;
     

@@ -3,8 +3,12 @@
 #include "Core.h"
 #include "Tensor.h"
 #include "ComputeGraph.h"
-#include "Embedding.h"
 #include "Dropout.h"
+
+namespace rfaa {
+class LinearLayer;
+class LayerNorm;
+}
 
 namespace rfaa {
 
@@ -16,6 +20,7 @@ struct AttnConfig {
     float dropout;     // dropout 率
     bool use_bias;     // 是否使用 bias
     
+    AttnConfig() = default;
     AttnConfig(int d, int h, float drop = 0.0f, bool bias = true)
         : dim(d), n_head(h), head_dim(d / h), dropout(drop), use_bias(bias) {
         if (dim % n_head != 0) {
@@ -53,7 +58,7 @@ public:
     TensorF32 forward(const TensorF32& msa, const TensorF32& pair_biased);
     
 private:
-    SelfAttention self_attn_;
+    std::unique_ptr<SelfAttention> self_attn_;
 
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
     LinearLayer* to_g_  = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
@@ -76,7 +81,7 @@ public:
     TensorF32 forward(const TensorF32& msa);
     
 protected:
-    SelfAttention self_attn_;
+    std::unique_ptr<SelfAttention> self_attn_;
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
     LinearLayer* to_g_  = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
     LinearLayer* to_out_ = nullptr; // N_HEAD*D_MSA (2048) → D_MSA (256)
@@ -106,7 +111,7 @@ public:
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
     
 private:
-    SelfAttention self_attn_;
+    std::unique_ptr<SelfAttention> self_attn_;
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
     LinearLayer* to_g_  = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
     LinearLayer* to_out_ = nullptr; // N_HEAD*D_PAIR_HIDDEN (256) → D_PAIR (128)
@@ -128,7 +133,7 @@ public:
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
     
 private:
-    SelfAttention self_attn_;
+    std::unique_ptr<SelfAttention> self_attn_;
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
     LinearLayer* to_g_  = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
     LinearLayer* to_out_ = nullptr; // N_HEAD*D_PAIR_HIDDEN (256) → D_PAIR (128)

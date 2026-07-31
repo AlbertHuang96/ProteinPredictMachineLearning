@@ -2,6 +2,8 @@
 
 #include "Tensor.h"
 #include "Embedding.h"
+#include "Attention.h"
+#include "PositionalEncoding.h"
 
 namespace rfaa {
 
@@ -71,21 +73,18 @@ class PairTrack : public Track {
 public:
     PairTrack(int seq_len, int dim = D_PAIR, Device device = Device::CPU);
     
+    // 设置外部注入的层 (由 RFAAModel 管理)
+    void set_embeddings(EmbeddingLayer* left_emb, EmbeddingLayer* right_emb,
+                        PositionalEncoding* pos_enc);
+    
     // 从 embedding 初始化
-    void init_from_embedding(const TensorF32& left, const TensorF32& right, const TensorF32& bond_feats, const TensorF32& dist_matrix);
+    void init_from_embedding(const TensorF32& left, const TensorF32& right,
+                             const TensorF32& bond_feats, const TensorF32& dist_matrix,
+                             const TensorF32& index);
     
     void inject_template(const TensorF32& templ);
     TensorF32 templ_stack(const TensorF32& in_templ, const TensorF32& rbf_feat, const TensorF32& t1d);
-    // Step 2: msa2pair (Outer Product Mean)
-    void update_from_msa(const TensorF32& msa);
     
-    // Step 3: pair2pair 自更新
-    void update_self(const TensorF32& state_gate, const TensorF32& rbf_feat);
-    
-    // 获取 attention bias
-    TensorF32 get_attention_bias(int n_head) const;
-    
-    // 实现接口
     void forward() override {}
     TensorF32& representation() override { return repr_; }
     const TensorF32& representation() const override { return repr_; }
@@ -97,8 +96,10 @@ private:
     int seq_len_;
     int dim_;
     
-    //struct Impl;
-    //std::unique_ptr<Impl> impl_;
+    // 外部注入的层 (non-owning)
+    EmbeddingLayer*    left_emb_   = nullptr;
+    EmbeddingLayer*    right_emb_  = nullptr;
+    PositionalEncoding* pos_enc_    = nullptr;
 };
 
 // 1D State Track

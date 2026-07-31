@@ -2,8 +2,8 @@
 
 #include "Track.h"
 #include "Attention.h"
-#include "SE3Transformer.h"
-#include "PositionalEncoding.h"
+#include "rfaa/SE3Transformer.h"
+#include "rfaa/PositionalEncoding.h"
 #include <string>
 #include <memory>
 
@@ -103,12 +103,10 @@ public:
     void proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state);
 
     TensorF32 compute_rbf_feature(const TensorF32& coords);
+    TensorF32 compute_l1_features(const TensorF32& coords);
     
-private:
-    RFAAConfig config_;
-    bool update_msa_pair_;
-    
-    // 子模块
+protected:
+    // 子模块 (protected 允许 FullBlock/RefineBlock 子类访问)
     std::unique_ptr<MSARowAttention> msa_row_attn_;
     std::unique_ptr<MSAColAttention> msa_col_attn_;
     std::unique_ptr<PairRowAttention> pair_row_attn_;
@@ -121,22 +119,19 @@ private:
     //std::unique_ptr<StructureUpdate> struct_update_;
     std::unique_ptr<PositionalEncoding> pos_enc_;
 
-    // 3D track
+private:
+    RFAAConfig config_;
+    bool update_msa_pair_;
+
+protected:
+    // 3D track (子类可访问)
     TensorF32 xyz_new_;              // (B, L, 3, 3)
     TensorF32 state_new_;            // (B, L, D_STATE) 可选，或直接用 state 引用
 
-    // ---- 3D SE 参数 (non-owning pointer, 由 RFAAModel 创建) ----
-    // 旧值类型 (保留注释):
-    // LayerNorm norm_msa_3d_(D_MSA);
-    // LayerNorm norm_pair_3d_(D_PAIR);
-    // static constexpr int NODE_3D_IN  = D_MSA + 21;      // 256+21 = 277  → Core.h ITER_NODE_3D_IN
-    // static constexpr int NODE_3D_OUT = N_L0_IN_FEATS;   // 32            → Core.h ITER_NODE_3D_OUT
-    // static constexpr int EDGE_3D_OUT = N_EDGE_FEATS;    // 32            → Core.h ITER_EDGE_3D_OUT
-    // LinearLayer embed_x_(NODE_3D_IN, NODE_3D_OUT);  
-    // LinearLayer embed_e_(D_PAIR, EDGE_3D_OUT);  
-    // LayerNorm  norm_node_3d_(NODE_3D_OUT);
-    // LayerNorm  norm_edge_3d_(EDGE_3D_OUT);
+private:
 
+protected:
+    // ---- 3D SE 参数 (non-owning pointer, 由 RFAAModel 创建, FullBlock 子类访问) ----
     LayerNorm*  norm_msa_3d_  = nullptr; // D_MSA (256)
     LayerNorm*  norm_pair_3d_ = nullptr; // D_PAIR (128)
     LinearLayer* embed_x_     = nullptr; // ITER_NODE_3D_IN (277) → ITER_NODE_3D_OUT (32)
@@ -145,12 +140,6 @@ private:
     LayerNorm*  norm_edge_3d_ = nullptr; // ITER_EDGE_3D_OUT (32)
 
     // ---- forward 内部参数 (non-owning pointer, 由 RFAAModel 创建) ----
-    // 旧值类型 (保留注释):
-    // LayerNorm state_norm(D_STATE);     LinearLayer linear(D_STATE, D_MSA);
-    // LayerNorm pair_layernorm(D_PAIR);
-    // LayerNorm msa_norm(D_MSA);         LinearLayer left_proj(D_MSA, 16); LinearLayer right_proj(D_MSA, 16); LinearLayer out_proj(256, D_PAIR);
-    // LinearLayer rbf_proj(D_RBF, D_PAIR); LayerNorm state_norm(D_STATE); LinearLayer left_proj(D_STATE, 16); LinearLayer right_proj(D_STATE, 16); LinearLayer gate_proj(256, D_PAIR);
-
     LayerNorm*   state2msa_norm_        = nullptr; // D_STATE (32)
     LinearLayer* state2msa_linear_      = nullptr; // D_STATE (32) → D_MSA (256)
     LayerNorm*   pair2msa_norm_         = nullptr; // D_PAIR (128)
@@ -172,11 +161,14 @@ private:
 public:
     const TensorF32& updated_coords() const { return xyz_new_; }
     //void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
+
+    friend class RFAAModel;  // RFAAModel 直接注入 non-owning pointers
 };
 
 class FullBlock : public IterBlock {
 public:
-    explicit FullBlock(const RFAAConfig& config) : IterBlock(config, true) {}
+    explicit FullBlock(const RFAAConfig& config, bool update_msa_pair = true)
+        : IterBlock(config, update_msa_pair) {}
 
     // a virtual dtor
     virtual ~FullBlock() = default;
@@ -194,7 +186,8 @@ private:
 
 class RefineBlock : public IterBlock {
 public:
-    explicit RefineBlock(const RFAAConfig& config) : RefineBlock(config, true) {}
+    explicit RefineBlock(const RFAAConfig& config, bool update_msa_pair = true)
+        : IterBlock(config, update_msa_pair) {}
 
     // a virtual dtor
     virtual ~RefineBlock() = default;
@@ -252,6 +245,8 @@ private:
     // ---- 输出缓存 ----
     TensorF32 xyz_new_;       // (B, L, 3, 3) 更新后的坐标
     TensorF32 state_new_;     // (B, L, D_STATE) 更新后的 state
+
+    friend class RFAAModel;  // RFAAModel 直接注入 non-owning pointers
 };
 
 // RFAA 主模型
@@ -298,6 +293,58 @@ private:
     LinearLayer*     emb_t1d_t2d_        = nullptr; // (224 → 64) get_templ_emb
     LinearLayer*     temp_stack_t1d_proj_ = nullptr; // (80 → 32) templ_stack
     LayerNorm*       temp_stack_norm_    = nullptr; // (64)
+
+    // ===== TemplatePairStack 子层 (全局单份, 2 次 forward 复用) =====
+    // 直接 LinearLayer/LayerNorm
+    LinearLayer*     tps_rbf_proj_      = nullptr; // D_RBF (64) → D_PAIR (128)
+    LayerNorm*       tps_state_norm_    = nullptr; // D_STATE (32)
+    LinearLayer*     tps_left_proj_     = nullptr; // D_STATE (32) → 16
+    LinearLayer*     tps_right_proj_    = nullptr; // D_STATE (32) → 16
+    LinearLayer*     tps_gate_proj_     = nullptr; // 16*16 (256) → D_PAIR (128)
+    // TriangleMultiplication out (2 LN + 6 LL)
+    LayerNorm*       tps_tri_out_layernorm_        = nullptr;
+    LinearLayer*     tps_tri_out_left_proj_        = nullptr;
+    LinearLayer*     tps_tri_out_right_proj_       = nullptr;
+    LinearLayer*     tps_tri_out_left_gate_        = nullptr;
+    LinearLayer*     tps_tri_out_right_gate_       = nullptr;
+    LinearLayer*     tps_tri_out_gate_             = nullptr;
+    LayerNorm*       tps_tri_out_output_layernorm_ = nullptr;
+    LinearLayer*     tps_tri_out_out_proj_         = nullptr;
+    // TriangleMultiplication in (2 LN + 6 LL)
+    LayerNorm*       tps_tri_in_layernorm_        = nullptr;
+    LinearLayer*     tps_tri_in_left_proj_        = nullptr;
+    LinearLayer*     tps_tri_in_right_proj_       = nullptr;
+    LinearLayer*     tps_tri_in_left_gate_        = nullptr;
+    LinearLayer*     tps_tri_in_right_gate_       = nullptr;
+    LinearLayer*     tps_tri_in_gate_             = nullptr;
+    LayerNorm*       tps_tri_in_output_layernorm_ = nullptr;
+    LinearLayer*     tps_tri_in_out_proj_         = nullptr;
+    // PairRowAttention (6 LL)
+    LinearLayer*     tps_pair_row_to_b_   = nullptr;
+    LinearLayer*     tps_pair_row_to_g_   = nullptr;
+    LinearLayer*     tps_pair_row_to_out_ = nullptr;
+    LinearLayer*     tps_pair_row_Wq_     = nullptr;
+    LinearLayer*     tps_pair_row_Wk_     = nullptr;
+    LinearLayer*     tps_pair_row_Wv_     = nullptr;
+    // PairColAttention (6 LL)
+    LinearLayer*     tps_pair_col_to_b_   = nullptr;
+    LinearLayer*     tps_pair_col_to_g_   = nullptr;
+    LinearLayer*     tps_pair_col_to_out_ = nullptr;
+    LinearLayer*     tps_pair_col_Wq_     = nullptr;
+    LinearLayer*     tps_pair_col_Wk_     = nullptr;
+    LinearLayer*     tps_pair_col_Wv_     = nullptr;
+    // FeedForward (1 LN + 2 LL)
+    LayerNorm*       tps_pair_ff_norm_    = nullptr;
+    LinearLayer*     tps_pair_ff_linear1_ = nullptr;
+    LinearLayer*     tps_pair_ff_linear2_ = nullptr;
+    // 子模块实例 (通过 set_params 注入)
+    TriangleMultiplication tps_tri_mul_out_;
+    TriangleMultiplication tps_tri_mul_in_;
+    PairRowAttention       tps_pair_row_attn_;
+    PairColAttention       tps_pair_col_attn_;
+    FeedForward            tps_pair_ff_;
+    // TemplatePairStack 实例
+    TemplatePairStack      tps_;
 
     // ===== attention / sub-module 参数 (per-block, vector) =====
     static constexpr int N_ITER = 12;   // extra(4) + main(8)
@@ -437,6 +484,11 @@ private:
     std::vector<std::unique_ptr<IterBlock>> extra_blocks_;
     std::vector<std::unique_ptr<IterBlock>> main_blocks_;
     std::vector<std::unique_ptr<IterBlock>> refine_blocks_;
+
+    // ===== Pair 初始化位置编码 =====
+    PositionalEncoding* pair_init_pos_enc_       = nullptr;
+    EmbeddingLayer*     pair_init_pos_enc_emb_res_  = nullptr; // (65, D_PAIR)
+    EmbeddingLayer*     pair_init_pos_enc_emb_atom_ = nullptr; // (17, D_PAIR)
     
     // 输出头
     //struct OutputHeads;

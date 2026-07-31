@@ -2,18 +2,37 @@
 #define RFAA_SE3_TRANSFORMER_H
 
 #include "Tensor.h"
-#include "Model.h"
+#include "Embedding.h"
 #include <vector>
 #include <string>
 #include <memory>
 #include <cmath>
 #include <array>
+#include <map>
+#include <set>
 #include <unordered_map>
 
 namespace rfaa {
 
 // 前向声明
-class Tensor;
+template<typename T> class Tensor;
+
+// SE3 配置 (与 RFAAConfig 对齐)
+struct SE3Config {
+    int num_degrees   = 2;   // SE(3) 表示的 degree 数
+    int num_channels  = 32;  // 通道数
+    int div           = 4;   // 除法因子
+    int n_heads       = 4;   // 注意力头数
+    int n_layers      = 2;   // GCN 层数
+    int hidden_dim    = 128; // 隐藏层维度
+    int node_dim      = 288; // 节点特征维度 (D_MSA + D_STATE)
+    int edge_dim      = 193; // 边特征维度 (D_PAIR + 64 + 1)
+    int l0_in_feats   = 32;  // degree-0 输入特征
+    int l0_out_feats  = 32;  // degree-0 输出特征
+    int l1_in_feats   = 16;  // degree-1 边特征
+    std::vector<int> l0_features = {32};  // degree-0 每层特征
+    std::vector<int> l1_features = {3};   // degree-1 每层特征
+};
 
 namespace se3 {
 
@@ -147,10 +166,15 @@ struct Fiber {
 
 // SE3 特征：存储不同类型特征的容器
 struct SE3Features {
-    std::vector<Tensor> features;  // 特征列表，每个特征对应一个不可约表示
+    std::vector<TensorF32> features;  // 特征列表，每个特征对应一个不可约表示
     
     SE3Features() = default;
-    SE3Features(const Fiber& fiber, const Tensor& prototype, int batch_size);
+    SE3Features(const Fiber& fiber, const TensorF32& prototype, int batch_size);
+    SE3Features(SE3Features&&) = default;
+    SE3Features& operator=(SE3Features&&) = default;
+    // 禁止拷贝
+    SE3Features(const SE3Features&) = delete;
+    SE3Features& operator=(const SE3Features&) = delete;
     
     void zero_();
     void add_(const SE3Features& other);
@@ -166,7 +190,7 @@ struct SE3Basis {
     int J_max_ = 0;
 
     // get_basis 缓存: key=(d_in, d_out) → (E, 1, 2*d_out+1, 1, 2*d_in+1, num_freq)
-    std::map<std::pair<int,int>, TensorF32> cache_;
+    mutable std::map<std::pair<int,int>, TensorF32> cache_;  // mutable: const get_basis 可修改
 
     SE3Basis() = default;
 
@@ -179,7 +203,7 @@ struct SE3Basis {
     //   for d_in, d_out: K_Js = [Y[J] @ Q_J for J in range(...)]
     //                   basis = stack(K_Js, -1).view(...)
     // 返回: (E, 1, 2*d_out+1, 1, 2*d_in+1, 2*min(d_in,d_out)+1)
-    const TensorF32& get_basis(int d_in, int d_out);
+    const TensorF32& get_basis(int d_in, int d_out) const;
 
     // Clebsch-Gordan 变换矩阵 Q_J(J, d_in, d_out)
     // 形状: (2*d_out+1, 2*d_in+1, 2*J+1)
@@ -331,7 +355,7 @@ private:
     Fiber f_in_, f_out_;
     // 每个度一个线性层: weights_[degree] 形状 (m_out, m_in)
     // 对标 Python: self.transform[str(d_out)]
-    std::unordered_map<int, LinearLayer> weights_;
+    std::unordered_map<int, LinearLayer*> weights_;
 };
 
 // GNormSE3：SE(3) 等变归一化层
@@ -344,8 +368,8 @@ public:
 private:
     Fiber fiber_;
     float eps_;
-    std::vector<Tensor> scales_;
-    std::vector<Tensor> biases_;
+    std::vector<TensorF32> scales_;
+    std::vector<TensorF32> biases_;
 };
 
 // ============================================================================
@@ -377,7 +401,7 @@ private:
     int N_;  // 节点数 (由 forward 确定)
 
     // fiber2head: (X, m, d_dim) → (X, n_heads, m/n_heads, d_dim)
-    TensorF32 fiber2head(const Tensor& feat, int m, int d_dim);
+    TensorF32 fiber2head(const TensorF32& feat, int m, int d_dim);
 
     // head2fiber: 逆操作 → (X, m, d_dim)
     TensorF32 head2fiber(const TensorF32& feat, int m, int d_dim);
@@ -467,7 +491,7 @@ public:
     
     SE3Features forward(const SE3Features& x,
                        const SE3Basis& basis,
-                       const Tensor& edge_index);
+                       const TensorI64& edge_index);
     
 private:
     Fiber fiber_in_;
@@ -502,6 +526,9 @@ public:
                    const Fiber& fiber_out,
                    int num_layers = 2, int edge_dim = 32,
                    int div = 4, int n_heads = 4, bool x_ij = false);
+    
+    // 便捷构造：从 SE3Config 构建默认 Fiber
+    explicit SE3Transformer(const SE3Config& cfg);
 
     // 前向传播
     // - h:          输入节点特征 SE3Features

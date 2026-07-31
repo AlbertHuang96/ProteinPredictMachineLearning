@@ -17,8 +17,8 @@ void MSATrack::init_from_features(const TensorF32& features) {
     int feat_dim = features.shape().dims.back();
     
     // 164 -> 256 hidden dim
-    LinearLayer linear(feat_dim, dim_);
-    repr_ = linear.forward(features);
+    //LinearLayer linear(feat_dim, dim_);
+    //repr_ = linear.forward(features);
 
     // Linear(feat_dim -> dim)
     // 这里简化，实际应调用 LinearLayer

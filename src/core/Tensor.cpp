@@ -365,7 +365,9 @@ std::string Tensor<T>::to_string() const {
 
 // 显式实例化
 template class Tensor<float>;
+template class Tensor<int64_t>;
 
 template<> DType Tensor<float>::dtype() const { return DType::F32; }
+template<> DType Tensor<int64_t>::dtype() const { return DType::I64; }
 
 } // namespace rfaa

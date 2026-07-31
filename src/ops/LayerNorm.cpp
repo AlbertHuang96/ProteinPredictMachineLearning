@@ -10,7 +10,7 @@ TensorF32 layer_norm(const TensorF32& input, float eps) {
     int64_t last_dim = shape.back();
     int64_t num_features = input.numel() / last_dim;
     
-    TensorF32 output = input;
+    TensorF32 output(input.shape(), input.device());
     float* data = output.data();
     const float* input_data = input.data();
     
@@ -51,7 +51,7 @@ TensorF32 layer_norm(const TensorF32& input, const TensorF32& gamma,
     const float* gamma_data = gamma.data();
     const float* beta_data = beta.data();
     
-    TensorF32 output = input;
+    TensorF32 output(input.shape(), input.device());
     float* data = output.data();
     const float* input_data = input.data();
     
