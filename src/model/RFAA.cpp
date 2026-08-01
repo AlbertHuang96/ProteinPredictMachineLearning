@@ -189,7 +189,17 @@ TensorF32 IterBlock::compute_l1_features(const TensorF32& coords) {
 void IterBlock::forward(TensorF32& msa, TensorF32& pair, 
                         TensorF32& state, 
                         const TensorF32& seq1hot,
-                        const TensorF32& coords) {
+                        const TensorF32& coords,
+                        const TensorF32& bond_feats,
+                        const TensorF32& dist_matrix,
+                        const TensorF32& same_chain,
+                        const TensorI64& residx) {
+    // residx 转 float 供 PositionalEncoding 使用
+    TensorF32 residx_f32(residx.shape());
+    if (residx.numel() > 0) {
+        for (int64_t i = 0; i < residx.numel(); ++i)
+            residx_f32.data()[i] = static_cast<float>(residx.data()[i]);
+    }
     
     if (update_msa_pair_) {
 
@@ -226,9 +236,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             // rel_pos, bond_dist = positionalEncoding(bond feat, dist matrix)
             // bias += linear(rel_pos) + linear(bond_dist)
 
-            // TODO: residx, bond_feats, dist_matrix, same_chain 需从外部输入传入
-            TensorF32 residx, bond_feats, dist_matrix, same_chain;
-            auto pos_out = pos_enc_->forward(coords, residx, bond_feats, dist_matrix, same_chain);
+            auto pos_out = pos_enc_->forward(coords, residx_f32, bond_feats, dist_matrix, same_chain);
             rbf_feature.copy_from(*add_impl(&rbf, &pos_out, /*inplace=*/false));
             // 旧栈上变量: LayerNorm pair_layernorm(D_PAIR); → pair2msa_norm_
             pair_biased.copy_from(*pair2msa_norm_->forward(&pair));
@@ -430,8 +438,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         TensorF32* edge_out = norm_edge_3d_->forward(&pair_emb);
 
         // ---- Step 4e: 构建图 ----
-        TensorI64 dummy_idx;  // TODO: 应从外部传入 idx_
-        se3::GraphData G = se3::make_graph(coords, *edge_out, dummy_idx, 64, 9);
+        se3::GraphData G = se3::make_graph(coords, *edge_out, residx, 64, 9);
 
         // ---- Step 4f: l1 特征 (位移向量) ----
         TensorF32 l1_feats = compute_l1_features(coords);  // (B*L, 3, 3)
@@ -516,7 +523,17 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
 void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
                         const TensorF32& seq1hot,
-                        const TensorF32& coords) {
+                        const TensorF32& coords,
+                        const TensorF32& bond_feats,
+                        const TensorF32& dist_matrix,
+                        const TensorF32& same_chain,
+                        const TensorI64& residx) {
+    // residx 转 float 供 PositionalEncoding 使用
+    TensorF32 residx_f32(residx.shape());
+    if (residx.numel() > 0) {
+        for (int64_t i = 0; i < residx.numel(); ++i)
+            residx_f32.data()[i] = static_cast<float>(residx.data()[i]);
+    }
     // FullBlock 在 IterBlock 的基础上增加了 msa_full 的使用和全局 column attention
     // msa_full 需要在 forward 函数参数中传入，或者在 IterBlock 中存储为成员变量
     
@@ -547,10 +564,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         // rel_pos, bond_dist = positionalEncoding(bond feat, dist matrix)
         // bias += linear(rel_pos) + linear(bond_dist)
 
-        // TODO: bond_feats, dist_matrix, same_chain 需从外部传入
-        // residx = residue index = index
-        TensorF32 residx, bond_feats, dist_matrix, same_chain;
-        auto pos_out = pos_enc_->forward(coords, residx, bond_feats, dist_matrix, same_chain);
+        auto pos_out = pos_enc_->forward(coords, residx_f32, bond_feats, dist_matrix, same_chain);
         rbf_feature.copy_from(*add_impl(&rbf, &pos_out, /*inplace=*/false));
         // 旧栈上变量: LayerNorm pair_layernorm(D_PAIR); → pair2msa_norm_
         pair_biased.copy_from(*pair2msa_norm_->forward(&pair));
@@ -674,8 +688,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         auto edge_emb = embed_e_->forward(pair_normed);
         auto edge_out = norm_edge_3d_->forward(&edge_emb);
 
-        TensorI64 dummy_idx;  // TODO: 应从外部传入 idx_
-        se3::GraphData G = se3::make_graph(coords, *edge_out, dummy_idx, 64, 9);
+        se3::GraphData G = se3::make_graph(coords, *edge_out, residx, 64, 9);
         TensorF32 l1_feats = compute_l1_features(coords);
 
         //Fiber fiber_in({NODE_3D_OUT, 3}, {0, 1});
@@ -758,21 +771,25 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
     has_seq_info_ = true;
 } */
 
-void RefineBlock::forward(TensorF32& msa_full, 
+void RefineBlock::forward(TensorF32& msa, 
                           TensorF32& pair, 
                           TensorF32& state, 
                           const TensorF32& seq1hot,
-                          const TensorF32& coords) {
+                          const TensorF32& coords,
+                          const TensorF32& bond_feats,
+                          const TensorF32& dist_matrix,
+                          const TensorF32& same_chain,
+                          const TensorI64& residx) {
 
     // ---- 获取维度 ----
-    const auto& msa_shape = msa_full.shape();
+    const auto& msa_shape = msa.shape();
     int B = static_cast<int>(msa_shape.dims[0]);
     int L = static_cast<int>(msa_shape.dims[2]);
 
     // ================================================================
     // Step 1: LayerNorm 归一化三个 track 输入
     // ================================================================
-    auto& node    = *norm_msa_->forward(&msa_full);     // (B, L, 256)
+    auto& node    = *norm_msa_->forward(&msa);     // (B, L, 256)
     auto& pair_n  = *norm_pair_->forward(&pair);        // (B, L, L, 128)
     auto& state_n = *norm_state_->forward(&state);      // (B, L, 32)
 
@@ -800,7 +817,6 @@ void RefineBlock::forward(TensorF32& msa_full,
     auto& pair_e1 = *norm_edge1_->forward(&pair_emb);
 
     // 获取辅助边特征
-    TensorI64 residx;  // TODO: 应从外部传入 idx_
     TensorF32 neighbor = se3::get_bonded_neigh(residx);            // (B, L, L, 1)
     TensorF32 rbf_feat = compute_rbf_feature(coords);      // (B, L, L, 64)
 
@@ -817,8 +833,7 @@ void RefineBlock::forward(TensorF32& msa_full,
     // Step 4: 构建消息传递图
     // Python: G = make_graph_topk(xyz, pair, idx, top_k=top_k)
     // ================================================================
-    TensorI64 dummy_idx_refine;  // TODO: 应从外部传入
-    se3::GraphData G = se3::make_graph(coords, *edge_out, dummy_idx_refine,
+    se3::GraphData G = se3::make_graph(coords, *edge_out, residx,
                              64 /* top_k */, 9 /* kmin */);
 
     // ================================================================
@@ -1409,10 +1424,12 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
         auto left  = pair_left_emb_->forward_exec(input.seq_tokens).unsqueeze(1);            // (B,1,L,128)
         auto right = pair_right_emb_->forward_exec(input.seq_tokens).unsqueeze(2);           // (B,L,1,128)
         auto pair_repr = outer_sum(left, right);                                              // (B,L,L,128)
-        // PositionalEncoding
-        TensorF32 bond_feats, dist_matrix, same_chain;  // TODO: 从 input 传入
-        TensorF32 dummy_residx;  // TODO: 应从 input 获取
-        auto pos_out = pair_init_pos_enc_->forward(pair_repr, dummy_residx, bond_feats, dist_matrix, same_chain);
+        // PositionalEncoding: 使用 input 中预计算的 bond_feats/dist_matrix/same_chain/residx
+        // idx 需要从 TensorI64 转为 TensorF32
+        TensorF32 residx_f32(input.residx.shape());
+        for (int64_t i = 0; i < input.residx.numel(); ++i)
+            residx_f32.data()[i] = static_cast<float>(input.residx.data()[i]);
+        auto pos_out = pair_init_pos_enc_->forward(pair_repr, residx_f32, input.bond_feats, input.dist_matrix, input.same_chain);
         pair_track_->representation().copy_from(*add_impl(&pair_repr, &pos_out, /*inplace=*/false));
     }
 
@@ -1464,7 +1481,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
             int B = t1d_emb.shape().dims[0], T = t1d_emb.shape().dims[1];
             auto state_q = state_track_->representation().view({B * L, 1, D_STATE});
             auto t1d_kv = t1d_emb.permute({0, 2, 1, 3}).view({B * L, T, 64});
-            CrossAttention cross_attn(D_STATE, 64, 8);  // Q=state(32), KV=template(64)
+            CrossAttention cross_attn(D_STATE, 64, 8);  // Q=state(32), KV=template(64), H=head(8)
             auto out = cross_attn.forward(state_q, t1d_kv);  // query, key-value
             // residual connection: state_rep + out_view (use graph node add_impl)
             auto& state_rep = state_track_->representation();
@@ -1472,8 +1489,10 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
             state_track_->representation().copy_from(*add_impl(&state_rep, &out_view, /*inplace=*/false));
         }
         TensorF32 templ_pair = get_templ_emb(input.t1d, input.t2d);  // (B,T,L,L,64)
-        // TODO: rbf_feature 应从前面的 IterBlock 计算中获得
-        TensorF32 rbf_feature;  // 占位，实际从 IterBlock 获取
+        // rbf_feature: 用初始 coords 计算 RBF 特征
+        TensorF32 init_coords;
+        init_coords.copy_from(input.coords);
+        TensorF32 rbf_feature = IterBlock::compute_rbf_feature(init_coords);  // (B, L, L, 64)
         // 旧: pair_track_->templ_stack(templ_pair, rbf_feature, input.t1d);
         // templ_stack 1406-1418
         // 旧栈上: LinearLayer t1d_proj(80,32), LayerNorm(64), TemplatePairStack
@@ -1515,15 +1534,15 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     // full/extra block use global column attention
 
     const TensorF32& seq1hot = one_hot_seq(input.seq_tokens, 21);
-    TensorI64 idx;  // TODO: 应从 input 获取 residue indices
-    set_seq_info(seq1hot, idx);
+    set_seq_info(seq1hot, input.residx);
 
     // Extra blocks
     // need to use msa_full
     // and use global column attention as well
     for (auto& block : extra_blocks_) {
         // stop grad
-        block->forward(msa_full, pair, state, seq1hot, coords);
+        block->forward(msa_full, pair, state, seq1hot, coords,
+                       input.bond_feats, input.dist_matrix, input.same_chain, input.residx);
         coords.copy_from(block->updated_coords());
     }
     
@@ -1531,7 +1550,8 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     for (auto& block : main_blocks_) {
         // stop grad
         // chiral grad
-        block->forward(msa, pair, state, seq1hot, coords);
+        block->forward(msa, pair, state, seq1hot, coords,
+                       input.bond_feats, input.dist_matrix, input.same_chain, input.residx);
         coords.copy_from(block->updated_coords());
     }
     

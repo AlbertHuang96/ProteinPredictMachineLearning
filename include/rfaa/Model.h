@@ -48,6 +48,8 @@ struct ModelInput {
     TensorF32 tor_feat;
     TensorF32 bond_feats;    // (B, L, L, d_bond) - 键特征
     TensorF32 dist_matrix;   // (B, L, L) - 距离矩阵
+    TensorF32 same_chain;    // (B, L, L) - 同链掩码
+    TensorI64 residx;        // (B, L) - 残基索引
 };
 
 // 模型输出
@@ -98,12 +100,16 @@ public:
     // 输入/输出通过引用修改
     virtual void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
                  const TensorF32& seq1hot,
-                 const TensorF32& coords);
+                 const TensorF32& coords,
+                 const TensorF32& bond_feats  = TensorF32(),
+                 const TensorF32& dist_matrix = TensorF32(),
+                 const TensorF32& same_chain  = TensorF32(),
+                 const TensorI64& residx       = TensorI64());
 
     void proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state);
 
-    TensorF32 compute_rbf_feature(const TensorF32& coords);
-    TensorF32 compute_l1_features(const TensorF32& coords);
+    static TensorF32 compute_rbf_feature(const TensorF32& coords);
+    static TensorF32 compute_l1_features(const TensorF32& coords);
     
 protected:
     // 子模块 (protected 允许 FullBlock/RefineBlock 子类访问)
@@ -179,7 +185,11 @@ public:
 
     void forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
                  const TensorF32& seq1hot,
-                 const TensorF32& coords) override;
+                 const TensorF32& coords,
+                 const TensorF32& bond_feats  = TensorF32(),
+                 const TensorF32& dist_matrix = TensorF32(),
+                 const TensorF32& same_chain  = TensorF32(),
+                 const TensorI64& residx       = TensorI64()) override;
 private:
     std::unique_ptr<MSAGlobalColAttention> msa_global_col_attn_;
 };
@@ -194,7 +204,11 @@ public:
 
     void forward(TensorF32& msa, TensorF32& pair, TensorF32& state, 
                  const TensorF32& seq1hot,
-                 const TensorF32& coords) override;
+                 const TensorF32& coords,
+                 const TensorF32& bond_feats  = TensorF32(),
+                 const TensorF32& dist_matrix = TensorF32(),
+                 const TensorF32& same_chain  = TensorF32(),
+                 const TensorI64& residx       = TensorI64()) override;
 
                  // 设置额外输入（在 forward 调用前设置）
     //void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);

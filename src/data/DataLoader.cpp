@@ -1287,11 +1287,31 @@ ModelInput RFAADataLoader::load_from_files(
     /* alpha_mask = alpha_mask.reshape(1,-1,L,10,1) */
     /* alpha_t = torch.cat((alpha, alpha_mask), dim=-1).reshape(1, -1, L, 30) */
 
-    // TODO: torsions, bond_feats, dist_matrix — 需要 xyz_t 和完整实现
+    // bond_feats, dist_matrix, same_chain, residx — 不依赖模板，可直接计算
+    {
+        int L = static_cast<int>(sequence.length());
+        input.bond_feats = get_protein_bond_feats(L);
+        input.bond_feats = input.bond_feats.unsqueeze(0);  // (L, L) → (1, L, L)
+        input.dist_matrix = get_bond_distances(get_protein_bond_feats(L));
+        input.dist_matrix = input.dist_matrix.unsqueeze(0); // (L, L) → (1, L, L)
+
+        // same_chain: 全 1 (单链场景)
+        TensorF32 same_chain({L, L});
+        same_chain.data()[0] = 1.0f;  // 触发分配
+        same_chain.zero_();
+        float* sc_data = same_chain.data();
+        for (int i = 0; i < L * L; i++) sc_data[i] = 1.0f;
+        input.same_chain = same_chain.unsqueeze(0);  // (1, L, L)
+
+        // residx: 0, 1, 2, ..., L-1
+        TensorI64 residx({L});
+        int64_t* ri_data = residx.data();
+        for (int i = 0; i < L; i++) ri_data[i] = static_cast<int64_t>(i);
+        input.residx = residx.unsqueeze(0);  // (1, L)
+    }
+
+    // TODO: torsions — 需要 xyz_t
     // input.tor_feat = get_torsions(xyz_t, sequence).torsions;
-    // int L = static_cast<int>(sequence.length());
-    // input.bond_feats = get_protein_bond_feats(L);
-    // input.dist_matrix = get_bond_distances(input.bond_feats);
 
     // Step 2: 解析 HHR
     /* HHRData hhr_data = parse_hhr(hhr_path);
@@ -2030,11 +2050,10 @@ TensorF32 RFAADataLoader::get_protein_bond_feats(int protein_L) {
     bond_feats.zero_();
     
     // 设置相邻残基之间的键（值为 5）
-    // 正向: (0,1), (1,2), ..., (L-2, L-1)
-    // 反向: (1,0), (2,1), ..., (L-1, L-2)
+    float* data = bond_feats.data();
     for (int i = 0; i < protein_L - 1; i++) {
-        //bond_feats.at({i, i + 1}) = 5.0f;
-        //bond_feats.at({i + 1, i}) = 5.0f;
+        data[i * protein_L + (i + 1)] = 5.0f;  // (i, i+1)
+        data[(i + 1) * protein_L + i] = 5.0f;  // (i+1, i)
     }
     
     return bond_feats;

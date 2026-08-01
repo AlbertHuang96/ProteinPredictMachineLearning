@@ -148,13 +148,20 @@ class CrossAttention {
 public:
     CrossAttention(int q_dim, int kv_dim, int n_head);
     
-    // query: (B, L, q_dim), kv: (B, T, L, kv_dim)
+    // query: (B*L, 1, q_dim), kv: (B*L, T, kv_dim)
+    // 输出: (B*L, 1, q_dim)
     TensorF32 forward(const TensorF32& query, const TensorF32& kv);
     
 private:
     int q_dim_, kv_dim_, n_head_;
-    //struct Impl;
-    //std::unique_ptr<Impl> impl_;
+    int head_dim_;   // = proj_dim / n_head, where proj_dim = max(q_dim, kv_dim) aligned to n_head
+    int proj_dim_;   // 公共投影维度 = n_head * head_dim
+
+    // 投影层: 把 Q 和 KV 投影到相同的 proj_dim
+    std::unique_ptr<LinearLayer> Wq_;   // q_dim → proj_dim
+    std::unique_ptr<LinearLayer> Wk_;   // kv_dim → proj_dim
+    std::unique_ptr<LinearLayer> Wv_;   // kv_dim → proj_dim
+    std::unique_ptr<LinearLayer> Wo_;   // proj_dim → q_dim (输出投影)
 };
 
 // Triangle Multiplication (Outgoing / Incoming)
