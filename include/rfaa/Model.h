@@ -280,6 +280,15 @@ public:
     // 加载/保存权重
     void load_weights(const std::string& path);
     void save_weights(const std::string& path) const;
+
+    // 收集所有参数 Tensor (weight/bias/gamma/beta), 顺序固定, 供保存/加载/统计使用
+    // 注意: 返回的是指向内部参数存储的裸指针集合, 仅用于读取; 生命周期由模型管理。
+    std::vector<TensorF32*> params();
+
+    // 收集所有参数 Tensor 及与之顺序一一对应的语义名 (block/attention 等), 供 GGUF 保存。
+    // param_names[i] 与 param_tensors[i] 严格对应, 不可交错。
+    void collect_params_with_names(std::vector<TensorF32*>& param_tensors,
+                                   std::vector<std::string>& param_names);
     
     // 设备管理
     void to(Device device);
@@ -519,6 +528,9 @@ private:
 
     void ensure_backend_ready();
     void transfer_params_to_backend();
+
+    // 收集所有参数 tensor 到指定容器 (weight/bias/gamma/beta), 顺序固定
+    void collect_all_params(std::vector<TensorF32*>& param_tensors);
 };
 
 } // namespace rfaa

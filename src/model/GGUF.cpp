@@ -77,9 +77,10 @@ struct GGUFLayout {
 };
 
 static GGUFLayout compute_layout(
-    const std::vector<Tensor*>& params,
+    const std::vector<TensorF32*>& params,
     const std::vector<std::pair<std::string, float>>& float_meta,
-    const std::vector<std::pair<std::string, std::string>>& str_meta)
+    const std::vector<std::pair<std::string, std::string>>& str_meta,
+    const std::vector<std::string>& tensor_names = {})
 {
     GGUFLayout L;
 
@@ -93,13 +94,18 @@ static GGUFLayout compute_layout(
 
     // ===== 3. Tensor Infos 大小 =====
     L.tensor_infos_bytes = 0;
-    for (auto* t : params) {
-        // tensor name 用空字符串 (快速 scan)
-        L.tensor_infos_bytes += SIZE_T_LEN + 0                    // name_len + ""
-                               + 4                                 // n_dims
-                               + t->ndim() * SIZE_T_LEN            // dims[]
-                               + 4                                 // type
-                               + 8;                                // offset
+    for (size_t i = 0; i < params.size(); i++) {
+        // 优先使用语义名; 未提供时退回 tensor_{i} 编号, 便于可读
+        std::string name;
+        if (i < tensor_names.size() && !tensor_names[i].empty())
+            name = tensor_names[i];
+        else
+            name = "tensor_" + std::to_string(i);
+        L.tensor_infos_bytes += SIZE_T_LEN + name.size()    // name_len + name
+                               + 4                           // n_dims
+                               + params[i]->shape().ndim() * SIZE_T_LEN  // dims[]
+                               + 4                           // type
+                               + 8;                          // offset
     }
 
     // ===== 4. 数据起点 (对齐) =====
@@ -119,13 +125,14 @@ static GGUFLayout compute_layout(
     return L;
 }
 
-void save_gguf(const std::vector<Tensor*>& params,
+void save_gguf(const std::vector<TensorF32*>& params,
                const std::string& path,
                const std::vector<std::pair<std::string, float>>& float_meta,
-               const std::vector<std::pair<std::string, std::string>>& str_meta)
+               const std::vector<std::pair<std::string, std::string>>& str_meta,
+               const std::vector<std::string>& tensor_names)
 {
     // ===== 阶段 A: 纯算术计算布局 =====
-    GGUFLayout L = compute_layout(params, float_meta, str_meta);
+    GGUFLayout L = compute_layout(params, float_meta, str_meta, tensor_names);
 
     // ===== 阶段 B: 顺序写入文件 (一次性, 不 seek 回跳) =====
     std::ofstream ofs(path, std::ios::binary);
@@ -154,15 +161,20 @@ void save_gguf(const std::vector<Tensor*>& params,
 
     // ------ B4: Tensor Infos ------
     for (size_t i = 0; i < params.size(); i++) {
-        Tensor* t = params[i];
+        TensorF32* t = params[i];
 
-        // 名称 (用 index 编号，可选)，这里暂为空
-        w.u64(0);  // name_len = 0
+        // 名称 (优先语义名; 否则退回 index 编号)
+        std::string tname;
+        if (i < tensor_names.size() && !tensor_names[i].empty())
+            tname = tensor_names[i];
+        else
+            tname = "tensor_" + std::to_string(i);
+        w.str(tname);
 
         // 维度
-        w.u32(static_cast<uint32_t>(t->ndim()));
-        for (int d = 0; d < t->ndim(); d++) {
-            w.u64(static_cast<uint64_t>(t->dims()[d]));
+        w.u32(static_cast<uint32_t>(t->shape().ndim()));
+        for (int d = 0; d < t->shape().ndim(); d++) {
+            w.u64(static_cast<uint64_t>(t->shape().dims[d]));
         }
 
         // 类型 (F32)
@@ -177,7 +189,7 @@ void save_gguf(const std::vector<Tensor*>& params,
 
     // ------ B6: Tensor 数据 ------
     for (size_t i = 0; i < params.size(); i++) {
-        Tensor* t = params[i];
+        TensorF32* t = params[i];
         size_t bytes = t->numel() * sizeof(float);
         w.raw(t->data(), bytes);
         w.pad_to(GGUF_ALIGN);  // 对齐下一个 tensor
@@ -187,7 +199,7 @@ void save_gguf(const std::vector<Tensor*>& params,
 }
 
 void load_gguf(const std::string& path,
-               std::vector<Tensor*>& params)
+               std::vector<TensorF32*>& params)
 {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) throw std::runtime_error("Cannot open: " + path);
@@ -250,11 +262,11 @@ void load_gguf(const std::string& path,
     // ------ 4. 定位到每个 offset 读数据 ------
     for (uint64_t i = 0; i < tensor_count; i++) {
         // 校验形状 (轻量)
-        Tensor* t = params[i];
-        if (static_cast<uint32_t>(t->ndim()) != tinfos[i].dims.size())
+        TensorF32* t = params[i];
+        if (static_cast<uint32_t>(t->shape().ndim()) != tinfos[i].dims.size())
             throw std::runtime_error("Dimension count mismatch for tensor " + std::to_string(i));
         for (size_t d = 0; d < tinfos[i].dims.size(); d++) {
-            if (static_cast<uint64_t>(t->dims()[d]) != tinfos[i].dims[d])
+            if (static_cast<uint64_t>(t->shape().dims[d]) != tinfos[i].dims[d])
                 throw std::runtime_error("Shape mismatch for tensor " + std::to_string(i) +
                     " dim[" + std::to_string(d) + "]");
         }

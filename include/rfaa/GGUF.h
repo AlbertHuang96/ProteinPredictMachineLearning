@@ -1,6 +1,10 @@
 #pragma once 
 
 #include <cstdint>
+#include <string>
+#include <vector>
+
+#include "rfaa/Tensor.h"
 
 namespace rfaa {
 
@@ -24,8 +28,8 @@ namespace rfaa {
 enum class GGMLQuantType : uint32_t {
     F32  = 0,
     F16  = 1,
-    Q4_0    = 2
-    Q4_1    = 3
+    Q4_0    = 2,
+    Q4_1    = 3,
     I8   = 24,
     I16  = 25,
     I32  = 26,
@@ -34,11 +38,12 @@ enum class GGMLQuantType : uint32_t {
 };
 
 void load_gguf(const std::string& path,
-               std::vector<Tensor*>& params);
+               std::vector<TensorF32*>& params);
 
-void save_gguf(const std::vector<Tensor*>& params,
+void save_gguf(const std::vector<TensorF32*>& params,
                const std::string& path,
                const std::vector<std::pair<std::string, float>>& float_meta,
-               const std::vector<std::pair<std::string, std::string>>& str_meta);
+               const std::vector<std::pair<std::string, std::string>>& str_meta,
+               const std::vector<std::string>& tensor_names = {});
 
 } // namespace rfaa

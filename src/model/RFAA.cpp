@@ -1677,184 +1677,249 @@ void RFAAModel::load_weights(const std::string& path) {
     std::cout << "Weights loaded and transferred to backend buffer." << std::endl;
 }
 
+// ============================================================
+// 私有辅助: 收集所有参数 Tensor (weight/bias/gamma/beta), 顺序固定
+// 供 transfer_params_to_backend / params() / 保存共用
+// ============================================================
+void RFAAModel::collect_all_params(std::vector<TensorF32*>& param_tensors) {
+    std::vector<std::string> names;  // 无名字版本: 忽略名字
+    collect_params_with_names(param_tensors, names);
+}
+
+// ============================================================
+// 收集所有参数 Tensor 及语义名 (block/attention 等), 顺序与 param_tensors 严格一一对应。
+// 命名规范 (对齐 RF2/AlphaFold 惯例):
+//   - 全局单份参数: "msa_emb", "state_emb", "pair_left_emb" ...
+//   - 模板参数:     "tps.<layer>"
+//   - per-block:    "main.{i}.attention.<attn>.<proj>", "extra.{i}.", "refine.{i}." ...
+//     (extra = FullBlock, main = IterBlock, 均共享 iter_* 参数, 索引为全局 0..11)
+//   - 每个 LinearLayer: <name>.weight / <name>.bias
+//   - 每个 LayerNorm:   <name>.gamma / <name>.beta
+//   - 每个 Embedding:   <name>.weight
+// ============================================================
+void RFAAModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors,
+                                          std::vector<std::string>& param_names) {
+    // 辅助 lambda：收集 LinearLayer / LayerNorm / EmbeddingLayer 的参数及名字
+    auto collect_linear = [&](LinearLayer* ll, const std::string& name) {
+        if (ll && ll->weight()) {
+            param_tensors.push_back(ll->weight());
+            if (!param_names.empty()) param_names.push_back(name + ".weight");
+        }
+        if (ll && ll->bias()) {
+            param_tensors.push_back(ll->bias());
+            if (!param_names.empty()) param_names.push_back(name + ".bias");
+        }
+    };
+    auto collect_layernorm = [&](LayerNorm* ln, const std::string& name) {
+        if (ln && ln->gamma()) {
+            param_tensors.push_back(ln->gamma());
+            if (!param_names.empty()) param_names.push_back(name + ".gamma");
+        }
+        if (ln && ln->beta()) {
+            param_tensors.push_back(ln->beta());
+            if (!param_names.empty()) param_names.push_back(name + ".beta");
+        }
+    };
+    auto collect_embedding = [&](EmbeddingLayer* emb, const std::string& name) {
+        if (emb && emb->weight()) {
+            param_tensors.push_back(emb->weight());
+            if (!param_names.empty()) param_names.push_back(name + ".weight");
+        }
+    };
+
+    // embedding / template 全局参数
+    collect_linear(msa_emb_, "msa_emb");
+    collect_embedding(state_emb_, "state_emb");
+    collect_embedding(pair_left_emb_, "pair_left_emb");
+    collect_embedding(pair_right_emb_, "pair_right_emb");
+    collect_linear(full_linear_, "full_linear");
+    collect_embedding(full_emb_, "full_emb");
+    collect_linear(bond_emb_, "bond_emb");
+    collect_linear(emb_t1d_, "emb_t1d");
+    collect_linear(proj_t1d_, "proj_t1d");
+    collect_linear(emb_t1d_t2d_, "emb_t1d_t2d");
+    collect_linear(temp_stack_t1d_proj_, "temp_stack_t1d_proj");
+    collect_layernorm(temp_stack_norm_, "temp_stack_norm");
+
+    // ===== TemplatePairStack 参数 =====
+    collect_linear(tps_rbf_proj_, "tps.rbf_proj");
+    collect_layernorm(tps_state_norm_, "tps.state_norm");
+    collect_linear(tps_left_proj_, "tps.left_proj");
+    collect_linear(tps_right_proj_, "tps.right_proj");
+    collect_linear(tps_gate_proj_, "tps.gate_proj");
+    // tri_mul_out
+    collect_layernorm(tps_tri_out_layernorm_, "tps.tri_mul_out.layernorm");
+    collect_linear(tps_tri_out_left_proj_, "tps.tri_mul_out.left_proj");
+    collect_linear(tps_tri_out_right_proj_, "tps.tri_mul_out.right_proj");
+    collect_linear(tps_tri_out_left_gate_, "tps.tri_mul_out.left_gate");
+    collect_linear(tps_tri_out_right_gate_, "tps.tri_mul_out.right_gate");
+    collect_linear(tps_tri_out_gate_, "tps.tri_mul_out.gate");
+    collect_layernorm(tps_tri_out_output_layernorm_, "tps.tri_mul_out.output_layernorm");
+    collect_linear(tps_tri_out_out_proj_, "tps.tri_mul_out.out_proj");
+    // tri_mul_in
+    collect_layernorm(tps_tri_in_layernorm_, "tps.tri_mul_in.layernorm");
+    collect_linear(tps_tri_in_left_proj_, "tps.tri_mul_in.left_proj");
+    collect_linear(tps_tri_in_right_proj_, "tps.tri_mul_in.right_proj");
+    collect_linear(tps_tri_in_left_gate_, "tps.tri_mul_in.left_gate");
+    collect_linear(tps_tri_in_right_gate_, "tps.tri_mul_in.right_gate");
+    collect_linear(tps_tri_in_gate_, "tps.tri_mul_in.gate");
+    collect_layernorm(tps_tri_in_output_layernorm_, "tps.tri_mul_in.output_layernorm");
+    collect_linear(tps_tri_in_out_proj_, "tps.tri_mul_in.out_proj");
+    // pair_row_attn
+    collect_linear(tps_pair_row_to_b_, "tps.attention.pair_row.to_b");
+    collect_linear(tps_pair_row_to_g_, "tps.attention.pair_row.to_g");
+    collect_linear(tps_pair_row_to_out_, "tps.attention.pair_row.to_out");
+    collect_linear(tps_pair_row_Wq_, "tps.attention.pair_row.Wq");
+    collect_linear(tps_pair_row_Wk_, "tps.attention.pair_row.Wk");
+    collect_linear(tps_pair_row_Wv_, "tps.attention.pair_row.Wv");
+    // pair_col_attn
+    collect_linear(tps_pair_col_to_b_, "tps.attention.pair_col.to_b");
+    collect_linear(tps_pair_col_to_g_, "tps.attention.pair_col.to_g");
+    collect_linear(tps_pair_col_to_out_, "tps.attention.pair_col.to_out");
+    collect_linear(tps_pair_col_Wq_, "tps.attention.pair_col.Wq");
+    collect_linear(tps_pair_col_Wk_, "tps.attention.pair_col.Wk");
+    collect_linear(tps_pair_col_Wv_, "tps.attention.pair_col.Wv");
+    // pair_ff
+    collect_layernorm(tps_pair_ff_norm_, "tps.pair_ff.norm");
+    collect_linear(tps_pair_ff_linear1_, "tps.pair_ff.linear1");
+    collect_linear(tps_pair_ff_linear2_, "tps.pair_ff.linear2");
+
+    // attention 参数 (12 blocks × 6 LinearLayer × 6 组)
+    // extra = FullBlock (索引 0..3), main = IterBlock (索引 4..11)
+    const std::string iter_block_name[12] = {
+        "extra.0", "extra.1", "extra.2", "extra.3",
+        "main.0",  "main.1",  "main.2",  "main.3",
+        "main.4",  "main.5",  "main.6",  "main.7",
+    };
+
+    for (int i = 0; i < N_ITER; ++i) {
+        const std::string& b = iter_block_name[i];
+        collect_linear(msa_row_Wq_[i], b + ".attention.msa_row.Wq");
+        collect_linear(msa_row_Wk_[i], b + ".attention.msa_row.Wk");
+        collect_linear(msa_row_Wv_[i], b + ".attention.msa_row.Wv");
+        collect_linear(msa_row_to_b_[i], b + ".attention.msa_row.to_b");
+        collect_linear(msa_row_to_g_[i], b + ".attention.msa_row.to_g");
+        collect_linear(msa_row_to_out_[i], b + ".attention.msa_row.to_out");
+
+        collect_linear(msa_col_Wq_[i], b + ".attention.msa_col.Wq");
+        collect_linear(msa_col_Wk_[i], b + ".attention.msa_col.Wk");
+        collect_linear(msa_col_Wv_[i], b + ".attention.msa_col.Wv");
+        collect_linear(msa_col_to_b_[i], b + ".attention.msa_col.to_b");
+        collect_linear(msa_col_to_g_[i], b + ".attention.msa_col.to_g");
+        collect_linear(msa_col_to_out_[i], b + ".attention.msa_col.to_out");
+
+        collect_linear(pair_row_Wq_[i], b + ".attention.pair_row.Wq");
+        collect_linear(pair_row_Wk_[i], b + ".attention.pair_row.Wk");
+        collect_linear(pair_row_Wv_[i], b + ".attention.pair_row.Wv");
+        collect_linear(pair_row_to_b_[i], b + ".attention.pair_row.to_b");
+        collect_linear(pair_row_to_g_[i], b + ".attention.pair_row.to_g");
+        collect_linear(pair_row_to_out_[i], b + ".attention.pair_row.to_out");
+
+        collect_linear(pair_col_Wq_[i], b + ".attention.pair_col.Wq");
+        collect_linear(pair_col_Wk_[i], b + ".attention.pair_col.Wk");
+        collect_linear(pair_col_Wv_[i], b + ".attention.pair_col.Wv");
+        collect_linear(pair_col_to_b_[i], b + ".attention.pair_col.to_b");
+        collect_linear(pair_col_to_g_[i], b + ".attention.pair_col.to_g");
+        collect_linear(pair_col_to_out_[i], b + ".attention.pair_col.to_out");
+
+        collect_layernorm(msa_ff_norm_[i], b + ".msa_ff.norm");
+        collect_linear(msa_ff_linear1_[i], b + ".msa_ff.linear1");
+        collect_linear(msa_ff_linear2_[i], b + ".msa_ff.linear2");
+
+        collect_layernorm(pair_ff_norm_[i], b + ".pair_ff.norm");
+        collect_linear(pair_ff_linear1_[i], b + ".pair_ff.linear1");
+        collect_linear(pair_ff_linear2_[i], b + ".pair_ff.linear2");
+
+        // TriangleMultiplication out
+        collect_layernorm(tri_out_layernorm_[i], b + ".tri_mul_out.layernorm");
+        collect_linear(tri_out_left_proj_[i], b + ".tri_mul_out.left_proj");
+        collect_linear(tri_out_right_proj_[i], b + ".tri_mul_out.right_proj");
+        collect_linear(tri_out_left_gate_[i], b + ".tri_mul_out.left_gate");
+        collect_linear(tri_out_right_gate_[i], b + ".tri_mul_out.right_gate");
+        collect_linear(tri_out_gate_[i], b + ".tri_mul_out.gate");
+        collect_layernorm(tri_out_output_layernorm_[i], b + ".tri_mul_out.output_layernorm");
+        collect_linear(tri_out_out_proj_[i], b + ".tri_mul_out.out_proj");
+
+        // TriangleMultiplication in
+        collect_layernorm(tri_in_layernorm_[i], b + ".tri_mul_in.layernorm");
+        collect_linear(tri_in_left_proj_[i], b + ".tri_mul_in.left_proj");
+        collect_linear(tri_in_right_proj_[i], b + ".tri_mul_in.right_proj");
+        collect_linear(tri_in_left_gate_[i], b + ".tri_mul_in.left_gate");
+        collect_linear(tri_in_right_gate_[i], b + ".tri_mul_in.right_gate");
+        collect_linear(tri_in_gate_[i], b + ".tri_mul_in.gate");
+        collect_layernorm(tri_in_output_layernorm_[i], b + ".tri_mul_in.output_layernorm");
+        collect_linear(tri_in_out_proj_[i], b + ".tri_mul_in.out_proj");
+
+        // IterBlock 3D SE 参数
+        collect_linear(iter_embed_x_[i], b + ".embed_x");
+        collect_linear(iter_embed_e_[i], b + ".embed_e");
+        collect_layernorm(iter_norm_node_3d_[i], b + ".norm_node_3d");
+        collect_layernorm(iter_norm_edge_3d_[i], b + ".norm_edge_3d");
+        collect_layernorm(iter_norm_msa_3d_[i], b + ".norm_msa_3d");
+        collect_layernorm(iter_norm_pair_3d_[i], b + ".norm_pair_3d");
+
+        // IterBlock forward 内部参数
+        collect_layernorm(iter_state2msa_norm_[i], b + ".state2msa_norm");
+        collect_linear(iter_state2msa_linear_[i], b + ".state2msa_linear");
+        collect_layernorm(iter_pair2msa_norm_[i], b + ".pair2msa_norm");
+        collect_layernorm(iter_msa2pair_norm_[i], b + ".msa2pair_norm");
+        collect_linear(iter_msa2pair_left_proj_[i], b + ".msa2pair_left_proj");
+        collect_linear(iter_msa2pair_right_proj_[i], b + ".msa2pair_right_proj");
+        collect_linear(iter_msa2pair_out_proj_[i], b + ".msa2pair_out_proj");
+        collect_linear(iter_pair2pair_rbf_proj_[i], b + ".pair2pair_rbf_proj");
+        collect_layernorm(iter_pair2pair_state_norm_[i], b + ".pair2pair_state_norm");
+        collect_linear(iter_pair2pair_left_proj_[i], b + ".pair2pair_left_proj");
+        collect_linear(iter_pair2pair_right_proj_[i], b + ".pair2pair_right_proj");
+        collect_linear(iter_pair2pair_gate_proj_[i], b + ".pair2pair_gate_proj");
+    }
+
+    // MSAGlobalColAttention 参数 (FullBlock only, N_GLOB=4)
+    for (int i = 0; i < N_GLOB; ++i) {
+        const std::string& b = iter_block_name[i];  // extra.{0..3}
+        collect_linear(msa_global_col_Wq_[i], b + ".attention.global_col.Wq");
+        collect_linear(msa_global_col_Wk_[i], b + ".attention.global_col.Wk");
+        collect_linear(msa_global_col_Wv_[i], b + ".attention.global_col.Wv");
+        collect_linear(msa_global_col_to_b_[i], b + ".attention.global_col.to_b");
+        collect_linear(msa_global_col_to_g_[i], b + ".attention.global_col.to_g");
+        collect_linear(msa_global_col_to_out_[i], b + ".attention.global_col.to_out");
+    }
+
+    // PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer, 12 组)
+    for (int i = 0; i < N_ITER; ++i) {
+        const std::string& b = iter_block_name[i];
+        collect_embedding(pos_enc_emb_res_[i], b + ".pos_enc_emb_res");
+        collect_embedding(pos_enc_emb_atom_[i], b + ".pos_enc_emb_atom");
+    }
+
+    // RefineBlock 参数 (N_REFINE_BLOCKS=4)
+    for (int i = 0; i < (int)refine_norm_msa_.size(); ++i) {
+        const std::string b = "refine." + std::to_string(i);
+        collect_layernorm(refine_norm_msa_[i], b + ".norm_msa");
+        collect_layernorm(refine_norm_pair_[i], b + ".norm_pair");
+        collect_layernorm(refine_norm_state_[i], b + ".norm_state");
+        collect_linear(refine_embed_x_[i], b + ".embed_x");
+        collect_layernorm(refine_norm_node_[i], b + ".norm_node");
+        collect_linear(refine_embed_e1_[i], b + ".embed_e1");
+        collect_layernorm(refine_norm_edge1_[i], b + ".norm_edge1");
+        collect_linear(refine_embed_e2_[i], b + ".embed_e2");
+        collect_layernorm(refine_norm_edge2_[i], b + ".norm_edge2");
+    }
+}
+
+std::vector<TensorF32*> RFAAModel::params() {
+    std::vector<TensorF32*> out;
+    collect_all_params(out);
+    return out;
+}
+
 void RFAAModel::transfer_params_to_backend() {
     if (!scheduler_ || !cpu_backend_) return;
 
     const BufferType* cpu_buft = cpu_backend_->buffer_type();
 
-    // ===== Step 1: 统计所有参数 tensor 的总大小（对标 ggml_backend_alloc_ctx_tensors 的 phase 1）=====
-    // 收集所有需要搬迁的参数 tensor
+    // ===== Step 1: 收集所有需要搬迁的参数 tensor =====
     std::vector<TensorF32*> param_tensors;
-
-    // 辅助 lambda：递归收集所有 LinearLayer / LayerNorm / EmbeddingLayer 的参数
-    auto collect_linear = [&](LinearLayer* ll) {
-        if (ll && ll->weight()) param_tensors.push_back(ll->weight());
-        if (ll && ll->bias())   param_tensors.push_back(ll->bias());
-    };
-    auto collect_layernorm = [&](LayerNorm* ln) {
-        if (ln && ln->gamma()) param_tensors.push_back(ln->gamma());
-        if (ln && ln->beta())  param_tensors.push_back(ln->beta());
-    };
-    auto collect_embedding = [&](EmbeddingLayer* emb) {
-        if (emb && emb->weight()) param_tensors.push_back(emb->weight());
-    };
-
-    // embedding / template 全局参数
-    collect_linear(msa_emb_);
-    collect_embedding(state_emb_);
-    collect_embedding(pair_left_emb_);
-    collect_embedding(pair_right_emb_);
-    collect_linear(full_linear_);
-    collect_embedding(full_emb_);
-    collect_linear(bond_emb_);
-    collect_linear(emb_t1d_);
-    collect_linear(proj_t1d_);
-    collect_linear(emb_t1d_t2d_);
-    collect_linear(temp_stack_t1d_proj_);
-    collect_layernorm(temp_stack_norm_);
-
-    // ===== TemplatePairStack 参数 =====
-    collect_linear(tps_rbf_proj_);
-    collect_layernorm(tps_state_norm_);
-    collect_linear(tps_left_proj_);
-    collect_linear(tps_right_proj_);
-    collect_linear(tps_gate_proj_);
-    // tri_mul_out
-    collect_layernorm(tps_tri_out_layernorm_);
-    collect_linear(tps_tri_out_left_proj_);
-    collect_linear(tps_tri_out_right_proj_);
-    collect_linear(tps_tri_out_left_gate_);
-    collect_linear(tps_tri_out_right_gate_);
-    collect_linear(tps_tri_out_gate_);
-    collect_layernorm(tps_tri_out_output_layernorm_);
-    collect_linear(tps_tri_out_out_proj_);
-    // tri_mul_in
-    collect_layernorm(tps_tri_in_layernorm_);
-    collect_linear(tps_tri_in_left_proj_);
-    collect_linear(tps_tri_in_right_proj_);
-    collect_linear(tps_tri_in_left_gate_);
-    collect_linear(tps_tri_in_right_gate_);
-    collect_linear(tps_tri_in_gate_);
-    collect_layernorm(tps_tri_in_output_layernorm_);
-    collect_linear(tps_tri_in_out_proj_);
-    // pair_row_attn
-    collect_linear(tps_pair_row_to_b_);
-    collect_linear(tps_pair_row_to_g_);
-    collect_linear(tps_pair_row_to_out_);
-    collect_linear(tps_pair_row_Wq_);
-    collect_linear(tps_pair_row_Wk_);
-    collect_linear(tps_pair_row_Wv_);
-    // pair_col_attn
-    collect_linear(tps_pair_col_to_b_);
-    collect_linear(tps_pair_col_to_g_);
-    collect_linear(tps_pair_col_to_out_);
-    collect_linear(tps_pair_col_Wq_);
-    collect_linear(tps_pair_col_Wk_);
-    collect_linear(tps_pair_col_Wv_);
-    // pair_ff
-    collect_layernorm(tps_pair_ff_norm_);
-    collect_linear(tps_pair_ff_linear1_);
-    collect_linear(tps_pair_ff_linear2_);
-
-    // attention 参数 (12 blocks × 6 LinearLayer × 6 组)
-    for (auto* ll : msa_row_Wq_)     collect_linear(ll);
-    for (auto* ll : msa_row_Wk_)     collect_linear(ll);
-    for (auto* ll : msa_row_Wv_)     collect_linear(ll);
-    for (auto* ll : msa_row_to_b_)   collect_linear(ll);
-    for (auto* ll : msa_row_to_g_)   collect_linear(ll);
-    for (auto* ll : msa_row_to_out_) collect_linear(ll);
-
-    for (auto* ll : msa_col_Wq_)     collect_linear(ll);
-    for (auto* ll : msa_col_Wk_)     collect_linear(ll);
-    for (auto* ll : msa_col_Wv_)     collect_linear(ll);
-    for (auto* ll : msa_col_to_b_)   collect_linear(ll);
-    for (auto* ll : msa_col_to_g_)   collect_linear(ll);
-    for (auto* ll : msa_col_to_out_) collect_linear(ll);
-
-    for (auto* ll : msa_global_col_Wq_)     collect_linear(ll);
-    for (auto* ll : msa_global_col_Wk_)     collect_linear(ll);
-    for (auto* ll : msa_global_col_Wv_)     collect_linear(ll);
-    for (auto* ll : msa_global_col_to_b_)   collect_linear(ll);
-    for (auto* ll : msa_global_col_to_g_)   collect_linear(ll);
-    for (auto* ll : msa_global_col_to_out_) collect_linear(ll);
-
-    for (auto* ll : pair_row_Wq_)     collect_linear(ll);
-    for (auto* ll : pair_row_Wk_)     collect_linear(ll);
-    for (auto* ll : pair_row_Wv_)     collect_linear(ll);
-    for (auto* ll : pair_row_to_b_)   collect_linear(ll);
-    for (auto* ll : pair_row_to_g_)   collect_linear(ll);
-    for (auto* ll : pair_row_to_out_) collect_linear(ll);
-
-    for (auto* ll : pair_col_Wq_)     collect_linear(ll);
-    for (auto* ll : pair_col_Wk_)     collect_linear(ll);
-    for (auto* ll : pair_col_Wv_)     collect_linear(ll);
-    for (auto* ll : pair_col_to_b_)   collect_linear(ll);
-    for (auto* ll : pair_col_to_g_)   collect_linear(ll);
-    for (auto* ll : pair_col_to_out_) collect_linear(ll);
-
-    for (auto* ln : msa_ff_norm_)     collect_layernorm(ln);
-    for (auto* ll : msa_ff_linear1_)  collect_linear(ll);
-    for (auto* ll : msa_ff_linear2_)  collect_linear(ll);
-
-    for (auto* ln : pair_ff_norm_)     collect_layernorm(ln);
-    for (auto* ll : pair_ff_linear1_)  collect_linear(ll);
-    for (auto* ll : pair_ff_linear2_)  collect_linear(ll);
-
-    // TriangleMultiplication 参数
-    for (auto* ln : tri_out_layernorm_)        collect_layernorm(ln);
-    for (auto* ll : tri_out_left_proj_)        collect_linear(ll);
-    for (auto* ll : tri_out_right_proj_)       collect_linear(ll);
-    for (auto* ll : tri_out_left_gate_)        collect_linear(ll);
-    for (auto* ll : tri_out_right_gate_)       collect_linear(ll);
-    for (auto* ll : tri_out_gate_)             collect_linear(ll);
-    for (auto* ln : tri_out_output_layernorm_) collect_layernorm(ln);
-    for (auto* ll : tri_out_out_proj_)         collect_linear(ll);
-
-    for (auto* ln : tri_in_layernorm_)        collect_layernorm(ln);
-    for (auto* ll : tri_in_left_proj_)        collect_linear(ll);
-    for (auto* ll : tri_in_right_proj_)       collect_linear(ll);
-    for (auto* ll : tri_in_left_gate_)        collect_linear(ll);
-    for (auto* ll : tri_in_right_gate_)       collect_linear(ll);
-    for (auto* ll : tri_in_gate_)             collect_linear(ll);
-    for (auto* ln : tri_in_output_layernorm_) collect_layernorm(ln);
-    for (auto* ll : tri_in_out_proj_)         collect_linear(ll);
-
-    // PositionalEncoding 参数
-    for (auto* emb : pos_enc_emb_res_)  collect_embedding(emb);
-    for (auto* emb : pos_enc_emb_atom_) collect_embedding(emb);
-
-    // IterBlock 3D SE 参数
-    for (auto* ll : iter_embed_x_)     collect_linear(ll);
-    for (auto* ll : iter_embed_e_)     collect_linear(ll);
-    for (auto* ln : iter_norm_node_3d_) collect_layernorm(ln);
-    for (auto* ln : iter_norm_edge_3d_) collect_layernorm(ln);
-    for (auto* ln : iter_norm_msa_3d_)  collect_layernorm(ln);
-    for (auto* ln : iter_norm_pair_3d_) collect_layernorm(ln);
-
-    // IterBlock forward 内部参数
-    for (auto* ln : iter_state2msa_norm_)       collect_layernorm(ln);
-    for (auto* ll : iter_state2msa_linear_)     collect_linear(ll);
-    for (auto* ln : iter_pair2msa_norm_)        collect_layernorm(ln);
-    for (auto* ln : iter_msa2pair_norm_)        collect_layernorm(ln);
-    for (auto* ll : iter_msa2pair_left_proj_)   collect_linear(ll);
-    for (auto* ll : iter_msa2pair_right_proj_)  collect_linear(ll);
-    for (auto* ll : iter_msa2pair_out_proj_)    collect_linear(ll);
-    for (auto* ll : iter_pair2pair_rbf_proj_)   collect_linear(ll);
-    for (auto* ln : iter_pair2pair_state_norm_) collect_layernorm(ln);
-    for (auto* ll : iter_pair2pair_left_proj_)  collect_linear(ll);
-    for (auto* ll : iter_pair2pair_right_proj_) collect_linear(ll);
-    for (auto* ll : iter_pair2pair_gate_proj_)  collect_linear(ll);
-
-    // RefineBlock 参数
-    for (auto* ln : refine_norm_msa_)   collect_layernorm(ln);
-    for (auto* ln : refine_norm_pair_)  collect_layernorm(ln);
-    for (auto* ln : refine_norm_state_) collect_layernorm(ln);
-    for (auto* ll : refine_embed_x_)    collect_linear(ll);
-    for (auto* ln : refine_norm_node_)  collect_layernorm(ln);
-    for (auto* ll : refine_embed_e1_)   collect_linear(ll);
-    for (auto* ln : refine_norm_edge1_) collect_layernorm(ln);
-    for (auto* ll : refine_embed_e2_)   collect_linear(ll);
-    for (auto* ln : refine_norm_edge2_) collect_layernorm(ln);
+    collect_all_params(param_tensors);
 
     // ===== Step 2: 计算总大小并分配 CPU backend buffer =====
     size_t total_size = 0;

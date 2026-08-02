@@ -37,6 +37,8 @@ set(CORE_SOURCES
     ../src/backend/CPUKernels.cpp
     ../src/backend/ThreadPool.cpp
     ../src/core/GradientClipper.cpp
+    # GGUF 序列化 (checkpoint 保存/加载)
+    ../src/model/GGUF.cpp
     # CUDA kernels
     ../src/cuda/CUDAKernels.cu
     ../src/cuda/OutProdKernel.cu
