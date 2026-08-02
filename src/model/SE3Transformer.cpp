@@ -2249,6 +2249,7 @@ SE3Features SE3Transformer::forward(const SE3Features& h,
     //   for layer in self.Gblock:
     //       h = layer(h, G=G, r=r, basis=basis)
 
+    // deep copy data since tensor was not allowed to copy
     SE3Features out;
     out.features.reserve(h.features.size());
     for (const auto& f : h.features) {
@@ -2259,7 +2260,10 @@ SE3Features SE3Transformer::forward(const SE3Features& h,
 
     for (size_t i = 0; i < blocks_.size(); ++i) {
         // GSE3Res: 残差注意力 + 跳跃连接
-        out = std::move(blocks_[i].gcn->forward(std::move(out), edge_index, edge_d, edge_w, basis));
+        // blocks_[i].gcn->forward returning a r-value, the first move was not necessary
+        // the second move no need as well: forward(const&) so the value will not be moved
+        //out = std::move(blocks_[i].gcn->forward(std::move(out), edge_index, edge_d, edge_w, basis));
+        out = blocks_[i].gcn->forward(out, edge_index, edge_d, edge_w, basis);
 
         // GNormBias: 等变非线性 (norm 分解 + ReLU + 重组)
         if (blocks_[i].norm != nullptr) {

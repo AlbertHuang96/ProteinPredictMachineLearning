@@ -13,7 +13,8 @@ option(BUILD_CORE_LIB "Build core as static/shared library" ON)
 option(BUILD_GPU_BACKEND "Build GPU backend as DLL" ON)
 option(BUILD_PYTHON_BRIDGE "Build Python bridge DLL" ON)
 option(BUILD_EXAMPLES "Build example applications" ON)
-option(BUILD_TESTS "Build unit tests" ON)
+option(BUILD_TESTS "Build unit tests" OFF)
+#cmake -DBUILD_TESTS=OFF
 
 # 查找依赖
 find_package(CUDAToolkit REQUIRED)

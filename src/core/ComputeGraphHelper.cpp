@@ -814,6 +814,54 @@ TensorF32* fape_loss(
 }
 
 // ============================================================
+// 9.5 FAPE 帧索引 + 常量图节点构造
+// ============================================================
+
+// constant_scalar(value) — 创建常量标量图节点
+TensorF32* constant_scalar(float value) {
+    int64_t ne[4] = {1, 1, 1, 1};
+    TensorF32* t = context().new_tensor<float>(1, ne);
+    t->data()[0] = value;
+    return t;
+}
+
+// constant_ones(dims) — 创建全 1 常量图节点
+TensorF32* constant_ones(const std::vector<int64_t>& dims) {
+    int64_t ne[4] = {1, 1, 1, 1};
+    for (size_t i = 0; i < dims.size() && i < 4; i++) {
+        ne[i] = dims[i];
+    }
+    TensorF32* t = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
+    for (int64_t i = 0; i < t->numel(); i++) {
+        t->data()[i] = 1.0f;
+    }
+    return t;
+}
+
+// build_frame_atom_indices(B, L) — 为 FAPE 构建帧索引
+// 坐标布局: (B, L, 3, 3) → 展平 (N_atoms=B*L*3, 3)
+//   残基 (b, l) 全局残基序号 r = b*L + l
+//   N = r*3+0, CA = r*3+1, C = r*3+2
+// 返回: TensorF32* ({B*L, 3})
+TensorF32* build_frame_atom_indices(int B, int L) {
+    int N_frames = B * L;
+    int64_t ne[2] = {N_frames, 3};
+    TensorF32* result = context().new_tensor<float>(2, ne);
+    float* data = result->data();
+
+    for (int b = 0; b < B; b++) {
+        for (int l = 0; l < L; l++) {
+            int r = b * L + l;
+            int base = r * 3;
+            data[r * 3 + 0] = static_cast<float>(base + 0);  // N
+            data[r * 3 + 1] = static_cast<float>(base + 1);  // CA
+            data[r * 3 + 2] = static_cast<float>(base + 2);  // C
+        }
+    }
+    return result;
+}
+
+// ============================================================
 // 10. 位置编码
 // ============================================================
 

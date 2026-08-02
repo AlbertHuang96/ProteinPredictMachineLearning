@@ -4,6 +4,8 @@
 #include <cassert>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
+#include <cctype>
 
 #include <cstdint>
 #include <memory>
@@ -1243,12 +1245,169 @@ rfaa::TensorF32 xyz_to_t2d(
     return t2d;
 }
 
+// ============================================================================
+// parse_csv_true_coords — 从 CSV mapping 文件解析真实坐标 (ground truth)
+// ============================================================================
+// CSV 格式 (由 Python 脚本生成):
+//   FASTA_Pos,FASTA_AA,PDB_ResNum,PDB_AA,CA_X,CA_Y,CA_Z,All_Atoms_Coords
+//   All_Atoms_Coords 示例: "N:(101.60,38.53,-1.96) | CA:(103.06,38.51,-2.16) | C:(...) | ..."
+//
+// 兼容策略 (不同 PDB 残基原子存储情况不一):
+//   1. 优先从 All_Atoms_Coords 提取 N / CA / C 三个骨架原子坐标
+//   2. CA 缺失时回退到 CA_X / CA_Y / CA_Z 列 (每个残基必有)
+//   3. N 或 C 缺失时用 CA 坐标回退 (避免零坐标导致 FAPE 异常)
+// 返回: (B=1, L, 3, 3) — [N, CA, C] × [x, y, z]
+TensorF32 RFAADataLoader::parse_csv_true_coords(
+    const std::string& csv_path,
+    int expected_L)
+{
+    std::ifstream file(csv_path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open CSV mapping file: " + csv_path);
+    }
+
+    // ========== 1. 读取所有数据行 (跳过 header) ==========
+    struct Atom3D { std::string name; float xyz[3]; };
+    struct CsvRow {
+        float ca[3];
+        std::vector<Atom3D> atoms; // name -> xyz
+    };
+    std::vector<CsvRow> rows;
+
+    std::string line;
+    bool is_header = true;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        // 去除 \r (Windows)
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        // ===== 解析一行 (字段可能被引号包裹, 含逗号/空格) =====
+        std::vector<std::string> fields;
+        std::string cur;
+        bool in_quotes = false;
+        for (size_t i = 0; i < line.size(); i++) {
+            char c = line[i];
+            if (c == '"') {
+                in_quotes = !in_quotes;
+            } else if (c == ',' && !in_quotes) {
+                fields.push_back(cur);
+                cur.clear();
+            } else {
+                cur.push_back(c);
+            }
+        }
+        fields.push_back(cur);
+
+        // 跳过 header
+        if (is_header) {
+            is_header = false;
+            continue;
+        }
+        if (fields.size() < 8) continue;  // 缺列则跳过
+
+        CsvRow row;
+        row.ca[0] = row.ca[1] = row.ca[2] = 0.0f;
+
+        // CA_X, CA_Y, CA_Z (字段 4,5,6)
+        try {
+            row.ca[0] = std::stof(fields[4]);
+            row.ca[1] = std::stof(fields[5]);
+            row.ca[2] = std::stof(fields[6]);
+        } catch (...) {
+            row.ca[0] = row.ca[1] = row.ca[2] = 0.0f;
+        }
+
+        // All_Atoms_Coords (字段 7): "N:(x,y,z) | CA:(x,y,z) | ..."
+        const std::string& all_atoms = fields[7];
+        // 按 " | " 分割原子条目
+        size_t pos = 0;
+        while (pos < all_atoms.size()) {
+            // 找到下一个 "("
+            size_t open = all_atoms.find('(', pos);
+            if (open == std::string::npos) break;
+            // 原子名 = 从 pos 到 '(' 去空格
+            std::string name = all_atoms.substr(pos, open - pos);
+            // 去除前后空白
+            name.erase(0, name.find_first_not_of(" \t"));
+            name.erase(name.find_last_not_of(" \t") + 1);
+            // 找到对应的 ')'
+            size_t close = all_atoms.find(')', open);
+            if (close == std::string::npos) break;
+            std::string coord_str = all_atoms.substr(open + 1, close - open - 1);
+            // 解析 x,y,z
+            float x = 0, y = 0, z = 0;
+            int cnt = sscanf(coord_str.c_str(), "%f,%f,%f", &x, &y, &z);
+            if (cnt == 3) {
+                Atom3D a;
+                a.name = name;
+                a.xyz[0] = x; a.xyz[1] = y; a.xyz[2] = z;
+                row.atoms.push_back(std::move(a));
+            }
+            pos = close + 1;
+        }
+
+        rows.push_back(std::move(row));
+    }
+
+    int L = (expected_L > 0) ? expected_L : static_cast<int>(rows.size());
+    if (L <= 0) {
+        throw std::runtime_error("CSV mapping file contains no valid rows: " + csv_path);
+    }
+
+    // ========== 2. 组装 coords (B=1, L, 3, 3) ==========
+    TensorF32 coords({1, L, 3, 3}, Device::CPU);
+    float* data = coords.data();
+
+    auto find_atom = [&](const CsvRow& row, const char* name) -> const float* {
+        for (const auto& a : row.atoms) {
+            if (a.name == name) return a.xyz;
+        }
+        return nullptr;
+    };
+
+    for (int l = 0; l < L; l++) {
+        const CsvRow& row = (l < static_cast<int>(rows.size())) ? rows[l] : rows.back();
+
+        const float* pN  = find_atom(row, "N");
+        const float* pCA = find_atom(row, "CA");
+        const float* pC  = find_atom(row, "C");
+
+        // CA 回退到 CA_X/Y/Z 列
+        float ca_fallback[3] = {row.ca[0], row.ca[1], row.ca[2]};
+        if (!pCA) pCA = ca_fallback;
+        if (!pN)  pN  = pCA;  // N 缺失 → CA
+        if (!pC)  pC  = pCA;  // C 缺失 → CA
+
+        int64_t base = (l * 3) * 3;  // (l, atom, coord)
+        for (int c = 0; c < 3; c++) {
+            data[base + 0*3 + c] = pN[c];    // N
+            data[base + 1*3 + c] = pCA[c];   // CA
+            data[base + 2*3 + c] = pC[c];    // C
+        }
+    }
+
+    return coords;
+}
+
 ModelInput RFAADataLoader::load_from_files(
     const std::string& a3m_path,
     const std::string& hhr_path,
-    const std::string& sequence
+    const std::string& sequence,
+    const std::string& csv_path
 ) {
     ModelInput input;
+
+    // 如果提供了 CSV mapping 文件, 加载真实坐标作为 ground truth
+    if (!csv_path.empty()) {
+        int L = (sequence.empty())
+                ? 0   // 无序列时以 CSV 行数为准 (parse_csv_true_coords 内部处理)
+                : static_cast<int>(sequence.length());
+        TensorF32 true_coords = parse_csv_true_coords(csv_path, L);
+        input.true_coords = std::move(true_coords);
+        // 同时用真实坐标初始化 input.coords (推理/初始结构), 复制一份
+        input.coords = TensorF32(input.true_coords.shape(), Device::CPU);
+        input.coords.copy_from(input.true_coords);
+    }
     
     // Step 1: 解析 A3M
     std::vector<std::vector<uint8_t>> a3m_raw = parse_a3m(a3m_path);

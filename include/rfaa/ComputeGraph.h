@@ -232,7 +232,8 @@ TensorF32* total_loss(
     TensorF32* loss_fape,
     TensorF32* loss_chi,
     TensorF32* loss_distogram,
-    TensorF32* loss_msa);
+    TensorF32* loss_msa,
+    TensorF32* loss_conf);
 TensorF32* plddt_loss(TensorF32* logits, TensorF32* lddt_onehot, TensorF32* ca_mask);
 TensorF32* fape_loss(
     TensorF32* pred_coords,
@@ -241,6 +242,18 @@ TensorF32* fape_loss(
     TensorF32* frames_mask,
     TensorF32* positions_mask,
     const FAPEConfig& config = FAPEConfig{});
+
+// 为 FAPE 构建帧索引图节点。
+// 坐标布局假设: (B, L, 3, 3) 展平为 (N_atoms=B*L*3, 3), 每残基 3 原子 [N, CA, C]
+//   residue r 的 N = r*3+0, CA = r*3+1, C = r*3+2
+// 返回: TensorF32* ({N_frames=B*L, 3}) — 每帧的 3 原子全局索引 (float-encoded int)
+TensorF32* build_frame_atom_indices(int B, int L);
+
+// 创建常量张量图节点 (leaf, 数据直接写入)
+// shape: dims (变长) → 返回 {dims} 全 1 的 TensorF32* 节点
+TensorF32* constant_ones(const std::vector<int64_t>& dims);
+// 创建常量标量图节点
+TensorF32* constant_scalar(float value);
 
 // 10. 位置编码
 TensorF32* rope(TensorF32* a, int n_past, int n_dims = 0);

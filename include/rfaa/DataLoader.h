@@ -197,8 +197,16 @@ public:
     ModelInput load_from_files(
         const std::string& a3m_path,
         const std::string& hhr_path,
-        const std::string& sequence
+        const std::string& sequence,
+        const std::string& csv_path = ""  // 可选: CSV mapping 文件 → true_coords
     );
+
+    // 从 CSV mapping 文件加载真实坐标 (ground truth)
+    // 返回: TensorF32 ({B=1, L, 3, 3}) — [N, CA, C] × [x, y, z]
+    // 兼容每个残基原子存储情况不一的 CSV (缺失原子回退到 CA)
+    static TensorF32 parse_csv_true_coords(
+        const std::string& csv_path,
+        int expected_L = -1);  // expected_L < 0 表示以 CSV 行数为准
 
     ReadTemplatesResult read_templates(
     int qlen,                      // 查询序列长度
