@@ -494,4 +494,95 @@ void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N) {
     cudaCheck(cudaGetLastError());
 }
 
+// ============================================================
+// CONCAT CUDA Kernel (OP_CONCAT) — N-ary 版本
+// 与 CPU kernel_concat 对齐：支持任意数量 src，沿 op_params[0]=dim 拼接。
+// 数据连续，故将多维索引退化为 1D 线性索引反解。
+// 通过 device 侧「src 指针数组 + start/len 偏移表」定位每个输出元素所属的 src。
+//
+// 重要前提：concat 不支持广播语义。调用方必须保证所有 src 的
+// 非拼接维与 dst 完全一致（即 dst 任意非拼接维不得大于 src 对应维）。
+// 本 kernel 复用 dst 的 ne0..ne3 作为 src 的 strides 基数（标准 concat 语义）。
+// 若 dst 某非拼接维 > src 对应维，则会产生越界/错位读，属于非法输入。
+// ============================================================
+
+// 反解 idx 得到 (i0,i1,i2,i3)，i0 为最内维
+__device__ static inline void concat_decompose_index(
+    int64_t idx,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+    int64_t& i0, int64_t& i1, int64_t& i2, int64_t& i3)
+{
+    int64_t t = idx;
+    i0 = t % ne0; t /= ne0;
+    i1 = t % ne1; t /= ne1;
+    i2 = t % ne2; t /= ne2;
+    i3 = t;
+}
+
+// 用 start/len 偏移表，将拼接维全局索引 gd 定位到所属 src 下标
+__device__ static inline int concat_pick_src(
+    int64_t gd, int n_src,
+    const int64_t* __restrict__ start,
+    const int64_t* __restrict__ len)
+{
+    for (int s = 0; s < n_src; s++) {
+        if (gd < start[s] + len[s]) return s;
+    }
+    return n_src - 1; // 兜底（gd 落在最后一个 src 区间）
+}
+
+__global__ void concat_nary_kernel_f32(
+    const float* const* __restrict__ srcs, // device 指针数组 [n_src]
+    const int64_t*     __restrict__ start, // device 偏移表 [n_src]
+    const int64_t*     __restrict__ len,   // device 长度表 [n_src]
+    float* __restrict__ dst,
+    int dim, int n_src,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3)
+{
+    const int64_t total = ne0 * ne1 * ne2 * ne3;
+    const int64_t idx   = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
+    if (idx >= total) return;
+
+    int64_t i0, i1, i2, i3;
+    concat_decompose_index(idx, ne0, ne1, ne2, ne3, i0, i1, i2, i3);
+
+    // 取出拼接维上的全局索引 gd
+    int64_t gd;
+    switch (dim) {
+        case 0:  gd = i0; break;
+        case 1:  gd = i1; break;
+        case 2:  gd = i2; break;
+        default: gd = i3; break;
+    }
+
+    const int  s     = concat_pick_src(gd, n_src, start, len);
+    const int64_t local = gd - start[s];
+    const float* src   = srcs[s];
+
+    // 拼接维用局部坐标 local，其余维沿用输出坐标。
+    // 前提（无广播语义）：非拼接维与 dst 一致，故直接用 dst 的 ne 作 strides。
+    int64_t a0 = (dim == 0) ? local : i0;
+    int64_t a1 = (dim == 1) ? local : i1;
+    int64_t a2 = (dim == 2) ? local : i2;
+    int64_t a3 = (dim == 3) ? local : i3;
+
+    dst[idx] = src[((a3 * ne2 + a2) * ne1 + a1) * ne0 + a0];
+}
+
+// host 包装：srcs/start/len 均须为已拷贝到 device 的指针
+void concat_nary_cuda(
+    const float* const* srcs, int n_src,
+    const int64_t* start, const int64_t* len,
+    float* dst, int dim,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3)
+{
+    const int64_t total = ne0 * ne1 * ne2 * ne3;
+    constexpr int BLOCK = 256;
+    const int grid = ceil_div(static_cast<int>(total), BLOCK);
+
+    concat_nary_kernel_f32<<<grid, BLOCK>>>(
+        srcs, start, len, dst, dim, n_src, ne0, ne1, ne2, ne3);
+    cudaCheck(cudaGetLastError());
+}
+
 } // namespace rfaa

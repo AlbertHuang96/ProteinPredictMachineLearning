@@ -1,6 +1,7 @@
 #include "rfaa/Backend.h"
 #include "rfaa/ComputeGraph.h"
 #include <cstring>
+#include <vector>
 
 namespace rfaa {
 
@@ -33,6 +34,14 @@ extern void out_prod_cuda(
     int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
     int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3);
 
+// N-ary concat：srcs/start/len 均须为 device 指针（见 concat_nary_cuda）。
+// 注意：concat 不支持广播语义，非拼接维必须与 dst 一致。
+extern void concat_nary_cuda(
+    const float* const* srcs, int n_src,
+    const int64_t* start, const int64_t* len,
+    float* dst, int dim,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3);
+
 // ============================================================
 // CUDABackend::dispatch_node
 // ============================================================
@@ -61,6 +70,10 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
 
         case OP_OUT_PROD:
             kernel_out_prod_cuda(node, p);
+            break;
+
+        case OP_CONCAT:
+            kernel_concat_cuda(node, p);
             break;
 
         case OP_SOFT_MAX:
@@ -251,6 +264,68 @@ void CUDABackend::kernel_out_prod_cuda(TensorF32 * node, ComputeParams * p) {
         ne00, ne01, ne02, ne03,
         ne10, ne11, ne12, ne13,
         ne0,  ne1,  ne2,  ne3);
+}
+
+void CUDABackend::kernel_concat_cuda(TensorF32 * node, ComputeParams * p) {
+    (void)p;
+    const int n_src = static_cast<int>(node->src.size());
+    if (n_src < 2) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+
+    const int dim = node->op_params[0];
+    if (dim < 0 || dim >= 4) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+
+    // ============================================================
+    // concat 不支持广播语义：强制要求所有 src 的非拼接维与 dst 一致
+    //（即 dst 任意非拼接维不得大于 src 对应维）。
+    // 不满足则直接置 NOT_SUPPORTED，避免在 CUDA kernel 内发生越界读。
+    // ============================================================
+    const int nd = node->shape().ndim();
+    for (int d = 0; d < 4; d++) {
+        if (d == dim) continue; // 拼接维可不同，由 start/len 表处理
+        const int64_t dst_d = (d < nd) ? node->shape().dims[d] : 1;
+        for (int s = 0; s < n_src; s++) {
+            const int      sd    = node->src[s]->shape().ndim();
+            const int64_t  src_d = (d < sd) ? node->src[s]->shape().dims[d] : 1;
+            if (src_d != dst_d) {
+                p->threadpool->ec = Status::NOT_SUPPORTED;
+                return;
+            }
+        }
+    }
+
+    // dst 形状
+    const int64_t ne0 = node->shape().ndim() > 0 ? node->shape().dims[0] : 1;
+    const int64_t ne1 = node->shape().ndim() > 1 ? node->shape().dims[1] : 1;
+    const int64_t ne2 = node->shape().ndim() > 2 ? node->shape().dims[2] : 1;
+    const int64_t ne3 = node->shape().ndim() > 3 ? node->shape().dims[3] : 1;
+
+    // 构造 host 侧 start/len 偏移表与 src 指针数组
+    std::vector<int64_t>    len(n_src), start(n_src, 0);
+    std::vector<const float*> srcs(n_src);
+    for (int s = 0; s < n_src; s++) {
+        len[s]   = node->src[s]->shape().dims[dim];
+        srcs[s]  = node->src[s]->data();
+    }
+    for (int s = 1; s < n_src; s++) start[s] = start[s - 1] + len[s - 1];
+
+    // 拷贝到 device
+    const float** d_srcs  = nullptr;
+    int64_t*      d_start = nullptr;
+    int64_t*      d_len   = nullptr;
+    cudaMalloc(&d_srcs,  sizeof(float*)   * n_src);
+    cudaMalloc(&d_start, sizeof(int64_t)  * n_src);
+    cudaMalloc(&d_len,   sizeof(int64_t)  * n_src);
+    cudaMemcpy(d_srcs,  srcs.data(),  sizeof(float*)  * n_src, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_start, start.data(), sizeof(int64_t) * n_src, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_len,   len.data(),   sizeof(int64_t) * n_src, cudaMemcpyHostToDevice);
+
+    concat_nary_cuda(
+        d_srcs, n_src, d_start, d_len, node->data(), dim,
+        ne0, ne1, ne2, ne3);
+
+    cudaFree(d_srcs);
+    cudaFree(d_start);
+    cudaFree(d_len);
 }
 
 } // namespace rfaa

@@ -213,6 +213,13 @@ int CPUBackend::get_n_tasks(TensorF32 * node, int n_threads) {
             // 注意力：按 batch × head 并行
             return n_threads;
         }
+        case OP_CONCAT: {
+            // 拼接：按输出元素数决定是否多线程
+            if (node->numel() > 1024 * 1024) {
+                return std::min(4, n_threads);
+            }
+            return 1;
+        }
         case OP_NONE:
         case OP_VIEW:
         case OP_RESHAPE:

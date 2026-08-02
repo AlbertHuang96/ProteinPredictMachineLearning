@@ -378,6 +378,7 @@ TensorF32* concat(const std::vector<TensorF32>& tensors, int dim) {
 
     TensorF32* result = context().new_tensor<float>(ndim, ne);
     result->op = OP_CONCAT;
+    result->op_params[0] = dim;   // 拼接维度，供 CPU/CUDA kernel 使用
     for (size_t i = 0; i < tensors.size() && i < GGML_MAX_SRC; i++) {
         result->src[i] = const_cast<TensorF32*>(&tensors[i]);
     }
@@ -400,6 +401,7 @@ TensorF32* concat_ptr(const std::vector<TensorF32*>& tensors, int dim) {
 
     TensorF32* result = context().new_tensor<float>(tensors[0]->shape().ndim(), ne);
     result->op = OP_CONCAT;
+    result->op_params[0] = dim;   // 拼接维度，供 CPU/CUDA kernel 使用
     for (size_t i = 0; i < tensors.size() && i < GGML_MAX_SRC; i++) {
         result->src[i] = tensors[i];
     }

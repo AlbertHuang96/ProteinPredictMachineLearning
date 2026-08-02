@@ -4,6 +4,7 @@
 #include "rfaa/FAPE.h"
 #include <cstring>
 #include <cmath>
+#include <vector>
 
 //#include <omp.h>
 
@@ -52,6 +53,7 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_NORM_BACK: kernel_norm_back(node, p); break;
         case OP_SUM:    kernel_sum(node, p);         break;
         case OP_MEAN:   kernel_mean(node, p);        break;
+        case OP_CONCAT: kernel_concat(node, p);      break;
         case OP_FAPE:      compute_forward_fape(p, node);      break;
         case OP_FAPE_BACK: compute_forward_fape_back(p, node); break;
         case OP_TRI_MUL:   kernel_tri_mul(node, p);            break;
@@ -598,6 +600,76 @@ void CPUBackend::kernel_scale(TensorF32 * node, ComputeParams * p) { (void)node;
 void CPUBackend::kernel_add1(TensorF32 * node, ComputeParams * p)  { (void)node; (void)p; }
 void CPUBackend::kernel_sum(TensorF32 * node, ComputeParams * p)   { (void)node; (void)p; }
 void CPUBackend::kernel_mean(TensorF32 * node, ComputeParams * p)  { (void)node; (void)p; }
+
+// ===== concat =====
+// 对标 ggml_compute_forward_concat_f32（项目仅 F32 连续数据，故无需 block_size / nb stride 处理）
+// 支持任意数量 src：沿 op_params[0] 指定的 dim 拼接。
+// 内存布局 row-major，ne0 最内维。每个 src 在非拼接维上与 dst 同形状或为广播/截断，
+// 这里按 src 自身形状映射（当 src 维度小于 dst 时越界元素跳过）。
+void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
+    const int dim = node->op_params[0];
+    const int nd  = node->shape().ndim();
+    if (dim < 0 || dim >= 4) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+
+    const int64_t ne0 = nd > 0 ? node->shape().dims[0] : 1;
+    const int64_t ne1 = nd > 1 ? node->shape().dims[1] : 1;
+    const int64_t ne2 = nd > 2 ? node->shape().dims[2] : 1;
+    const int64_t ne3 = nd > 3 ? node->shape().dims[3] : 1;
+
+    const int n_src = static_cast<int>(node->src.size());
+    if (n_src < 2) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+
+    // 各 src 在 dim 维的长度与累积起点
+    std::vector<int64_t> len(n_src), start(n_src, 0);
+    for (int s = 0; s < n_src; s++) len[s] = node->src[s]->shape().dims[dim];
+    for (int s = 1; s < n_src; s++) start[s] = start[s - 1] + len[s - 1];
+
+    float * d = node->data();
+
+    const int64_t total = ne0 * ne1 * ne2 * ne3;
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t i_lo  = per * p->ith;
+    const int64_t i_hi  = (i_lo + per < total) ? (i_lo + per) : total;
+
+    for (int64_t idx = i_lo; idx < i_hi; idx++) {
+        int64_t t  = idx;
+        const int64_t i0 = t % ne0; t /= ne0;
+        const int64_t i1 = t % ne1; t /= ne1;
+        const int64_t i2 = t % ne2; t /= ne2;
+        const int64_t i3 = t;
+
+        // dim 维全局索引（决定元素所属 src 及 src 内索引）
+        int64_t gd;
+        switch (dim) {
+            case 0:  gd = i0; break;
+            case 1:  gd = i1; break;
+            case 2:  gd = i2; break;
+            default: gd = i3; break;
+        }
+
+        // 线性定位所属 src
+        int s = 0;
+        for (int k = 0; k < n_src; k++) {
+            if (gd < start[k] + len[k]) { s = k; break; }
+        }
+        const int64_t local = gd - start[s];
+
+        const TensorF32* src = node->src[s];
+        const int64_t s0 = src->shape().ndim() > 0 ? src->shape().dims[0] : 1;
+        const int64_t s1 = src->shape().ndim() > 1 ? src->shape().dims[1] : 1;
+        const int64_t s2 = src->shape().ndim() > 2 ? src->shape().dims[2] : 1;
+        const int64_t s3 = src->shape().ndim() > 3 ? src->shape().dims[3] : 1;
+
+        const int64_t a0 = (dim == 0) ? local : i0;
+        const int64_t a1 = (dim == 1) ? local : i1;
+        const int64_t a2 = (dim == 2) ? local : i2;
+        const int64_t a3 = (dim == 3) ? local : i3;
+
+        if (a0 >= s0 || a1 >= s1 || a2 >= s2 || a3 >= s3) continue;
+
+        d[idx] = src->data()[((a3 * s2 + a2) * s1 + a1) * s0 + a0];
+    }
+}
 
 void CPUBackend::kernel_sigmoid(TensorF32 * node, ComputeParams * p) {
     TensorF32* output = node->src[0];

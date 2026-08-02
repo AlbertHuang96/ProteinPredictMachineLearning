@@ -592,6 +592,7 @@ private:
     static void kernel_add1    (TensorF32 * node, ComputeParams * p);
     static void kernel_sum     (TensorF32 * node, ComputeParams * p);
     static void kernel_mean    (TensorF32 * node, ComputeParams * p);
+    static void kernel_concat  (TensorF32 * node, ComputeParams * p);
 
     static void kernel_sigmoid (TensorF32 * node, ComputeParams * p);
 
@@ -666,6 +667,7 @@ private:
     static void kernel_add1_cuda     (TensorF32 * node, ComputeParams * p);
     static void kernel_sum_cuda      (TensorF32 * node, ComputeParams * p);
     static void kernel_mean_cuda     (TensorF32 * node, ComputeParams * p);
+    static void kernel_concat_cuda   (TensorF32 * node, ComputeParams * p);
 
     // CUDA unary kernels
     static void kernel_relu_cuda   (TensorF32 * node);

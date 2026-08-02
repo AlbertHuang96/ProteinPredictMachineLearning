@@ -88,6 +88,17 @@ bool CUDABackend::supports_op(TensorF32* node) const {
                    src1->type == TENSOR_TYPE_F32 &&
                    node->type == TENSOR_TYPE_F32;
 
+        case OP_CONCAT: {
+            // N-ary concat：遍历所有 src。
+            // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致，
+            // 该约束在 kernel_concat_cuda 内强制校验。
+            if (node->src.size() < 2) return false;
+            for (const auto* s : node->src) {
+                if (!s || s->type != TENSOR_TYPE_F32) return false;
+            }
+            return node->type == TENSOR_TYPE_F32;
+        }
+
         case OP_SOFT_MAX:
             return true;
 
