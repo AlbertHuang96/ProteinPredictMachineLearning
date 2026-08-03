@@ -60,7 +60,14 @@ public:
                     LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv);
     
     TensorF32 forward(const TensorF32& msa, const TensorF32& pair_biased);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维)
+    // msa: 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    // pair_biased: 值 (B,L,L,D_PAIR) = 图 [D_PAIR, L, L, B]
+    // 返回: 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    TensorF32* forward_graph(TensorF32* msa, TensorF32* pair_biased);
+
 private:
     std::unique_ptr<SelfAttention> self_attn_;
 
@@ -83,7 +90,13 @@ public:
     
     // msa 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& msa);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维)
+    // msa: 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    // 返回: 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    TensorF32* forward_graph(TensorF32* msa);
+
 protected:
     std::unique_ptr<SelfAttention> self_attn_;
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
@@ -113,7 +126,14 @@ public:
     
     // pair/str_bias 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维)
+    // pair: 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    // str_bias: 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    // 返回: 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    TensorF32* forward_graph(TensorF32* pair, TensorF32* str_bias);
+
 private:
     std::unique_ptr<SelfAttention> self_attn_;
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
@@ -135,7 +155,14 @@ public:
     
     // pair/str_bias 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维)
+    // pair: 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    // str_bias: 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    // 返回: 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    TensorF32* forward_graph(TensorF32* pair, TensorF32* str_bias);
+
 private:
     std::unique_ptr<SelfAttention> self_attn_;
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
@@ -155,7 +182,14 @@ public:
     // query: (B*L, 1, q_dim), kv: (B*L, T, kv_dim)
     // 输出: (B*L, 1, q_dim)
     TensorF32 forward(const TensorF32& query, const TensorF32& kv);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维)
+    // query: 值 (B*L,1,q_dim) = 图 [q_dim, 1, 1, B*L]
+    // kv:    值 (B*L,T,kv_dim) = 图 [kv_dim, T, 1, B*L]
+    // 返回: 值 (B*L,1,q_dim) = 图 [q_dim, 1, 1, B*L]
+    TensorF32* forward_graph(TensorF32* query, TensorF32* kv);
+
 private:
     int q_dim_, kv_dim_, n_head_;
     int head_dim_;   // = proj_dim / n_head, where proj_dim = max(q_dim, kv_dim) aligned to n_head

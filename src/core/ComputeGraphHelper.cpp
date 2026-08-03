@@ -133,6 +133,10 @@ TensorF32* transpose(TensorF32* a) {
     TensorF32* result = context().new_tensor<float>(static_cast<int>(new_dims.size()), new_dims.data());
     result->op     = OP_TRANSPOSE;
     result->src[0] = a;
+    // 存维度映射（交换最后两维），供 kernel_permute 复用
+    const int n = a->shape().ndim();
+    for (int i = 0; i < n; i++) result->op_params[i] = i;
+    std::swap(result->op_params[n - 1], result->op_params[n - 2]);
     return result;
 }
 
@@ -323,23 +327,21 @@ TensorF32* reshape(TensorF32* a, const Shape& new_shape) {
 
 // permute(a, dims) — 维度重排
 // ---------------------------------------------------------------------------
-// 【重要 · 暂不实现】permute 的两种落地方案（决策记录）：
+// 【方案 B 已实现】permute 采用"实际重排数据到连续行主序"的方案：
 //
-//   ggml 的做法：permute/view/reshape/transpose 是"零拷贝视图"——只重排张量的
-//   ne[](形状) 与 nb[](每维字节步长)，共享底层 data 指针，内存 0 移动；
-//   后端 compute 时一律 no-op。其前提是张量持有 nb[] 步长数组。
+//   ggml 的做法（方案 A 可选）：permute/view/reshape/transpose 是"零拷贝视图"——
+//   只重排 ne[](形状) 与 nb[](每维字节步长)，共享底层 data 指针，内存 0 移动；
+//   后端 compute 时一律 no-op。前提是张量持有 nb[] 步长数组。
 //
-//   方案 A（对齐 ggml，推荐，改动大）：为 Tensor 增加 nb[] 步长字段，
-//   permute/view/reshape 只改 shape+nb、共享 data_，并把所有 kernel 的寻址
-//   从线性索引 data[i] 改为按 nb[] 计算偏移。彻底解决零拷贝 + 布局一致性问题。
+//   方案 A（对齐 ggml，改动大）：为 Tensor 增加 nb[] 步长字段，permute/view/reshape
+//   只改 shape+nb、共享 data_，并把所有 kernel 寻址改为按 nb[] 计算偏移。
 //
-//   方案 B（务实，改动小）：Tensor 无 nb，permute 构造时分配新内存并实际
-//   重排数据到连续行主序。有内存移动开销，但当前可立即落地，不需改 kernel。
+//   方案 B（务实，改动小，当前实现）：Tensor 无 nb，permute 构造时分配新内存，
+//   kernel 按 dims 映射把数据实际重排到连续行主序。有 O(numel) 内存移动开销，
+//   但不需要改任何现有 kernel 的寻址。dims 映射存入 op_params[0..3] 供 kernel 使用。
 //
-//   【当前状态】两个方案均未实现。注意：当前项目 Tensor 无 nb[]，若只改 shape
-//   不搬数据（模仿 ggml），行主序下数据解释会错误；且 dispatch_node 中
-//   OP_VIEW/OP_RESHAPE/OP_PERMUTE/OP_TRANSPOSE/OP_CONT 无 case，会落 default→NOT_SUPPORTED。
-//   图化（RFAA.cpp 手写循环改图 op）依赖此步先落地。
+//   【dispatch 约定】OP_PERMUTE/OP_TRANSPOSE → kernel_permute（重排）；
+//   OP_RESHAPE/OP_VIEW/OP_CONT → kernel_cpy（整块 memcpy，元素顺序不变）。
 // ---------------------------------------------------------------------------
 TensorF32* permute(TensorF32* a, const std::vector<int>& dims) {
     assert(dims.size() == static_cast<size_t>(a->shape().ndim()));
@@ -351,10 +353,10 @@ TensorF32* permute(TensorF32* a, const std::vector<int>& dims) {
     TensorF32* result = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
     result->op     = OP_PERMUTE;
     result->src[0] = a;
-    // 存储 permute 的维度映射到 op_params
-    //for (size_t i = 0; i < dims.size(); i++) {
-    //    result->op_params[i] = dims[i];
-    //}
+    // 存储 permute 的维度映射到 op_params，供 kernel_permute 重排数据
+    for (size_t i = 0; i < dims.size(); i++) {
+        result->op_params[i] = dims[i];
+    }
     return result;
 }
 

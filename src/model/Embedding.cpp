@@ -11,9 +11,6 @@ namespace rfaa {
 // Embedding 层实现
 
 
-
-// e
-
     EmbeddingLayer* EmbeddingLayer::create(int num_embeddings, int embedding_dim) {
         auto* layer = new EmbeddingLayer();
         layer->num_embeddings_ = num_embeddings;

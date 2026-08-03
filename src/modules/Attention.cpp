@@ -14,13 +14,12 @@ TensorF32 SelfAttention::forward(const TensorF32& Q, const TensorF32& K, const T
     // GGML dims = [L, D_head, n_head, batch]
     //
     // out_prod 语义: dst[i0,i1] = sum_k src0[i0,k] * src1[i1,k]
-    // 收缩维是 dims[1], 即 D_head
+    // 收缩维是 dims[1]
 
-    // ===== 1. scores = Q @ K^T =====
-    // out_prod 隐含 B^T, 无需 permute K
-    // Q: [L_q, D_head, H, B]  K: [L_k, D_head, H, B]
-    // 收缩 D_head → scores: [L_q, L_k, H, B] = (B, H, L_q, L_k)
-    auto scores = out_prod(const_cast<TensorF32*>(&Q), const_cast<TensorF32*>(&K));
+    // ===== 1. scores = K @ Q^T  (key 最内维 dims[0], 使 softmax 沿 key 轴归一) =====
+    // out_prod(K, Q): src0=K [L_k, D_head, H, B], src1=Q [L_q, D_head, H, B]
+    // 收缩 dims[1]=D_head → scores: [L_k, L_q, H, B] = 值 (B, H, L_q, L_k)
+    auto scores = out_prod(const_cast<TensorF32*>(&K), const_cast<TensorF32*>(&Q));
 
     // ===== 2. scale = 1/sqrt(d_head) =====
     float scale_val = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
@@ -31,24 +30,17 @@ TensorF32 SelfAttention::forward(const TensorF32& Q, const TensorF32& K, const T
         scaled = add_impl(scaled, const_cast<TensorF32*>(bias), /*inplace=*/false);
     }
 
-    // ===== 4. softmax =====
-    auto attn = softmax(scaled);  // (B, H, L_q, L_k), dims = [L_k, L_q, H, B]
+    // ===== 4. softmax 沿 dims[0]=L_k (key 轴) 归一 =====
+    auto attn = softmax(scaled);  // [L_k, L_q, H, B] = 值 (B, H, L_q, L_k)
 
     // ===== 5. attn @ V =====
-    // attn: [L_k, L_q, H, B], ne01 = L_q
-    // V:    [L_v, D_head, H, B], ne11 = D_head
-    // L_q ≠ D_head, 不能直接 out_prod
-    //
-    // 需要 permute 让收缩维对齐:
-    // attn 需要在 L_k 上收缩 → permute 把 L_k 放到 dims[1]
-    // attn: (B, H, L_q, L_k) → permute({0,1,3,2}) → (B, H, L_k, L_q)
-    //       dims = [L_q, L_k, H, B], ne01 = L_k
-    // V 需要在 L_k 上收缩 → permute 把 L_k 放到 dims[1]
-    // V:    (B, H, D_head, L_k) → permute({0,1,3,2}) → (B, H, L_k, D_head)
-    //       dims = [D_head, L_k, H, B], ne11 = L_k
-    auto attn_t = permute(attn, {0, 1, 3, 2});
-    auto V_t    = permute(const_cast<TensorF32*>(&V), {0, 1, 3, 2});
-    auto output = out_prod(attn_t, V_t);  // (B, H, D_head, L_q)
+    // attn: [L_k, L_q, H, B] (key dim0, query dim1)
+    // V:    [L_k, D_head, H, B] (key dim0, head_dim dim1)
+    // 需把 query 放 dim0、key 放 dim1（attn），head_dim 放 dim0、key 放 dim1（V），
+    // 使 out_prod 在 dims[1]=L_k 上收缩:
+    auto attn_t = permute(attn, {1, 0, 2, 3});                              // [L_k,L_q,H,B] → [L_q,L_k,H,B]
+    auto V_t    = permute(const_cast<TensorF32*>(&V), {1, 0, 2, 3});        // [L_k,D,H,B]   → [D,L_k,H,B]
+    auto output = out_prod(attn_t, V_t);  // 收缩 dims[1]=L_k → [L_q, D_head, H, B] = 值 (B,H,D_head,L_q)
 
     TensorF32 result;
     result.copy_from(*output);
@@ -61,8 +53,10 @@ TensorF32* SelfAttention::forward_graph(TensorF32* Q, TensorF32* K, TensorF32* V
     // 输入约定: Q, K, V 均为 (batch, n_head, D_head, L)
     // GGML dims = [L, D_head, n_head, batch]
 
-    // 1. scores = Q @ K^T (out_prod 收缩 dims[1]=D_head)
-    auto scores = out_prod(Q, K);
+    // 1. scores = K @ Q^T (key 最内 dims[0], 使 softmax 沿 key 轴归一)
+    // out_prod(K, Q): src0=K [L_k,D_head,H,B], src1=Q [L_q,D_head,H,B]
+    // 收缩 dims[1]=D_head → [L_k, L_q, H, B]
+    auto scores = out_prod(K, Q);
     // 2. scale = 1/sqrt(d_head)
     float scale_val = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
     auto scaled = scale(scores, scale_val);
@@ -70,12 +64,13 @@ TensorF32* SelfAttention::forward_graph(TensorF32* Q, TensorF32* K, TensorF32* V
     if (bias != nullptr) {
         scaled = add_impl(scaled, bias, /*inplace=*/false);
     }
-    // 4. softmax
-    auto attn = softmax(scaled);  // (B, H, L_q, L_k), dims = [L_k, L_q, H, B]
-    // 5. attn @ V
-    auto attn_t = permute(attn, {0, 1, 3, 2});       // (B, H, L_k, L_q), dims=[L_q, L_k, H, B]
-    auto V_t    = permute(V, {0, 1, 3, 2});          // (B, H, L_k, D_head)
-    auto output = out_prod(attn_t, V_t);             // (B, H, D_head, L_q)
+    // 4. softmax 沿 dims[0]=L_k (key 轴) 归一
+    auto attn = softmax(scaled);  // [L_k, L_q, H, B]
+    // 5. attn @ V: 把 query 放 dim0、key 放 dim1 (attn)，head_dim 放 dim0、key 放 dim1 (V)，
+    //    使 out_prod 在 dims[1]=L_k 上收缩 → [L_q, D_head, H, B]
+    auto attn_t = permute(attn, {1, 0, 2, 3});  // [L_k,L_q,H,B] → [L_q,L_k,H,B]
+    auto V_t    = permute(V, {1, 0, 2, 3});     // [L_k,D,H,B]   → [D,L_k,H,B]
+    auto output = out_prod(attn_t, V_t);        // 收缩 dims[1]=L_k → [L_q, D_head, H, B]
 
     return output;   // 返回图节点，不再 copy_from
 }
@@ -120,6 +115,55 @@ TensorF32 MSARowAttention::forward(const TensorF32& msa, const TensorF32& pair_b
     
     auto gated_attn_out = out_prod(gate, &attn_out);
     return to_out_->forward(*gated_attn_out);
+}
+
+// ===== MSARowAttention::forward_graph (图模式) =====
+// 与值版 forward 逻辑一致，但输入输出均为图节点指针（ggml 布局 dims[0]=最内维）
+// 约定: 值 (d0,d1,d2,d3) = 图 [d3,d2,d1,d0]
+//      值 .view(vshape)     → 图 view(node, reversed(vshape))
+//      值 .permute(p) (4D)   → 图 permute(node, g), g[k] = 3 - p[3-k]
+TensorF32* MSARowAttention::forward_graph(TensorF32* msa, TensorF32* pair_biased) {
+    // 输入: msa 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    //       pair_biased 值 (B,L,L,D_PAIR) = 图 [D_PAIR, L, L, B]
+    // Wq_->forward_graph(msa) → 值 (B,N,L,H*D) = 图 [H*D, L, N, B]
+    auto* Q = Wq_->forward_graph(msa);
+    int B = static_cast<int>(Q->shape().dims[3]);   // B (最外层)
+    int N = static_cast<int>(Q->shape().dims[2]);   // N_seq
+    int L = static_cast<int>(Q->shape().dims[1]);   // L (残基)
+    int H = config_.n_head;                          // 8
+    int D = D_MSA;                                   // 256
+
+    // Split heads:
+    // 值: (B,N,L,H*D) → view({B*N,L,H,D}) → (B*N,L,H,D) → permute({0,2,3,1}) → (B*N,H,D,L)
+    // 图: [H*D,L,N,B] → view([D,H,L,B*N]) → permute({2,0,1,3}) → [L,D,H,B*N] (self_attn 契约)
+    Q = view(Q, Shape{D, H, L, B * N});
+    Q = permute(Q, {2, 0, 1, 3});
+    auto* K = Wk_->forward_graph(msa);
+    K = view(K, Shape{D, H, L, B * N});
+    K = permute(K, {2, 0, 1, 3});
+    auto* V = Wv_->forward_graph(msa);
+    V = view(V, Shape{D, H, L, B * N});
+    V = permute(V, {2, 0, 1, 3});
+
+    // bias: to_b_ D_PAIR→N_HEAD, 值 (B,L,L,8) = 图 [8,L,L,B]
+    auto* bias = to_b_->forward_graph(pair_biased);
+    // gate: to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]
+    auto* gv   = to_g_->forward_graph(msa);
+    auto* gate = sigmoid(gv);
+
+    // self_attn: Q,K,V 均为 [L,D,H,B*N], 输出 [L,D,H,B*N] = 值 (B*N,H,D,L)
+    auto* attn_out = self_attn_->forward_graph(Q, K, V, bias);
+
+    // Merge heads:
+    // 值: (B*N,H,D,L) → permute({0,3,1,2}) → (B*N,L,H,D) → view({B,N,L,H*D}) → (B,N,L,H*D)
+    // 图: [L,D,H,B*N] → permute({1,2,0,3}) → [D,H,L,B*N] → view([H*D,L,N,B])
+    auto* merged = permute(attn_out, {1, 2, 0, 3}); // [D,H,L,B*N] = 值 (B*N,L,H,D)
+    merged = view(merged, Shape{H * D, L, N, B});   // [H*D,L,N,B] = 值 (B,N,L,H*D)
+
+    // 门控: gate 与 merged 同为 [H*D,L,N,B]
+    auto* gated = out_prod(gate, merged);
+    // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
+    return to_out_->forward_graph(gated);
 }
 
 // ===== MSAColAttention (non-owning pointer 版本) =====
@@ -167,6 +211,51 @@ TensorF32 MSAColAttention::forward(const TensorF32& msa) {
 
     auto gated_attn_out = out_prod(gate, &attn_out);
     return to_out_->forward(*gated_attn_out);
+}
+
+// ===== MSAColAttention::forward_graph (图模式) =====
+// 与值版 forward 一致，输入输出均为图节点指针（ggml 布局 dims[0]=最内维）
+TensorF32* MSAColAttention::forward_graph(TensorF32* msa) {
+    // 输入: msa 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    // Wq_->forward_graph(msa) → 值 (B,N,L,H*D) = 图 [H*D, L, N, B]
+    auto* Q = Wq_->forward_graph(msa);
+    int B = static_cast<int>(Q->shape().dims[3]);   // B (最外层)
+    int N = static_cast<int>(Q->shape().dims[2]);   // N_seq
+    int L = static_cast<int>(Q->shape().dims[1]);   // L (残基)
+    int H = config_.n_head;                          // 8
+    int D = D_MSA;                                   // 256
+
+    // Split heads (沿 N_seq 维做 attention, L 合并进 batch):
+    // 值: (B,N,L,H*D) → view({B*L,N,H,D}) → (B*L,N,H,D) → permute({0,2,3,1}) → (B*L,H,D,N)
+    // 图: [H*D,L,N,B] → view([D,H,N,B*L]) → permute({2,0,1,3}) → [N,D,H,B*L] (self_attn 契约)
+    Q = view(Q, Shape{D, H, N, B * L});
+    Q = permute(Q, {2, 0, 1, 3});
+    auto* K = Wk_->forward_graph(msa);
+    K = view(K, Shape{D, H, N, B * L});
+    K = permute(K, {2, 0, 1, 3});
+    auto* V = Wv_->forward_graph(msa);
+    V = view(V, Shape{D, H, N, B * L});
+    V = permute(V, {2, 0, 1, 3});
+
+    // gate: to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]
+    auto* gv   = to_g_->forward_graph(msa);
+    auto* gate = sigmoid(gv);
+
+    // self_attn: Q,K,V 均为 [N,D,H,B*L], 输出 [N,D,H,B*L] = 值 (B*L,H,D,N)
+    auto* attn_out = self_attn_->forward_graph(Q, K, V);
+
+    // Merge heads:
+    // 值: (B*L,H,D,N) → permute({0,3,1,2}) → (B*L,N,H,D) → view({B,L,N,H*D}) → (B,L,N,H*D)
+    //     → permute({0,2,1,3}) → (B,N,L,H*D)
+    // 图: [N,D,H,B*L] → permute({1,2,0,3}) → [D,H,N,B*L] → view([H*D,N,L,B]) → permute({0,2,1,3}) → [H*D,L,N,B]
+    auto* merged = permute(attn_out, {1, 2, 0, 3}); // [D,H,N,B*L] = 值 (B*L,N,H,D)
+    merged = view(merged, Shape{H * D, N, L, B});   // [H*D,N,L,B] = 值 (B,L,N,H*D)
+    merged = permute(merged, {0, 2, 1, 3});          // [H*D,L,N,B] = 值 (B,N,L,H*D)
+
+    // 门控: gate 与 merged 同为 [H*D,L,N,B]
+    auto* gated = out_prod(gate, merged);
+    // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
+    return to_out_->forward_graph(gated);
 }
 
 // ===== MSAGlobalColAttention =====
@@ -286,6 +375,54 @@ TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_
     return to_out_->forward(*gated_attn_out);
 }
 
+// ===== PairRowAttention::forward_graph (图模式) =====
+// 与值版 forward 一致，输入输出均为图节点指针（ggml 布局 dims[0]=最内维）
+TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias) {
+    // 输入: pair 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    //       str_bias 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    // Wq_->forward_graph(pair) → 值 (B,Lr,Lc,H*D) = 图 [H*D, Lc, Lr, B]
+    auto* Q = Wq_->forward_graph(pair);
+    int B  = static_cast<int>(Q->shape().dims[3]);   // B (最外层)
+    int Lr = static_cast<int>(Q->shape().dims[2]);   // L_row
+    int Lc = static_cast<int>(Q->shape().dims[1]);   // L_col
+    int H  = config_.n_head;                         // 8
+    int D  = D_PAIR_HIDDEN;                          // 32
+
+    // Split heads (沿最后一个 L 维=行做 attention, L_col 合并进 batch):
+    // 值: (B,Lr,Lc,H*D) → view({B*Lc,Lr,H,D}) → (B*Lc,Lr,H,D) → permute({0,2,3,1}) → (B*Lc,H,D,Lr)
+    // 图: [H*D,Lc,Lr,B] → view([D,H,Lr,B*Lc]) → permute({2,0,1,3}) → [Lr,D,H,B*Lc] (self_attn 契约)
+    Q = view(Q, Shape{D, H, Lr, B * Lc});
+    Q = permute(Q, {2, 0, 1, 3});
+    auto* K = Wk_->forward_graph(pair);
+    K = view(K, Shape{D, H, Lr, B * Lc});
+    K = permute(K, {2, 0, 1, 3});
+    auto* V = Wv_->forward_graph(pair);
+    V = view(V, Shape{D, H, Lr, B * Lc});
+    V = permute(V, {2, 0, 1, 3});
+
+    // bias: to_b_ D_PAIR→N_HEAD, 值 (B,Lr,Lc,8) = 图 [8,Lc,Lr,B]
+    auto* bias = to_b_->forward_graph(str_bias);
+    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]
+    auto* gv   = to_g_->forward_graph(pair);
+    auto* gate = sigmoid(gv);
+
+    // self_attn: Q,K,V 均为 [Lr,D,H,B*Lc], 输出 [Lr,D,H,B*Lc] = 值 (B*Lc,H,D,Lr)
+    auto* attn_out = self_attn_->forward_graph(Q, K, V, bias);
+
+    // Merge heads:
+    // 值: (B*Lc,H,D,Lr) → permute({0,3,1,2}) → (B*Lc,Lr,H,D) → view({B,Lc,Lr,H*D}) → (B,Lc,Lr,H*D)
+    //     → permute({0,2,1,3}) → (B,Lr,Lc,H*D)
+    // 图: [Lr,D,H,B*Lc] → permute({1,2,0,3}) → [D,H,Lr,B*Lc] → view([H*D,Lr,Lc,B]) → permute({0,2,1,3}) → [H*D,Lc,Lr,B]
+    auto* merged = permute(attn_out, {1, 2, 0, 3}); // [D,H,Lr,B*Lc] = 值 (B*Lc,Lr,H,D)
+    merged = view(merged, Shape{H * D, Lr, Lc, B}); // [H*D,Lr,Lc,B] = 值 (B,Lc,Lr,H*D)
+    merged = permute(merged, {0, 2, 1, 3});          // [H*D,Lc,Lr,B] = 值 (B,Lr,Lc,H*D)
+
+    // 门控: gate 与 merged 同为 [H*D,Lc,Lr,B]
+    auto* gated = out_prod(gate, merged);
+    // 输出投影: H*D → D_PAIR, 返回 [D_PAIR,Lc,Lr,B] = 值 (B,Lr,Lc,D_PAIR)
+    return to_out_->forward_graph(gated);
+}
+
 // ===== PairColAttention =====
 void PairColAttention::set_params(const AttnConfig& config,
                                   LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
@@ -331,6 +468,52 @@ TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_
 
     auto gated_attn_out = out_prod(gate, &attn_out);
     return to_out_->forward(*gated_attn_out);
+}
+
+// ===== PairColAttention::forward_graph (图模式) =====
+// 与值版 forward 一致，输入输出均为图节点指针（ggml 布局 dims[0]=最内维）
+TensorF32* PairColAttention::forward_graph(TensorF32* pair, TensorF32* str_bias) {
+    // 输入: pair 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    //       str_bias 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
+    // Wq_->forward_graph(pair) → 值 (B,Lr,Lc,H*D) = 图 [H*D, Lc, Lr, B]
+    auto* Q = Wq_->forward_graph(pair);
+    int B  = static_cast<int>(Q->shape().dims[3]);   // B (最外层)
+    int Lr = static_cast<int>(Q->shape().dims[2]);   // L_row
+    int Lc = static_cast<int>(Q->shape().dims[1]);   // L_col
+    int H  = config_.n_head;                         // 8
+    int D  = D_PAIR_HIDDEN;                          // 32
+
+    // Split heads (沿倒数第二个 L 维=列做 attention, L_row 合并进 batch):
+    // 值: (B,Lr,Lc,H*D) → view({B*Lr,Lc,H,D}) → (B*Lr,Lc,H,D) → permute({0,2,3,1}) → (B*Lr,H,D,Lc)
+    // 图: [H*D,Lc,Lr,B] → view([D,H,Lc,B*Lr]) → permute({2,0,1,3}) → [Lc,D,H,B*Lr] (self_attn 契约)
+    Q = view(Q, Shape{D, H, Lc, B * Lr});
+    Q = permute(Q, {2, 0, 1, 3});
+    auto* K = Wk_->forward_graph(pair);
+    K = view(K, Shape{D, H, Lc, B * Lr});
+    K = permute(K, {2, 0, 1, 3});
+    auto* V = Wv_->forward_graph(pair);
+    V = view(V, Shape{D, H, Lc, B * Lr});
+    V = permute(V, {2, 0, 1, 3});
+
+    // bias: to_b_ D_PAIR→N_HEAD, 值 (B,Lr,Lc,8) = 图 [8,Lc,Lr,B]
+    auto* bias = to_b_->forward_graph(str_bias);
+    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]
+    auto* gv   = to_g_->forward_graph(pair);
+    auto* gate = sigmoid(gv);
+
+    // self_attn: Q,K,V 均为 [Lc,D,H,B*Lr], 输出 [Lc,D,H,B*Lr] = 值 (B*Lr,H,D,Lc)
+    auto* attn_out = self_attn_->forward_graph(Q, K, V, bias);
+
+    // Merge heads:
+    // 值: (B*Lr,H,D,Lc) → permute({0,3,1,2}) → (B*Lr,Lc,H,D) → view({B,Lr,Lc,H*D}) → (B,Lr,Lc,H*D)
+    // 图: [Lc,D,H,B*Lr] → permute({1,2,0,3}) → [D,H,Lc,B*Lr] → view([H*D,Lc,Lr,B])
+    auto* merged = permute(attn_out, {1, 2, 0, 3}); // [D,H,Lc,B*Lr] = 值 (B*Lr,Lc,H,D)
+    merged = view(merged, Shape{H * D, Lc, Lr, B}); // [H*D,Lc,Lr,B] = 值 (B,Lr,Lc,H*D)
+
+    // 门控: gate 与 merged 同为 [H*D,Lc,Lr,B]
+    auto* gated = out_prod(gate, merged);
+    // 输出投影: H*D → D_PAIR, 返回 [D_PAIR,Lc,Lr,B] = 值 (B,Lr,Lc,D_PAIR)
+    return to_out_->forward_graph(gated);
 }
 
 CrossAttention::CrossAttention(int q_dim, int kv_dim, int n_head)
@@ -404,6 +587,60 @@ TensorF32 CrossAttention::forward(const TensorF32& query, const TensorF32& kv) {
     // ===== 7. 输出投影: 64 → 32 =====
     auto result = Wo_->forward(merged);  // (B*L, 1, 32)
     return result;
+}
+
+// ===== CrossAttention::forward_graph (图模式) =====
+// 与值版 forward 逻辑一致，但输入输出均为图节点指针（ggml 布局 dims[0]=最内维）
+TensorF32* CrossAttention::forward_graph(TensorF32* query, TensorF32* kv) {
+    // 输入: query 值 (B*L,1,q_dim) = 图 [q_dim, 1, 1, B*L]
+    //       kv    值 (B*L,T,kv_dim) = 图 [kv_dim, T, 1, B*L]
+    int BL = static_cast<int>(query->shape().dims[3]); // B*L
+    int T  = static_cast<int>(kv->shape().dims[1]);    // 模板数
+    int H  = n_head_;    // 8
+    int D  = head_dim_;  // 8
+    int PD = proj_dim_;  // 64 = H*D
+
+    // ===== 1. 投影到公共维度 =====
+    auto* Q = Wq_->forward_graph(query);  // 值 (BL,1,64) = 图 [64,1,1,BL]
+    auto* K = Wk_->forward_graph(kv);     // 值 (BL,T,64) = 图 [64,T,1,BL]
+    auto* V = Wv_->forward_graph(kv);     // 值 (BL,T,64) = 图 [64,T,1,BL]
+
+    // ===== 2. Split heads =====
+    // Q: 值 (BL,1,64) → view({BL,1,H,D}) → (BL,1,H,D) → permute({0,2,3,1}) → (BL,H,D,1)
+    //    图 [64,1,1,BL] → view([D,H,1,BL]) → permute({2,0,1,3}) → [1,D,H,BL]
+    Q = view(Q, Shape{D, H, 1, BL});
+    Q = permute(Q, {2, 0, 1, 3});
+    // K: 值 (BL,T,64) → view({BL,T,H,D}) → (BL,T,H,D) → permute({0,2,3,1}) → (BL,H,D,T)
+    //    图 [64,T,1,BL] → view([D,H,T,BL]) → permute({2,0,1,3}) → [T,D,H,BL]
+    K = view(K, Shape{D, H, T, BL});
+    K = permute(K, {2, 0, 1, 3});
+    // V: 同 K
+    V = view(V, Shape{D, H, T, BL});
+    V = permute(V, {2, 0, 1, 3});
+
+    // ===== 3. Q @ K^T (收缩 dims[1]=D_head) =====
+    // Q: [1,D,H,BL], K: [T,D,H,BL] → out_prod → [1,T,H,BL] = 值 (BL,H,1,T)
+    auto* scores = out_prod(Q, K);
+
+    // ===== 4. Scale + softmax =====
+    float scale_val = 1.0f / std::sqrt(static_cast<float>(D));
+    auto* scaled = scale(scores, scale_val);
+    auto* attn = softmax(scaled);  // [1,T,H,BL]
+
+    // ===== 5. attn @ V (permute 对齐收缩维) =====
+    // 值版 attn/V 用 permute({0,1,3,2}); 图等价映射 g=[1,0,2,3]
+    auto* attn_t = permute(attn, {1, 0, 2, 3});  // [1,T,H,BL] → [T,1,H,BL]
+    auto* V_t    = permute(V, {1, 0, 2, 3});     // [T,D,H,BL] → [D,T,H,BL]
+    auto* output = out_prod(attn_t, V_t);        // [T,D,H,BL] = 值 (BL,H,D,T)
+
+    // ===== 6. Merge heads =====
+    // 值: output → permute({0,3,1,2}) → (BL,T,H,D) → view({BL,1,PD}) → (BL,1,64)
+    // 图: [T,D,H,BL] → permute({1,2,0,3}) → [D,H,T,BL] → view([PD,1,BL])
+    auto* merged = permute(output, {1, 2, 0, 3});  // [D,H,T,BL] = 值 (BL,T,H,D)
+    merged = view(merged, Shape{PD, 1, BL});        // [PD,1,BL] = 值 (BL,1,PD)
+
+    // ===== 7. 输出投影: proj_dim → q_dim =====
+    return Wo_->forward_graph(merged);  // 值 (B*L,1,q_dim) = 图 [q_dim,1,1,B*L]
 }
 
 // ===== TriangleMultiplication (non-owning pointer 版本) =====

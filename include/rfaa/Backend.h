@@ -597,6 +597,15 @@ private:
     static void kernel_sqr     (TensorF32 * node, ComputeParams * p);
     static void kernel_concat  (TensorF32 * node, ComputeParams * p);
 
+    // ===== shape op（方案 B：Tensor 无 nb，均需实际拷贝）=====
+    // kernel_cpy:    整块 memcpy src→dst（reshape/view/cont，元素顺序不变）
+    static void kernel_cpy     (TensorF32 * node, ComputeParams * p);
+    // kernel_permute: 按 op_params 的 dims 映射重排数据（permute/transpose）
+    static void kernel_permute (TensorF32 * node, ComputeParams * p);
+
+    // ===== set_rows (scatter 写入指定行) =====
+    static void kernel_set_rows     (TensorF32 * node, ComputeParams * p);
+
     // ===== get_rows / get_rows_back (embedding 查表) =====
     static void kernel_get_rows     (TensorF32 * node, ComputeParams * p);
     static void kernel_get_rows_back(TensorF32 * node, ComputeParams * p);

@@ -57,8 +57,16 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_REPEAT:      kernel_repeat(node, p);      break;
         case OP_REPEAT_BACK: kernel_repeat_back(node, p); break;
         case OP_CONCAT: kernel_concat(node, p);      break;
+        // 方案 B shape op：reshape/view/cont/cpy 整块拷贝；permute/transpose 重排
+        case OP_RESHAPE:
+        case OP_VIEW:
+        case OP_CONT:
+        case OP_CPY:     kernel_cpy(node, p);         break;
+        case OP_PERMUTE:
+        case OP_TRANSPOSE: kernel_permute(node, p);   break;
         case OP_GET_ROWS:      kernel_get_rows(node, p);       break;
         case OP_GET_ROWS_BACK: kernel_get_rows_back(node, p);  break;
+        case OP_SET_ROWS:      kernel_set_rows(node, p);       break;
         case OP_FAPE:      compute_forward_fape(p, node);      break;
         case OP_FAPE_BACK: compute_forward_fape_back(p, node); break;
         case OP_TRI_MUL:   kernel_tri_mul(node, p);            break;
@@ -601,6 +609,68 @@ void CPUBackend::kernel_dup(TensorF32 * node) {
     std::memcpy(node->data(), node->src[0]->data(), node->numel() * sizeof(float));
 }
 
+// ===== cpy (整块拷贝): dst = src0 =====
+// 用于 reshape/view/cont/cpy：元素内存顺序不变，dst 是新分配内存，必须整块 memcpy。
+// 方案 B 下 Tensor 无 nb[]，这些 shape op 不能像 ggml 那样共享 data 指针。
+void CPUBackend::kernel_cpy(TensorF32 * node, ComputeParams * p) {
+    if (p->ith != 0) {
+        p->threadpool->barrier_wait();
+        return;
+    }
+    const float * src = node->src[0]->data();
+    float       * dst = node->data();
+    std::memcpy(dst, src, node->numel() * sizeof(float));
+    p->threadpool->barrier_wait();
+}
+
+// ===== permute (维度重排, 实际搬数据) =====
+// 方案 B：Tensor 无 nb，按 op_params 的 dims 映射把数据重排到连续行主序。
+//   src 各维大小 sd[i]；dst 各维大小 dd[i]。
+//   dst 的第 p 维来自 src 的第 dims[p] 维（op_params 存的映射）。
+//   对 dst 每个连续元素 idx，反解 dst 坐标(j0,j1,j2,j3) → src 坐标 i_{dims[p]}=j_p
+//   → src 线性偏移(行主序 dims[0]最内)，写入 dst[idx]。
+// 用于 OP_PERMUTE / OP_TRANSPOSE（transpose 构造器已把交换映射写入 op_params）。
+// 并行安全：各线程写 dst 不同 idx，无 data race。
+void CPUBackend::kernel_permute(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * a = node->src[0];
+    TensorF32       * dst = node;
+
+    const int ndim = a->shape().ndim();
+    // 从 op_params 读 dims 映射（permute/transpose 构造器已写入）
+    int dims[4] = {0, 1, 2, 3};
+    for (int i = 0; i < ndim && i < 4; i++) dims[i] = node->op_params[i];
+
+    int64_t sd[4] = {1, 1, 1, 1};   // src 各维大小
+    int64_t dd[4] = {1, 1, 1, 1};   // dst 各维大小
+    for (int i = 0; i < ndim && i < 4; i++) { sd[i] = a->shape().dims[i]; dd[i] = dst->shape().dims[i]; }
+
+    const float * s_data = a->data();
+    float       * d_data = dst->data();
+
+    const int64_t total = dst->numel();
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        // 反解 dst 坐标 (j0,j1,j2,j3)，dims[0]=最内维
+        int64_t t = idx;
+        const int64_t j0 = t % dd[0]; t /= dd[0];
+        const int64_t j1 = t % dd[1]; t /= dd[1];
+        const int64_t j2 = t % dd[2]; t /= dd[2];
+        const int64_t j3 = t;
+
+        // src 坐标: i_{dims[p]} = j_p
+        int64_t i[4] = {0, 0, 0, 0};
+        const int64_t jv[4] = {j0, j1, j2, j3};
+        for (int p = 0; p < ndim && p < 4; p++) i[dims[p]] = jv[p];
+
+        // src 线性偏移（行主序 dims[0] 最内）
+        const int64_t off = ((i[3] * sd[2] + i[2]) * sd[1] + i[1]) * sd[0] + i[0];
+        d_data[idx] = s_data[off];
+    }
+}
+
 // ===== sqr (逐元素平方): dst[i] = src[i] * src[i] =====
 // 独立 op（非 unary）。按线程分片并行。ggml 中该 op 用 n_tasks=1。
 void CPUBackend::kernel_sqr(TensorF32 * node, ComputeParams * p) {
@@ -858,6 +928,64 @@ void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
 
         d[idx] = src->data()[((a3 * s2 + a2) * s1 + a1) * s0 + a0];
     }
+}
+
+// ===== set_rows (scatter 写入指定行) =====
+// 语义: set_rows(a, b, c)
+//   a(src[0]): 目标张量 (N, M)，含已有值
+//   b(src[1]): 行索引 (K,)（float 编码的整数）
+//   c(src[2]): 值源 (K, M)，每行对应一个要写入的行
+// dst(node): (N, M) — 先整体拷贝 a（保留未覆盖行），再把 c 的第 k 行覆写到 b[k] 指定的行。
+// 对应 ggml set_rows 的 scatter 语义（但 RFAA 版本 a 为已含值的目标，仅覆盖 b 指定行）。
+void CPUBackend::kernel_set_rows(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * a = node->src[0];   // 目标 (N, M)
+    const TensorF32 * b = node->src[1];   // 行索引 (K,)
+    const TensorF32 * c = node->src[2];   // 值源 (K, M)
+    TensorF32       * dst = node;         // (N, M)
+
+    const int64_t N = a->shape().dims[0];   // 行数
+    const int64_t M = a->shape().dims[1];   // 列数（每行长度）
+    const int64_t K = b->shape().dims[0];   // 索引数
+
+    const float * a_data = static_cast<const float*>(a->data());
+    const float * b_data = static_cast<const float*>(b->data());
+    const float * c_data = static_cast<const float*>(c->data());
+    float       * d_data = static_cast<float*>(dst->data());
+
+    // ===== 安全版：thread 0 串行完成全部（拷贝 + 查重 + scatter）=====
+    // 全部在 thread 0 上执行，其他线程 barrier 后返回。绝对无 data race，
+    // 且不写全局 ThreadPool::ec，避免跨 graph 复用线程池时污染后续节点状态。
+    if (p->ith != 0) {
+        p->threadpool->barrier_wait();
+        return;
+    }
+
+    // 1) 拷贝 a 全量 → dst（保留未覆盖行）
+    std::memcpy(d_data, a_data, N * M * sizeof(float));
+
+    // 2) 预扫 b 强制"无重复索引"
+    //    set_rows 语义是"每行被 scatter 一次"；重复索引会导致结果未定义。
+    //    检测到重复 → 跳过 scatter，仅保留 a 的拷贝（不设全局错误状态）。
+    bool dup = false;
+    std::vector<uint8_t> seen(static_cast<size_t>(N), 0);
+    for (int64_t k = 0; k < K; k++) {
+        const int64_t i1 = static_cast<int64_t>(b_data[k]);
+        if (i1 < 0 || i1 >= N) continue;   // 越界索引：clamp 阶段处理
+        if (seen[static_cast<size_t>(i1)]) { dup = true; break; }
+        seen[static_cast<size_t>(i1)] = 1;
+    }
+
+    // 3) 无重复才执行 scatter
+    if (!dup) {
+        for (int64_t k = 0; k < K; k++) {
+            int64_t i1 = static_cast<int64_t>(b_data[k]);
+            if (i1 < 0) i1 = 0;
+            if (i1 >= N) i1 = N - 1;
+            std::memcpy(d_data + i1 * M, c_data + k * M, M * sizeof(float));
+        }
+    }
+
+    p->threadpool->barrier_wait();
 }
 
 // ===== get_rows (embedding 查表前向) =====
