@@ -80,8 +80,8 @@ TensorF32* scale(TensorF32* a, float s) {
     TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_SCALE;
     result->src[0] = a;
-    // op_params 存储 scale 因子
-    //result->op_params[0] = reinterpret_cast<int32_t&>(s);  // float → int32 位模式
+    // op_params 存储 scale 因子 (float 位模式)，供 CPU/CUDA kernel 与反向读取
+    reinterpret_cast<float&>(result->op_params[0]) = s;
     return result;
 }
 
@@ -322,6 +322,25 @@ TensorF32* reshape(TensorF32* a, const Shape& new_shape) {
 }
 
 // permute(a, dims) — 维度重排
+// ---------------------------------------------------------------------------
+// 【重要 · 暂不实现】permute 的两种落地方案（决策记录）：
+//
+//   ggml 的做法：permute/view/reshape/transpose 是"零拷贝视图"——只重排张量的
+//   ne[](形状) 与 nb[](每维字节步长)，共享底层 data 指针，内存 0 移动；
+//   后端 compute 时一律 no-op。其前提是张量持有 nb[] 步长数组。
+//
+//   方案 A（对齐 ggml，推荐，改动大）：为 Tensor 增加 nb[] 步长字段，
+//   permute/view/reshape 只改 shape+nb、共享 data_，并把所有 kernel 的寻址
+//   从线性索引 data[i] 改为按 nb[] 计算偏移。彻底解决零拷贝 + 布局一致性问题。
+//
+//   方案 B（务实，改动小）：Tensor 无 nb，permute 构造时分配新内存并实际
+//   重排数据到连续行主序。有内存移动开销，但当前可立即落地，不需改 kernel。
+//
+//   【当前状态】两个方案均未实现。注意：当前项目 Tensor 无 nb[]，若只改 shape
+//   不搬数据（模仿 ggml），行主序下数据解释会错误；且 dispatch_node 中
+//   OP_VIEW/OP_RESHAPE/OP_PERMUTE/OP_TRANSPOSE/OP_CONT 无 case，会落 default→NOT_SUPPORTED。
+//   图化（RFAA.cpp 手写循环改图 op）依赖此步先落地。
+// ---------------------------------------------------------------------------
 TensorF32* permute(TensorF32* a, const std::vector<int>& dims) {
     assert(dims.size() == static_cast<size_t>(a->shape().ndim()));
 
@@ -439,6 +458,22 @@ TensorF32* get_rows(TensorF32* a, TensorF32* b) {
     result->op     = OP_GET_ROWS;
     result->src[0] = a;
     result->src[1] = b;
+    return result;
+}
+
+// get_rows_back(dy, idx, W) — get_rows 的反向
+// 前向: y = get_rows(W, idx) = W[idx]   (y: (K, M))
+// 反向: dL/dW[i,:] = sum_{k: idx[k]==i} dy[k,:]   (散点累加回权重表)
+// dy: (K, M), idx: (K,), W: (N, M) → dW: (N, M)
+TensorF32* get_rows_back(TensorF32* dy, TensorF32* idx, TensorF32* W) {
+    int ndim = W->shape().ndim();
+    int64_t ne[4] = {W->shape().dims[0], W->shape().dims[1], 1, 1};
+    if (ndim >= 3) ne[2] = W->shape().dims[2];
+    TensorF32* result = context().new_tensor<float>(ndim, ne);
+    result->op     = OP_GET_ROWS_BACK;
+    result->src[0] = dy;    // upstream gradient (K, M)
+    result->src[1] = idx;   // row indices (K,)
+    result->src[2] = W;     // weight table (N, M), 仅用于取形状
     return result;
 }
 
@@ -1029,6 +1064,49 @@ TensorF32* sigmoid(TensorF32* a) {
     set_unary_op(result, UNARY_OP_SIGMOID);
     result->src[0] = a;
     return result;
+}
+
+// ============================================================
+// 15. one_hot_seq / outer_sum 图节点版本（embedding / pair 特征构建）
+// ============================================================
+
+// one_hot_seq_graph(seq, num_classes) — one-hot 编码（图节点版本）
+// 用 get_rows 从"单位矩阵常量表"按整数索引取行，得到 one-hot。
+// seq: 一维扁平整数索引图节点 (K,)（ggml 布局 dims[0]=最内维）
+// 返回 [num_classes, K] 图节点（ggml 布局 dims[0]=最内维）。
+// 依赖 get_rows（已实现 kernel）。若 seq 是多维，需调用方先扁平化（view/reshape kernel 待补）。
+TensorF32* one_hot_seq_graph(TensorF32* seq, int num_classes) {
+    // 构造单位矩阵常量 leaf: [num_classes, num_classes]（ggml 布局 dims[0]=num_classes 最内）
+    int64_t eye_dims[] = {num_classes, num_classes};
+    TensorF32* eye = context().new_tensor<float>(2, eye_dims);
+    eye->flag = 0;  // 常量，不可训练
+    const int64_t nn = (int64_t)num_classes * num_classes;
+    float* ed = static_cast<float*>(eye->data());
+    for (int64_t i = 0; i < nn; i++) ed[i] = 0.0f;
+    for (int c = 0; c < num_classes; c++) ed[c * num_classes + c] = 1.0f;
+
+    // 按索引取行 → 输出 [num_classes, K]
+    return get_rows(eye, seq);
+}
+
+// outer_sum_graph(left, right) — outer sum（图节点版本）
+// 语义: left[i,:] + right[:,j] → left[i,j]，即 (B,1,L,D) + (B,L,1,D) → (B,L,L,D)。
+// 图节点采用 ggml 布局（dims[0]=最内维）:
+//   left  [D,1,L,B] + right [D,L,1,B] → [D,L,L,B]
+// 用 repeat 把 left/right 各自广播到目标形状 [D,L,L,B]，再 add_impl。
+// 依赖 repeat / add_impl（均已有 kernel）。返回图节点。
+TensorF32* outer_sum_graph(TensorF32* left, TensorF32* right) {
+    const int64_t D = left->shape().dims[0];
+    const int64_t L = left->shape().dims[2];
+    const int64_t B = left->shape().dims[3];
+
+    // 占位目标节点 [D,L,L,B]（作为 repeat 的形状来源，其数据不被读取）
+    int64_t tgt_dims[] = {D, L, L, B};
+    TensorF32* target = context().new_tensor<float>(4, tgt_dims);
+
+    auto* l = repeat(left, target);   // [D,1,L,B] → [D,L,L,B]
+    auto* r = repeat(right, target);  // [D,L,1,B] → [D,L,L,B]
+    return add_impl(l, r, /*inplace=*/false);
 }
 
 } // namespace rfaa

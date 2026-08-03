@@ -19,7 +19,9 @@ namespace rfaa {
         layer->num_embeddings_ = num_embeddings;
         layer->embedding_dim_  = embedding_dim;
 
-        int64_t dims[] = {embedding_dim, num_embeddings};  // (D, V)
+        // 布局改为 (V, D) = (num_embeddings, embedding_dim)，每行是一个 token 的向量，
+        // 以匹配 get_rows(W, idx) 的"按行取"语义（get_rows 沿 dim[0] 取行）
+        int64_t dims[] = {num_embeddings, embedding_dim};  // (V, D)
         layer->weights_ = context().new_tensor<float>(2, dims);
         layer->weights_->flag = TENSOR_FLAG_PARAM;
 
@@ -37,7 +39,9 @@ namespace rfaa {
     // ===== 图模式：get_rows =====
     TensorF32* EmbeddingLayer::forward_graph(TensorF32* indices) {
         // embedding 本质是 get_rows(weight, indices)
-        //return get_rows(weights_, indices);
+        // weight: (V, D), indices: (K,) → output: (K, D)
+        // 反向由 OP_GET_ROWS → get_rows_back 自动展开
+        return get_rows(weights_, indices);
     }
 
     // TODO
@@ -315,6 +319,34 @@ namespace rfaa {
         }
         
         return output;
+    }
+
+    // ===== FullEmbedding::forward_graph (图模式) =====
+    // 广播 query: msa_emb + repeat(seq_emb)  (B,N,L,d_msa)
+    // 图节点采用 ggml 布局 (dims[0]=最内维):
+    //   msa_emb : [d_msa, L, N, B]  (emb_->forward_graph 输出, mul_mat)
+    //   seq_emb : [d_msa, B*L]      (emb_q_->forward_graph 输出, get_rows, 一维扁平索引)
+    // 广播路径: seq_emb -> view [d_msa, L, 1, B] -> repeat 到 msa_emb 形状 -> add
+    // ⚠️ 依赖: view / repeat / add_impl 图 op。其中 view 图节点当前缺 dispatch kernel，
+    //    需先补 view/unsqueeze kernel 才能执行。布局以 RFAAModel 图化后的上游约定为准。
+    TensorF32* FullEmbedding::forward_graph(TensorF32* msa, TensorF32* seq, TensorF32* idx) {
+        // msa : (B, N, L, d_init) → emb 线性投影
+        auto* msa_emb = emb_->forward_graph(msa);              // [d_msa, L, N, B]
+
+        // seq : (B, L) 整数索引 → query 行嵌入 (get_rows 按行取, 输出 [d_msa, B*L])
+        auto* seq_emb = emb_q_->forward_graph(seq);            // [d_msa, B*L]
+
+        // 广播: seq_emb [d_msa, B*L] → view [d_msa, L, 1, B] → repeat → [d_msa, L, N, B]
+        // 注: 依赖上游 msa_emb 的 ggml 布局 (dims[1]=L, dims[3]=B), 需与 RFAAModel 图化一致
+        const int64_t L = msa_emb->shape().dims[1];
+        const int64_t B = msa_emb->shape().dims[3];
+        auto* seq_b     = view(seq_emb, Shape{seq_emb->shape().dims[0], L, 1, B});  // [d_msa, L, 1, B]
+        auto* seq_expand = repeat(seq_b, msa_emb);             // 广播到 msa_emb 形状 [d_msa, L, N, B]
+
+        // msa_emb + broadcast(query) (inplace 不改输入)
+        auto* out = add_impl(msa_emb, seq_expand, /*inplace=*/false);
+        (void)idx;
+        return out;
     }
 /* if d_init==0:
             d_init=ChemData().NAATOKENS-1+4

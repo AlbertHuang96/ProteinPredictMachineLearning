@@ -37,7 +37,11 @@ public:
     
     // Q, K, V 来自同一输入
     TensorF32 forward(const TensorF32& Q, const TensorF32& K, const TensorF32& V, const TensorF32* bias = nullptr);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针，无 copy_from 值拷贝，图节点沿前向一路传播
+    TensorF32* forward_graph(TensorF32* Q, TensorF32* K, TensorF32* V, TensorF32* bias = nullptr);
+
     // 加载权重
     void load_weights(const std::string& prefix);
     
@@ -180,7 +184,11 @@ public:
     
     // pair: (B, L, L, D)
     TensorF32 forward(const TensorF32& pair, bool bOutgoing = true);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针
+    TensorF32* forward_graph(TensorF32* pair, bool bOutgoing = true);
+
 private:
     static constexpr int D_HIDDEN_TRIMUL = 128;
 
@@ -219,7 +227,11 @@ public:
                     LayerNorm* layernorm, LinearLayer* linear1, LinearLayer* linear2);
     
     TensorF32 forward(const TensorF32& x);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针。训练时 dropout 先以 identity 处理（图 drop 后续补）
+    TensorF32* forward_graph(TensorF32* x);
+
 private:
     int dim_ = 0, hidden_dim_ = 0;
     float dropout_rate_ = 0.1f;

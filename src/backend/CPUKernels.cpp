@@ -41,6 +41,7 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_SUB:
         case OP_MUL:
         case OP_DIV:    kernel_elemwise(node, p);    break;
+        case OP_SQR:    kernel_sqr(node, p);         break;
         case OP_ADD1:   kernel_add1(node, p);        break;
         case OP_SCALE:  kernel_scale(node, p);       break;
         case OP_MUL_MAT:   kernel_mul_mat(node, p);  break;
@@ -53,7 +54,11 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_NORM_BACK: kernel_norm_back(node, p); break;
         case OP_SUM:    kernel_sum(node, p);         break;
         case OP_MEAN:   kernel_mean(node, p);        break;
+        case OP_REPEAT:      kernel_repeat(node, p);      break;
+        case OP_REPEAT_BACK: kernel_repeat_back(node, p); break;
         case OP_CONCAT: kernel_concat(node, p);      break;
+        case OP_GET_ROWS:      kernel_get_rows(node, p);       break;
+        case OP_GET_ROWS_BACK: kernel_get_rows_back(node, p);  break;
         case OP_FAPE:      compute_forward_fape(p, node);      break;
         case OP_FAPE_BACK: compute_forward_fape_back(p, node); break;
         case OP_TRI_MUL:   kernel_tri_mul(node, p);            break;
@@ -596,10 +601,194 @@ void CPUBackend::kernel_dup(TensorF32 * node) {
     std::memcpy(node->data(), node->src[0]->data(), node->numel() * sizeof(float));
 }
 
-void CPUBackend::kernel_scale(TensorF32 * node, ComputeParams * p) { (void)node; (void)p; }
-void CPUBackend::kernel_add1(TensorF32 * node, ComputeParams * p)  { (void)node; (void)p; }
-void CPUBackend::kernel_sum(TensorF32 * node, ComputeParams * p)   { (void)node; (void)p; }
-void CPUBackend::kernel_mean(TensorF32 * node, ComputeParams * p)  { (void)node; (void)p; }
+// ===== sqr (逐元素平方): dst[i] = src[i] * src[i] =====
+// 独立 op（非 unary）。按线程分片并行。ggml 中该 op 用 n_tasks=1。
+void CPUBackend::kernel_sqr(TensorF32 * node, ComputeParams * p) {
+    const float * src = node->src[0]->data();
+    float       * dst = node->data();
+
+    const int64_t total = node->numel();
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t i = start; i < end; i++) dst[i] = src[i] * src[i];
+}
+
+// ===== scale (标量乘法): dst = src0 * s =====
+// s 以 float 位模式存于 op_params[0]（由 scale() 构造器写入）
+void CPUBackend::kernel_scale(TensorF32 * node, ComputeParams * p) {
+    const float s = reinterpret_cast<const float&>(node->op_params[0]);
+    const float * src = node->src[0]->data();
+    float       * dst = node->data();
+
+    const int64_t total = node->numel();
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t i = start; i < end; i++) dst[i] = src[i] * s;
+}
+
+// ===== add1 (加标量): dst = src0 + b =====
+// b 是标量张量 node->src[1]（读其 data()[0]）
+void CPUBackend::kernel_add1(TensorF32 * node, ComputeParams * p) {
+    const float b    = node->src[1]->data()[0];
+    const float * src = node->src[0]->data();
+    float       * dst = node->data();
+
+    const int64_t total = node->numel();
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t i = start; i < end; i++) dst[i] = src[i] + b;
+}
+
+// ===== sum (全元素求和): dst[0] = Σ all src0 =====
+// 输出为标量 (1,)。不同线程对同一 dst[0] 累加会 data race，
+// 故在 thread 0 上串行 reduce（与 FAPE/get_rows_back 的 thread-0-only 模式一致）。
+void CPUBackend::kernel_sum(TensorF32 * node, ComputeParams * p) {
+    if (p->ith != 0) {
+        p->threadpool->barrier_wait();
+        return;
+    }
+    const float * src = node->src[0]->data();
+    const int64_t n   = node->src[0]->numel();
+    float s = 0.0f;
+    for (int64_t i = 0; i < n; i++) s += src[i];
+    node->data()[0] = s;
+    p->threadpool->barrier_wait();
+}
+
+// ===== mean (全元素平均): dst[0] = Σ src0 / n =====
+// 输出为标量 (1,)。同样 thread 0 串行 reduce。
+void CPUBackend::kernel_mean(TensorF32 * node, ComputeParams * p) {
+    if (p->ith != 0) {
+        p->threadpool->barrier_wait();
+        return;
+    }
+    const float * src = node->src[0]->data();
+    const int64_t n   = node->src[0]->numel();
+    float s = 0.0f;
+    for (int64_t i = 0; i < n; i++) s += src[i];
+    node->data()[0] = (n > 0) ? (s / static_cast<float>(n)) : 0.0f;
+    p->threadpool->barrier_wait();
+}
+
+// ===== repeat (广播) =====
+// 语义: 将 src0 广播到 node(=src1) 的形状。src0 的尾部维与 dst 尾部维对齐，
+//       src0 维度数少于 dst 时，缺失的前导维按 1 处理（即广播）。
+//       src0 某维 == dst 该维 或 src0 该维 == 1 时合法。
+// 使用场景: sum/mean 反向 add1_or_set 首次设置 grad 时，把标量 grad 广播成 src 形状。
+void CPUBackend::kernel_repeat(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * src0 = node->src[0];
+    TensorF32       * dst  = node;
+
+    const int nd_src = src0->shape().ndim();
+    const int nd_dst = dst->shape().ndim();
+
+    const int64_t ne0[4] = {
+        src0->shape().dims[0],
+        (nd_src > 1) ? src0->shape().dims[1] : 1,
+        (nd_src > 2) ? src0->shape().dims[2] : 1,
+        (nd_src > 3) ? src0->shape().dims[3] : 1
+    };
+    const int64_t nd0 = dst->shape().dims[0];
+    const int64_t nd1 = (nd_dst > 1) ? dst->shape().dims[1] : 1;
+    const int64_t nd2 = (nd_dst > 2) ? dst->shape().dims[2] : 1;
+    const int64_t nd3 = (nd_dst > 3) ? dst->shape().dims[3] : 1;
+
+    const float * src_data = src0->data();
+    float       * dst_data = dst->data();
+
+    const int64_t total = nd0 * nd1 * nd2 * nd3;
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        int64_t t = idx;
+        const int64_t i3 = t % nd3; t /= nd3;
+        const int64_t i2 = t % nd2; t /= nd2;
+        const int64_t i1 = t % nd1; t /= nd1;
+        const int64_t i0 = t;
+
+        // 尾部对齐的 src0 索引（缺失维取模 1 = 0）
+        const int64_t s0 = i0 % ne0[0];
+        const int64_t s1 = i1 % ne0[1];
+        const int64_t s2 = i2 % ne0[2];
+        const int64_t s3 = i3 % ne0[3];
+
+        dst_data[idx] = src_data[((s3 * ne0[2] + s2) * ne0[1] + s1) * ne0[0] + s0];
+    }
+}
+
+// ===== repeat_back (归约，repeat 的逆操作) =====
+// 语义: 把 src0(大形状，被 repeat 广播的结果/梯度) 归约回 node(小形状)。
+//       dst[j] = Σ_{k} src0[j + k*dd] ，其中对每个维度 d：
+//         - dd[d] = dst 该维大小，sd[d] = src0 该维大小（尾部对齐），
+//         - k 遍历 [0, sd[d]/dd[d])。
+//       src0 前导维数多于 dst 时，src0 多出的前导维是纯广播维（dst 对应维=1），全部累加。
+// 使用场景: OP_ADD/OP_MUL/OP_REPEAT 反向中 repeat_back(grad, src)。
+// 并行安全: 每个 dst 元素独立归约，各线程处理互不重叠的 dst 子集，无 data race。
+void CPUBackend::kernel_repeat_back(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * src0 = node->src[0];
+    TensorF32       * dst  = node;
+
+    const int nd_src = src0->shape().ndim();
+    const int nd_dst = dst->shape().ndim();
+
+    // 尾部对齐维度。dst 的维 d (0=最内维) 对应 src0 的维 (d + off)，off = nd_src - nd_dst。
+    // dst 缺失前导维（d >= nd_dst）按 1 处理；src0 缺失前导维（d+off >= nd_src）按 1 处理。
+    const int off = nd_src - nd_dst;
+
+    int64_t dd[4] = {1, 1, 1, 1};   // dst 各维
+    int64_t sd[4] = {1, 1, 1, 1};   // src0 各维
+    for (int d = 0; d < nd_dst && d < 4; d++) dd[d] = dst->shape().dims[d];
+    for (int d = 0; d < nd_src && d < 4; d++) sd[d] = src0->shape().dims[d];
+
+    // 归约次数: 每维 src0 大小 / dst 大小（尾部对齐）。sd/dd 应为非负整数。
+    int64_t rd[4] = {1, 1, 1, 1};
+    for (int d = 0; d < 4; d++) {
+        const int s_idx = d + off;
+        const int64_t sdim = (s_idx >= 0 && s_idx < 4) ? sd[s_idx] : 1;
+        const int64_t ddim = dd[d];
+        rd[d] = (ddim > 0) ? (sdim / ddim) : 1;
+    }
+
+    const float * src_data = src0->data();
+    float       * dst_data = dst->data();
+
+    const int64_t total = dd[0] * dd[1] * dd[2] * dd[3];
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        int64_t t = idx;
+        const int64_t j0 = t % dd[0]; t /= dd[0];
+        const int64_t j1 = t % dd[1]; t /= dd[1];
+        const int64_t j2 = t % dd[2]; t /= dd[2];
+        const int64_t j3 = t;
+
+        float sum = 0.0f;
+        for (int64_t k0 = 0; k0 < rd[0]; k0++) {
+            const int64_t s0 = j0 + k0 * dd[0];
+            for (int64_t k1 = 0; k1 < rd[1]; k1++) {
+                const int64_t s1 = j1 + k1 * dd[1];
+                for (int64_t k2 = 0; k2 < rd[2]; k2++) {
+                    const int64_t s2 = j2 + k2 * dd[2];
+                    for (int64_t k3 = 0; k3 < rd[3]; k3++) {
+                        const int64_t s3 = j3 + k3 * dd[3];
+                        sum += src_data[((s3 * sd[2] + s2) * sd[1] + s1) * sd[0] + s0];
+                    }
+                }
+            }
+        }
+        dst_data[idx] = sum;
+    }
+}
 
 // ===== concat =====
 // 对标 ggml_compute_forward_concat_f32（项目仅 F32 连续数据，故无需 block_size / nb stride 处理）
@@ -669,6 +858,75 @@ void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
 
         d[idx] = src->data()[((a3 * s2 + a2) * s1 + a1) * s0 + a0];
     }
+}
+
+// ===== get_rows (embedding 查表前向) =====
+// 前向: y = W[idx], 即按 idx 从 W 中取行
+// src0: W (N, M) 权重表; src1: idx (K,) 行索引 (float-encoded ints)
+// dst:  y (K, M)  — 逐行拷贝 W[idx[k]] → y[k]
+void CPUBackend::kernel_get_rows(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * W   = node->src[0];
+    const TensorF32 * idx = node->src[1];
+    TensorF32       * dst = node;
+
+    const int64_t N = W->shape().dims[0];      // 权重表行数 (= 词表大小)
+    const int64_t M = W->shape().dims[1];      // 每行长度 (= 嵌入维度)
+    const int64_t K = idx->shape().dims[0];    // 索引数量
+
+    const float * W_data   = static_cast<const float*>(W->data());
+    const float * idx_data = static_cast<const float*>(idx->data());
+    float       * d_data   = static_cast<float*>(dst->data());
+
+    const int64_t total = K;
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t k = start; k < end; k++) {
+        int64_t i = static_cast<int64_t>(idx_data[k]);
+        if (i < 0) i = 0;
+        if (i >= N) i = N - 1;
+        // 逐元素拷贝第 i 行到输出第 k 行 (row-major)
+        std::memcpy(d_data + k * M, W_data + i * M, M * sizeof(float));
+    }
+}
+
+// ===== get_rows_back (embedding 查表反向) =====
+// 前向: y = W[idx], 反向 dL/dW[i,:] = sum_{k: idx[k]==i} dy[k,:]
+// src0: dy (K, M) upstream gradient
+// src1: idx (K,) row indices (float-encoded ints)
+// src2: W (N, M) 权重表 (仅用于取形状 N, M)
+// dst:  dW (N, M) — 先清零，再按 idx 散点累加
+void CPUBackend::kernel_get_rows_back(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * dy  = node->src[0];
+    const TensorF32 * idx = node->src[1];
+    const TensorF32 * W   = node->src[2];
+    TensorF32       * dst = node;
+
+    const int64_t N = W->shape().dims[0];      // 权重表行数 (= 词表大小)
+    const int64_t M = W->shape().dims[1];      // 每行长度 (= 嵌入维度)
+    const int64_t K = idx->shape().dims[0];    // 索引数量
+
+    const float * dy_data   = static_cast<const float*>(dy->data());
+    const float * idx_data  = static_cast<const float*>(idx->data());
+    float       * dW_data   = static_cast<float*>(dst->data());
+
+    // ===== 仅在 thread 0 上执行清零 + 散点累加 =====
+    // 注意: 同一 token (i) 可能出现在多个 k, 必须 += 累加而非覆盖;
+    //       不同 k 可能映射到同一 i, 若跨线程并行会 data race, 故串行在 thread 0 完成.
+    if (p->ith == 0) {
+        std::memset(dW_data, 0, N * M * sizeof(float));
+
+        for (int64_t k = 0; k < K; k++) {
+            int64_t i = static_cast<int64_t>(idx_data[k]);
+            if (i < 0 || i >= N) continue;   // 越界索引丢弃
+            for (int64_t d = 0; d < M; d++) {
+                dW_data[i * M + d] += dy_data[k * M + d];
+            }
+        }
+    }
+
+    p->threadpool->barrier_wait();
 }
 
 void CPUBackend::kernel_sigmoid(TensorF32 * node, ComputeParams * p) {

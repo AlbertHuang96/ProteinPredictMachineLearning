@@ -184,6 +184,11 @@ public:
     void set_params(LinearLayer* emb, EmbeddingLayer* emb_q, int d_msa);
     
     TensorF32 forward(const TensorF32& msa, const TensorF32& seq, const TensorF32& idx);
+
+    // ===== 图模式前向（训练用）=====
+    // 输入输出均为图节点指针：msa_emb + broadcast(query_seq_emb)
+    // 返回 msa embedding (B,N,L,d_msa)
+    TensorF32* forward_graph(TensorF32* msa, TensorF32* seq, TensorF32* idx);
         
     // Query embedd
     /* if d_init==0:

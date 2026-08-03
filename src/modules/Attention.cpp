@@ -55,6 +55,31 @@ TensorF32 SelfAttention::forward(const TensorF32& Q, const TensorF32& K, const T
     return result;
 }
 
+// ===== SelfAttention::forward_graph (图模式) =====
+// 与值版 forward 逻辑完全一致，但输入输出均为图节点指针，去掉 copy_from 值拷贝
+TensorF32* SelfAttention::forward_graph(TensorF32* Q, TensorF32* K, TensorF32* V, TensorF32* bias) {
+    // 输入约定: Q, K, V 均为 (batch, n_head, D_head, L)
+    // GGML dims = [L, D_head, n_head, batch]
+
+    // 1. scores = Q @ K^T (out_prod 收缩 dims[1]=D_head)
+    auto scores = out_prod(Q, K);
+    // 2. scale = 1/sqrt(d_head)
+    float scale_val = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
+    auto scaled = scale(scores, scale_val);
+    // 3. add bias
+    if (bias != nullptr) {
+        scaled = add_impl(scaled, bias, /*inplace=*/false);
+    }
+    // 4. softmax
+    auto attn = softmax(scaled);  // (B, H, L_q, L_k), dims = [L_k, L_q, H, B]
+    // 5. attn @ V
+    auto attn_t = permute(attn, {0, 1, 3, 2});       // (B, H, L_k, L_q), dims=[L_q, L_k, H, B]
+    auto V_t    = permute(V, {0, 1, 3, 2});          // (B, H, L_k, D_head)
+    auto output = out_prod(attn_t, V_t);             // (B, H, D_head, L_q)
+
+    return output;   // 返回图节点，不再 copy_from
+}
+
 // ===== MSARowAttention (non-owning pointer 版本) =====
 // 旧构造函数 (保留注释):
 // MSARowAttention::MSARowAttention(const AttnConfig& config) : config_(config) {}
@@ -423,6 +448,31 @@ TensorF32 TriangleMultiplication::forward(const TensorF32& pair, bool bOutgoing)
     return std::move(*tri_mul_forward_gated);
 }
 
+// ===== TriangleMultiplication::forward_graph (图模式) =====
+// 输入输出均为图节点指针，LayerNorm/Linear 走 forward_graph 指针接口
+TensorF32* TriangleMultiplication::forward_graph(TensorF32* pair, bool bOutgoing) {
+    auto pair_norm  = layernorm_->forward(pair);               // TensorF32*
+    auto left       = left_proj_->forward_graph(pair_norm);    // TensorF32*
+    auto right      = right_proj_->forward_graph(pair_norm);
+    auto lgv        = left_gate_->forward_graph(pair_norm);
+    auto rgv        = right_gate_->forward_graph(pair_norm);
+    auto left_gate  = sigmoid(lgv);
+    auto right_gate = sigmoid(rgv);
+    auto left_gated  = out_prod(left, left_gate);
+    auto right_gated = out_prod(right, right_gate);
+
+    auto tri_mul_forward = triangle_mul(left_gated, right_gated, float(pair->shape().dims[1]), bOutgoing);
+
+    auto tri_mul_forward_norm = output_layernorm_->forward(tri_mul_forward);
+    auto tri_mul_forward_proj = out_proj_->forward_graph(tri_mul_forward_norm);
+
+    auto gv = gate_->forward_graph(pair_norm);
+    auto gate_out = sigmoid(gv);
+    auto tri_mul_forward_gated = out_prod(gate_out, tri_mul_forward_proj);
+
+    return tri_mul_forward_gated;   // 返回图节点
+}
+
 
 // ===== FeedForward (non-owning pointer 版本) =====
 // 旧构造函数 (保留注释):
@@ -444,6 +494,17 @@ TensorF32 FeedForward::forward(const TensorF32& x) {
     auto* x_relu  = relu(&x_hidden);                                   // relu 接受指针，返回指针
     auto x_dropped = dropout_.forward(*x_relu);                        // dropout 接受值引用
     auto x_out = linear2_->forward(x_dropped);                        // 传引用
+    return x_out;
+}
+
+// ===== FeedForward::forward_graph (图模式) =====
+// 输入输出均为图节点指针。训练时 dropout 以 identity 处理（图 drop 后续补充）
+TensorF32* FeedForward::forward_graph(TensorF32* x) {
+    auto x_norm    = layernorm_->forward(x);              // TensorF32*
+    auto x_hidden  = linear1_->forward_graph(x_norm);     // TensorF32*
+    auto x_relu    = relu(x_hidden);                       // relu 返回指针
+    // dropout 图模式暂以 identity 处理（训练时图 drop 需后续专用 op）
+    auto x_out     = linear2_->forward_graph(x_relu);
     return x_out;
 }
 

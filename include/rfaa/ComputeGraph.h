@@ -200,7 +200,19 @@ TensorF32* cont     (TensorF32* a);
 
 // 7. 索引
 TensorF32* get_rows(TensorF32* a, TensorF32* b);
+// get_rows_back(dy, idx, W) — get_rows 的反向：将 dy 按 idx 散点累加回权重表 W
+// dy: (K, M), idx: (K,), W: (N, M) → dW: (N, M)
+TensorF32* get_rows_back(TensorF32* dy, TensorF32* idx, TensorF32* W);
 TensorF32* set_rows(TensorF32* a, TensorF32* b, TensorF32* c);
+
+// one_hot_seq 图版：seq 为一维扁平整数索引图节点 → get_rows(eye, seq)
+// 返回 [num_classes, K] 图节点（ggml 布局 dims[0]=最内维）。依赖 get_rows（已实现）。
+// ⚠️ seq 需先扁平为一维 (view/reshape kernel 待补时由调用方保证已扁平)
+TensorF32* one_hot_seq_graph(TensorF32* seq, int num_classes = 21);
+
+// outer_sum 图版：left [D,1,L,B] + right [D,L,1,B] → [D,L,L,B]（ggml 布局 dims[0]=最内维）
+// 用 repeat 广播 + add_impl 组装。依赖 repeat / add_impl（均已有 kernel）。返回图节点。
+TensorF32* outer_sum_graph(TensorF32* left, TensorF32* right);
 
 // 8. 特殊
 TensorF32* diag_mask_inf (TensorF32* a, int n_past);

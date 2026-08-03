@@ -592,12 +592,13 @@ void ComputeGraph::compute_backward(
             }
         } break;
         case OP_GET_ROWS: {
+            // 前向: y = get_rows(src0=W, src1=idx) = W[idx]
+            // 反向: dL/dW = get_rows_back(grad, idx, W) — 按 idx 散点累加
             if (src0_needs_grads) {
-                // TODO: needs get_rows_back graph node and kernel
-                // add_or_set(ctx, cgraph, isrc0, get_rows_back(grad, src1, src0));
+                add_or_set(ctx, cgraph, isrc0, get_rows_back(grad, src1, src0));
             }
             if (src1_needs_grads) {
-                // noop
+                // noop: 索引不可导
             }
         } break;
         case OP_DIAG_MASK_INF: {

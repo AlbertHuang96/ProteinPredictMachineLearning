@@ -592,7 +592,14 @@ private:
     static void kernel_add1    (TensorF32 * node, ComputeParams * p);
     static void kernel_sum     (TensorF32 * node, ComputeParams * p);
     static void kernel_mean    (TensorF32 * node, ComputeParams * p);
+    static void kernel_repeat  (TensorF32 * node, ComputeParams * p);
+    static void kernel_repeat_back(TensorF32 * node, ComputeParams * p);
+    static void kernel_sqr     (TensorF32 * node, ComputeParams * p);
     static void kernel_concat  (TensorF32 * node, ComputeParams * p);
+
+    // ===== get_rows / get_rows_back (embedding 查表) =====
+    static void kernel_get_rows     (TensorF32 * node, ComputeParams * p);
+    static void kernel_get_rows_back(TensorF32 * node, ComputeParams * p);
 
     static void kernel_sigmoid (TensorF32 * node, ComputeParams * p);
 
