@@ -1,7 +1,31 @@
 #include "rfaa/Attention.h"
 #include "rfaa/Embedding.h"
+#include "rfaa/Context.h"
 
 namespace rfaa {
+
+namespace {
+
+// 把 to_b_ 投影出的 pair bias [H, Lq, Lk, B]（值 (B,Lk,Lq,H)）规整为
+// self_attn scores 布局 [Lk, Lq, H, B*fold]（值 (B*fold, H, Lq, Lk)），
+// 并将 batch 沿 fold 维广播（pair bias 与 fold 维无关）。
+//
+// 图 op 布局约定：值 (d0,d1,d2,d3) = 图 [d3,d2,d1,d0]。
+//   scores = out_prod(K,Q) → [Lk,Lq,H,B] = 值 (B,H,Lq,Lk)
+//   bias   = [H,Lq,Lk,B] = 值 (B,Lk,Lq,H)
+// permute({1,2,0,3}) → [Lk,Lq,H,B] = 值 (B,H,Lq,Lk)，与 scores 逐元素一致。
+TensorF32* prepare_pair_bias(TensorF32* bias,
+                             int64_t Lq, int64_t Lk, int64_t B, int64_t fold) {
+    bias = permute(bias, {1, 2, 0, 3});          // [H,Lq,Lk,B] → [Lk,Lq,H,B]
+    if (fold != 1) {
+        int64_t tgt[] = {Lk, Lq, bias->shape().dims[2], B * fold};
+        TensorF32* target = context().new_tensor<float>(4, tgt);
+        bias = repeat(bias, target);              // 广播 batch B → B*fold
+    }
+    return bias;
+}
+
+} // namespace
 
 // Attention 模块的桩实现
 // 实际应调用 CUDA kernel 或 CPU 实现
@@ -26,6 +50,8 @@ TensorF32 SelfAttention::forward(const TensorF32& Q, const TensorF32& K, const T
     auto scaled = scale(scores, scale_val);
 
     // ===== 3. add bias =====
+    // 遗留：值版 bias 广播未处理（同 Bug3）。bias 需先 permute+repeat 展开成与
+    // scaled 完全相同的形状再 add_impl（图模式已用 prepare_pair_bias 修复）。
     if (bias != nullptr) {
         scaled = add_impl(scaled, const_cast<TensorF32*>(bias), /*inplace=*/false);
     }
@@ -105,7 +131,7 @@ TensorF32 MSARowAttention::forward(const TensorF32& msa, const TensorF32& pair_b
 
     V = V.view(Shape({B * N, L, H, D}));
     V = V.permute({0, 2, 3, 1});
-    auto bias = to_b_->forward(pair_biased);
+    auto bias = to_b_->forward(pair_biased);  // 遗留：值版 bias 广播未处理（同 Bug3）
     auto gv   = to_g_->forward(msa);
     auto gate = sigmoid(&gv);
     auto attn_out = self_attn_->forward(Q, K, V, &bias);
@@ -146,7 +172,9 @@ TensorF32* MSARowAttention::forward_graph(TensorF32* msa, TensorF32* pair_biased
     V = permute(V, {2, 0, 1, 3});
 
     // bias: to_b_ D_PAIR→N_HEAD, 值 (B,L,L,8) = 图 [8,L,L,B]
+    // 规整为 scores 布局 [L,L,H,B*N]（值 (B*N,H,L,L)），并把 batch 沿 N_seq 广播。
     auto* bias = to_b_->forward_graph(pair_biased);
+    bias = prepare_pair_bias(bias, /*Lq=*/L, /*Lk=*/L, /*B=*/B, /*fold=*/N);
     // gate: to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]
     auto* gv   = to_g_->forward_graph(msa);
     auto* gate = sigmoid(gv);
@@ -327,6 +355,72 @@ TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
     return to_out_->forward(*gated_attn_out);
 }
 
+// ===== MSAGlobalColAttention::forward_graph (图模式) =====
+// Global Col attention: Q 在 N_seq 维取 mean, 然后 1-to-many attention。
+// 与值版 forward 逻辑一致，输入输出均为图节点指针（ggml 布局 dims[0]=最内维）。
+// 关键点：现有 mean/sum 都是全局塌缩到标量，sum_rows 只沿最内维求和。
+// 因此把待消去的 N_seq 先用 permute 挪到最内维 (graph dim0)，再 sum_rows，再 scale(1/N)。
+// 图布局约定: 值 (d0,d1,d2,d3) = 图 [d3,d2,d1,d0]。
+TensorF32* MSAGlobalColAttention::forward_graph(TensorF32* msa) {
+    // 输入: msa 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    // Wq_->forward_graph(msa) → 值 (B,N,L,H*D) = 图 [H*D, L, N, B]
+    auto* Q = Wq_->forward_graph(msa);
+    int B = static_cast<int>(Q->shape().dims[3]);   // B (最外层)
+    int N = static_cast<int>(Q->shape().dims[2]);   // N_seq
+    int L = static_cast<int>(Q->shape().dims[1]);   // L (残基)
+    int H = config_.n_head;                          // 8
+    int D = D_MSA;                                   // 256
+
+    // ===== 1. Q mean over N_seq (值 dim1) =====
+    // 值: (B,N,L,H*D) → mean(dim=1) → (B,L,H*D)
+    // 图: [H*D,L,N,B] → permute({2,1,0,3}) → [N,L,H*D,B] → sum_rows(沿最内维 N)
+    //     → [1,L,H*D,B] → scale(1/N) → [1,L,H*D,B] → permute({0,2,1,3}) → [1,H*D,L,B]
+    auto* qp = permute(Q, {2, 1, 0, 3});             // [N,L,H*D,B] = 值 (B,H*D,L,N)
+    auto* qs = sum_rows(qp);                         // [1,L,H*D,B] = 值 (B,H*D,L,1)，Σ_n
+    auto* qm = scale(qs, 1.0f / static_cast<float>(N)); // 均值
+    auto* qm2 = permute(qm, {0, 2, 1, 3});           // [1,H*D,L,B] = 值 (B,L,H*D,1)
+
+    // ===== 2. Split Q heads =====
+    // 值: (B,L,H*D,1) → view({B*L,H,D,1}) → (B*L,H,D,1) (L_seq=1, self_attn 契约)
+    // 图: [1,H*D,L,B] → view([1,D,H,B*L]) → [1,D,H,B*L]
+    auto* Qh = view(qm2, Shape{1, D, H, B * L});
+
+    // ===== 3. Split KV heads =====
+    // 值: (B,N,L,H*D) → view({B*L,N,H,D}) → (B*L,N,H,D) → permute({0,2,3,1}) → (B*L,H,D,N)
+    // 图: [H*D,L,N,B] → view([D,H,N,B*L]) → permute({2,0,1,3}) → [N,D,H,B*L]
+    auto* K = Wk_->forward_graph(msa);
+    K = view(K, Shape{D, H, N, B * L});
+    K = permute(K, {2, 0, 1, 3});
+    auto* V = Wv_->forward_graph(msa);
+    V = view(V, Shape{D, H, N, B * L});
+    V = permute(V, {2, 0, 1, 3});
+
+    // ===== 4. gate =====
+    // to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]
+    auto* gv   = to_g_->forward_graph(msa);
+    auto* gate = sigmoid(gv);
+
+    // ===== 5. self_attn: Q=[1,D,H,B*L], K/V=[N,D,H,B*L] → [1,D,H,B*L] = 值 (B*L,H,D,1) =====
+    auto* attn_out = self_attn_->forward_graph(Qh, K, V);
+
+    // ===== 6. Merge heads + 显式 repeat 广播 N_seq 维 =====
+    // 值: (B*L,H,D,1) → view({B,L,H*D}) → (B,L,H*D) → view({B,1,L,H*D}) → (B,1,L,H*D)
+    //     → repeat → (B,N,L,H*D)
+    // 图: [1,D,H,B*L] → view([H*D,L,B]) → [H*D,L,B] → view([H*D,L,1,B]) → [H*D,L,1,B]
+    //     → repeat 到 [H*D,L,N,B]（显式广播，避免依赖 out_prod 的 src1 广播）
+    auto* merged = view(attn_out, Shape{H * D, L, B});   // [H*D,L,B] = 值 (B,L,H*D)
+    merged = view(merged, Shape{H * D, L, 1, B});        // [H*D,L,1,B] = 值 (B,1,L,H*D)
+    int64_t tgt[4] = {H * D, L, N, B};
+    TensorF32* target = context().new_tensor<float>(4, tgt);
+    merged = repeat(merged, target);                      // [H*D,L,N,B] = 值 (B,N,L,H*D)
+
+    // ===== 7. 门控 + 输出投影 =====
+    // gate 与 merged 同为 [H*D,L,N,B]
+    auto* gated = out_prod(gate, merged);
+    // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
+    return to_out_->forward_graph(gated);
+}
+
 // ===== PairRowAttention =====
 void PairRowAttention::set_params(const AttnConfig& config,
                                   LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
@@ -359,7 +453,7 @@ TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_
     V = V.view(Shape({B * Lc, Lr, H, D}));
     V = V.permute({0, 2, 3, 1});
 
-    auto bias = to_b_->forward(str_bias);
+    auto bias = to_b_->forward(str_bias);  // 遗留：值版 bias 广播未处理（同 Bug3）；前置不变量 pair 方阵(Lr==Lc==L)
     auto gv   = to_g_->forward(pair);
     auto gate = sigmoid(&gv);
 
@@ -401,7 +495,10 @@ TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     V = permute(V, {2, 0, 1, 3});
 
     // bias: to_b_ D_PAIR→N_HEAD, 值 (B,Lr,Lc,8) = 图 [8,Lc,Lr,B]
+    // 规整为 scores 布局 [Lr,Lr,H,B*Lc]（值 (B*Lc,H,Lr,Lr)），并把 batch 沿 Lc 广播。
+    // 前置不变量：pair 为方阵（Lr==Lc==L），实际网络里 str_bias 来自 rbf_proj (B,L,L,D_PAIR)。
     auto* bias = to_b_->forward_graph(str_bias);
+    bias = prepare_pair_bias(bias, /*Lq=*/Lr, /*Lk=*/Lr, /*B=*/B, /*fold=*/Lc);
     // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]
     auto* gv   = to_g_->forward_graph(pair);
     auto* gate = sigmoid(gv);
@@ -455,7 +552,7 @@ TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_
     V = V.view(Shape({B * Lr, Lc, H, D}));
     V = V.permute({0, 2, 3, 1});
 
-    auto bias = to_b_->forward(str_bias);
+    auto bias = to_b_->forward(str_bias);  // 遗留：值版 bias 广播未处理（同 Bug3）；前置不变量 pair 方阵(Lr==Lc==L)
     auto gv   = to_g_->forward(pair);
     auto gate = sigmoid(&gv);
 
@@ -496,7 +593,10 @@ TensorF32* PairColAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     V = permute(V, {2, 0, 1, 3});
 
     // bias: to_b_ D_PAIR→N_HEAD, 值 (B,Lr,Lc,8) = 图 [8,Lc,Lr,B]
+    // 规整为 scores 布局 [Lc,Lc,H,B*Lr]（值 (B*Lr,H,Lc,Lc)），并把 batch 沿 Lr 广播。
+    // 前置不变量：pair 为方阵（Lr==Lc==L），实际网络里 str_bias 来自 rbf_proj (B,L,L,D_PAIR)。
     auto* bias = to_b_->forward_graph(str_bias);
+    bias = prepare_pair_bias(bias, /*Lq=*/Lc, /*Lk=*/Lc, /*B=*/B, /*fold=*/Lr);
     // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]
     auto* gv   = to_g_->forward_graph(pair);
     auto* gate = sigmoid(gv);

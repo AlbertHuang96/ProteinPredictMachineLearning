@@ -107,6 +107,17 @@ public:
                  const TensorF32& same_chain  = TensorF32(),
                  const TensorI64& residx       = TensorI64());
 
+    // ===== 图模式前向（仅 msa/pair 两条 track，供未来训练入口驱动调用）=====
+    // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维):
+    //   msa   : 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    //   pair  : 值 (B,L,L,D_PAIR) = 图 [D_PAIR, L, L, B]
+    //   rbf   : 值 (B,L,L,D_RBF)  = 图 [D_RBF, L, L, B]  (RBF + pos_enc 注入)
+    //   state : 值 (B,L,D_STATE)  = 图 [D_STATE, L, B]
+    // 返回: 更新后的 pair 图节点；msa 通过引用回写。
+    // 注: SE3 / pos_enc / 坐标更新等图外部分由调用方在 block 边界回落值张量后处理。
+    virtual TensorF32* forward_graph(TensorF32*& msa, TensorF32*& pair,
+                                     TensorF32* rbf, TensorF32* state);
+
     void proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state);
 
     static TensorF32 compute_rbf_feature(const TensorF32& coords);
@@ -191,6 +202,11 @@ public:
                  const TensorF32& dist_matrix = TensorF32(),
                  const TensorF32& same_chain  = TensorF32(),
                  const TensorI64& residx       = TensorI64()) override;
+
+    // ===== 图模式前向（仅 msa/pair 两条 track；msa 走 global column attention）=====
+    // 布局约定同 IterBlock::forward_graph。
+    TensorF32* forward_graph(TensorF32*& msa_full, TensorF32*& pair,
+                             TensorF32* rbf, TensorF32* state) override;
 private:
     std::unique_ptr<MSAGlobalColAttention> msa_global_col_attn_;
 };

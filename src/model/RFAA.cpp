@@ -5,8 +5,52 @@
 #include <iostream>
 
 #include "rfaa/Dropout.h"
+#include "rfaa/Context.h"
 
 namespace rfaa {
+
+namespace {
+// ===== proj_state_add_to_query_row 图版（掩码广播 add）=====
+// 语义: msa[:,0,:,:] += proj_state  (msa 第 0 条序列 query 行注入)
+//   msa        : 图 [D_MSA, L, N, B]   (值 (B,N,L,D_MSA))
+//   proj_state : 图 [D_MSA, L, B]      (值 (B,L,D_MSA)，state2msa_linear 输出)
+// 返回: 新的 msa 图节点（n==0 处 += proj_state，其余 n 不变）。
+//
+// 为什么不用 get_rows/set_rows：CPU kernel 只支持严格 2D(N,M)（行沿 dims[0]，每行
+// 只 memcpy dims[1] 个 float），而目标 query 行在 dims[2]（N 序列维），无法正确
+// 4D 切片。改为掩码广播，全部复用已验证 kernel：
+//   unsqueeze / view / repeat / mul / add_impl。
+TensorF32* query_row_add_graph(TensorF32* msa, TensorF32* proj_state) {
+    const int64_t D = msa->shape().dims[0];  // D_MSA
+    const int64_t L = msa->shape().dims[1];
+    const int64_t N = msa->shape().dims[2];
+    const int64_t B = msa->shape().dims[3];
+
+    // 1) proj_state [D,L,B] -> [D,L,1,B]（OP_RESHAPE -> kernel_cpy，行主序不变）
+    TensorF32* ps_unsq = unsqueeze(proj_state, 2);
+
+    // 2) 目标形状占位节点（repeat 只取 b->shape()，不读数据）
+    int64_t tgt_dims[] = {D, L, N, B};
+    TensorF32* target = context().new_tensor<float>(4, tgt_dims);
+
+    // 3) 常量掩码 [N] = [1,0,0,...] -> view 为 [1,1,N,1]
+    int64_t mask_dims[] = {N};
+    TensorF32* n_mask = context().new_tensor<float>(1, mask_dims);
+    n_mask->flag = 0;                        // 常量，不可训练
+    float* md = n_mask->data();
+    for (int64_t i = 0; i < N; i++) md[i] = (i == 0) ? 1.0f : 0.0f;
+    TensorF32* n_mask4 = view(n_mask, Shape{1, 1, N, 1});
+
+    // 4) 掩码广播到 [D,L,N,B]：kernel_repeat 尾部对齐取模，仅在 n==0 处=1
+    TensorF32* mask_r = repeat(n_mask4, target);
+    // 5) proj_state 广播到 [D,L,N,B]（所有 n 相同）
+    TensorF32* ps_r   = repeat(ps_unsq, target);
+    // 6) addend = proj_state * mask -> n!=0 处清零
+    TensorF32* addend = mul(ps_r, mask_r);
+    // 7) msa + addend（同形 [D,L,N,B] 逐元素加）
+    return add_impl(msa, addend, /*inplace=*/false);
+}
+} // namespace
 
 RFAAConfig::RFAAConfig() {
     // 默认 SE3 配置
@@ -521,6 +565,78 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
     
 }
 
+// ===== IterBlock::forward_graph (图模式) =====
+// 仅处理 msa/pair 两条 track (1D/2D 注意力 + FF)。SE3 / pos_enc / 坐标更新等图外
+// 部分由调用方在 block 边界回落值张量后处理（未来训练入口驱动接入）。
+// 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维):
+//   msa   : 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+//   pair  : 值 (B,L,L,D_PAIR) = 图 [D_PAIR, L, L, B]
+//   rbf   : 值 (B,L,L,D_RBF)  = 图 [D_RBF, L, L, B]  (RBF + pos_enc 注入)
+//   state : 值 (B,L,D_STATE)  = 图 [D_STATE, L, B]
+// 返回: 更新后的 pair 图节点；msa 通过引用回写。
+TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
+                                    TensorF32* rbf, TensorF32* state) {
+    // ------------ 1D track: msa2msa ------------
+    // Step 1: state -> msa[:,0] (query row 注入，图版：掩码广播 add)
+    //   proj_state [D_MSA, L, B] = Linear(LayerNorm(state))
+    TensorF32* proj_state = state2msa_linear_->forward_graph(
+        state2msa_norm_->forward(state));
+    msa = query_row_add_graph(msa, proj_state);   // msa[:,0,:,:] += proj_state
+
+    // pair -> pair_biased (msa row attention bias): pair2msa_norm(pair) + rbf
+    TensorF32* pair_biased = add_impl(
+        pair2msa_norm_->forward(pair), rbf, /*inplace=*/false);
+
+    // MSA Row Attention (with bias)
+    msa = msa_row_attn_->forward_graph(msa, pair_biased);
+    // TODO: dropout(row_attn_out, 0.15) 图 drop 后续补
+    // MSA Column Attention
+    msa = msa_col_attn_->forward_graph(msa);
+    // FeedForward
+    msa = msa_ff_->forward_graph(msa);
+
+    // ------------ 2D track: msa2pair (outer-product-mean) ------------
+    // TODO(入口驱动): msa2pair 的 outer-product-mean = einsum('bikd,bjkd->bijd',
+    //                left, right) 需要收缩 N_seq 维，当前图 out_prod 只收缩 dims[1]，
+    //                无对应 einsum 图 op；且值版 outer_product(B,N,L,16)×(B,N,L,16)
+    //                与 MathUtils::outer_product 签名 (B,1,L,D)×(B,L,1,D) 不符，
+    //                属待修。此处以图节点骨架 + 回落 TODO 标注:
+    //   auto msa_normed = msa2pair_norm_->forward(msa);            // [D_MSA, L, N, B]
+    //   auto left  = msa2pair_left_proj_->forward_graph(msa_normed);   // [16, L, N, B]
+    //   auto right = msa2pair_right_proj_->forward_graph(msa_normed);  // [16, L, N, B]
+    //   auto right_mean = scale(right, 1.0f / N);                 // right / N
+    //   auto pair_update = outer_product_mean_graph(left, right_mean);  // [128,L,L,B]
+    //   pair = add_impl(pair, pair_update, /*inplace=*/false);    // residual
+
+    // Triangle Multiplication (out/in) + residual
+    pair = add_impl(pair, tri_mul_out_->forward_graph(pair, /*bOutgoing=*/true),
+                    /*inplace=*/false);
+    pair = add_impl(pair, tri_mul_in_->forward_graph(pair, /*bOutgoing=*/false),
+                    /*inplace=*/false);
+    // TODO: dropout drop_row 0.15 图 drop 后续补
+
+    // ------------ pair2pair ------------
+    // rbf -> rbf_proj (bias 注入 pair row/col attention)
+    TensorF32* rbf_proj = pair2pair_rbf_proj_->forward_graph(rbf);   // [128, L, L, B]
+    // gate = sigmoid(gate_proj(outer_product(state)))
+    // TODO(入口驱动): gate 的 outer_product(left,right)->gate_proj->sigmoid 亦需
+    //                einsum 图 op（同 msa2pair 注），先跳过，rbf_proj 直接作 bias。
+    //   TensorF32* state_normed = pair2pair_state_norm_->forward(state);
+    //   TensorF32* left  = pair2pair_left_proj_->forward_graph(state_normed);   // [16,L,B]
+    //   TensorF32* right = pair2pair_right_proj_->forward_graph(state_normed);  // [16,L,B]
+    //   TensorF32* gate  = gate_outer_mean_graph(left, right);                   // TODO
+    //   rbf_proj = mul(rbf_proj, gate);
+
+    // Biased Axial Attention (row/col) + residual
+    pair = add_impl(pair, pair_row_attn_->forward_graph(pair, rbf_proj),
+                    /*inplace=*/false);
+    pair = add_impl(pair, pair_col_attn_->forward_graph(pair, rbf_proj),
+                    /*inplace=*/false);
+    // TODO: pair_ff residual（值版 forward 中 pair_ff 亦未激活，后续补齐）
+
+    return pair;
+}
+
 void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
                         const TensorF32& seq1hot,
                         const TensorF32& coords,
@@ -752,6 +868,67 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         xyz_new_.copy_from(xyz_new);
     }
 
+}
+
+// ===== FullBlock::forward_graph (图模式) =====
+// 与 IterBlock::forward_graph 一致，但 msa_full 用 global column attention。
+// 布局约定同 IterBlock::forward_graph。
+TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
+                                    TensorF32* rbf, TensorF32* state) {
+    // ------------ 1D track: msa2msa ------------
+    // Step 1: state -> msa_full[:,0] (query row 注入，图版：掩码广播 add)
+    //   proj_state [D_MSA, L, B] = Linear(LayerNorm(state))
+    TensorF32* proj_state = state2msa_linear_->forward_graph(
+        state2msa_norm_->forward(state));
+    msa_full = query_row_add_graph(msa_full, proj_state);   // msa_full[:,0,:,:] += proj_state
+
+    // pair -> pair_biased (msa row attention bias): pair2msa_norm(pair) + rbf
+    TensorF32* pair_biased = add_impl(
+        pair2msa_norm_->forward(pair), rbf, /*inplace=*/false);
+
+    // MSA Row Attention (with bias)
+    msa_full = msa_row_attn_->forward_graph(msa_full, pair_biased);
+    // TODO: dropout(row_attn_out, 0.15) 图 drop 后续补
+    // MSA Global Column Attention
+    msa_full = msa_global_col_attn_->forward_graph(msa_full);
+    // FeedForward
+    msa_full = msa_ff_->forward_graph(msa_full);
+
+    // ------------ 2D track: msa2pair (outer-product-mean) ------------
+    // TODO(入口驱动): 同 IterBlock::forward_graph，einsum 'bikd,bjkd->bijd' 需
+    //                einsum 图 op，暂以回落 TODO 标注。
+    //   auto msa_normed = msa2pair_norm_->forward(msa_full);
+    //   auto left  = msa2pair_left_proj_->forward_graph(msa_normed);   // [16,L,N,B]
+    //   auto right = msa2pair_right_proj_->forward_graph(msa_normed);  // [16,L,N,B]
+    //   auto right_mean = scale(right, 1.0f / N);
+    //   auto pair_update = outer_product_mean_graph(left, right_mean); // [128,L,L,B]
+    //   pair = add_impl(pair, pair_update, /*inplace=*/false);
+
+    // Triangle Multiplication (out/in) + residual
+    pair = add_impl(pair, tri_mul_out_->forward_graph(pair, /*bOutgoing=*/true),
+                    /*inplace=*/false);
+    pair = add_impl(pair, tri_mul_in_->forward_graph(pair, /*bOutgoing=*/false),
+                    /*inplace=*/false);
+    // TODO: dropout drop_row 0.15 图 drop 后续补
+
+    // ------------ pair2pair ------------
+    TensorF32* rbf_proj = pair2pair_rbf_proj_->forward_graph(rbf);   // [128, L, L, B]
+    // TODO(入口驱动): gate = sigmoid(gate_proj(outer_product(state))) 需 einsum 图
+    //                op，先跳过，rbf_proj 直接作 bias（同 IterBlock::forward_graph）。
+    //   TensorF32* state_normed = pair2pair_state_norm_->forward(state);
+    //   TensorF32* left  = pair2pair_left_proj_->forward_graph(state_normed);   // [16,L,B]
+    //   TensorF32* right = pair2pair_right_proj_->forward_graph(state_normed);  // [16,L,B]
+    //   TensorF32* gate  = gate_outer_mean_graph(left, right);                   // TODO
+    //   rbf_proj = mul(rbf_proj, gate);
+
+    // Biased Axial Attention (row/col) + residual
+    pair = add_impl(pair, pair_row_attn_->forward_graph(pair, rbf_proj),
+                    /*inplace=*/false);
+    pair = add_impl(pair, pair_col_attn_->forward_graph(pair, rbf_proj),
+                    /*inplace=*/false);
+    // TODO: pair_ff residual（值版 forward 中 pair_ff 亦未激活，后续补齐）
+
+    return pair;
 }
 
 // RefineBlock 构造函数已在 Model.h 中 inline 定义

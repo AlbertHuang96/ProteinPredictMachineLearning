@@ -591,6 +591,7 @@ private:
     static void kernel_scale   (TensorF32 * node, ComputeParams * p);
     static void kernel_add1    (TensorF32 * node, ComputeParams * p);
     static void kernel_sum     (TensorF32 * node, ComputeParams * p);
+    static void kernel_sum_rows(TensorF32 * node, ComputeParams * p);
     static void kernel_mean    (TensorF32 * node, ComputeParams * p);
     static void kernel_repeat  (TensorF32 * node, ComputeParams * p);
     static void kernel_repeat_back(TensorF32 * node, ComputeParams * p);

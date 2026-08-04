@@ -53,6 +53,7 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_NORM:      kernel_norm(node, p);     break;
         case OP_NORM_BACK: kernel_norm_back(node, p); break;
         case OP_SUM:    kernel_sum(node, p);         break;
+        case OP_SUM_ROWS: kernel_sum_rows(node, p);  break;
         case OP_MEAN:   kernel_mean(node, p);        break;
         case OP_REPEAT:      kernel_repeat(node, p);      break;
         case OP_REPEAT_BACK: kernel_repeat_back(node, p); break;
@@ -728,6 +729,44 @@ void CPUBackend::kernel_sum(TensorF32 * node, ComputeParams * p) {
     float s = 0.0f;
     for (int64_t i = 0; i < n; i++) s += src[i];
     node->data()[0] = s;
+    p->threadpool->barrier_wait();
+}
+
+// ===== sum_rows (沿最内维 dims[0] 求和) =====
+// 语义: dst[0, i1, i2, i3] = Σ_{i0} src[i0, i1, i2, i3]，输出形状 {1, dims[1], dims[2], dims[3]}。
+// 用于 Q mean 等"沿最内维规约、保留其余维度"的场景（graph 布局 dims[0]=最内维）。
+// 并行安全: 每个 dst 元素独立对一段连续的最内维归约，各线程处理互不重叠的 dst 子集。
+void CPUBackend::kernel_sum_rows(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * src = node->src[0];
+    TensorF32       * dst = node;
+
+    const int64_t ne0 = src->shape().dims[0];
+    const int64_t ne1 = (src->shape().ndim() > 1) ? src->shape().dims[1] : 1;
+    const int64_t ne2 = (src->shape().ndim() > 2) ? src->shape().dims[2] : 1;
+    const int64_t ne3 = (src->shape().ndim() > 3) ? src->shape().dims[3] : 1;
+
+    const float * src_data = src->data();
+    float       * dst_data = dst->data();
+
+    // 独立输出元素数（不含被归约的最内维 ne0）
+    const int64_t total = ne1 * ne2 * ne3;
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        int64_t t = idx;
+        const int64_t i1 = t % ne1; t /= ne1;
+        const int64_t i2 = t % ne2; t /= ne2;
+        const int64_t i3 = t;
+
+        // src 行基地址: (i3, i2, i1) 起始的连续 ne0 个元素
+        const float * row = src_data + ((i3 * ne2 + i2) * ne1 + i1) * ne0;
+        float s = 0.0f;
+        for (int64_t i0 = 0; i0 < ne0; i0++) s += row[i0];
+        dst_data[idx] = s;
+    }
+
     p->threadpool->barrier_wait();
 }
 

@@ -115,6 +115,12 @@ public:
 
     // msa 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& msa);
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维)
+    // msa: 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    // 返回: 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
+    TensorF32* forward_graph(TensorF32* msa);
 };
 
 class PairRowAttention {
