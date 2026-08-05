@@ -230,10 +230,10 @@ int main(int argc, char* argv[]) {
         input.true_coords = zeros<float>({1, L, 3, 3}, Device::CPU);
     }
     // 模型在 CUDA 上, 把输入搬到 CUDA
-    input.msa_latent = input.msa_latent.to(Device::CUDA);
-    input.seq_tokens = input.seq_tokens.to(Device::CUDA);
-    input.coords     = input.coords.to(Device::CUDA);
-    input.true_coords= input.true_coords.to(Device::CUDA);
+    //input.msa_latent = input.msa_latent.to(Device::CUDA);
+    //input.seq_tokens = input.seq_tokens.to(Device::CUDA);
+    //input.coords     = input.coords.to(Device::CUDA);
+    //input.true_coords= input.true_coords.to(Device::CUDA);
     
     // 5. 训练循环
     const int num_epochs = 10;

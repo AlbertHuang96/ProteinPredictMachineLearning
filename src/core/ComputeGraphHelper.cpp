@@ -755,7 +755,7 @@ TensorF32* distogram_loss(
 }
 
 // total_loss(...) — 组合总损失 = 0.5*FAPE + 0.5*Chi + 0.3*Distogram + 2.0*MSA + 0.01*Conf
-// 最后一项 L_conf 尚未实现，暂不参与计算
+// 
 TensorF32* total_loss(
     TensorF32* loss_fape,
     TensorF32* loss_chi,
