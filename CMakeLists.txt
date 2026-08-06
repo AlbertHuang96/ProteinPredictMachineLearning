@@ -38,9 +38,11 @@ include_directories(
 
 # 编译选项
 if(MSVC)
-    add_compile_options(/W4 /O2)
+    add_compile_options(/W4)
+    # /O2
 else()
-    add_compile_options(-Wall -O3 -fPIC)
+    add_compile_options(-Wall -fPIC)
+    # -O3
 endif()
 
 # 子目录

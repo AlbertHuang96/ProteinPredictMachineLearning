@@ -611,6 +611,13 @@ private:
     static void kernel_get_rows     (TensorF32 * node, ComputeParams * p);
     static void kernel_get_rows_back(TensorF32 * node, ComputeParams * p);
 
+    // ===== SE3 消息传递三件套（方案 B）=====
+    static void kernel_edge_gather_rows(TensorF32 * node, ComputeParams * p);
+    static void kernel_per_edge_matmul (TensorF32 * node, ComputeParams * p);
+    static void kernel_scatter_add     (TensorF32 * node, ComputeParams * p);
+    static void kernel_per_edge_matmul_back_kernel   (TensorF32 * node, ComputeParams * p);
+    static void kernel_per_edge_matmul_back_gathered (TensorF32 * node, ComputeParams * p);
+
     static void kernel_sigmoid (TensorF32 * node, ComputeParams * p);
 
     // ===== 数据成员 =====
@@ -685,6 +692,13 @@ private:
     static void kernel_sum_cuda      (TensorF32 * node, ComputeParams * p);
     static void kernel_mean_cuda     (TensorF32 * node, ComputeParams * p);
     static void kernel_concat_cuda   (TensorF32 * node, ComputeParams * p);
+
+    // SE3 消息传递三件套（方案 B）+ per_edge_matmul 反向核
+    static void kernel_edge_gather_rows_cuda (TensorF32 * node, ComputeParams * p);
+    static void kernel_per_edge_matmul_cuda  (TensorF32 * node, ComputeParams * p);
+    static void kernel_scatter_add_cuda      (TensorF32 * node, ComputeParams * p);
+    static void kernel_per_edge_matmul_back_kernel_cuda   (TensorF32 * node, ComputeParams * p);
+    static void kernel_per_edge_matmul_back_gathered_cuda (TensorF32 * node, ComputeParams * p);
 
     // CUDA unary kernels
     static void kernel_relu_cuda   (TensorF32 * node);

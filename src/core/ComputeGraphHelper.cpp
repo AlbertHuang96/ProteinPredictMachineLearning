@@ -490,6 +490,85 @@ TensorF32* set_rows(TensorF32* a, TensorF32* b, TensorF32* c) {
 }
 
 // ============================================================
+// 7.5 SE3 消息传递三件套（方案 B）
+// ============================================================
+
+// edge_gather_rows(node_feat, edge_src_idx)
+//   node_feat: (N, C)；edge_src_idx: (E,)
+//   dst: (E, C) — dst[e,:] = node_feat[src_idx[e],:]
+TensorF32* edge_gather_rows(TensorF32* node_feat, TensorF32* edge_src_idx) {
+    int64_t ne[4] = {
+        edge_src_idx->shape().dims[0],  // E
+        node_feat->shape().dims[1],     // C
+        1, 1
+    };
+    TensorF32* result = context().new_tensor<float>(2, ne);
+    result->op     = OP_EDGE_GATHER_ROWS;
+    result->src[0] = node_feat;
+    result->src[1] = edge_src_idx;
+    return result;
+}
+
+// per_edge_matmul(kernel, gathered)
+//   kernel: (E, M, K)；gathered: (E, K)
+//   dst: (E, M) — dst[e,:] = kernel[e] @ gathered[e,:]
+TensorF32* per_edge_matmul(TensorF32* kernel, TensorF32* gathered) {
+    const int64_t E = kernel->shape().dims[0];
+    const int64_t M = kernel->shape().dims[1];
+    int64_t ne[2] = {E, M};
+    TensorF32* result = context().new_tensor<float>(2, ne);
+    result->op     = OP_PER_EDGE_MATMUL;
+    result->src[0] = kernel;
+    result->src[1] = gathered;
+    return result;
+}
+
+// scatter_add(msg, edge_tgt_idx, node_count)
+//   msg: (E, M)；edge_tgt_idx: (E,)；node_count: N
+//   dst: (N, M) — dst[tgt[e],:] += msg[e,:]
+//   node_count 存入 op_params[0]（kernel 用它确定输出行数 N）。
+TensorF32* scatter_add(TensorF32* msg, TensorF32* edge_tgt_idx, int node_count) {
+    const int64_t E = msg->shape().dims[0];
+    const int64_t M = msg->shape().dims[1];
+    int64_t ne[2] = {node_count, M};
+    TensorF32* result = context().new_tensor<float>(2, ne);
+    result->op     = OP_SCATTER_ADD;
+    result->src[0] = msg;
+    result->src[1] = edge_tgt_idx;
+    result->op_params[0] = node_count;
+    return result;
+}
+
+// per_edge_matmul_back_kernel(grad, gathered)
+//   grad: (E, M)；gathered: (E, K) → dkernel: (E, M, K)
+//   dkernel[e,r,c] = grad[e,r] * gathered[e,c]  (逐边外积)
+TensorF32* per_edge_matmul_back_kernel(TensorF32* grad, TensorF32* gathered) {
+    const int64_t E = grad->shape().dims[0];
+    const int64_t M = grad->shape().dims[1];
+    const int64_t K = gathered->shape().dims[1];
+    int64_t ne[3] = {E, M, K};
+    TensorF32* result = context().new_tensor<float>(3, ne);
+    result->op     = OP_PER_EDGE_MATMUL_BACK_KERNEL;
+    result->src[0] = grad;
+    result->src[1] = gathered;
+    return result;
+}
+
+// per_edge_matmul_back_gathered(grad, kernel)
+//   grad: (E, M)；kernel: (E, M, K) → dgathered: (E, K)
+//   dgathered[e,c] = sum_r kernel[e,r,c] * grad[e,r]
+TensorF32* per_edge_matmul_back_gathered(TensorF32* grad, TensorF32* kernel) {
+    const int64_t E = grad->shape().dims[0];
+    const int64_t K = kernel->shape().dims[2];
+    int64_t ne[2] = {E, K};
+    TensorF32* result = context().new_tensor<float>(2, ne);
+    result->op     = OP_PER_EDGE_MATMUL_BACK_GATHERED;
+    result->src[0] = grad;
+    result->src[1] = kernel;
+    return result;
+}
+
+// ============================================================
 // 8. 特殊操作
 // ============================================================
 

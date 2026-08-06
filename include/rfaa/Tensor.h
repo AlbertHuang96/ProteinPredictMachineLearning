@@ -148,6 +148,16 @@ enum tensor_op {
     OP_FAPE_BACK,
     OP_TRI_MUL,
     OP_TRI_MUL_BACK,
+    // SE3 消息传递三件套（方案 B）
+    // 按 edge_index 从节点特征取源节点行（gather）
+    OP_EDGE_GATHER_ROWS,
+    // 逐边矩阵乘: kernel[E,M,K] @ gathered[E,K,1] → (E,M)（消息生成）
+    OP_PER_EDGE_MATMUL,
+    // 按 edge_index 把边消息散点累加到目标节点（scatter-add）
+    OP_SCATTER_ADD,
+    // per_edge_matmul 反向（梯度 wrt kernel 与 gathered）
+    OP_PER_EDGE_MATMUL_BACK_KERNEL,     // grad(E,M)⊗gathered(E,K) → dkernel(E,M,K)
+    OP_PER_EDGE_MATMUL_BACK_GATHERED,   // kernel(E,M,K)ᵀ@grad(E,M) → dgathered(E,K)
     OP_COUNT,
 };
 

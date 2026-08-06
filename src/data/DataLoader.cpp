@@ -498,7 +498,7 @@ ModelInput RFAADataLoader::load(const std::string& sequence) {
     std::string hhr_path = ExternalTools::run_hhsearch(a3m_path, hhsearch_db_);
     
     // Step 3: 加载数据
-    return load_from_files(a3m_path, hhr_path, sequence);
+    return load_from_files(a3m_path, sequence);
 }
 
 // ========== 辅助函数：torch.where(qmap[:,1] == nt) ==========
@@ -1246,6 +1246,49 @@ rfaa::TensorF32 xyz_to_t2d(
 }
 
 // ============================================================================
+// read_fasta_first_sequence — 从 FASTA 文件读取第一条查询序列
+// ============================================================================
+std::string RFAADataLoader::read_fasta_first_sequence(const std::string& fasta_path) {
+    std::ifstream file(fasta_path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open FASTA file: " + fasta_path);
+    }
+
+    std::string sequence;
+    sequence.reserve(4096);
+    bool in_first_record = false;   // 是否已进入第一条序列记录
+    bool first_done      = false;   // 第一条序列是否已经读取完毕
+
+    std::string line;
+    while (std::getline(file, line)) {
+        // 去掉尾部 \r (Windows 换行)
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+
+        if (line.empty()) continue;
+
+        if (line[0] == '>') {
+            if (first_done) break;        // 遇到第二条记录的头, 结束
+            in_first_record = true;       // 开始第一条记录
+            continue;
+        }
+
+        // 注释行 (FASTA 允许以 ';' 开头)
+        if (line[0] == ';') continue;
+
+        if (in_first_record) {
+            sequence += line;
+        }
+        // 头部之前出现的杂散序列行 (严格 FASTA 中不应出现) 忽略
+    }
+
+    if (sequence.empty()) {
+        throw std::runtime_error("No sequence found in FASTA file: " + fasta_path);
+    }
+
+    return sequence;
+}
+
+// ============================================================================
 // parse_csv_true_coords — 从 CSV mapping 文件解析真实坐标 (ground truth)
 // ============================================================================
 // CSV 格式 (由 Python 脚本生成):
@@ -1391,9 +1434,9 @@ TensorF32 RFAADataLoader::parse_csv_true_coords(
 
 ModelInput RFAADataLoader::load_from_files(
     const std::string& a3m_path,
-    const std::string& hhr_path,
     const std::string& sequence,
-    const std::string& csv_path
+    const std::string& csv_path,
+    const std::string& hhr_path
 ) {
     ModelInput input;
 
@@ -1409,11 +1452,29 @@ ModelInput RFAADataLoader::load_from_files(
         input.coords.copy_from(input.true_coords);
     }
     
-    // Step 1: 解析 A3M
-    std::vector<std::vector<uint8_t>> a3m_raw = parse_a3m(a3m_path);
+    // Step 1: 解析 A3M (含插入计数矩阵)
+    std::vector<std::vector<uint8_t>> a3m_raw;
+    std::vector<std::vector<uint8_t>> a3m_ins;
+    a3m_raw = parse_a3m(a3m_path, &a3m_ins);
     A3MData a3m_data;
-    a3m_data.sequences = {};  // TODO: convert raw data to A3MData
-    a3m_data.num_sequences = static_cast<int>(a3m_raw.size());
+    // 将 uint8 token (0-20) 逆向映射回氨基酸字符, 填充 a3m_data.sequences
+    // ALPHABET 需与 parse_a3m 保持一致: "ARNDCQEGHILKMFPSTWYV-" (token 20 = gap)
+    static const char* A3M_ALPHABET = "ARNDCQEGHILKMFPSTWYV-";
+    a3m_data.sequences.clear();
+    a3m_data.sequences.reserve(a3m_raw.size());
+    for (const auto& row : a3m_raw) {
+        std::string seq;
+        seq.reserve(row.size());
+        for (uint8_t tok : row) {
+            // 防御: 越界 token 一律视为 gap
+            seq.push_back(tok < 21 ? A3M_ALPHABET[tok] : '-');
+        }
+        a3m_data.sequences.push_back(std::move(seq));
+    }
+    // 插入计数矩阵: (N_seq, L), 与 sequences 一一对应
+    a3m_data.ins_matrix = std::move(a3m_ins);
+    // parse_a3m 已跳过 '>' 头行, 故每行都是合法序列
+    a3m_data.num_sequences = static_cast<int>(a3m_data.sequences.size());
     a3m_data.sequence_length = a3m_raw.empty() ? 0 : static_cast<int>(a3m_raw[0].size());
     input.msa_latent = prepare_msa_latent(a3m_data);
     input.msa_full = prepare_msa_full(a3m_data);
@@ -1680,8 +1741,11 @@ HHRData RFAADataLoader::parse_hhr(const std::string& hhr_path) {
     return result;
 }
 
-std::vector<std::vector<uint8_t>> RFAADataLoader::parse_a3m(const std::string& a3m_path) {
+std::vector<std::vector<uint8_t>> RFAADataLoader::parse_a3m(
+    const std::string& a3m_path,
+    std::vector<std::vector<uint8_t>>* ins_matrix) {
     std::vector<std::vector<uint8_t>> msa;
+    std::vector<std::vector<uint8_t>> ins_out;
     
     // 构建 ASCII 到整数的快速查找表 (256 大小)
     uint8_t char_map[256];
@@ -1706,24 +1770,51 @@ std::vector<std::vector<uint8_t>> RFAADataLoader::parse_a3m(const std::string& a
         while (!line.empty() && std::isspace(line.back())) {
             line.pop_back();
         }
+        if (line.empty()) continue;
         
-        // 转换：移除小写，大写转整数
+        // 转换：移除小写，大写转整数; 同时统计每列的插入计数 (RFAA 算法)
         std::vector<uint8_t> seq;
+        std::vector<uint8_t> ins_row;  // 长度 = 清洗后对齐列数
         seq.reserve(line.size());
+        ins_row.reserve(line.size());
         for (char c : line) {
-            if (std::isupper(c)) {
+            if (std::isupper(static_cast<unsigned char>(c))) {
                 seq.push_back(char_map[static_cast<uint8_t>(c)]);
+                ins_row.push_back(0);
             } else if (c == '-') {
                 seq.push_back(20); // gap
+                ins_row.push_back(0);
             }
-            // 小写字母跳过
+            // 小写字母: 不进入 seq/ins_row, 作为插入在下方统计
         }
         
         if (!seq.empty()) {
+            // 插入计数: 对每个小写 (插入) 位置, collapsed = pos - 出现次序,
+            // 相同 collapsed 的连续插入归到同一对齐列, 计数为该列插入长度。
+            // 等价于 RFAA data_loader_utils.py: a=pos-arange(pos.size()); i[unique]=count
+            std::vector<int> pos;
+            for (size_t k = 0; k < line.size(); ++k) {
+                if (std::islower(static_cast<unsigned char>(line[k]))) pos.push_back((int)k);
+            }
+            if (!pos.empty()) {
+                std::vector<int> collapsed(pos.size());
+                for (size_t i = 0; i < pos.size(); ++i) collapsed[i] = pos[i] - (int)i;
+                // collapsed 非递减, 连续相等者归组
+                size_t i = 0;
+                while (i < collapsed.size()) {
+                    int val = collapsed[i];
+                    int cnt = 0;
+                    while (i < collapsed.size() && collapsed[i] == val) { ++cnt; ++i; }
+                    if (val >= 0 && val < (int)ins_row.size()) ins_row[val] = (uint8_t)cnt;
+                }
+            }
+            
             msa.push_back(std::move(seq));
+            ins_out.push_back(std::move(ins_row));
         }
     }
     
+    if (ins_matrix) *ins_matrix = std::move(ins_out);
     return msa;
 }
 
@@ -2292,34 +2383,126 @@ TensorF32 RFAADataLoader::get_bond_distances(const rfaa::TensorF32& bond_feats) 
 
 TensorF32 RFAADataLoader::prepare_msa_latent(const A3MData& a3m_data) {
     // 准备 msa_latent: (B, N_clust, L, 164)
-    // 简化：返回零张量
+    // 参考 RFAA MSAFeaturize (data_loader_utils.py):
+    //   msa_seed = cat([msa_clust_onehot(80), msa_clust_profile(80),
+    //                   ins_clust(2), term_info(2)], dim=-1)   // 80+80+2+2 = 164
+    // - msa_clust_onehot: token 的 one-hot (NAATOKENS=80)
+    // - msa_clust_profile: 簇内各位置 AA 频率。当前无聚类 (每个簇仅 1 条序列),
+    //   故 profile = 该序列自身的 one-hot。
+    // - ins_clust: [seed插入统计, 簇平均插入统计]。无聚类时两者均 = 该序列自身的
+    //   插入计数, 经 (2/π)·arctan(ins/3) 变换。数据来自 a3m_data.ins_matrix。
+    // - term_info: N端(i==0)/C端(i==L-1) 标记。
+    // 行 0 固定为 query 序列 (a3m_data.sequences[0])。
     int B = 1;  // batch size = 1
     int N_clust = std::min(max_seqs_, a3m_data.num_sequences);
     int L = std::min(max_length_, a3m_data.sequence_length);
-    
+    if (N_clust <= 0 || L <= 0) {
+        return TensorF32({B, std::max(N_clust, 0), std::max(L, 0), MSA_LATENT_DIM},
+                         Device::CPU);
+    }
+
     TensorF32 msa_latent({B, N_clust, L, MSA_LATENT_DIM}, Device::CPU);
     msa_latent.zero_();
-    
-    // TODO: 实际实现
-    // 1. 将序列转换为 embedding
-    // 2. 添加位置编码
-    // 3. 返回 (B, N_clust, L, 164)
-    
+    float* data = msa_latent.data();
+
+    // A3M 21 字母码 (与 parse_a3m 的 ALPHABET 一致): 索引 0-20, 20 = gap
+    static const char* A3M_ALPHABET = "ARNDCQEGHILKMFPSTWYV-";
+    const float kInsScale = (2.0f / 3.14159265358979f);  // (2/π), 用于 arctan(ins/3)
+
+    for (int s = 0; s < N_clust; ++s) {
+        const std::string& seq = (s < (int)a3m_data.sequences.size())
+                                 ? a3m_data.sequences[s] : std::string();
+        // 该序列的插入计数 (与 sequences 一一对应)
+        const std::vector<uint8_t>* ins =
+            (s < (int)a3m_data.ins_matrix.size()) ? &a3m_data.ins_matrix[s] : nullptr;
+        // 将 AA 字符串转为 token 索引 (A3M 码)
+        std::vector<int> toks(L, 20);  // 默认 gap
+        for (int i = 0; i < L; ++i) {
+            char c = (i < (int)seq.size()) ? seq[i] : '-';
+            for (int a = 0; a < 21; ++a) {
+                if (A3M_ALPHABET[a] == c) { toks[i] = a; break; }
+            }
+        }
+
+        float* row = data + (size_t)s * L * MSA_LATENT_DIM;  // B=1
+        for (int i = 0; i < L; ++i) {
+            int tok = toks[i];
+            if (tok < 0 || tok >= NAATOKENS) tok = NAATOKENS - 1;  // boundary cases
+            float* f = row + (size_t)i * MSA_LATENT_DIM;
+
+            // 1) one-hot (80)
+            f[tok] = 1.0f;
+            // 2) profile (80): 单簇时 = 自身 one-hot
+            f[NAATOKENS + tok] = 1.0f;
+            // 3) ins_clust (2): (2/π)·arctan(ins/3)。无聚类时 seed 与簇均值相同
+            float ins_val = 0.0f;
+            if (ins && i < (int)ins->size()) ins_val = static_cast<float>((*ins)[i]);
+            float ins_feat = kInsScale * std::atan(ins_val / 3.0f);
+            f[2 * NAATOKENS + 0] = ins_feat;  // seed 插入统计
+            f[2 * NAATOKENS + 1] = ins_feat;  // 簇平均插入统计
+            // 4) term_info (2): 紧跟 ins_clust 之后, 偏移 2*NAATOKENS+2
+            if (i == 0)     f[2 * NAATOKENS + 2] = 1.0f;  // N 端
+            if (i == L - 1) f[2 * NAATOKENS + 3] = 1.0f;  // C 端
+        }
+    }
+
     return msa_latent;
 }
 
 TensorF32 RFAADataLoader::prepare_msa_full(const A3MData& a3m_data) {
     // 准备 msa_full: (B, N_extra, L, 83)
-    // 简化：返回零张量
-    int B = 1;
+    // 参考 RFAA MSAFeaturize (data_loader_utils.py):
+    //   msa_extra = cat([msa_extra_onehot(80), ins_extra(1), term_info(2)], dim=-1)  // 80+1+2 = 83
+    // - msa_extra_onehot: token 的 one-hot (NAATOKENS=80), 处理完整未聚类 MSA (Track 0)。
+    // - ins_extra: 插入统计 (1 维), (2/π)·arctan(ins/3), 数据来自 a3m_data.ins_matrix。
+    // - term_info: N端(i==0)/C端(i==L-1) 标记。
+    int B = 1;  // batch size = 1
     int N_extra = std::min(max_seqs_, a3m_data.num_sequences);
     int L = std::min(max_length_, a3m_data.sequence_length);
-    
+    if (N_extra <= 0 || L <= 0) {
+        return TensorF32({B, std::max(N_extra, 0), std::max(L, 0), MSA_FULL_DIM},
+                         Device::CPU);
+    }
+
     TensorF32 msa_full({B, N_extra, L, MSA_FULL_DIM}, Device::CPU);
     msa_full.zero_();
-    
-    // TODO: 实际实现 (类似 A3MParser::to_msa_features)
-    
+    float* data = msa_full.data();
+
+    // A3M 21 字母码 (与 parse_a3m 的 ALPHABET 一致): 索引 0-20, 20 = gap
+    static const char* A3M_ALPHABET = "ARNDCQEGHILKMFPSTWYV-";
+    const float kInsScale = (2.0f / 3.14159265358979f);  // (2/π), 用于 arctan(ins/3)
+
+    for (int s = 0; s < N_extra; ++s) {
+        const std::string& seq = (s < (int)a3m_data.sequences.size())
+                                 ? a3m_data.sequences[s] : std::string();
+        const std::vector<uint8_t>* ins =
+            (s < (int)a3m_data.ins_matrix.size()) ? &a3m_data.ins_matrix[s] : nullptr;
+        std::vector<int> toks(L, 20);  // 默认 gap
+        for (int i = 0; i < L; ++i) {
+            char c = (i < (int)seq.size()) ? seq[i] : '-';
+            for (int a = 0; a < 21; ++a) {
+                if (A3M_ALPHABET[a] == c) { toks[i] = a; break; }
+            }
+        }
+
+        float* row = data + (size_t)s * L * MSA_FULL_DIM;  // B=1
+        for (int i = 0; i < L; ++i) {
+            int tok = toks[i];
+            if (tok < 0 || tok >= NAATOKENS) tok = NAATOKENS - 1;  // 防御
+            float* f = row + (size_t)i * MSA_FULL_DIM;
+
+            // 1) one-hot (80)
+            f[tok] = 1.0f;
+            // 2) ins_extra (1): (2/π)·arctan(ins/3), 位于 NAATOKENS (80)
+            float ins_val = 0.0f;
+            if (ins && i < (int)ins->size()) ins_val = static_cast<float>((*ins)[i]);
+            f[NAATOKENS] = kInsScale * std::atan(ins_val / 3.0f);
+            // 3) term_info (2): 紧跟 ins_extra 之后, 偏移 NAATOKENS+1
+            if (i == 0)     f[NAATOKENS + 1] = 1.0f;  // N 端
+            if (i == L - 1) f[NAATOKENS + 2] = 1.0f;  // C 端
+        }
+    }
+
     return msa_full;
 }
 

@@ -232,6 +232,8 @@ void ComputeGraph::build_backward_expand(
             case OP_GET_ROWS:      // row indices not differentiable
             case OP_GET_ROWS_BACK: // same as for GET_ROWS
             case OP_ROPE:          // positions not differentiable
+            case OP_EDGE_GATHER_ROWS:  // 边源节点索引不可导
+            case OP_SCATTER_ADD:       // 边目标节点索引不可导
                 ignore_src[1] = true;
                 break;
  
@@ -600,6 +602,41 @@ void ComputeGraph::compute_backward(
             if (src1_needs_grads) {
                 // noop: 索引不可导
             }
+        } break;
+        case OP_EDGE_GATHER_ROWS: {
+            // 前向: dst[e,:] = node_feat[src_idx[e],:] (src0=node_feat, src1=src_idx)
+            // 反向: dnode_feat = scatter_add(grad, src_idx, N) — 把边梯度散点累加回源节点
+            if (src0_needs_grads) {
+                const int N = static_cast<int>(src0->shape().dims[0]);
+                add_or_set(ctx, cgraph, isrc0, scatter_add(grad, src1, N));
+            }
+            // src1 (索引) 不可导
+        } break;
+        case OP_PER_EDGE_MATMUL: {
+            // 前向: dst[e,:] = kernel[e] @ gathered[e,:] (src0=kernel(E,M,K), src1=gathered(E,K))
+            if (src0_needs_grads) {
+                // dkernel[e,r,c] = grad[e,r] * gathered[e,c]
+                add_or_set(ctx, cgraph, isrc0, per_edge_matmul_back_kernel(grad, src1));
+            }
+            if (src1_needs_grads) {
+                // dgathered[e,c] = sum_r kernel[e,r,c] * grad[e,r]
+                add_or_set(ctx, cgraph, isrc1, per_edge_matmul_back_gathered(grad, src0));
+            }
+        } break;
+        case OP_SCATTER_ADD: {
+            // 前向: dst[tgt[e],:] += msg[e,:] (src0=msg(E,M), src1=tgt_idx)
+            // 反向: dmsg[e,:] = grad[tgt[e],:] — 从目标节点梯度 gather 回边消息
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, edge_gather_rows(grad, src1));
+            }
+            // src1 (索引) 不可导
+        } break;
+        case OP_PER_EDGE_MATMUL_BACK_KERNEL: {
+            // 前向(反向op): dkernel = grad⊗gathered。该 op 本身不参与上层求导的输入梯度。
+            // 其 src 已是梯度节点，无需继续求导。
+        } break;
+        case OP_PER_EDGE_MATMUL_BACK_GATHERED: {
+            // 同上：其 src 已是梯度节点，无需继续求导。
         } break;
         case OP_DIAG_MASK_INF: {
             if (src0_needs_grads) {

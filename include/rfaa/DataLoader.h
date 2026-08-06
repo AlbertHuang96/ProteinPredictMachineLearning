@@ -20,6 +20,7 @@ namespace rfaa {
 struct A3MData {
     std::string query_sequence;                    // 查询序列 (字符串)
     std::vector<std::string> sequences;           // 所有 MSA 序列
+    std::vector<std::vector<uint8_t>> ins_matrix; // (N_seq, L): 每个对齐列后的插入计数 (与 sequences 对齐)
     std::vector<float> deletion_probabilities;     // 删除概率 (用于特征计算)
     int num_sequences;                           // 序列数量
     int sequence_length;                         // 序列长度
@@ -190,16 +191,29 @@ public:
      * @brief 从现有文件加载 (不运行外部工具)
      * 
      * @param a3m_path A3M 文件路径
-     * @param hhr_path HHR 文件路径
      * @param sequence 查询序列
+     * @param csv_path 可选: CSV mapping 文件 → true_coords
+     * @param hhr_path 可选: HHR 模板文件 → 默认空 (暂未接入模板)
      * @return ModelInput 模型输入数据
      */
     ModelInput load_from_files(
         const std::string& a3m_path,
-        const std::string& hhr_path,
         const std::string& sequence,
-        const std::string& csv_path = ""  // 可选: CSV mapping 文件 → true_coords
+        const std::string& csv_path = "",  // 可选: CSV mapping 文件 → true_coords
+        const std::string& hhr_path = ""   // 可选: HHR 模板文件 → 默认空
     );
+
+    /**
+     * @brief 从 FASTA 文件读取查询序列
+     * 
+     * 只读取文件中的第一条序列 (第一个 '>' 头之后的序列行拼接)。
+     * 跳过注释行 (以 ';' 开头) 与空行, 忽略除第一个头以外的其他记录。
+     * 
+     * @param fasta_path FASTA 文件路径
+     * @return std::string 第一个序列的氨基酸字符串 (不包含任何头/空白)
+     * @throws std::runtime_error 文件无法打开或文件中无任何序列
+     */
+    static std::string read_fasta_first_sequence(const std::string& fasta_path);
 
     // 从 CSV mapping 文件加载真实坐标 (ground truth)
     // 返回: TensorF32 ({B=1, L, 3, 3}) — [N, CA, C] × [x, y, z]
@@ -229,9 +243,12 @@ public:
      * @brief 解析 A3M 文件
      * 
      * @param a3m_path A3M 文件路径
-     * @return A3MData 解析结果
+     * @param ins_matrix 可选输出: 插入计数矩阵 (N_seq, L), 与返回的 MSA 一一对应
+     * @return MSA 整数 token (N_seq, L), 0-20 (20=gap)
      */
-    static std::vector<std::vector<uint8_t>> parse_a3m(const std::string& a3m_path);
+    static std::vector<std::vector<uint8_t>> parse_a3m(
+        const std::string& a3m_path,
+        std::vector<std::vector<uint8_t>>* ins_matrix = nullptr);
 
     static TensorF32 a3m_to_msa_features(
         const std::vector<std::vector<uint8_t>>& a3m_data,

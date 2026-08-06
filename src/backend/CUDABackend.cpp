@@ -102,6 +102,13 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_SOFT_MAX:
             return true;
 
+        case OP_EDGE_GATHER_ROWS:
+        case OP_PER_EDGE_MATMUL:
+        case OP_SCATTER_ADD:
+        case OP_PER_EDGE_MATMUL_BACK_KERNEL:
+        case OP_PER_EDGE_MATMUL_BACK_GATHERED:
+            return true;
+
         case OP_SOFT_MAX_BACK:
             if (!src0 || !src1) return false;
             return src0->type == TENSOR_TYPE_F32 &&

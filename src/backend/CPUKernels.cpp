@@ -68,6 +68,11 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_GET_ROWS:      kernel_get_rows(node, p);       break;
         case OP_GET_ROWS_BACK: kernel_get_rows_back(node, p);  break;
         case OP_SET_ROWS:      kernel_set_rows(node, p);       break;
+        case OP_EDGE_GATHER_ROWS: kernel_edge_gather_rows(node, p); break;
+        case OP_PER_EDGE_MATMUL:  kernel_per_edge_matmul (node, p); break;
+        case OP_SCATTER_ADD:      kernel_scatter_add     (node, p); break;
+        case OP_PER_EDGE_MATMUL_BACK_KERNEL:   kernel_per_edge_matmul_back_kernel(node, p); break;
+        case OP_PER_EDGE_MATMUL_BACK_GATHERED: kernel_per_edge_matmul_back_gathered(node, p); break;
         case OP_FAPE:      compute_forward_fape(p, node);      break;
         case OP_FAPE_BACK: compute_forward_fape_back(p, node); break;
         case OP_TRI_MUL:   kernel_tri_mul(node, p);            break;
@@ -1094,6 +1099,184 @@ void CPUBackend::kernel_get_rows_back(TensorF32 * node, ComputeParams * p) {
     }
 
     p->threadpool->barrier_wait();
+}
+
+// ===== edge_gather_rows (SE3 消息传递：按边源节点索引取行) =====
+// 前向: dst[e,:] = node_feat[src_idx[e],:]
+// src0: node_feat (N, C) 节点特征
+// src1: edge_src_idx (E,) 源节点 id（float-encoded int）
+// dst:  (E, C) — 逐行拷贝 node_feat[src_idx[e]] → dst[e]
+// 语义与 get_rows 一致（gather），独立 op 便于 SE3 消息阶段显式表达与反向散点。
+void CPUBackend::kernel_edge_gather_rows(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * node_feat = node->src[0];  // (N, C)
+    const TensorF32 * src_idx   = node->src[1];  // (E,)
+    TensorF32       * dst       = node;          // (E, C)
+
+    const int64_t N = node_feat->shape().dims[0];
+    const int64_t C = node_feat->shape().dims[1];
+    const int64_t E = src_idx->shape().dims[0];
+
+    const float * nf_data  = static_cast<const float*>(node_feat->data());
+    const float * idx_data = static_cast<const float*>(src_idx->data());
+    float       * d_data   = static_cast<float*>(dst->data());
+
+    const int64_t total = E;
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t e = start; e < end; e++) {
+        int64_t i = static_cast<int64_t>(idx_data[e]);
+        if (i < 0) i = 0;
+        if (i >= N) i = N - 1;
+        std::memcpy(d_data + e * C, nf_data + i * C, C * sizeof(float));
+    }
+}
+
+// ===== per_edge_matmul (SE3 消息传递：逐边矩阵乘) =====
+// 前向: dst[e,:] = kernel[e] @ gathered[e,:]
+// src0: kernel (E, M, K) 展平 row-major (E*M*K)，每条边独立卷积核矩阵
+// src1: gathered (E, K) 该边源节点特征
+// dst:  (E, M)
+void CPUBackend::kernel_per_edge_matmul(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * kernel   = node->src[0];  // (E, M, K)
+    const TensorF32 * gathered = node->src[1];  // (E, K)
+    TensorF32       * dst      = node;          // (E, M)
+
+    const int64_t E = kernel->shape().dims[0];
+    const int64_t M = kernel->shape().dims[1];
+    const int64_t K = kernel->shape().dims[2];
+
+    const float * k_data = static_cast<const float*>(kernel->data());
+    const float * g_data = static_cast<const float*>(gathered->data());
+    float       * d_data = static_cast<float*>(dst->data());
+
+    const int64_t total = E;
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t e = start; e < end; e++) {
+        const float * K_e = k_data + e * M * K;       // (M, K)
+        const float * g_e = g_data + e * K;           // (K,)
+        float       * d_e = d_data + e * M;           // (M,)
+        for (int64_t r = 0; r < M; r++) {
+            float val = 0.0f;
+            for (int64_t c = 0; c < K; c++) {
+                val += K_e[r * K + c] * g_e[c];
+            }
+            d_e[r] = val;
+        }
+    }
+}
+
+// ===== scatter_add (SE3 消息传递：边消息散点累加到目标节点) =====
+// 前向: dst[tgt[e],:] += msg[e,:]
+// src0: msg (E, M) 边消息
+// src1: edge_tgt_idx (E,) 目标节点 id（float-encoded int）
+// dst:  (N, M)，N = node->op_params[0]（节点数）
+// 先清零再累加。多个边可指向同一目标节点，必须 += 而非覆盖，故串行在 thread 0 完成。
+void CPUBackend::kernel_scatter_add(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * msg         = node->src[0];  // (E, M)
+    const TensorF32 * tgt_idx     = node->src[1];  // (E,)
+    TensorF32       * dst         = node;          // (N, M)
+
+    const int64_t N = node->op_params[0];
+    const int64_t E = msg->shape().dims[0];
+    const int64_t M = msg->shape().dims[1];
+
+    const float * m_data  = static_cast<const float*>(msg->data());
+    const float * idx_data = static_cast<const float*>(tgt_idx->data());
+    float       * d_data  = static_cast<float*>(dst->data());
+
+    // 串行：清零 + 累加，避免同目标节点多边并行 data race
+    if (p->ith == 0) {
+        std::memset(d_data, 0, N * M * sizeof(float));
+        for (int64_t e = 0; e < E; e++) {
+            int64_t i = static_cast<int64_t>(idx_data[e]);
+            if (i < 0 || i >= N) continue;   // 越界丢弃
+            for (int64_t c = 0; c < M; c++) {
+                d_data[i * M + c] += m_data[e * M + c];
+            }
+        }
+    }
+
+    p->threadpool->barrier_wait();
+}
+
+// ===== per_edge_matmul_back_kernel (per_edge_matmul 反向 wrt kernel) =====
+// 前向: dst[e,:] = kernel[e] @ gathered[e,:]
+// 反向: dkernel[e,r,c] = grad[e,r] * gathered[e,c]  (逐边外积)
+// src0: grad (E, M) 上游梯度
+// src1: gathered (E, K) 前向输入
+// dst:  dkernel (E, M, K)
+void CPUBackend::kernel_per_edge_matmul_back_kernel(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * grad     = node->src[0];  // (E, M)
+    const TensorF32 * gathered = node->src[1];  // (E, K)
+    TensorF32       * dst      = node;          // (E, M, K)
+
+    const int64_t E = grad->shape().dims[0];
+    const int64_t M = grad->shape().dims[1];
+    const int64_t K = gathered->shape().dims[1];
+
+    const float * g_data = static_cast<const float*>(grad->data());
+    const float * f_data = static_cast<const float*>(gathered->data());
+    float       * d_data = static_cast<float*>(dst->data());
+
+    const int64_t total = E;
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t e = start; e < end; e++) {
+        const float * g_e = g_data + e * M;   // (M,)
+        const float * f_e = f_data + e * K;   // (K,)
+        float       * d_e = d_data + e * M * K; // (M, K)
+        for (int64_t r = 0; r < M; r++) {
+            const float gr = g_e[r];
+            for (int64_t c = 0; c < K; c++) {
+                d_e[r * K + c] = gr * f_e[c];
+            }
+        }
+    }
+}
+
+// ===== per_edge_matmul_back_gathered (per_edge_matmul 反向 wrt gathered) =====
+// 前向: dst[e,:] = kernel[e] @ gathered[e,:]
+// 反向: dgathered[e,c] = sum_r kernel[e,r,c] * grad[e,r]
+// src0: grad (E, M) 上游梯度
+// src1: kernel (E, M, K) 前向输入
+// dst:  dgathered (E, K)
+void CPUBackend::kernel_per_edge_matmul_back_gathered(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * grad   = node->src[0];  // (E, M)
+    const TensorF32 * kernel = node->src[1];  // (E, M, K)
+    TensorF32       * dst    = node;          // (E, K)
+
+    const int64_t E = grad->shape().dims[0];
+    const int64_t M = grad->shape().dims[1];
+    const int64_t K = kernel->shape().dims[2];
+
+    const float * g_data = static_cast<const float*>(grad->data());
+    const float * k_data = static_cast<const float*>(kernel->data());
+    float       * d_data = static_cast<float*>(dst->data());
+
+    const int64_t total = E;
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t e = start; e < end; e++) {
+        const float * g_e = g_data + e * M;   // (M,)
+        const float * k_e = k_data + e * M * K; // (M, K)
+        float       * d_e = d_data + e * K;   // (K,)
+        for (int64_t c = 0; c < K; c++) {
+            float val = 0.0f;
+            for (int64_t r = 0; r < M; r++) {
+                val += k_e[r * K + c] * g_e[r];
+            }
+            d_e[c] = val;
+        }
+    }
 }
 
 void CPUBackend::kernel_sigmoid(TensorF32 * node, ComputeParams * p) {

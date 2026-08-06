@@ -205,6 +205,33 @@ TensorF32* get_rows(TensorF32* a, TensorF32* b);
 TensorF32* get_rows_back(TensorF32* dy, TensorF32* idx, TensorF32* W);
 TensorF32* set_rows(TensorF32* a, TensorF32* b, TensorF32* c);
 
+// 7.5 SE3 消息传递三件套（方案 B：edge_gather / per_edge_matmul / scatter_add）
+// ---------------------------------------------------------------------------
+// edge_gather_rows(node_feat, edge_src_idx) — 按边源节点索引取行（gather）
+//   node_feat: (N, C) 节点特征；edge_src_idx: (E,) 源节点 id（float-encoded int）
+//   dst: (E, C) — dst[e,:] = node_feat[edge_src_idx[e],:]
+//   ⚠️ 与 get_rows 语义一致（get_rows 本身即该操作），但独立 op 便于显式表达
+//      SE3 消息传递阶段，并在 backward 时散点累加回节点梯度（见 scatter_add）。
+TensorF32* edge_gather_rows(TensorF32* node_feat, TensorF32* edge_src_idx);
+
+// per_edge_matmul(kernel, gathered) — 逐边矩阵乘（消息生成）
+//   kernel: (E, M, K) 每条边独立的卷积核矩阵（row-major 展平 (E*M*K)）
+//   gathered: (E, K) 该边源节点特征（edge_gather_rows 输出）
+//   dst: (E, M) — dst[e,:] = kernel[e] @ gathered[e,:]
+TensorF32* per_edge_matmul(TensorF32* kernel, TensorF32* gathered);
+
+// scatter_add(msg, edge_tgt_idx, node_count) — 边消息散点累加到目标节点
+//   msg: (E, M) 边消息；edge_tgt_idx: (E,) 目标节点 id（float-encoded int）
+//   node_count: 节点数 N（用于确定 dst 形状，可为常量/占位节点）
+//   dst: (N, M) — dst[tgt[e],:] += msg[e,:]
+TensorF32* scatter_add(TensorF32* msg, TensorF32* edge_tgt_idx, int node_count);
+
+// per_edge_matmul 的反向（由 compute_backward 内部构造，不直接调用）：
+// per_edge_matmul_back_kernel(grad, gathered): grad(E,M)⊗gathered(E,K) → dkernel(E,M,K)
+TensorF32* per_edge_matmul_back_kernel(TensorF32* grad, TensorF32* gathered);
+// per_edge_matmul_back_gathered(grad, kernel): kernel(E,M,K)ᵀ@grad(E,M) → dgathered(E,K)
+TensorF32* per_edge_matmul_back_gathered(TensorF32* grad, TensorF32* kernel);
+
 // one_hot_seq 图版：seq 为一维扁平整数索引图节点 → get_rows(eye, seq)
 // 返回 [num_classes, K] 图节点（ggml 布局 dims[0]=最内维）。依赖 get_rows（已实现）。
 // ⚠️ seq 需先扁平为一维 (view/reshape kernel 待补时由调用方保证已扁平)

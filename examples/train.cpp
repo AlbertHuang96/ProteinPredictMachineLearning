@@ -187,36 +187,39 @@ int main(int argc, char* argv[]) {
     std::cout << "Model created and moved to CUDA" << std::endl;
     
     // 4. 加载预训练权重 (通过 Python 桥接)
-    if (argc > 1) {
-        std::string weights_path = argv[1];
-        ProteinTools::load_torch_weights(model, weights_path);
-    }
+    // 暂时没有预训练权重, 先注释掉, 待有权重文件后再启用
+    // if (argc > 1) {
+    //     std::string weights_path = argv[1];
+    //     ProteinTools::load_torch_weights(model, weights_path);
+    // }
     
     // ============================================================
-    // 数据加载: 通过 RFAADataLoader 从 A3M/HHR + CSV mapping 加载
+    // 数据加载: 通过 RFAADataLoader 从 A3M + CSV mapping 加载
     // CSV 提供真实坐标 (true_coords), 作为 FAPE 的 ground truth
+    // hhr 模板文件暂时没有, 放在最后, 默认为空 (暂未接入模板)
     // ============================================================
-    // 命令行参数: train <a3m> <hhr> <sequence> <csv_mapping>
-    // 例如: train 1a00.a3m 1a00.hhr "MVLSPADKTNVKAAWGKVG..." data/1a00_P69905_mapping.csv
-    std::string a3m_path  = (argc > 2) ? argv[2] : "query.a3m";
-    std::string hhr_path  = (argc > 3) ? argv[3] : "query.hhr";
-    std::string sequence  = (argc > 4) ? argv[4] : "";
-    std::string csv_path  = (argc > 5) ? argv[5] : "data/1a00_P69905_mapping.csv";
+    // 命令行参数: train <a3m> <fasta> <csv_mapping> [hhr]
+    // 例如: train 1a00.a3m data/P04637.fasta data/1a00_P69905_mapping.csv
+    //       或带 hhr: train 1a00.a3m data/P04637.fasta data/1a00_P69905_mapping.csv 1a00.hhr
+    std::string a3m_path    = (argc > 1) ? argv[1] : "query.a3m";
+    std::string fasta_path  = (argc > 2) ? argv[2] : "data/P04637.fasta";
+    std::string csv_path    = (argc > 3) ? argv[3] : "data/1a00_P69905_mapping.csv";
+    std::string hhr_path    = (argc > 4) ? argv[4] : "";  // hhr 放最后, 默认为空
 
-    if (sequence.empty()) {
-        // 无显式序列时从 CSV 行数推断长度 (demo 场景)
-        std::cerr << "No sequence provided; using CSV-derived length. "
-                     "Pass <a3m> <hhr> <sequence> <csv> as argv[2..5]." << std::endl;
+    // 从 FASTA 文件读取查询序列 (只读第一条)
+    std::string sequence;
+    try {
+        sequence = RFAADataLoader::read_fasta_first_sequence(fasta_path);
+        std::cout << "Read query sequence from " << fasta_path
+                  << " (L=" << sequence.length() << ")" << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Failed to read FASTA: " << e.what() << std::endl;
+        return 1;
     }
 
     RFAADataLoader loader("", "", 512, 4, 2048);
-    ModelInput input = loader.load_from_files(a3m_path, hhr_path, sequence, csv_path);
-    int L = 0;
-    if (!sequence.empty()) {
-        L = static_cast<int>(sequence.length());
-    } else if (input.true_coords.numel() > 0) {
-        L = static_cast<int>(input.true_coords.shape().dims[1]);
-    }
+    ModelInput input = loader.load_from_files(a3m_path, sequence, csv_path, hhr_path);
+    int L = static_cast<int>(sequence.length());
 
     std::cout << "Loaded data. L=" << L
               << " true_coords shape=(" << (input.true_coords.numel() > 0 ? 1 : 0)
