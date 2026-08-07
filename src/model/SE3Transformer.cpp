@@ -1,5 +1,6 @@
 #include "rfaa/SE3Transformer.h"
 #include "rfaa/Tensor.h"
+#include "rfaa/ComputeGraph.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
@@ -1087,6 +1088,26 @@ std::vector<TensorF32*> RadialFunc::parameters() {
     return params;
 }
 
+// 图模式前向：x: (E, edge_dim+1) 图节点 → R: (E, out, in, num_freq) 图节点
+// 布局 dims=[num_freq, in, out, E]（dims[0]=最内维）。
+// BN 在图上用逐通道 affine（gamma*x+beta, repeat 广播）近似（值版是按 batch 统计的 BN，
+// 这里用参数作逐通道缩放偏移以保持可导）。若需严格对齐值版需额外 batch-norm-over-rows op。
+TensorF32* RadialFunc::forward_graph(TensorF32* x) {
+    // ---- Layer 1: Linear → BN(affine) → ReLU ----
+    TensorF32* h = linear1_->forward_graph(x);          // (E, 32)
+    h = add_impl(mul(h, repeat(bn1_gamma_, h)), repeat(bn1_beta_, h), /*inplace=*/false);
+    h = relu(h);
+    // ---- Layer 2: Linear → BN(affine) → ReLU ----
+    h = linear2_->forward_graph(h);                     // (E, 32)
+    h = add_impl(mul(h, repeat(bn2_gamma_, h)), repeat(bn2_beta_, h), /*inplace=*/false);
+    h = relu(h);
+    // ---- Layer 3: Linear → reshape (E, num_freq*in*out) → (E, out, in, num_freq) ----
+    TensorF32* y = linear3_->forward_graph(h);          // (E, num_freq*in*out)
+    const int64_t E = y->shape().dims[1];
+    // view: 展平 i0 = ((o*in+ci)*num_freq + j) → dims=[num_freq, in, out, E]
+    return view(y, Shape({E, out_dim_, in_dim_, num_freq_}));
+}
+
 // ============================================================================
 // PairwiseConv 实现
 // ============================================================================
@@ -1265,6 +1286,68 @@ TensorF32 PairwiseConv::forward(const TensorF32& feat, const TensorF32& basis) {
 
 std::vector<TensorF32*> PairwiseConv::parameters() {
     return rp_.parameters();
+}
+
+// 图模式前向：生成等变卷积核图节点。
+// feat: (E, edge_dim+1) 图节点 dims=[edge_dim+1, E]
+// basis: 值版常量 (E,1,d_out,1,d_in,num_freq)，内存 index (e,mo,mi,j)=((e*d_out+mo)*d_in+mi)*num_freq+j
+// 返回 kernel: dims=[C=in*d_in, R=out*d_out, E]，kernel[e,r=(co,mo),c=(ci,mi)] = Σ_j R[e,co,ci,j]*basis[e,mo,mi,j]
+//
+// 思路（全部用已有/新图 op，ggml 布局 dims[0]=最内维）：
+//   R = RadialFunc_graph(feat) → dims=[num_freq, in, out, E]
+//   对固定 co：R_co (E,in,num_freq) dims=[nf,in,E] 用 permute+view+get_rows 提取
+//   对固定 (co,mo)、遍历 mi：block_mi = per_edge_matmul(R_co, basis_mo_mi) → (E,in)
+//   concat mi → 行 r；unsqueeze + concat r → kernel (E, R, C) dims=[C,R,E]
+TensorF32* PairwiseConv::forward_graph(TensorF32* feat, const TensorF32& basis) {
+    const int64_t E      = feat->shape().dims[1];
+    const int64_t out    = nc_out_;
+    const int64_t in     = nc_in_;
+    const int64_t dout   = d_out_;
+    const int64_t din    = d_in_;
+    const int64_t nf     = num_freq_;
+
+    // 1) 径向权重 R (E,out,in,nf) dims=[nf,in,out,E]
+    TensorF32* R = rp_.forward_graph(feat);
+
+    // 2) permute R → (E,in,nf,out) dims=[nf,in,E,out]，再 view → 2D (out, E*in*nf) 供 get_rows 按 co 切片
+    TensorF32* R_perm = permute(R, std::vector<int>{0, 1, 3, 2});
+    const int64_t E_in_nf = E * in * nf;
+    TensorF32* R_2d = view(R_perm, Shape({E_in_nf, out}));   // dims=[E*in*nf, out]
+
+    // 收集所有输出行 r=(co,mo)
+    std::vector<TensorF32*> kernel_rows;   // 每个 unsqueeze 后 dims=[in*din, 1, E]
+    for (int64_t co = 0; co < out; co++) {
+        // R_co = R[:,co,:,:] → (E,in,nf) dims=[nf,in,E]
+        TensorF32* co_leaf = constant_scalar(static_cast<float>(co));
+        TensorF32* R_co_flat = get_rows(R_2d, co_leaf);          // (1, E*in*nf)
+        TensorF32* R_co = view(R_co_flat, Shape({E, in, nf}));   // dims=[nf,in,E]
+
+        for (int64_t mo = 0; mo < dout; mo++) {
+            std::vector<TensorF32*> row_blocks;   // 每个 dims=[in, E]，按 mi 拼 → [in*din, E]
+            for (int64_t mi = 0; mi < din; mi++) {
+                // 常量叶子 basis_mo_mi (E,nf) dims=[nf,E]，basis_mo_mi[e,j]=basis[e,mo,mi,j]
+                std::vector<float> bdat(E * nf);
+                for (int64_t e = 0; e < E; e++) {
+                    for (int64_t j = 0; j < nf; j++) {
+                        bdat[e * nf + j] = basis.data()[((e * dout + mo) * din + mi) * nf + j];
+                    }
+                }
+                TensorF32* b_col = constant_tensor({nf, E}, bdat.data());   // dims=[nf,E]
+                // block_mi[e,ci] = Σ_j R[e,co,ci,j]*basis[e,mo,mi,j]  (E,in) dims=[in,E]
+                TensorF32* block = per_edge_matmul(R_co, b_col);
+                row_blocks.push_back(block);
+            }
+            // 拼 mi → kernel 行 r 的 (E, in*din) dims=[in*din, E]
+            TensorF32* kernel_row = concat_ptr(row_blocks, 0);
+            // unsqueeze(dim=1) → dims=[in*din, 1, E]
+            TensorF32* row_3d = unsqueeze(kernel_row, 1);
+            kernel_rows.push_back(row_3d);
+        }
+    }
+
+    // 3) 拼所有行 r → kernel (E, out*dout, in*din) dims=[in*din, out*dout, E]
+    TensorF32* kernel = concat_ptr(kernel_rows, 1);
+    return kernel;
 }
 
 // ============================================================================
@@ -1503,6 +1586,129 @@ std::vector<TensorF32*> GConvSE3Partial::parameters() {
         params.insert(params.end(), p.begin(), p.end());
     }
     return params;
+}
+
+// 图模式前向：返回每个输出度的边消息图节点。
+// 与值版 forward 语义一致（Step1 feat 拼接 + Step2 核生成 + Step3 消息传递），
+// 全部用图 op 表达；节点/边特征均按 ggml 布局 dims[0]=最内维。
+//
+// 输入：
+//   h_nodes: 每输入度一个节点特征图节点 (N, m_in*d_dim_in)，dims=[m_in*d_dim_in, N]。
+//            顺序须与 f_in_ 一致；x_ij=="cat" 时 f_in_ 比 f_in_orig_ 多一个度1通道
+//            （相对位置通道），调用方需在对应位置 concat 相对坐标特征。
+//   edge_src_idx/edge_tgt_idx: (E,) 源/目标节点 id（float-encoded int）。
+//   edge_d: (E,3) dims=[3,E]；edge_w: (E,edge_dim) dims=[edge_dim,E] 或 nullptr。
+//   basis: 预计算球谐基（值版常量，本方法内部转常量叶子）。
+// 返回: out[i] = (E, m_out*d_dim_out) 扁平边消息图节点 dims=[m_out*d_dim_out, E]。
+std::vector<TensorF32*> GConvSE3Partial::forward_graph(
+        const std::vector<TensorF32*>& h_nodes,
+        TensorF32* edge_src_idx,
+        TensorF32* edge_tgt_idx,
+        TensorF32* edge_d,
+        TensorF32* edge_w,
+        const SE3Basis& basis) {
+    (void)edge_tgt_idx;   // 本方法产出边消息，目标节点 scatter 由下游（如 GMABSE3）使用
+
+    // ===== Step 1: feat = concat([edge_w, ||d||]) =====
+    TensorF32* r_norm = sqrt(sum_rows(sqr(edge_d)));   // (E,1) dims=[1,E]
+    TensorF32* feat;
+    if (edge_w != nullptr) {
+        // (E, edge_dim) + (E,1) → (E, edge_dim+1)，沿最内维 dims[0] 拼接
+        feat = concat_ptr({edge_w, r_norm}, 0);
+    } else {
+        feat = r_norm;   // (E,1)
+    }
+
+    // ===== Step 2: 预计算所有度对等变卷积核 =====
+    std::map<std::pair<int,int>, TensorF32*> kernels_map;
+    for (auto& kv : kernel_unary_) {
+        int d_in  = kv.first.first;
+        int d_out = kv.first.second;
+        PairwiseConv* pc = kv.second;
+        const TensorF32& basis_pair = basis.get_basis(d_in, d_out);
+        kernels_map[kv.first] = pc->forward_graph(feat, basis_pair);
+    }
+
+    // ===== Step 3: 消息传递（edge_gather → per_edge_matmul → 累加输入度）=====
+    std::vector<TensorF32*> out(f_out_.size(), nullptr);
+    for (size_t j = 0; j < f_out_.size(); j++) {
+        const int d_out     = f_out_.degrees[j];
+        const int m_out     = f_out_.multiplicities[j];
+        const int d_dim_out = 2 * d_out + 1;
+        TensorF32* msg = nullptr;
+        for (size_t i = 0; i < f_in_.size(); i++) {
+            const int d_in     = f_in_.degrees[i];
+            const int m_in     = f_in_.multiplicities[i];
+            const int d_dim_in = 2 * d_in + 1;
+            auto k_it = kernels_map.find(std::make_pair(d_in, d_out));
+            if (k_it == kernels_map.end()) continue;
+            // kernel dims=[m_in*d_dim_in, m_out*d_dim_out, E]
+            TensorF32* kernel = k_it->second;
+            // 按源节点 gather: (E, m_in*d_dim_in) dims=[m_in*d_dim_in, E]
+            TensorF32* gathered = edge_gather_rows(h_nodes[i], edge_src_idx);
+            // 逐边 matmul: (E, m_out*d_dim_out) dims=[m_out*d_dim_out, E]
+            TensorF32* part = per_edge_matmul(kernel, gathered);
+            msg = (msg == nullptr) ? part : add_impl(msg, part, /*inplace=*/false);
+        }
+        out[j] = msg;
+    }
+    return out;
+}
+
+// ============================================================================
+// G1x1SE3 实现：节点级 1x1 等变线性（逐度通道混合）
+// 构造函数与值版 forward 见文件头部原有实现（RadialFunc 之前的 G1x1SE3 段）。
+// ============================================================================
+
+// 图模式前向：节点级 1x1 等变线性（逐度通道混合）。
+// 用"块对角权重" mul_mat：W_expanded[(mo*d_dim+dd),(mi*d_dim+dd)]=W[mo,mi]（其余0），
+// 使 out[n,mo,dd]=Σ_mi W[mo,mi]*x[n,mi,dd]，即只在通道 m 上混合、不混 Wigner 分量 dd（等变）。
+// x_nodes[i] 对应 f_in_.features；返回的 out 对应 f_out_ 中每个度。
+std::vector<TensorF32*> G1x1SE3::forward_graph(const std::vector<TensorF32*>& x_nodes) {
+    std::vector<TensorF32*> out(f_out_.size(), nullptr);
+    for (size_t j = 0; j < f_out_.size(); ++j) {
+        int d = f_out_.degrees[j];
+        int m_out = f_out_.multiplicities[j];
+        int d_dim = 2 * d + 1;
+
+        int in_idx = -1;
+        for (size_t i = 0; i < f_in_.size(); ++i) {
+            if (f_in_.degrees[i] == d) { in_idx = static_cast<int>(i); break; }
+        }
+        if (in_idx < 0 || !weights_.count(d) || x_nodes[in_idx] == nullptr) continue;
+
+        int m_in = f_in_.multiplicities[in_idx];
+        TensorF32* x_d = x_nodes[in_idx];                 // dims=[m_in*d_dim, N]
+        const int64_t N = x_d->shape().dims[1];
+
+        const float* w_data = weights_[d]->weight()->data();  // (m_out, m_in)
+        const float* b_data = weights_[d]->bias() ? weights_[d]->bias()->data() : nullptr;
+
+        // 构建块对角 W_expanded dims=[m_out*d_dim, m_in*d_dim]（最内维 = m_in*d_dim）
+        const int64_t out_F = m_out * d_dim, in_F = m_in * d_dim;
+        std::vector<float> Wexp(out_F * in_F, 0.0f);
+        for (int mo = 0; mo < m_out; ++mo)
+            for (int mi = 0; mi < m_in; ++mi)
+                for (int dd = 0; dd < d_dim; ++dd) {
+                    Wexp[(mo * d_dim + dd) * in_F + (mi * d_dim + dd)] = w_data[mo * m_in + mi];
+                }
+        TensorF32* W_expanded = constant_tensor({in_F, out_F}, Wexp.data());
+
+        // out = mul_mat(x_d, W_expanded) + bias
+        TensorF32* y = mul_mat(x_d, W_expanded);   // dims=[out_F, N]
+        if (b_data) {
+            // bias: (m_out,) → 沿 mo 扩展，每个 dd 相同 → (out_F,)
+            std::vector<float> bexp(out_F);
+            for (int mo = 0; mo < m_out; ++mo)
+                for (int dd = 0; dd < d_dim; ++dd)
+                    bexp[mo * d_dim + dd] = b_data[mo];
+            TensorF32* b_node = constant_tensor({out_F, 1}, bexp.data());
+            TensorF32* b_bcast = repeat(b_node, y);   // dims=[out_F, N]
+            y = add_impl(y, b_bcast, /*inplace=*/false);
+        }
+        out[j] = y;
+    }
+    return out;
 }
 
 // ============================================================================

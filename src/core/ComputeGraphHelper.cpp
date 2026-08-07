@@ -493,15 +493,16 @@ TensorF32* set_rows(TensorF32* a, TensorF32* b, TensorF32* c) {
 // 7.5 SE3 消息传递三件套（方案 B）
 // ============================================================
 
+// ============================================================
+// 布局约定：本项目的图张量采用 ggml 约定 dims[0]=最内维（最快变化）。
+// 因此"按边"（E 个样本）的 2D 张量布局为 dims=[features, E]（feature 最内）。
 // edge_gather_rows(node_feat, edge_src_idx)
-//   node_feat: (N, C)；edge_src_idx: (E,)
-//   dst: (E, C) — dst[e,:] = node_feat[src_idx[e],:]
+//   node_feat: (N, C)，ggml 布局 dims=[C, N]；edge_src_idx: (E,)
+//   dst: (E, C)，ggml 布局 dims=[C, E] — dst[e,:] = node_feat[src_idx[e],:]
 TensorF32* edge_gather_rows(TensorF32* node_feat, TensorF32* edge_src_idx) {
-    int64_t ne[4] = {
-        edge_src_idx->shape().dims[0],  // E
-        node_feat->shape().dims[1],     // C
-        1, 1
-    };
+    const int64_t E = edge_src_idx->shape().dims[0];
+    const int64_t C = node_feat->shape().dims[0];   // 最内维=特征维 C
+    int64_t ne[4] = { C, E, 1, 1 };
     TensorF32* result = context().new_tensor<float>(2, ne);
     result->op     = OP_EDGE_GATHER_ROWS;
     result->src[0] = node_feat;
@@ -510,12 +511,14 @@ TensorF32* edge_gather_rows(TensorF32* node_feat, TensorF32* edge_src_idx) {
 }
 
 // per_edge_matmul(kernel, gathered)
-//   kernel: (E, M, K)；gathered: (E, K)
-//   dst: (E, M) — dst[e,:] = kernel[e] @ gathered[e,:]
+//   kernel: (E, M, K)，ggml 布局 dims=[K, M, E]；gathered: (E, K)，dims=[K, E]
+//   dst: (E, M)，dims=[M, E] — dst[e,:] = kernel[e] @ gathered[e,:]
+//   （每条边一个独立矩阵 kernel[e] (M×K) 乘该边源特征 (K,) → (M,)）
 TensorF32* per_edge_matmul(TensorF32* kernel, TensorF32* gathered) {
-    const int64_t E = kernel->shape().dims[0];
+    const int64_t E = kernel->shape().dims[2];
     const int64_t M = kernel->shape().dims[1];
-    int64_t ne[2] = {E, M};
+    const int64_t K = kernel->shape().dims[0];
+    int64_t ne[2] = { M, E };
     TensorF32* result = context().new_tensor<float>(2, ne);
     result->op     = OP_PER_EDGE_MATMUL;
     result->src[0] = kernel;
@@ -524,13 +527,13 @@ TensorF32* per_edge_matmul(TensorF32* kernel, TensorF32* gathered) {
 }
 
 // scatter_add(msg, edge_tgt_idx, node_count)
-//   msg: (E, M)；edge_tgt_idx: (E,)；node_count: N
-//   dst: (N, M) — dst[tgt[e],:] += msg[e,:]
+//   msg: (E, M)，dims=[M, E]；edge_tgt_idx: (E,)；node_count: N
+//   dst: (N, M)，dims=[M, N] — dst[tgt[e],:] += msg[e,:]
 //   node_count 存入 op_params[0]（kernel 用它确定输出行数 N）。
 TensorF32* scatter_add(TensorF32* msg, TensorF32* edge_tgt_idx, int node_count) {
-    const int64_t E = msg->shape().dims[0];
-    const int64_t M = msg->shape().dims[1];
-    int64_t ne[2] = {node_count, M};
+    const int64_t M = msg->shape().dims[0];
+    const int64_t E = msg->shape().dims[1];
+    int64_t ne[2] = { M, node_count };
     TensorF32* result = context().new_tensor<float>(2, ne);
     result->op     = OP_SCATTER_ADD;
     result->src[0] = msg;
@@ -540,13 +543,13 @@ TensorF32* scatter_add(TensorF32* msg, TensorF32* edge_tgt_idx, int node_count) 
 }
 
 // per_edge_matmul_back_kernel(grad, gathered)
-//   grad: (E, M)；gathered: (E, K) → dkernel: (E, M, K)
+//   grad: (E, M) dims=[M,E]；gathered: (E, K) dims=[K,E] → dkernel dims=[K,M,E]
 //   dkernel[e,r,c] = grad[e,r] * gathered[e,c]  (逐边外积)
 TensorF32* per_edge_matmul_back_kernel(TensorF32* grad, TensorF32* gathered) {
-    const int64_t E = grad->shape().dims[0];
-    const int64_t M = grad->shape().dims[1];
-    const int64_t K = gathered->shape().dims[1];
-    int64_t ne[3] = {E, M, K};
+    const int64_t M = grad->shape().dims[0];
+    const int64_t E = grad->shape().dims[1];
+    const int64_t K = gathered->shape().dims[0];
+    int64_t ne[3] = {K, M, E};
     TensorF32* result = context().new_tensor<float>(3, ne);
     result->op     = OP_PER_EDGE_MATMUL_BACK_KERNEL;
     result->src[0] = grad;
@@ -555,12 +558,12 @@ TensorF32* per_edge_matmul_back_kernel(TensorF32* grad, TensorF32* gathered) {
 }
 
 // per_edge_matmul_back_gathered(grad, kernel)
-//   grad: (E, M)；kernel: (E, M, K) → dgathered: (E, K)
+//   grad: (E, M) dims=[M,E]；kernel dims=[K,M,E] → dgathered dims=[K,E]
 //   dgathered[e,c] = sum_r kernel[e,r,c] * grad[e,r]
 TensorF32* per_edge_matmul_back_gathered(TensorF32* grad, TensorF32* kernel) {
-    const int64_t E = grad->shape().dims[0];
-    const int64_t K = kernel->shape().dims[2];
-    int64_t ne[2] = {E, K};
+    const int64_t K = kernel->shape().dims[0];
+    const int64_t E = grad->shape().dims[1];
+    int64_t ne[2] = {K, E};
     TensorF32* result = context().new_tensor<float>(2, ne);
     result->op     = OP_PER_EDGE_MATMUL_BACK_GATHERED;
     result->src[0] = grad;
@@ -953,6 +956,19 @@ TensorF32* constant_ones(const std::vector<int64_t>& dims) {
     for (int64_t i = 0; i < t->numel(); i++) {
         t->data()[i] = 1.0f;
     }
+    return t;
+}
+
+// constant_tensor(dims, data) — 从已有数据创建常量叶子图节点（逐元素拷贝）。
+// 用于把不参与求导的预计算量（如 SE3 球谐基切片、edge_index 索引、相对坐标等）注入图。
+// data 元素个数须 == dims 的乘积。
+TensorF32* constant_tensor(const std::vector<int64_t>& dims, const float* data) {
+    int64_t ne[4] = {1, 1, 1, 1};
+    for (size_t i = 0; i < dims.size() && i < 4; i++) {
+        ne[i] = dims[i];
+    }
+    TensorF32* t = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
+    std::memcpy(t->data(), data, static_cast<size_t>(t->numel()) * sizeof(float));
     return t;
 }
 

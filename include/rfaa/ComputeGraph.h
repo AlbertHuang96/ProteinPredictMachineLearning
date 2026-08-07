@@ -293,6 +293,8 @@ TensorF32* build_frame_atom_indices(int B, int L);
 TensorF32* constant_ones(const std::vector<int64_t>& dims);
 // 创建常量标量图节点
 TensorF32* constant_scalar(float value);
+// 从已有数据创建常量叶子图节点（逐元素拷贝，不参与求导）
+TensorF32* constant_tensor(const std::vector<int64_t>& dims, const float* data);
 
 // 10. 位置编码
 TensorF32* rope(TensorF32* a, int n_past, int n_dims = 0);

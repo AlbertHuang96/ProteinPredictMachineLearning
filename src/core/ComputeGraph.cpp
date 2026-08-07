@@ -604,10 +604,10 @@ void ComputeGraph::compute_backward(
             }
         } break;
         case OP_EDGE_GATHER_ROWS: {
-            // 前向: dst[e,:] = node_feat[src_idx[e],:] (src0=node_feat, src1=src_idx)
+            // 前向: dst[e,:] = node_feat[src_idx[e],:] (src0=node_feat dims=[C,N], src1=src_idx)
             // 反向: dnode_feat = scatter_add(grad, src_idx, N) — 把边梯度散点累加回源节点
             if (src0_needs_grads) {
-                const int N = static_cast<int>(src0->shape().dims[0]);
+                const int N = static_cast<int>(src0->shape().dims[1]);  // ggml 布局: 节点数为 dims[1]
                 add_or_set(ctx, cgraph, isrc0, scatter_add(grad, src1, N));
             }
             // src1 (索引) 不可导

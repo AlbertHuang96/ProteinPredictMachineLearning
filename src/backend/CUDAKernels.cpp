@@ -301,51 +301,51 @@ void CUDABackend::kernel_out_prod_cuda(TensorF32 * node, ComputeParams * p) {
 
 void CUDABackend::kernel_edge_gather_rows_cuda(TensorF32 * node, ComputeParams * p) {
     (void)p;
-    const TensorF32* node_feat = node->src[0];  // (N, C)
+    const TensorF32* node_feat = node->src[0];  // dims=[C, N]
     const TensorF32* src_idx   = node->src[1];  // (E,)
-    const int N = static_cast<int>(node_feat->shape().dims[0]);
-    const int C = static_cast<int>(node_feat->shape().dims[1]);
+    const int C = static_cast<int>(node_feat->shape().dims[0]);
+    const int N = static_cast<int>(node_feat->shape().dims[1]);
     const int E = static_cast<int>(src_idx->shape().dims[0]);
     edge_gather_rows_cuda(node_feat->data(), src_idx->data(), node->data(), N, C, E);
 }
 
 void CUDABackend::kernel_per_edge_matmul_cuda(TensorF32 * node, ComputeParams * p) {
     (void)p;
-    const TensorF32* kernel   = node->src[0];  // (E, M, K)
-    const TensorF32* gathered = node->src[1];  // (E, K)
-    const int E = static_cast<int>(kernel->shape().dims[0]);
+    const TensorF32* kernel   = node->src[0];  // dims=[K, M, E]
+    const TensorF32* gathered = node->src[1];  // dims=[K, E]
+    const int K = static_cast<int>(kernel->shape().dims[0]);
     const int M = static_cast<int>(kernel->shape().dims[1]);
-    const int K = static_cast<int>(kernel->shape().dims[2]);
+    const int E = static_cast<int>(kernel->shape().dims[2]);
     per_edge_matmul_cuda(kernel->data(), gathered->data(), node->data(), M, K, E);
 }
 
 void CUDABackend::kernel_scatter_add_cuda(TensorF32 * node, ComputeParams * p) {
     (void)p;
-    const TensorF32* msg      = node->src[0];  // (E, M)
+    const TensorF32* msg      = node->src[0];  // dims=[M, E]
     const TensorF32* tgt_idx  = node->src[1];  // (E,)
     const int N = node->op_params[0];
-    const int E = static_cast<int>(msg->shape().dims[0]);
-    const int M = static_cast<int>(msg->shape().dims[1]);
+    const int M = static_cast<int>(msg->shape().dims[0]);
+    const int E = static_cast<int>(msg->shape().dims[1]);
     scatter_add_cuda(msg->data(), tgt_idx->data(), node->data(), N, M, E);
 }
 
 void CUDABackend::kernel_per_edge_matmul_back_kernel_cuda(TensorF32 * node, ComputeParams * p) {
     (void)p;
-    const TensorF32* grad     = node->src[0];  // (E, M)
-    const TensorF32* gathered = node->src[1];  // (E, K)
-    const int E = static_cast<int>(grad->shape().dims[0]);
-    const int M = static_cast<int>(grad->shape().dims[1]);
-    const int K = static_cast<int>(gathered->shape().dims[1]);
+    const TensorF32* grad     = node->src[0];  // dims=[M, E]
+    const TensorF32* gathered = node->src[1];  // dims=[K, E]
+    const int M = static_cast<int>(grad->shape().dims[0]);
+    const int E = static_cast<int>(grad->shape().dims[1]);
+    const int K = static_cast<int>(gathered->shape().dims[0]);
     per_edge_matmul_back_kernel_cuda(grad->data(), gathered->data(), node->data(), M, K, E);
 }
 
 void CUDABackend::kernel_per_edge_matmul_back_gathered_cuda(TensorF32 * node, ComputeParams * p) {
     (void)p;
-    const TensorF32* grad   = node->src[0];  // (E, M)
-    const TensorF32* kernel = node->src[1];  // (E, M, K)
-    const int E = static_cast<int>(grad->shape().dims[0]);
-    const int M = static_cast<int>(grad->shape().dims[1]);
-    const int K = static_cast<int>(kernel->shape().dims[2]);
+    const TensorF32* grad   = node->src[0];  // dims=[M, E]
+    const TensorF32* kernel = node->src[1];  // dims=[K, M, E]
+    const int M = static_cast<int>(grad->shape().dims[0]);
+    const int E = static_cast<int>(grad->shape().dims[1]);
+    const int K = static_cast<int>(kernel->shape().dims[0]);
     per_edge_matmul_back_gathered_cuda(grad->data(), kernel->data(), node->data(), M, K, E);
 }
 

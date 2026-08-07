@@ -1103,17 +1103,16 @@ void CPUBackend::kernel_get_rows_back(TensorF32 * node, ComputeParams * p) {
 
 // ===== edge_gather_rows (SE3 消息传递：按边源节点索引取行) =====
 // 前向: dst[e,:] = node_feat[src_idx[e],:]
-// src0: node_feat (N, C) 节点特征
-// src1: edge_src_idx (E,) 源节点 id（float-encoded int）
-// dst:  (E, C) — 逐行拷贝 node_feat[src_idx[e]] → dst[e]
+// ggml 布局：node_feat dims=[C, N]，src_idx (E,)，dst dims=[C, E]
+// src0: node_feat (N, C) 节点特征；src1: src_idx (E,)；dst: (E, C)
 // 语义与 get_rows 一致（gather），独立 op 便于 SE3 消息阶段显式表达与反向散点。
 void CPUBackend::kernel_edge_gather_rows(TensorF32 * node, ComputeParams * p) {
-    const TensorF32 * node_feat = node->src[0];  // (N, C)
+    const TensorF32 * node_feat = node->src[0];  // dims=[C, N]
     const TensorF32 * src_idx   = node->src[1];  // (E,)
-    TensorF32       * dst       = node;          // (E, C)
+    TensorF32       * dst       = node;          // dims=[C, E]
 
-    const int64_t N = node_feat->shape().dims[0];
-    const int64_t C = node_feat->shape().dims[1];
+    const int64_t C = node_feat->shape().dims[0];
+    const int64_t N = node_feat->shape().dims[1];
     const int64_t E = src_idx->shape().dims[0];
 
     const float * nf_data  = static_cast<const float*>(node_feat->data());
@@ -1129,23 +1128,24 @@ void CPUBackend::kernel_edge_gather_rows(TensorF32 * node, ComputeParams * p) {
         int64_t i = static_cast<int64_t>(idx_data[e]);
         if (i < 0) i = 0;
         if (i >= N) i = N - 1;
+        // 每行连续 C 个特征（C 最内维）
         std::memcpy(d_data + e * C, nf_data + i * C, C * sizeof(float));
     }
 }
 
 // ===== per_edge_matmul (SE3 消息传递：逐边矩阵乘) =====
 // 前向: dst[e,:] = kernel[e] @ gathered[e,:]
-// src0: kernel (E, M, K) 展平 row-major (E*M*K)，每条边独立卷积核矩阵
-// src1: gathered (E, K) 该边源节点特征
-// dst:  (E, M)
+// ggml 布局：kernel dims=[K, M, E]，gathered dims=[K, E]，dst dims=[M, E]
+// src0: kernel (E, M, K) 每条边独立卷积核矩阵 (M×K)
+// src1: gathered (E, K) 该边源节点特征；dst: (E, M)
 void CPUBackend::kernel_per_edge_matmul(TensorF32 * node, ComputeParams * p) {
-    const TensorF32 * kernel   = node->src[0];  // (E, M, K)
-    const TensorF32 * gathered = node->src[1];  // (E, K)
-    TensorF32       * dst      = node;          // (E, M)
+    const TensorF32 * kernel   = node->src[0];  // dims=[K, M, E]
+    const TensorF32 * gathered = node->src[1];  // dims=[K, E]
+    TensorF32       * dst      = node;          // dims=[M, E]
 
-    const int64_t E = kernel->shape().dims[0];
+    const int64_t K = kernel->shape().dims[0];
     const int64_t M = kernel->shape().dims[1];
-    const int64_t K = kernel->shape().dims[2];
+    const int64_t E = kernel->shape().dims[2];
 
     const float * k_data = static_cast<const float*>(kernel->data());
     const float * g_data = static_cast<const float*>(gathered->data());
@@ -1157,7 +1157,7 @@ void CPUBackend::kernel_per_edge_matmul(TensorF32 * node, ComputeParams * p) {
     const int64_t end   = (start + per < total) ? (start + per) : total;
 
     for (int64_t e = start; e < end; e++) {
-        const float * K_e = k_data + e * M * K;       // (M, K)
+        const float * K_e = k_data + e * M * K;       // (M, K) row-major
         const float * g_e = g_data + e * K;           // (K,)
         float       * d_e = d_data + e * M;           // (M,)
         for (int64_t r = 0; r < M; r++) {
@@ -1172,18 +1172,17 @@ void CPUBackend::kernel_per_edge_matmul(TensorF32 * node, ComputeParams * p) {
 
 // ===== scatter_add (SE3 消息传递：边消息散点累加到目标节点) =====
 // 前向: dst[tgt[e],:] += msg[e,:]
-// src0: msg (E, M) 边消息
-// src1: edge_tgt_idx (E,) 目标节点 id（float-encoded int）
-// dst:  (N, M)，N = node->op_params[0]（节点数）
+// ggml 布局：msg dims=[M, E]，tgt_idx (E,)，dst dims=[M, N]
+// src0: msg (E, M) 边消息；src1: tgt_idx (E,)；dst: (N, M)，N = op_params[0]
 // 先清零再累加。多个边可指向同一目标节点，必须 += 而非覆盖，故串行在 thread 0 完成。
 void CPUBackend::kernel_scatter_add(TensorF32 * node, ComputeParams * p) {
-    const TensorF32 * msg         = node->src[0];  // (E, M)
+    const TensorF32 * msg         = node->src[0];  // dims=[M, E]
     const TensorF32 * tgt_idx     = node->src[1];  // (E,)
-    TensorF32       * dst         = node;          // (N, M)
+    TensorF32       * dst         = node;          // dims=[M, N]
 
     const int64_t N = node->op_params[0];
-    const int64_t E = msg->shape().dims[0];
-    const int64_t M = msg->shape().dims[1];
+    const int64_t M = msg->shape().dims[0];
+    const int64_t E = msg->shape().dims[1];
 
     const float * m_data  = static_cast<const float*>(msg->data());
     const float * idx_data = static_cast<const float*>(tgt_idx->data());
@@ -1207,17 +1206,15 @@ void CPUBackend::kernel_scatter_add(TensorF32 * node, ComputeParams * p) {
 // ===== per_edge_matmul_back_kernel (per_edge_matmul 反向 wrt kernel) =====
 // 前向: dst[e,:] = kernel[e] @ gathered[e,:]
 // 反向: dkernel[e,r,c] = grad[e,r] * gathered[e,c]  (逐边外积)
-// src0: grad (E, M) 上游梯度
-// src1: gathered (E, K) 前向输入
-// dst:  dkernel (E, M, K)
+// ggml 布局：grad dims=[M,E]，gathered dims=[K,E]，dst dims=[K,M,E]
 void CPUBackend::kernel_per_edge_matmul_back_kernel(TensorF32 * node, ComputeParams * p) {
-    const TensorF32 * grad     = node->src[0];  // (E, M)
-    const TensorF32 * gathered = node->src[1];  // (E, K)
-    TensorF32       * dst      = node;          // (E, M, K)
+    const TensorF32 * grad     = node->src[0];  // dims=[M, E]
+    const TensorF32 * gathered = node->src[1];  // dims=[K, E]
+    TensorF32       * dst      = node;          // dims=[K, M, E]
 
-    const int64_t E = grad->shape().dims[0];
-    const int64_t M = grad->shape().dims[1];
-    const int64_t K = gathered->shape().dims[1];
+    const int64_t M = grad->shape().dims[0];
+    const int64_t E = grad->shape().dims[1];
+    const int64_t K = gathered->shape().dims[0];
 
     const float * g_data = static_cast<const float*>(grad->data());
     const float * f_data = static_cast<const float*>(gathered->data());
@@ -1231,7 +1228,7 @@ void CPUBackend::kernel_per_edge_matmul_back_kernel(TensorF32 * node, ComputePar
     for (int64_t e = start; e < end; e++) {
         const float * g_e = g_data + e * M;   // (M,)
         const float * f_e = f_data + e * K;   // (K,)
-        float       * d_e = d_data + e * M * K; // (M, K)
+        float       * d_e = d_data + e * M * K; // (M, K) row-major
         for (int64_t r = 0; r < M; r++) {
             const float gr = g_e[r];
             for (int64_t c = 0; c < K; c++) {
@@ -1244,17 +1241,15 @@ void CPUBackend::kernel_per_edge_matmul_back_kernel(TensorF32 * node, ComputePar
 // ===== per_edge_matmul_back_gathered (per_edge_matmul 反向 wrt gathered) =====
 // 前向: dst[e,:] = kernel[e] @ gathered[e,:]
 // 反向: dgathered[e,c] = sum_r kernel[e,r,c] * grad[e,r]
-// src0: grad (E, M) 上游梯度
-// src1: kernel (E, M, K) 前向输入
-// dst:  dgathered (E, K)
+// ggml 布局：grad dims=[M,E]，kernel dims=[K,M,E]，dst dims=[K,E]
 void CPUBackend::kernel_per_edge_matmul_back_gathered(TensorF32 * node, ComputeParams * p) {
-    const TensorF32 * grad   = node->src[0];  // (E, M)
-    const TensorF32 * kernel = node->src[1];  // (E, M, K)
-    TensorF32       * dst    = node;          // (E, K)
+    const TensorF32 * grad   = node->src[0];  // dims=[M, E]
+    const TensorF32 * kernel = node->src[1];  // dims=[K, M, E]
+    TensorF32       * dst    = node;          // dims=[K, E]
 
-    const int64_t E = grad->shape().dims[0];
-    const int64_t M = grad->shape().dims[1];
-    const int64_t K = kernel->shape().dims[2];
+    const int64_t M = grad->shape().dims[0];
+    const int64_t E = grad->shape().dims[1];
+    const int64_t K = kernel->shape().dims[0];
 
     const float * g_data = static_cast<const float*>(grad->data());
     const float * k_data = static_cast<const float*>(kernel->data());
@@ -1267,7 +1262,7 @@ void CPUBackend::kernel_per_edge_matmul_back_gathered(TensorF32 * node, ComputeP
 
     for (int64_t e = start; e < end; e++) {
         const float * g_e = g_data + e * M;   // (M,)
-        const float * k_e = k_data + e * M * K; // (M, K)
+        const float * k_e = k_data + e * M * K; // (M, K) row-major
         float       * d_e = d_data + e * K;   // (K,)
         for (int64_t c = 0; c < K; c++) {
             float val = 0.0f;

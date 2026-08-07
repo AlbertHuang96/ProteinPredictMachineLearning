@@ -230,6 +230,11 @@ public:
     // 返回: (E, out_dim, 1, in_dim, 1, num_freq) 六维径向权重
     TensorF32 forward(const TensorF32& x);
 
+    // 图模式前向：x 为图节点 (E, edge_dim+1) → R (E, out_dim, in_dim, num_freq)
+    // 布局 dims=[num_freq, in_dim, out_dim, E]（dims[0]=最内维），去掉值版的 "1" 维。
+    // 使用 mul_mat / add_impl / mul / scale / relu 等已有图 op；BN 用逐通道 affine（gamma/beta repeat 广播）。
+    TensorF32* forward_graph(TensorF32* x);
+
     // 获取所有参数
     std::vector<TensorF32*> parameters();
 
@@ -278,6 +283,11 @@ public:
     // 返回: (E, d_out·nc_out, d_in·nc_in) 等变卷积核矩阵
     TensorF32 forward(const TensorF32& feat, const TensorF32& basis);
 
+    // 图模式前向：feat 为图节点 (E, edge_dim+1)，basis 为常量 (E,1,d_out,1,d_in,num_freq)
+    // 返回 kernel 图节点 (E, out*d_out, in*d_in)，dims=[in*d_in, out*d_out, E]。
+    // 用 per_edge_matmul 在固定 (mo,mi) 块上逐边做 R_co ⊗ basis 收缩，再 concat 组装。
+    TensorF32* forward_graph(TensorF32* feat, const TensorF32& basis);
+
     // 获取参数
     std::vector<TensorF32*> parameters();
 
@@ -322,6 +332,21 @@ public:
                         const TensorF32* edge_w,
                         const SE3Basis& basis);
 
+    // 图模式前向：返回每个输出度的边消息图节点。
+    // 输入（均为图节点）：
+    //   h_nodes: 每输入度一个节点特征图节点 (N, m_in*d_dim_in) 扁平
+    //   edge_src_idx / edge_tgt_idx: (E,) 源/目标节点 id（float-encoded int）
+    //   edge_d: (E,3) 边位移图节点；edge_w: (E,edge_dim) 边特征图节点或 nullptr
+    //   basis: 预计算球谐基（值版常量，kernel 生成时转常量叶子）
+    // 返回: out[i] = (E, m_out*d_dim_out) 扁平边消息（对应 f_out_.degrees[i]）。
+    std::vector<TensorF32*> forward_graph(
+        const std::vector<TensorF32*>& h_nodes,
+        TensorF32* edge_src_idx,
+        TensorF32* edge_tgt_idx,
+        TensorF32* edge_d,
+        TensorF32* edge_w,
+        const SE3Basis& basis);
+
     // 获取参数
     std::vector<TensorF32*> parameters();
 
@@ -350,6 +375,13 @@ public:
     G1x1SE3(const Fiber& f_in, const Fiber& f_out);
 
     SE3Features forward(const SE3Features& x);
+
+    // 图模式前向：节点级 1x1 等变线性（逐度通道混合，不跨度、不经边）。
+    // x_nodes: 每输入度一个扁平节点特征图节点 (N, m_in*d_dim) dims=[m_in*d_dim, N]。
+    // 返回: out[i] = (N, m_out*d_dim) 扁平图节点 dims=[m_out*d_dim, N]（对应 f_out_ 中出现的度）。
+    // 用"块对角权重"mul_mat：W_expanded[(mo*d_dim+dd),(mi*d_dim+dd)]=W[mo,mi]（其余0），
+    // 使 out[n,mo,dd]=Σ_mi W[mo,mi]*x[n,mi,dd]（等变：只混合通道，不混合 Wigner 分量 dd）。
+    std::vector<TensorF32*> forward_graph(const std::vector<TensorF32*>& x_nodes);
 
 private:
     Fiber f_in_, f_out_;
