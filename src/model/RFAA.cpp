@@ -61,6 +61,9 @@ RFAAConfig::RFAAConfig() {
     se3_config.n_heads = 4;
     se3_config.l0_features = {32};   // state 输出
     se3_config.l1_features = {3};    // 坐标更新
+    // 度1 输入通道数统一与 l1_features[0]=3 对齐（值版 l1_feats 为 3 通道）；
+    // SE3Transformer(SE3Config) 构造器据此构建 fiber_in 度1=3，避免默认 16 与 3 不匹配。
+    se3_config.l1_in_feats = 3;
 }
 
 // IterBlock 实现
@@ -566,16 +569,19 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 }
 
 // ===== IterBlock::forward_graph (图模式) =====
-// 仅处理 msa/pair 两条 track (1D/2D 注意力 + FF)。SE3 / pos_enc / 坐标更新等图外
-// 部分由调用方在 block 边界回落值张量后处理（未来训练入口驱动接入）。
+// 处理 msa/pair 两条 track (1D/2D 注意力 + FF) + SE3(3D) track。
 // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维):
 //   msa   : 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
 //   pair  : 值 (B,L,L,D_PAIR) = 图 [D_PAIR, L, L, B]
 //   rbf   : 值 (B,L,L,D_RBF)  = 图 [D_RBF, L, L, B]  (RBF + pos_enc 注入)
-//   state : 值 (B,L,D_STATE)  = 图 [D_STATE, L, B]
-// 返回: 更新后的 pair 图节点；msa 通过引用回写。
+//   state : 值 (B,L,D_STATE)  = 图 [D_STATE, L, B]；SE3 通过引用回写更新
+// 返回: 更新后的 pair 图节点；msa、state 通过引用回写。
+// 注: 当 coords/seq1hot 提供时，末尾追加 SE3(3D) track（见 run_se3_graph）。
 TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
-                                    TensorF32* rbf, TensorF32* state) {
+                                    TensorF32* rbf, TensorF32*& state,
+                                    const TensorF32* coords,
+                                    const TensorI64* residx,
+                                    const TensorF32* seq1hot) {
     // ------------ 1D track: msa2msa ------------
     // Step 1: state -> msa[:,0] (query row 注入，图版：掩码广播 add)
     //   proj_state [D_MSA, L, B] = Linear(LayerNorm(state))
@@ -634,7 +640,102 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
                     /*inplace=*/false);
     // TODO: pair_ff residual（值版 forward 中 pair_ff 亦未激活，后续补齐）
 
+    // ------------ 3D track: SE3 Transformer ------------
+    // 当提供结构输入（coords/seq1hot）时，追加 SE3 等变更新。
+    // 结构常量（make_graph → 边 src/tgt/d/w、basis）依赖"更新后 pair 的值"，而 pair 在此为图节点，
+    //    需训练入口在 block 边界回落值后经值版 embed_e_/norm_edge_3d_/make_graph 计算，再注入
+    //    run_se3_graph。因此此处 forward_graph 本身不构造 G/basis，SE3 由训练入口调用
+    //    run_se3_graph(G, basis, coords, seq1hot) 驱动（图外值回落），见 run_se3_graph 说明。
+    // TODO(入口驱动): 训练入口在每次 block 前回落 pair → edge_out → make_graph → basis，
+    //   然后调用 run_se3_graph 完成 SE3 图块与 state 回写。
+    (void)coords; (void)residx; (void)seq1hot;
+
     return pair;
+}
+
+// SE3(3D) track 图模式子流程（可微部分用图 op，结构常量由调用方以 G/basis 注入）。
+//   node 度0 = norm_node_3d(embed_x(cat(msa 沿 Nseq 维均值, seq1hot)))  → 图节点 [32,B*L]
+//   node 度1 = l1_feats (compute_l1_features(coords))                    → 常量叶子
+//   edge     = G.edge_index / G.edge_d / G.edge_w → src/tgt/d/w 常量叶子
+//   basis    = 调用方预计算（SE3Basis.compute(G.edge_d, 2)）
+//   out      = se3_->forward_graph({node0,node1}, src, tgt, d, w, basis, N=B*L)
+//   state    = out[0].view({B,L,D_STATE})（引用回写）
+// 说明：结构预处理（make_graph 需 edge_out 值张量）属"图外"，由训练入口在 block 边界
+//       回落值计算后传入 G/basis/coords；此处仅做可微 node 嵌入 + se3_ 调用。
+void IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                              TensorF32*& state,
+                              const se3::GraphData& G, const SE3Basis& basis,
+                              const TensorF32& coords, const TensorF32& seq1hot) {
+    (void)pair; (void)rbf;
+    const int B = seq1hot.shape().dims[0];
+    const int L = seq1hot.shape().dims[1];
+    const int64_t N = static_cast<int64_t>(B) * L;   // 图节点数
+
+    // ---- node 度0：msa 沿 Nseq 维均值 → cat(seq1hot) → embed_x_ → norm_node_3d_ ----
+    // msa 图节点 [D_MSA, L, Nseq, B]：permute 把 Nseq 移到最内 dims[0] 后 sum_rows 归约
+    const int64_t Nseq = msa->shape().dims[2];
+    TensorF32* msa_p = permute(msa, std::vector<int>{2, 0, 1, 3});    // [Nseq, D_MSA, L, B]
+    TensorF32* msa_s = sum_rows(msa_p);                              // [1, D_MSA, L, B]
+    TensorF32* msa_m = scale(msa_s, 1.0f / static_cast<float>(Nseq)); // 均值
+    TensorF32* msa_v = view(msa_m, Shape({D_MSA, L, B}));            // [D_MSA, L, B]
+    TensorF32* s1h   = constant_tensor({21, L, B}, seq1hot.data());  // [21, L, B]
+    TensorF32* node_cat = concat_ptr({msa_v, s1h}, 0);               // [D_MSA+21, L, B]
+    TensorF32* node_emb = embed_x_->forward_graph(node_cat);         // [32, L, B]
+    TensorF32* node_nrm = norm_node_3d_->forward(node_emb);          // [32, L, B]
+    TensorF32* node0 = view(node_nrm, Shape({ITER_NODE_3D_OUT, N})); // [32, B*L]（n=b*L+l）
+
+    // ---- node 度1：l1_feats 常量叶子 [3*d_dim1, B*L]，与值版 node_se3.features[1] 对齐 ----
+    // 值版固定度1输入 = l1_feats (B*L, 3, 3)（3 通道位移向量，d_dim1=3）。
+    // SE3Transformer(SE3Config) 构造器已把 fiber_in 度1 通道数取 cfg.l1_features[0]=3，
+    // 故此处直接填 3 通道的 9 个元素，无需补零，与值版严格一致。
+    TensorF32 l1 = compute_l1_features(coords);                      // (B*L, 3, 3)
+    const int m1     = 3;                                             // 度1 通道数（值版 l1_feats 固定 3）
+    const int d_dim1 = 3;                                             // 度1 → 2*1+1
+    std::vector<float> l1data(static_cast<size_t>(m1) * d_dim1 * N, 0.0f);
+    for (int64_t n = 0; n < N; ++n)
+        for (int a = 0; a < m1; ++a)
+            for (int c = 0; c < d_dim1; ++c)
+                l1data[(static_cast<size_t>(a) * d_dim1 + c) * N + n] =
+                    l1.data()[n * 9 + a * 3 + c];
+    TensorF32* node1 = constant_tensor({m1 * d_dim1, N}, l1data.data());
+
+    // ---- 边特征常量叶子（由调用方值版 make_graph 注入）----
+    const int64_t E = G.edge_index.numel() > 0 ? G.edge_index.shape().dims[1] : 0;
+    if (E <= 0) {
+        // 无有效边图（结构常量未注入），SE3 图块无法执行；仅回写 state=输入（等价跳过）。
+        return;
+    }
+    std::vector<float> src_d(static_cast<size_t>(E)), tgt_d(static_cast<size_t>(E));
+    for (int64_t e = 0; e < E; ++e) {
+        src_d[e] = static_cast<float>(G.edge_index.data()[e]);
+        tgt_d[e] = static_cast<float>(G.edge_index.data()[E + e]);
+    }
+    TensorF32* edge_src = constant_tensor({E}, src_d.data());
+    TensorF32* edge_tgt = constant_tensor({E}, tgt_d.data());
+    // edge_d: (E,3) → [3,E]；edge_w: (E,E_dim) → [E_dim,E]
+    std::vector<float> dd(static_cast<size_t>(3 * E));
+    for (int64_t e = 0; e < E; ++e)
+        for (int c = 0; c < 3; ++c) dd[static_cast<size_t>(c) * E + e] = G.edge_d.data()[e * 3 + c];
+    TensorF32* edge_d = constant_tensor({3, E}, dd.data());
+    const int64_t E_dim = G.edge_w.numel() > 0 ? G.edge_w.shape().dims[1] : 0;
+    std::vector<float> ww(static_cast<size_t>(E_dim * E), 0.0f);
+    for (int64_t e = 0; e < E; ++e)
+        for (int64_t c = 0; c < E_dim; ++c)
+            ww[static_cast<size_t>(c) * E + e] =
+                G.edge_w.numel() > 0 ? G.edge_w.data()[e * E_dim + c] : 0.0f;
+    TensorF32* edge_w = constant_tensor({E_dim, E}, ww.data());
+
+    // ---- SE3 Transformer forward_graph ----
+    std::vector<TensorF32*> h_nodes = {node0, node1};
+    std::vector<TensorF32*> se3_out = se3_->forward_graph(
+        h_nodes, edge_src, edge_tgt, edge_d, edge_w, basis, static_cast<int>(N));
+
+    // ---- state 回写：度0 → (B,L,D_STATE) 图 [D_STATE, L, B] ----
+    // se3_out[0] 为 [32, B*L]（度0 输出），节点序 n=b*L+l → view [D_STATE, L, B]
+    state = view(se3_out[0], Shape({D_STATE, L, B}));
+
+    // TODO(入口驱动): 坐标更新 = offset(se3_out[1]) 回落值后叠加到 coords → xyz_new_。
+    //   属"图外"值回落，需训练入口先 graph_compute(se3_out[1]) 再按值版 Step4k 计算。
 }
 
 void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
@@ -872,9 +973,12 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
 
 // ===== FullBlock::forward_graph (图模式) =====
 // 与 IterBlock::forward_graph 一致，但 msa_full 用 global column attention。
-// 布局约定同 IterBlock::forward_graph。
+// 布局约定同 IterBlock::forward_graph；SE3 track 由末尾追加（同 IterBlock，见 run_se3_graph）。
 TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
-                                    TensorF32* rbf, TensorF32* state) {
+                                    TensorF32* rbf, TensorF32*& state,
+                                    const TensorF32* coords,
+                                    const TensorI64* residx,
+                                    const TensorF32* seq1hot) {
     // ------------ 1D track: msa2msa ------------
     // Step 1: state -> msa_full[:,0] (query row 注入，图版：掩码广播 add)
     //   proj_state [D_MSA, L, B] = Linear(LayerNorm(state))
@@ -927,6 +1031,11 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
     pair = add_impl(pair, pair_col_attn_->forward_graph(pair, rbf_proj),
                     /*inplace=*/false);
     // TODO: pair_ff residual（值版 forward 中 pair_ff 亦未激活，后续补齐）
+
+    // ------------ 3D track: SE3 Transformer ------------
+    // 同 IterBlock::forward_graph：SE3 结构常量由训练入口值版回落 make_graph 后
+    // 调用 run_se3_graph 驱动；此处预留调用位。
+    //(void)coords; (void)residx; (void)seq1hot;
 
     return pair;
 }

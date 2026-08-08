@@ -95,9 +95,15 @@ TensorF32* neg(TensorF32* a) {
 // ============================================================
 
 // mul_mat(a, b) — 矩阵乘法 a @ b
-// a: (M, K), b: (K, N) → (M, N)
+// 布局约定（与 CPU/CUDA kernel 一致，ggml dims[0]=最内维/列）：
+//   a 视为 (M, K)：a.dims[1]=M 行, a.dims[0]=K 列
+//   b 视为 (N, K)：b.dims[1]=N 行, b.dims[0]=K 列（b 以 (N,K) 转置存储 b[j*K+k]）
+//   result (M, N)：result.dims[0]=N（列, 最内）, result.dims[1]=M（行）
+//   result[i,j] = sum_k a[i,k]*b[j,k]
+// 修正：result.dims[0] 应为 b 的行数 N=b.dims[1]，而非 b.dims[0](=K)；
+//   原实现写 b.dims[0] 导致非方阵时输出形状错误。
 TensorF32* mul_mat(TensorF32* a, TensorF32* b) {
-    int64_t ne[2] = {b->shape().dims[0], a->shape().dims[1]};
+    int64_t ne[2] = {b->shape().dims[1], a->shape().dims[1]};
     TensorF32* result = context().new_tensor<float>(2, ne);
 
     result->op     = OP_MUL_MAT;
@@ -214,6 +220,15 @@ TensorF32* relu(TensorF32* a) {
     result->op     = OP_UNARY;
     result->src[0] = a;
     set_unary_op(result, UNARY_OP_RELU);
+    return result;
+}
+
+// exp(a) — 自然指数 e^a
+TensorF32* exp(TensorF32* a) {
+    TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
+    result->op     = OP_UNARY;
+    result->src[0] = a;
+    set_unary_op(result, UNARY_OP_EXP);
     return result;
 }
 
@@ -451,10 +466,15 @@ TensorF32* cont(TensorF32* a) {
 // ============================================================
 
 // get_rows(a, b) — 按索引 b 从 a 中取行
-// a: (N, M, ...), b: (K,) → (K, M, ...)
+// 布局约定（与 kernel_get_rows 一致，ggml dims[0]=最内维/行内长度）：
+//   a 视为 (N, M)：a.dims[0]=N 行, a.dims[1]=M 行内长度
+//   b: (K,) 行索引（float-encoded int），按 a.dims[0] 选行
+//   result (K, M)：result.dims[0]=M（行内长度, 最内）, result.dims[1]=K（行数）
+//   result[k, :] = a[idx[k], :]
+// 修正：result.dims 应为 {a.dims[1](行内长), b.dims[0](K)}，原实现写反成 {K, M}。
 TensorF32* get_rows(TensorF32* a, TensorF32* b) {
     int ndim = a->shape().ndim();
-    int64_t ne[4] = {b->shape().dims[0], a->shape().dims[1], 1, 1};
+    int64_t ne[4] = {a->shape().dims[1], b->shape().dims[0], 1, 1};
     if (ndim >= 3) ne[2] = a->shape().dims[2];
     TensorF32* result = context().new_tensor<float>(ndim, ne);
     result->op     = OP_GET_ROWS;

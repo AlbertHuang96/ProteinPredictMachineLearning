@@ -175,6 +175,7 @@ TensorF32* softmax_backward(TensorF32* grad, TensorF32* output);
 TensorF32* silu   (TensorF32* a);
 TensorF32* gelu   (TensorF32* a);
 TensorF32* relu   (TensorF32* a);
+TensorF32* exp    (TensorF32* a);
 TensorF32* leaky_relu(TensorF32* a, float alpha = 0.01f);
 TensorF32* sigmoid(TensorF32* a);
 

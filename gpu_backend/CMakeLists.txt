@@ -7,7 +7,6 @@ set(GPU_SOURCES
     #../src/cuda/SE3Kernel.cu
     ../src/cuda/MathKernel.cu
     ../src/cuda/OutProdKernel.cu
-    ../src/cuda/SE3MessagePassingKernel.cu
 )
 
 

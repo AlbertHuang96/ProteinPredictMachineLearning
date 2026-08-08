@@ -1,18 +1,19 @@
 
 # ProteinPredictMachineLearning Project
-PPML project
-Inspired by RosettaFoldAllAtom
-and 
-llama.cpp and GGML
+PPML project  
+Inspired by RosettaFoldAllAtom  
+and   
+llama.cpp and GGML  
 
 ## Project Structure
 
-Main goal:
-predict the 3D structure of a protein with limited compute resources, 
-i.e. personal computer
-still leave potential to running on a GPU server
-or multiplatform deploy
-Theoretically, it could predict structure of all-atom protein.
+Main goal:  
+
+predict the 3D structure of a protein with limited compute resources,   
+i.e. personal computer  
+still leave potential to running on a GPU server  
+or multiplatform deploy  
+Theoretically, it could predict structure of all-atom protein.  
 
 ### Data pipeline
 preprocessing
@@ -21,34 +22,24 @@ MSA
 templates
 
 ### Transformers
-1D tracks
-2D tracks
-3D tracks
 
-forward and backend process
-backend graph
-loss functions
-GGUF saving and loading
+forward and backend process  
+backend graph  
+loss functions  
+GGUF saving and loading  
 
 ### Optimize (TODOs)
-flash attention
-kv-cache
-MoE
-LoRA fine-tuning?
 
-GPU backend i.e. CUDA node
-graph Op fuse?
-grad accumulation
-grad checkpoint?
+LoRA fine-tuning  
 
-flash attention?
+GPU backend i.e. CUDA node  
 
-detect hardware:
-kv-cache
-paged attention?
+detect hardware:  
+kv-cache  
+paged attention?  
 
-quantized data training?
-mixed precision training?
+quantized data training?  
+mixed precision training?  
 
 
 
@@ -58,7 +49,7 @@ mixed precision training?
 RFAA-Cpp
 │
 ├── Core Infrastructure ───── Tensor + Memory Pool + Compute Graph Engine
-│   ├── Tensor abstraction         GGML-style tensor, 18 quantization types (F32 → Q8_K)
+│   ├── Tensor abstraction         GGML-style tensor
 │   ├── Context memory pool       Unified allocation for all weights & intermediate tensors
 │   ├── ComputeGraph              DAG compute graph with forward expansion + reverse autograd
 │   └── Backend scheduler         Multi-backend (CPU / CUDA) automatic graph splitting & dispatch
@@ -96,9 +87,9 @@ RFAA-Cpp
 │   └── RFAAModel                 Main model: Embedding → Blocks ×16 → Output Heads
 │
 ├── Data Pipeline ───── Input preparation
-│   ├── A3M / HHR parsing        MSA and template search result files
+│   ├── A3M parsing        MSA and template search result files
 │   ├── Template feature extraction   1D features + 2D features + coordinates
-│   ├── HHblits / HHsearch       External search tool wrappers
+│   ├── 
 │   └── RFAADataLoader           End-to-end preprocessing (sequence → model input)
 │
 ├── Serialization & Integration
@@ -107,8 +98,7 @@ RFAA-Cpp
 │
 ├── GPU Acceleration (CUDA)
 │   ├── CUDA Tensor               Device-side tensor implementation
-│   ├── Attention Kernel          Flash Attention and other custom kernels
-│   └── SE3 / Math Kernels        Equivariant convolution + general matrix acceleration
+│   ├── 
 │
 └── Build Artifacts
     ├── rfaa_core                 Core library (static / shared)
@@ -125,9 +115,9 @@ RFAA-Cpp
 | Compute graph + eager execution | `forward_graph` builds graph (training/autograd), `forward_exec` runs directly (inference) |
 | Multi-backend scheduling | BackendScheduler auto-assigns graph nodes to CPU / CUDA with cross-device data transfer |
 | SE(3) equivariance | Group-theoretic spherical harmonics + CG coefficients + Wigner D matrices ensure rotation/translation physical consistency |
-| Quantized inference | 18 quantization types (Q4_0~Q8_K) suitable for consumer GPUs and edge devices |
-| Track architecture | MSA (1D) / Pair (2D) / State (3D) three-pathway information flow, inspired by AlphaFold2 / RosettaFold |
-| Template-aware | Full injection of HHsearch template 1D/2D/3D features via CrossAttention + TemplatePairStack |
+
+| Track architecture | MSA (1D) / Pair (2D) / Coords(3D) three-pathway information flow, inspired by AlphaFold2 / RosettaFold |
+| Template-aware | Full injection of template 1D/2D/3D features via CrossAttention + TemplatePairStack |
 | Modular iteration | IterBlock / RefineBlock / FullBlock encapsulate update logic at different granularity for flexible composition |
 
 ## Build Requirements
@@ -162,24 +152,5 @@ make -j$(nproc)
   - nu2/nu1/nu0: 16-18
   - chi_1 (na): 19
 
-## Roadmap
 
-- Flash Attention
-- Inference: KV-cache
-- GGML integration:
-```cpp
-struct ggml_context * ctx = ggml_init(params);
-
-struct ggml_tensor * tensor_a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_A, rows_A);
-struct ggml_tensor * tensor_b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, cols_B, rows_B);
-memcpy(tensor_a->data, matrix_A, ggml_nbytes(tensor_a));
-memcpy(tensor_b->data, matrix_B, ggml_nbytes(tensor_b));
-
-struct ggml_cgraph * gf = ggml_new_graph(ctx);
-struct ggml_tensor *result = ggml_mul_mat(ctx, tensor_a, tensor_b);
-
-ggml_build_forward_expand(gf, result);
-
-int n_threads = 1;
-ggml_graph_compute_with_ctx(ctx, gf, n_threads);
 ```

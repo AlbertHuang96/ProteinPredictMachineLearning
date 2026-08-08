@@ -1309,10 +1309,15 @@ TensorF32* PairwiseConv::forward_graph(TensorF32* feat, const TensorF32& basis) 
     // 1) 径向权重 R (E,out,in,nf) dims=[nf,in,out,E]
     TensorF32* R = rp_.forward_graph(feat);
 
-    // 2) permute R → (E,in,nf,out) dims=[nf,in,E,out]，再 view → 2D (out, E*in*nf) 供 get_rows 按 co 切片
-    TensorF32* R_perm = permute(R, std::vector<int>{0, 1, 3, 2});
+    // 2) permute R → (out, nf, in, E)：把被切片的输出通道 co 移到最内 dims[0]（get_rows 按 dims[0] 选行），
+    //    其余保持 nf,in,E 顺序（nf 最内，便于后续 view 回 [nf,in,E]）。
+    //    再 view → 2D (out, E*in*nf)：dims[0]=out（行，供 get_rows 按 co 选），dims[1]=E*in*nf（行内长，nf 最内）。
+    //    ⚠️ 修正：原实现 permute{0,1,3,2}+view[E*in*nf,out] 把可变长 E*in*nf 放 dims[0]（get_rows 当行）、
+    //      把待切 co 放 dims[1]（get_rows 当行内长），方向反了；配合本次 get_rows 修复（按 a.dims[0] 选行、
+    //      输出 a.dims[1] 长）会切错行并输出错误长度。现改为 co 在 dims[0]、行内长在 dims[1]。
+    TensorF32* R_perm = permute(R, std::vector<int>{2, 0, 1, 3});
     const int64_t E_in_nf = E * in * nf;
-    TensorF32* R_2d = view(R_perm, Shape({E_in_nf, out}));   // dims=[E*in*nf, out]
+    TensorF32* R_2d = view(R_perm, Shape({out, E_in_nf}));   // dims=[out, E*in*nf]
 
     // 收集所有输出行 r=(co,mo)
     std::vector<TensorF32*> kernel_rows;   // 每个 unsqueeze 后 dims=[in*din, 1, E]
@@ -2004,6 +2009,78 @@ SE3Features GMABSE3::forward(const SE3Features& v,
     return output;
 }
 
+// 图模式前向：SE(3)-等变多头自注意力（节点级输出）。全部用已有图 op 表达，
+// 图张量采用 ggml 布局 dims[0]=最内维。与值版 GMABSE3::forward 语义一致：
+//   Step1 各度特征按 f_key_ 顺序沿通道维 concat → k_cat [K_total,E] / q_cat [K_total,N]
+//   Step2 按目标节点 gather q → q_gathered [K_total,E]
+//   Step3 逐元素 dot = k_cat*q_gathered，再经头掩码 mul_mat 归约到每头分数
+//        （e[h,e]=sum_{c in head h} k[e,c]*q[tgt(e),c]），除以 sqrt(K_total)
+//   Step4 edge_softmax：exp → scatter_add 到目标节点求和 → gather 回边 → div
+//        （软最大归一化，省略 max 减稳，数学等价的 softmax）
+//   Step5 每度值特征 v_d [m*d_dim,E]：按头通道映射构造 a_v[c,e]=a[h(c),e]，
+//        逐元素乘 → scatter_add 到目标节点 → out [m*d_dim,N]
+std::vector<TensorF32*> GMABSE3::forward_graph(
+        const std::vector<TensorF32*>& v_nodes,
+        const std::vector<TensorF32*>& k_nodes,
+        const std::vector<TensorF32*>& q_nodes,
+        TensorF32* edge_tgt_idx,
+        int N) {
+    const int64_t E = edge_tgt_idx->shape().dims[0];
+
+    // ---- 键/查询总通道数 ----
+    int64_t K_total = 0;
+    for (size_t i = 0; i < f_key_.size(); ++i)
+        K_total += f_key_.multiplicities[i] * (2 * f_key_.degrees[i] + 1);
+    const int64_t C_k = K_total / n_heads_;
+
+    // ===== Step 1: 各度沿通道维 concat =====
+    TensorF32* k_cat = concat_ptr(k_nodes, 0);   // [K_total, E]
+    TensorF32* q_cat = concat_ptr(q_nodes, 0);   // [K_total, N]
+
+    // ===== Step 2: q 按目标节点 gather =====
+    TensorF32* q_gathered = edge_gather_rows(q_cat, edge_tgt_idx);   // [K_total, E]
+
+    // ===== Step 3: 逐元素点积 + 头归约 =====
+    TensorF32* dot = mul(k_cat, q_gathered);                          // [K_total, E]
+    // 头掩码 H[c,h]=1 若 c 属于头 h（通道块 [h*C_k,(h+1)*C_k)）
+    std::vector<float> hdata(K_total * n_heads_, 0.0f);
+    for (int64_t c = 0; c < K_total; ++c)
+        hdata[c * n_heads_ + (c / C_k)] = 1.0f;                        // dims=[K_total, n_heads]
+    TensorF32* H = constant_tensor({K_total, n_heads_}, hdata.data());
+    TensorF32* e = mul_mat(dot, H);                                    // [n_heads, E]  e[h,e]
+    e = scale(e, 1.0f / std::sqrt(static_cast<float>(K_total)));
+
+    // ===== Step 4: edge_softmax（无 max 减稳）=====
+    TensorF32* exp_e    = exp(e);                                       // [n_heads, E]
+    TensorF32* s_node   = scatter_add(exp_e, edge_tgt_idx, N);          // [n_heads, N]
+    TensorF32* s_edge   = edge_gather_rows(s_node, edge_tgt_idx);       // [n_heads, E]
+    TensorF32* a        = div(exp_e, s_edge);                           // [n_heads, E]
+
+    // ===== Step 5: 每度注意力加权聚合 =====
+    std::vector<TensorF32*> out(f_value_.size(), nullptr);
+    for (size_t i = 0; i < f_value_.size(); ++i) {
+        const int d      = f_value_.degrees[i];
+        const int m      = f_value_.multiplicities[i];
+        const int d_dim  = 2 * d + 1;
+        const int m_head = m / n_heads_;
+        const int mhdd   = m_head * d_dim;          // 每头占据的通道数
+        const int64_t C  = m * d_dim;               // 该度总通道数
+
+        // 通道 c 属于头 h(c)=c/mhdd；构造头索引常量 [C]（float-encoded int）
+        std::vector<float> hidx(C);
+        for (int64_t c = 0; c < C; ++c) hidx[c] = static_cast<float>(c / mhdd);
+        TensorF32* h_idx = constant_tensor({C}, hidx.data());
+
+        // a_v[c,e] = a[h(c),e]：get_rows 按头取行（a 行=n_heads）→ [E,C]，transpose → [C,E]
+        TensorF32* a_rows = get_rows(a, h_idx);                         // [E, C]  (dims=[E,C])
+        TensorF32* a_v    = transpose(a_rows);                          // [C, E]
+
+        TensorF32* v_scaled = mul(a_v, v_nodes[i]);                     // [C, E]
+        out[i] = scatter_add(v_scaled, edge_tgt_idx, N);                // [C, N]
+    }
+    return out;
+}
+
 // ============================================================================
 // GSE3Res 实现
 // ============================================================================
@@ -2065,7 +2142,7 @@ GSE3Res::GSE3Res(const Fiber& f_in, const Fiber& f_out,
         // cat: 拼接 mid_out 和原始输入 → 需要更大的输入 Fiber
         std::vector<int> cat_mults, cat_degs;
         // 合并 f_mid_out 和 f_in_ 的度 (取并集, multiplicities 相加)
-        std::unordered_map<int, int> cat_map;
+        std::map<int, int> cat_map;  // 有序 map：确保 cat_fiber_ 的度顺序确定（升序）
         for (size_t i = 0; i < f_mid_out_.size(); ++i)
             cat_map[f_mid_out_.degrees[i]] += f_mid_out_.multiplicities[i];
         for (size_t i = 0; i < f_in_.size(); ++i)
@@ -2075,6 +2152,7 @@ GSE3Res::GSE3Res(const Fiber& f_in, const Fiber& f_out,
             cat_mults.push_back(kv.second);
         }
         Fiber cat_fiber(cat_mults, cat_degs);
+        cat_fiber_ = cat_fiber;              // 记录拼接 Fiber 度顺序（forward_graph 按此顺序 concat）
         out_proj_ = new G1x1SE3(cat_fiber, f_out_);
     } else if (skip_ == "sum") {
         out_proj_ = new G1x1SE3(f_mid_out_, f_out_);
@@ -2206,6 +2284,75 @@ SE3Features GSE3Res::forward(const SE3Features& h,
         z = std::move(z_proj);
     }
 
+    return z;
+}
+
+// 图模式前向（节点级）。与值版 GSE3Res::forward 语义一致，全部用图 op 表达：
+//   Step1 QKV 投影：v/k = GConvSE3Partial_graph(h_nodes, src, tgt, d, w, basis)（边级），
+//                   q = G1x1SE3_graph(h_nodes)（节点级）
+//   Step2 attn_->forward_graph(v, k, q, tgt_idx, N) → z（节点级，每 f_mid_out_ 度）
+//   Step3 残差 + 输出投影：
+//         skip=='cat'：把 z 与 h 各度沿通道 concat（按 cat_fiber_ 度顺序）→ out_proj_graph
+//         skip=='sum'：z → out_proj_graph（f_mid_out→f_out），再与 h 对应度逐元素相加
+// 输入 h_nodes[i] dims=[m*d_dim, N]（对应 f_in_.degrees[i]）；返回 out[i] dims=[m*d_dim, N]。
+std::vector<TensorF32*> GSE3Res::forward_graph(
+        const std::vector<TensorF32*>& h_nodes,
+        TensorF32* edge_src_idx,
+        TensorF32* edge_tgt_idx,
+        TensorF32* edge_d,
+        TensorF32* edge_w,
+        const SE3Basis& basis,
+        int N) {
+    // ===== Step 1: QKV 投影 =====
+    std::vector<TensorF32*> v = v_proj_->forward_graph(h_nodes, edge_src_idx, edge_tgt_idx,
+                                                       edge_d, edge_w, basis);  // 边级，f_mid_out_
+    std::vector<TensorF32*> k = k_proj_->forward_graph(h_nodes, edge_src_idx, edge_tgt_idx,
+                                                       edge_d, edge_w, basis);  // 边级，f_mid_in_
+    std::vector<TensorF32*> q = q_proj_->forward_graph(h_nodes);              // 节点级，f_mid_in_
+
+    // ===== Step 2: 多头注意力 → 节点级 z（f_mid_out_）=====
+    std::vector<TensorF32*> z = attn_->forward_graph(v, k, q, edge_tgt_idx, N);
+
+    // ===== Step 3: 残差 + 输出投影 =====
+    if (skip_ == "cat") {
+        // 按 cat_fiber_ 度顺序，把 z 与 h 各度沿通道维 concat
+        std::vector<TensorF32*> cat_nodes;
+        for (size_t j = 0; j < cat_fiber_.size(); ++j) {
+            const int d = cat_fiber_.degrees[j];
+            TensorF32* zj = nullptr;
+            TensorF32* hj = nullptr;
+            for (size_t a = 0; a < f_mid_out_.size(); ++a)
+                if (f_mid_out_.degrees[a] == d) { zj = z[a]; break; }
+            for (size_t b = 0; b < f_in_.size(); ++b)
+                if (f_in_.degrees[b] == d) { hj = h_nodes[b]; break; }
+
+            if (zj != nullptr && hj != nullptr) {
+                cat_nodes.push_back(concat_ptr({zj, hj}, 0));   // 沿通道 dims[0]
+            } else if (zj != nullptr) {
+                cat_nodes.push_back(zj);
+            } else if (hj != nullptr) {
+                cat_nodes.push_back(hj);
+            }
+        }
+        return out_proj_->forward_graph(cat_nodes);             // f_mid_out+? → f_out_
+    } else if (skip_ == "sum") {
+        std::vector<TensorF32*> zp = out_proj_->forward_graph(z);   // f_mid_out → f_out_
+        // 与 h 对应度逐元素相加
+        std::vector<TensorF32*> out(f_out_.size(), nullptr);
+        for (size_t i = 0; i < f_out_.size(); ++i) {
+            const int d = f_out_.degrees[i];
+            TensorF32* res = zp[i];
+            for (size_t b = 0; b < f_in_.size(); ++b) {
+                if (f_in_.degrees[b] == d) {
+                    res = add_impl(res, h_nodes[b], /*inplace=*/false);
+                    break;
+                }
+            }
+            out[i] = res;
+        }
+        return out;
+    }
+    // 无 skip（理论不出现）→ 直接返回注意力输出
     return z;
 }
 
@@ -2344,6 +2491,48 @@ SE3Features GNormBias::forward(const SE3Features& x) {
     return output;
 }
 
+// 图模式前向：对每度节点特征图节点做等变非线性。与值版 GNormBias::forward 语义一致：
+//   norm  = sqrt(sum_{dd} v[ch,dd]²)           （逐节点、逐通道，跨 Wigner 分量）
+//   t     = ReLU(norm + bias[ch])               （仅作用在标量 norm 上，等变）
+//   out   = v * t / (norm + eps)                （重组；用 norm+eps 防除零，数值等价）
+// 输入 x_nodes[i] dims=[m*d_dim, N]（对应 fiber_.degrees[i]）；返回 out[i] dims=[m*d_dim, N]。
+// 全部用已有图 op：view/sqr/sum_rows/sqrt/constant_tensor/repeat/add_impl/relu/add1_impl/div/mul。
+std::vector<TensorF32*> GNormBias::forward_graph(
+        const std::vector<TensorF32*>& x_nodes) {
+    std::vector<TensorF32*> out(x_nodes.size(), nullptr);
+    for (size_t i = 0; i < x_nodes.size(); ++i) {
+        const int d     = fiber_.degrees[i];
+        const int m     = fiber_.multiplicities[i];
+        const int d_dim = 2 * d + 1;
+
+        TensorF32* x = x_nodes[i];                       // [m*d_dim, N]
+        const int64_t N = x->shape().dims[1];
+
+        // ---- Step 1: 极坐标分解 norm ----
+        TensorF32* v3     = view(x, Shape({d_dim, m, N}));      // [d_dim, m, N]（d_dim 最内）
+        TensorF32* sum_sq = sum_rows(sqr(v3));                  // [1, m, N]（沿 d_dim 归约）
+        TensorF32* norm   = sqrt(sum_sq);                       // [1, m, N]
+
+        // ---- Step 2: t = ReLU(norm + bias) ----
+        // bias: (m,) → [1,m,1]，repeat 广播到 norm 形状 [1,m,N]
+        const float* b_data = bias_.at(d).data();
+        std::vector<float> bdat(static_cast<size_t>(m));
+        for (int c = 0; c < m; ++c) bdat[c] = b_data[c];
+        TensorF32* bias3    = constant_tensor({1, m, 1}, bdat.data());   // [1,m,1]
+        TensorF32* bias_br  = repeat(bias3, norm);                       // [1,m,N]
+        TensorF32* t        = relu(add_impl(norm, bias_br, /*inplace=*/false));  // [1,m,N]
+
+        // ---- Step 3: 重组 out = v * t/(norm+eps) ----
+        TensorF32* denom    = add1_impl(norm, constant_scalar(eps_), /*inplace=*/false);  // [1,m,N]
+        TensorF32* scale3   = div(t, denom);                            // [1,m,N]
+        // scale3 [1,m,N] → [d_dim,m,N]（每通道 d_dim 个 Wigner 分量共享同一 scale）→ view 回 [m*d_dim,N]
+        TensorF32* scale3d  = repeat(scale3, v3);                       // [d_dim, m, N]
+        TensorF32* scale_f  = view(scale3d, Shape({m * d_dim, N}));     // [m*d_dim, N]
+        out[i] = mul(x, scale_f);                                       // [m*d_dim, N]
+    }
+    return out;
+}
+
 // ============================================================================
 // TFN 实现
 // ============================================================================
@@ -2436,11 +2625,15 @@ SE3Transformer::SE3Transformer(const Fiber& fiber_in, const Fiber& fiber_mid,
     build_gcn();
 }
 
+// 说明：度1（坐标/位移）输入/输出通道数统一取 cfg.l1_features[0]（协调特征数），
+// 以与值版调用方注入的 node_se3.features[1] = l1_feats (B*L, 3, 3)（度1=3通道）对齐，
+// 也保证输出 features[1] 可 view 成 (B,L,3,3)。不可用 cfg.l1_in_feats（其默认 16 与
+// l1_feats 的 3 通道不符，会导致值版/图版 SE3 度1 输入维度不匹配）。
 SE3Transformer::SE3Transformer(const SE3Config& cfg)
     : SE3Transformer(
-        Fiber({cfg.l0_in_feats, cfg.l1_in_feats}, {0, 1}),       // fiber_in
-        Fiber({cfg.l0_out_feats, cfg.l1_in_feats / 2}, {0, 1}),  // fiber_mid
-        Fiber({cfg.l0_out_feats, cfg.l1_in_feats}, {0, 1}),      // fiber_out
+        Fiber({cfg.l0_in_feats, cfg.l1_features[0]}, {0, 1}),         // fiber_in  度1=3
+        Fiber({cfg.l0_out_feats, std::max(1, cfg.l1_features[0] / 2)}, {0, 1}),  // fiber_mid 度1
+        Fiber({cfg.l0_out_feats, cfg.l1_features[0]}, {0, 1}),        // fiber_out 度1=3
         cfg.num_degrees, cfg.num_channels,
         cfg.div, cfg.n_heads, false) {}
 
@@ -2478,6 +2671,31 @@ SE3Features SE3Transformer::forward(const SE3Features& h,
     }
 
     return out;
+}
+
+// 图模式前向：逐块执行 blocks_（GSE3Res → GNormBias，输出层无 GNormBias）。
+// 与值版 SE3Transformer::forward 语义一致。所有节点特征为扁平图节点 dims=[m*d_dim, N]，
+// ggml 布局 dims[0]=最内维。层间 Fiber 对齐由 GSE3Res::forward_graph 内部完成
+// （按自身 f_in_ 索引输入、按 cat_fiber_/f_out_ 输出），上一层输出 vector 原样传下一层。
+std::vector<TensorF32*> SE3Transformer::forward_graph(
+        const std::vector<TensorF32*>& h_nodes,
+        TensorF32* edge_src_idx,
+        TensorF32* edge_tgt_idx,
+        TensorF32* edge_d,
+        TensorF32* edge_w,
+        const SE3Basis& basis,
+        int N) {
+    std::vector<TensorF32*> cur = h_nodes;
+    for (size_t i = 0; i < blocks_.size(); ++i) {
+        // GSE3Res 图块（skip='cat'：内部 concat 残差 + 输出投影）
+        cur = blocks_[i].gcn->forward_graph(cur, edge_src_idx, edge_tgt_idx,
+                                            edge_d, edge_w, basis, N);
+        // GNormBias 图块（等变非线性），输出层 norm==nullptr 跳过
+        if (blocks_[i].norm != nullptr) {
+            cur = blocks_[i].norm->forward_graph(cur);
+        }
+    }
+    return cur;
 }
 
 std::vector<TensorF32*> SE3Transformer::parameters() {

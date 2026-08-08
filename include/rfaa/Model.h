@@ -107,18 +107,38 @@ public:
                  const TensorF32& same_chain  = TensorF32(),
                  const TensorI64& residx       = TensorI64());
 
-    // ===== 图模式前向（仅 msa/pair 两条 track，供未来训练入口驱动调用）=====
+    // ===== 图模式前向（msa/pair 两条 track + SE3(3D) track，供训练入口驱动调用）=====
     // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维):
-    //   msa   : 值 (B,N,L,D_MSA) = 图 [D_MSA, L, N, B]
-    //   pair  : 值 (B,L,L,D_PAIR) = 图 [D_PAIR, L, L, B]
-    //   rbf   : 值 (B,L,L,D_RBF)  = 图 [D_RBF, L, L, B]  (RBF + pos_enc 注入)
-    //   state : 值 (B,L,D_STATE)  = 图 [D_STATE, L, B]
-    // 返回: 更新后的 pair 图节点；msa 通过引用回写。
-    // 注: SE3 / pos_enc / 坐标更新等图外部分由调用方在 block 边界回落值张量后处理。
+    //   msa    : 值 (B,N,L,D_MSA)  = 图 [D_MSA, L, N, B]
+    //   pair   : 值 (B,L,L,D_PAIR) = 图 [D_PAIR, L, L, B]
+    //   rbf    : 值 (B,L,L,D_RBF)  = 图 [D_RBF, L, L, B]  (RBF + pos_enc 注入)
+    //   state  : 值 (B,L,D_STATE)  = 图 [D_STATE, L, B]；SE3 通过引用回写更新
+    //   coords : 值 (B,L,3,3) 骨架坐标（固定结构输入，非可微；用于 make_graph/l1_feats/basis）
+    //   residx : 值 (B,L) 残基索引（make_graph 用）
+    //   seq1hot: 值 (B,L,21) 序列 one-hot（node 输入 concat 用）
+    // 返回: 更新后的 pair 图节点；msa、state 通过引用回写。
+    // 注: 当 coords/seq1hot 提供时，末尾追加 SE3(3D) track：
+    //   node0 = norm_node_3d(embed_x(cat(msa_sum, seq1hot))) 图节点 [32,B*L]；
+    //   node1 = l1_feats 常量叶子 [m1*d_dim1,B*L]（m1=SE3 fiber_in 度1通道数，不足补零）；
+    //   边 src/tgt/d/w 与 basis 由 make_graph/compute_l1_features/basis.compute 值版常量注入；
+    //   state = SE3 输出度0 [B,L,D_STATE]；xyz_new_ = 坐标更新（图外值回落）。
     virtual TensorF32* forward_graph(TensorF32*& msa, TensorF32*& pair,
-                                     TensorF32* rbf, TensorF32* state);
+                                     TensorF32* rbf, TensorF32*& state,
+                                     const TensorF32* coords = nullptr,
+                                     const TensorI64* residx = nullptr,
+                                     const TensorF32* seq1hot = nullptr);
 
     void proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state);
+
+    // SE3(3D) track 图模式子流程。
+    // 可微部分（node 度0：msa 沿 Nseq 均值 + seq1hot → embed_x_ → norm_node_3d_）走图 op；
+    // 结构常量由调用方值版预处理后以 G（make_graph 产物）与 basis 注入。
+    // 调用 se3_->forward_graph，把 state（度0）经引用回写，坐标更新落到 xyz_new_（图外值回落）。
+    // msa/pair/rbf 为图节点（最新 track 输出）；G/basis/coords/seq1hot 为结构常量。
+    void run_se3_graph(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                       TensorF32*& state,
+                       const se3::GraphData& G, const SE3Basis& basis,
+                       const TensorF32& coords, const TensorF32& seq1hot);
 
     static TensorF32 compute_rbf_feature(const TensorF32& coords);
     static TensorF32 compute_l1_features(const TensorF32& coords);
@@ -203,10 +223,13 @@ public:
                  const TensorF32& same_chain  = TensorF32(),
                  const TensorI64& residx       = TensorI64()) override;
 
-    // ===== 图模式前向（仅 msa/pair 两条 track；msa 走 global column attention）=====
-    // 布局约定同 IterBlock::forward_graph。
+    // ===== 图模式前向（msa/pair + SE3；msa 走 global column attention）=====
+    // 布局约定同 IterBlock::forward_graph；SE3 track 由 IterBlock::forward_graph 末尾追加。
     TensorF32* forward_graph(TensorF32*& msa_full, TensorF32*& pair,
-                             TensorF32* rbf, TensorF32* state) override;
+                             TensorF32* rbf, TensorF32*& state,
+                             const TensorF32* coords = nullptr,
+                             const TensorI64* residx = nullptr,
+                             const TensorF32* seq1hot = nullptr) override;
 private:
     std::unique_ptr<MSAGlobalColAttention> msa_global_col_attn_;
 };

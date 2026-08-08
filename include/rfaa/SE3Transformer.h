@@ -427,6 +427,20 @@ public:
                         const SE3Features& q,
                         const TensorI64& edge_index);
 
+    // 图模式前向（节点级输出）。所有输入/输出为扁平图节点，ggml 布局 dims[0]=最内维。
+    //   v_nodes: 每 f_value_ 度一个边特征图节点 dims=[m*d_dim, E]（GConvSE3Partial 输出）
+    //   k_nodes: 每 f_key_  度一个边特征图节点 dims=[m*d_dim, E]
+    //   q_nodes: 每 f_key_  度一个节点特征图节点 dims=[m*d_dim, N]（G1x1SE3 输出）
+    //   edge_tgt_idx: (E,) 目标节点 id（float-encoded int）
+    //   N: 节点数
+    // 返回: out[i] = (N, m*d_dim) 聚合节点特征图节点 dims=[m*d_dim, N]（对应 f_value_.degrees[i]）。
+    std::vector<TensorF32*> forward_graph(
+        const std::vector<TensorF32*>& v_nodes,
+        const std::vector<TensorF32*>& k_nodes,
+        const std::vector<TensorF32*>& q_nodes,
+        TensorF32* edge_tgt_idx,
+        int N);
+
 private:
     Fiber f_value_, f_key_;
     int n_heads_;
@@ -477,6 +491,22 @@ public:
                         const TensorF32* edge_w,
                         const SE3Basis& basis);
 
+    // 图模式前向（节点级）。所有输入/输出为扁平图节点，ggml 布局 dims[0]=最内维。
+    //   h_nodes: 每 f_in_ 度一个节点特征图节点 dims=[m*d_dim, N]
+    //   edge_src_idx / edge_tgt_idx: (E,) 源/目标节点 id
+    //   edge_d: (E,3) dims=[3,E]；edge_w: (E,edge_dim) dims=[edge_dim,E] 或 nullptr
+    //   basis: 预计算球谐基（值版常量）
+    //   N: 节点数
+    // 返回: out[i] = (N, m*d_dim) 扁平节点特征图节点 dims=[m*d_dim, N]（对应 f_out_.degrees[i]）。
+    std::vector<TensorF32*> forward_graph(
+        const std::vector<TensorF32*>& h_nodes,
+        TensorF32* edge_src_idx,
+        TensorF32* edge_tgt_idx,
+        TensorF32* edge_d,
+        TensorF32* edge_w,
+        const SE3Basis& basis,
+        int N);
+
     // 获取参数
     std::vector<TensorF32*> parameters();
 
@@ -488,6 +518,9 @@ private:
     // 中间 Fiber: f_mid_out (输出度 ÷ div 通道), f_mid_in (仅 f_in 存在的度)
     Fiber f_mid_out_;
     Fiber f_mid_in_;
+    // skip=='cat' 时的拼接 Fiber（cat_map 合并 f_mid_out 与 f_in 各度通道数）;
+    // 记录度顺序供 forward_graph 按相同顺序 concat 后喂给 out_proj_。
+    Fiber cat_fiber_;
 
     // 子模块
     GConvSE3Partial* v_proj_ = nullptr;  // 值投影
@@ -502,12 +535,18 @@ private:
 class GNormBias {
 public:
     GNormBias(const Fiber& fiber);
-    
+
     SE3Features forward(const SE3Features& x);
-    
+
+    // 图模式前向：对每度节点特征图节点做等变非线性。
+    // 输入 x_nodes[i] = (N, m*d_dim) 扁平图节点 dims=[m*d_dim, N]（对应 fiber_.degrees[i]）。
+    // 返回 out[i] = (N, m*d_dim) 扁平图节点 dims=[m*d_dim, N]。
+    // 计算：norm=sqrt(clamp(sum_{dd} v², eps))；t=ReLU(norm+bias)；out = v * (t/norm)。
+    std::vector<TensorF32*> forward_graph(const std::vector<TensorF32*>& x_nodes);
+
 private:
     Fiber fiber_;
-    
+
     std::unordered_map<int, TensorF32> bias_;  // bias_[degree]: (1, m) 逐通道偏置
     float eps_ = 1e-12f;  // 防止除零
 
@@ -574,8 +613,30 @@ public:
                         const TensorF32* edge_w,
                         const SE3Basis& basis);
 
+    // 图模式前向（节点级）。所有输入/输出为扁平图节点，ggml 布局 dims[0]=最内维。
+    //   h_nodes: 每 fiber_in_ 度一个节点特征图节点 dims=[m*d_dim, N]
+    //            （顺序须与 fiber_in_.degrees 一致；当前构造 x_ij=false 无需附加相对位置通道）
+    //   edge_src_idx / edge_tgt_idx: (E,) 源/目标节点 id（float-encoded int）
+    //   edge_d: (E,3) dims=[3,E]；edge_w: (E,edge_dim) dims=[edge_dim,E] 或 nullptr
+    //   basis: 预计算球谐基（值版常量）
+    //   N: 节点数
+    // 返回: out[i] = (N, m*d_dim) 扁平节点特征图节点 dims=[m*d_dim, N]（对应 fiber_out_.degrees[i]）。
+    // 逐块执行 blocks_：GSE3Res（skip='cat'）→ GNormBias（输出层 norm==nullptr 跳过）。
+    std::vector<TensorF32*> forward_graph(
+        const std::vector<TensorF32*>& h_nodes,
+        TensorF32* edge_src_idx,
+        TensorF32* edge_tgt_idx,
+        TensorF32* edge_d,
+        TensorF32* edge_w,
+        const SE3Basis& basis,
+        int N);
+
     // 获取参数
     std::vector<TensorF32*> parameters();
+
+    // 输入/输出 Fiber 访问器（供图模式接线时确定 node 度/通道）
+    const Fiber& fiber_in()  const { return fiber_in_; }
+    const Fiber& fiber_out() const { return fiber_out_; }
 
 private:
     int num_layers_, edge_dim_, div_, n_heads_;

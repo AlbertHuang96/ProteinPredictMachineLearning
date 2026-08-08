@@ -46,6 +46,7 @@ set(CORE_SOURCES
     ../src/cuda/SE3Kernel.cu
     ../src/cuda/MathKernel.cu
     ../src/cuda/CudaTensor.cu
+    ../src/cuda/SE3MessagePassingKernel.cu
 )
 
 # 启用 CUDA 语言
