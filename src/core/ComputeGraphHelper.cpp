@@ -765,21 +765,32 @@ TensorF32* supervised_chi_loss(
 //   Step 5: loss = sum(masked_CE) / (sum(bert_mask) + 1e-8)
 TensorF32* masked_msa_loss(TensorF32* logits, TensorF32* true_msa, TensorF32* bert_mask) {
     float eps = 1e-8f;
+    const int num_classes = 23;
 
-    // Step 1: log_softmax = log(softmax(logits)) → [N_seq, N_res, 23]
+    // 布局说明（ggml dims[0]=最内维）:
+    //   true_msa [N_seq, N_res] → 图 dims={N_res, N_seq}
+    //   N_res = true_msa->dims[0], N_seq = true_msa->dims[1]
+    const int64_t N_res = true_msa->shape().dims[0];
+    const int64_t N_seq = true_msa->shape().dims[1];
+    const int64_t K     = N_res * N_seq;  // 扁平位置总数
+
+    // Step 1: log_softmax = log(softmax(logits)) → dims={23, N_res, N_seq}
     auto lsm = log(softmax(logits));
 
-    // Step 2: one_hot(true_msa, 23) → [N_seq, N_res, 23]
-    // one_hot_seq 接受 const TensorF32& (值类型), 此处解引用指针
-    // TODO: one_hot_seq not yet implemented
-    auto labels = true_msa;  // placeholder
+    // Step 2: one_hot(true_msa, 23) → labels dims={23, N_res, N_seq}
+    //   true_msa {N_res, N_seq} → view 扁平为 1D {K}
+    //   one_hot_seq_graph(flat, 23) → {23, K}（类别维在最内 dims[0]）
+    //   view 回 {23, N_res, N_seq}，与 lsm 逐元素对齐（扁平序一致）
+    auto flat_msa = view(true_msa, Shape({K}));
+    auto oh_flat  = one_hot_seq_graph(flat_msa, num_classes);   // {23, K}
+    auto labels   = view(oh_flat, Shape({num_classes, N_res, N_seq})); // {23, N_res, N_seq}
 
-    // Step 3: CE per-position = -sum(labels * log_softmax, dim=-1) → [N_seq, N_res]
-    auto weighted = mul(labels, lsm);       // [N_seq, N_res, 23]
-    auto ce       = neg(sum_rows(weighted)); // [N_seq, N_res]
+    // Step 3: CE per-position = -sum(labels * log_softmax, dim=-1) → {1, N_res, N_seq}
+    auto weighted = mul(labels, lsm);        // {23, N_res, N_seq}
+    auto ce       = neg(sum_rows(weighted)); // 沿 dims[0]=23 求和 → {1, N_res, N_seq}
 
-    // Step 4: 应用 bert_mask
-    auto masked_ce = mul(ce, bert_mask);    // [N_seq, N_res]
+    // Step 4: 应用 bert_mask（ce {1,N_res,N_seq} 与 bert_mask {N_res,N_seq} 广播）
+    auto masked_ce = mul(ce, bert_mask);    // {1, N_res, N_seq}
 
     // Step 5: 归一化标量 loss
     auto sum_masked = sum(masked_ce);

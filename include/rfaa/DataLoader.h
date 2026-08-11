@@ -310,6 +310,45 @@ private:
     TensorF32 prepare_msa_full(const A3MData& a3m_data);
     TensorF32 prepare_seq_tokens(const std::string& sequence);
     TensorF32 prepare_coords(const std::string& sequence);  // 初始坐标 (可选)
+
+    // BERT-style Masked MSA 预处理:
+    // 从 MSA token (N_seq, L, token 0-20) 随机掩码一部分位置 (默认 ~15%)。
+    // 返回: (B=1, N_seq, L) 的 true_msa (被掩码位置的真实 aatype) 与 bert_mask (1.0=掩码)。
+    // 掩码位置在 msa_latent 特征中也应被替换为 MASK token (由调用方处理)；
+    // 本函数仅负责产出监督标签 true_msa 与 bert_mask。
+    void prepare_msa_mask(
+        const std::vector<std::vector<uint8_t>>& msa_tokens,
+        TensorF32& out_true_msa,
+        TensorF32& out_bert_mask,
+        float mask_frac = 0.15f);
+
+    // Chi (扭转角) 监督标签预处理:
+    // 从真实骨架坐标 coords (B,L,3,3) = [N,CA,C] 计算扭转角 sin/cos 与有效掩码。
+    //   out_gt_chi   : (B,L,7,2) — 7 角 (omega,phi,psi,chi1-4) 的 (sin,cos)。
+    //                 骨架角 (omega/phi/psi) 由 N/CA/C 计算；chi1-4 需侧链原子,
+    //                 true_coords 不含侧链, 故 chi1-4 置 0 (mask=0)。
+    //   out_chi_mask : (B,L,7)   — 1.0=有效 (骨架角), 0.0=无效 (chi1-4)。
+    static void prepare_chi_labels(
+        const TensorF32& coords,            // (B,L,3,3)
+        TensorF32& out_gt_chi,              // (B,L,7,2)
+        TensorF32& out_chi_mask);           // (B,L,7)
+
+    // Distogram 监督标签预处理:
+    // 从真实骨架坐标 coords (B,L,3,3) 计算 4 组 one-hot (D 60/Ω 36/Θ 36/Φ 18)
+    // 与 pair_mask (B,L,L)。coords 支持 B>1 (每 batch 独立计算)。
+    static void prepare_distogram_labels(
+        const TensorF32& coords,            // (B,L,3,3)
+        TensorF32& out_D_onehot,            // (B,L,L,60)
+        TensorF32& out_O_onehot,            // (B,L,L,36)
+        TensorF32& out_T_onehot,            // (B,L,L,36)
+        TensorF32& out_P_onehot,            // (B,L,L,18)
+        TensorF32& out_pair_mask);          // (B,L,L)
+
+    // CA 原子有效掩码预处理:
+    // 从真实骨架坐标 (B,L,3,3) 判断每个残基 CA 是否有效 (坐标非零)。
+    static void prepare_ca_mask(
+        const TensorF32& coords,            // (B,L,3,3)
+        TensorF32& out_ca_mask);            // (B,L)
 };
 
 } // namespace rfaa

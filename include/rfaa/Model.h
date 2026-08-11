@@ -51,6 +51,24 @@ struct ModelInput {
     TensorF32 dist_matrix;   // (B, L, L) - 距离矩阵
     TensorF32 same_chain;    // (B, L, L) - 同链掩码
     TensorI64 residx;        // (B, L) - 残基索引
+
+    // ---- Masked MSA 监督 (BERT-style) ----
+    TensorF32 true_msa;      // (B, N_clust, L) - 被掩码位置的真实 aatype token (0-20)
+    TensorF32 bert_mask;     // (B, N_clust, L) - 掩码标记 (1.0=被掩码, 0.0=未掩码)
+
+    // ---- Chi (扭转角) 监督 ----
+    TensorF32 gt_chi;        // (B, L, 7, 2) - 真实扭转角 (omega,phi,psi,chi1-4) 的 sin/cos
+    TensorF32 chi_mask;      // (B, L, 7)    - chi 角有效掩码 (1.0=有效, 0.0=无效)
+
+    // ---- Distogram 监督 (从真实坐标 binning) ----
+    TensorF32 D_onehot;      // (B, L, L, 60) - 距离 one-hot (Cβ-Cβ, 60 bins)
+    TensorF32 O_onehot;      // (B, L, L, 36) - Ω 二面角 one-hot
+    TensorF32 T_onehot;      // (B, L, L, 36) - Θ 二面角 one-hot
+    TensorF32 P_onehot;      // (B, L, L, 18) - Φ 平面角 one-hot
+    TensorF32 pair_mask;     // (B, L, L)     - pair 有效掩码 (残基对均有效=1)
+
+    // ---- pLDDT 监督 ----
+    TensorF32 ca_mask;       // (B, L)        - CA 原子有效掩码 (1.0=有效)
 };
 
 // 模型输出
@@ -60,10 +78,16 @@ struct ModelOutput {
     TensorF32 state;         // (B, L, D_STATE)
     TensorF32 coords;        // (B, L, 3, 3) - 更新后的坐标
     TensorF32 alpha;         // (B, L, NTOTALDOFS, 2) - 侧链扭转角
+
+    // Masked MSA 预测头 logits (供 masked_msa_loss)
+    TensorF32 msa_logits;    // (B, N, L, 23) - MSA head 输出 (每个序列位置/残基的 23 类 aatype logits)
     
     // 辅助输出
-    TensorF32 lddt;          // (B, L) - 每残基置信度
-    TensorF32 distogram;     // (B, L, L, n_bins) - 距离分布
+    TensorF32 lddt;          // (B, L, 50) - pLDDT logits (每残基 50 bins)
+    TensorF32 distogram;     // (B, L, L, 60) - 距离分布 logits
+    TensorF32 omega;         // (B, L, L, 36) - Ω 二面角 logits
+    TensorF32 theta;         // (B, L, L, 36) - Θ 二面角 logits
+    TensorF32 phi;           // (B, L, L, 18) - Φ 平面角 logits
     TensorF32 pae;           // (B, L, L) - 预测对齐误差
 };
 
@@ -408,6 +432,28 @@ private:
     FeedForward            tps_pair_ff_;
     // TemplatePairStack 实例
     TemplatePairStack      tps_;
+
+    // ===== 输出头参数 (全局单份) =====
+    // Masked MSA head: LayerNorm(D_MSA) → Linear(D_MSA→D_MSA) → ReLU → Linear(D_MSA→23)
+    LayerNorm*   msa_head_ln_      = nullptr;  // D_MSA (256)
+    LinearLayer* msa_head_linear1_ = nullptr;  // D_MSA (256) → D_MSA (256)
+    LinearLayer* msa_head_linear2_ = nullptr;  // D_MSA (256) → 23
+
+    // Chi (扭转角) head: LayerNorm(D_STATE) → Linear(D_STATE→D_STATE) → ReLU → Linear(D_STATE→7*2)
+    // 输出 alpha (B, L, 7, 2) — omega/phi/psi/chi1-4 的未归一化 (sin, cos)
+    LayerNorm*   chi_head_ln_      = nullptr;  // D_STATE (32)
+    LinearLayer* chi_head_linear1_ = nullptr;  // D_STATE (32) → D_STATE (32)
+    LinearLayer* chi_head_linear2_ = nullptr;  // D_STATE (32) → 14
+
+    // Distogram head: 从 pair 特征投影 4 组 logits (D/Ω/Θ/Φ)
+    // 输出 distogram (B,L,L,60), omega (B,L,L,36), theta (B,L,L,36), phi (B,L,L,18)
+    LinearLayer* distogram_d_head_ = nullptr;  // D_PAIR → 60 (距离 bins)
+    LinearLayer* distogram_o_head_ = nullptr;  // D_PAIR → 36 (Ω bins)
+    LinearLayer* distogram_t_head_ = nullptr;  // D_PAIR → 36 (Θ bins)
+    LinearLayer* distogram_p_head_ = nullptr;  // D_PAIR → 18 (Φ bins)
+
+    // pLDDT head: state → lddt logits (B,L,50)
+    LinearLayer* plddt_head_       = nullptr;  // D_STATE → 50
 
     // ===== attention / sub-module 参数 (per-block, vector) =====
     static constexpr int N_ITER = 12;   // extra(4) + main(8)

@@ -1,4 +1,5 @@
 #include "rfaa/DataLoader.h"
+#include "rfaa/DistogramBins.h"
 #include <fstream>
 #include <sstream>
 #include <cassert>
@@ -13,6 +14,8 @@
 #include <iostream>
 #include <string>
 #include <vector>
+
+#include <random>
 
 #include <queue>
 #include <algorithm>
@@ -1480,6 +1483,27 @@ ModelInput RFAADataLoader::load_from_files(
     input.msa_full = prepare_msa_full(a3m_data);
     input.seq_tokens = prepare_seq_tokens(sequence);
 
+    // ---- Masked MSA 监督标签 (BERT-style) ----
+    // a3m_raw 即 MSA 整数 token (N_seq, L, 0-20)。此处实施 mask 操作:
+    //   1. prepare_msa_mask 随机选择 ~15% 位置 (query 行除外) 作为掩码,
+    //      产出 true_msa (被掩码位置真实 aatype) 与 bert_mask (1.0=掩码)。
+    //   2. 特征侧 (input.msa_latent / msa_full) 中对应被掩码位置的 AA one-hot
+    //      应在后续替换为 MASK token — 当前 prepare_msa_latent 未实施特征替换,
+    //      仅产出监督标签; 特征替换留待 MSA head 接入时补充。
+    prepare_msa_mask(a3m_raw, input.true_msa, input.bert_mask);
+
+    // ---- Chi (扭转角) 监督标签 (从真实坐标计算) ----
+    // true_coords (B,L,3,3)=[N,CA,C]。骨架角 (omega/phi/psi) 由 N/CA/C 计算,
+    // chi1-4 需侧链原子 (true_coords 不含), mask=0。仅当提供真实坐标时计算。
+    if (input.true_coords.numel() > 0) {
+        prepare_chi_labels(input.true_coords, input.gt_chi, input.chi_mask);
+        // ---- Distogram 监督标签 (从真实坐标 binning) ----
+        prepare_distogram_labels(input.true_coords, input.D_onehot, input.O_onehot,
+                                 input.T_onehot, input.P_onehot, input.pair_mask);
+        // ---- CA 有效掩码 ----
+        prepare_ca_mask(input.true_coords, input.ca_mask);
+    }
+
     // read templates (TODO: 需要 FFindexDB 支持)
     // ReadTemplatesResult read_templates_result = read_templates(
     //     sequence.length(), ffdb, hhr_path, atab_fn, max_templates_);
@@ -2447,6 +2471,247 @@ TensorF32 RFAADataLoader::prepare_msa_latent(const A3MData& a3m_data) {
     }
 
     return msa_latent;
+}
+
+// ============================================================================
+// prepare_msa_mask — BERT-style Masked MSA 预处理
+// ============================================================================
+// 输入: msa_tokens (N_seq, L), token 0-20 (20=gap)
+// 输出:
+//   out_true_msa : (B=1, N_seq, L) — 掩码位置保留真实 aatype token (0-20), 其余置 0
+//   out_bert_mask: (B=1, N_seq, L) — 1.0=被掩码位置, 0.0=未掩码
+// 实现: 以 mask_frac 概率(默认0.15)均匀随机选择位置作为掩码。
+//   query 行(seq 0)不掩码, 保证结构/序列监督稳定。
+void RFAADataLoader::prepare_msa_mask(
+    const std::vector<std::vector<uint8_t>>& msa_tokens,
+    TensorF32& out_true_msa,
+    TensorF32& out_bert_mask,
+    float mask_frac) {
+    const int B = 1;
+    // 与 prepare_msa_latent 的 N_clust = min(max_seqs_, num_sequences) 保持一致,
+    // 保证 true_msa/bert_mask 的 N_seq 与 msa_logits(来自 msa, N_clust 截断) 对齐。
+    const int N_seq = std::min(max_seqs_, static_cast<int>(msa_tokens.size()));
+    const int L = (msa_tokens.empty()) ? 0
+                  : std::min(max_length_, static_cast<int>(msa_tokens[0].size()));
+
+    out_true_msa  = TensorF32({B, N_seq, L}, Device::CPU);
+    out_bert_mask = TensorF32({B, N_seq, L}, Device::CPU);
+    out_true_msa.zero_();
+    out_bert_mask.zero_();
+
+    // 确定性随机种子 (后续可改为每 epoch 重新采样)
+    std::mt19937 rng(42);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    for (int s = 0; s < N_seq; ++s) {
+        for (int i = 0; i < L; ++i) {
+            float tok = (i < (int)msa_tokens[s].size()) ? (float)msa_tokens[s][i] : 20.0f; // gap
+            int64_t idx = (int64_t)s * L + i;
+            out_true_msa.data()[idx] = tok;
+
+            // 掩码: query 行 (s==0) 不掩码; 其余按概率
+            if (s != 0 && dist(rng) < mask_frac) {
+                out_bert_mask.data()[idx] = 1.0f;
+                // 注意: 被掩码位置的特征替换为 MASK token 由调用方在
+                //       构建 msa_latent 特征时处理; 这里仅产出监督标签。
+            }
+        }
+    }
+}
+
+// ============================================================================
+// prepare_chi_labels — Chi (扭转角) 监督标签预处理
+// ============================================================================
+// 从真实骨架坐标 coords (B,L,3,3)=[N,CA,C] 计算 7 角 (omega,phi,psi,chi1-4) 的
+// (sin,cos) 与有效掩码。
+//   - 骨架角 omega/phi/psi 仅需 N/CA/C, 由 dihedral 计算, mask=1。
+//   - chi1-4 需侧链原子 (CB/CG...), true_coords 不含侧链, 故置 0, mask=0。
+//   - 骨架角仅在同残基/相邻残基坐标有效时置 1 (近似: 全部视为有效, 因 coords 已补齐)。
+// 输出:
+//   out_gt_chi   : (B,L,7,2)  — 7 角 (sin,cos)
+//   out_chi_mask : (B,L,7)    — 1.0=有效
+void RFAADataLoader::prepare_chi_labels(
+    const TensorF32& coords,
+    TensorF32& out_gt_chi,
+    TensorF32& out_chi_mask) {
+    int B = static_cast<int>(coords.shape().dims[0]);
+    int L = static_cast<int>(coords.shape().dims[1]);
+
+    out_gt_chi   = TensorF32({B, L, 7, 2}, Device::CPU);
+    out_chi_mask = TensorF32({B, L, 7}, Device::CPU);
+    out_gt_chi.zero_();
+    out_chi_mask.zero_();
+
+    // 标量 dihedral: 四个三维向量 a,b,c,d → 二面角 (弧度), 返回 (sin, cos)
+    auto dihedral = [](const float a[3], const float b[3],
+                       const float c[3], const float d[3], float& s, float& cs) {
+        // b1 = b - a, b2 = c - b, b3 = d - c
+        float b1x = b[0]-a[0], b1y = b[1]-a[1], b1z = b[2]-a[2];
+        float b2x = c[0]-b[0], b2y = c[1]-b[1], b2z = c[2]-b[2];
+        float b3x = d[0]-c[0], b3y = d[1]-c[1], b3z = d[2]-c[2];
+        // n1 = b1 × b2, n2 = b2 × b3
+        float n1x = b1y*b2z - b1z*b2y, n1y = b1z*b2x - b1x*b2z, n1z = b1x*b2y - b1y*b2x;
+        float n2x = b2y*b3z - b2z*b3y, n2y = b2z*b3x - b2x*b3z, n2z = b2x*b3y - b2y*b3x;
+        // m1 = n1 × (b2/|b2|)
+        float b2n = std::sqrt(b2x*b2x + b2y*b2y + b2z*b2z) + 1e-6f;
+        float b2ux = b2x/b2n, b2uy = b2y/b2n, b2uz = b2z/b2n;
+        float m1x = n1y*b2uz - n1z*b2uy, m1y = n1z*b2ux - n1x*b2uz, m1z = n1x*b2uy - n1y*b2ux;
+        // x = n1·n2, y = m1·n2
+        float x = n1x*n2x + n1y*n2y + n1z*n2z;
+        float y = m1x*n2x + m1y*n2y + m1z*n2z;
+        float ang = std::atan2(y, x);
+        s  = std::sin(ang);
+        cs = std::cos(ang);
+    };
+
+    // 坐标访问辅助: coords[b, l, atom(0=N,1=CA,2=C), c]
+    auto atom = [&](int b, int l, int a, int c) -> float {
+        if (l < 0 || l >= L) return 0.0f;
+        const float* d = coords.data();
+        return d[((b*L + l)*3 + a)*3 + c];
+    };
+
+    const float* mask_d = out_chi_mask.data();
+    for (int b = 0; b < B; ++b) {
+        for (int l = 0; l < L; ++l) {
+            // 每残基 3 骨架原子坐标
+            float N[3]  = {atom(b,l,0,0), atom(b,l,0,1), atom(b,l,0,2)};
+            float CA[3] = {atom(b,l,1,0), atom(b,l,1,1), atom(b,l,1,2)};
+            float C[3]  = {atom(b,l,2,0), atom(b,l,2,1), atom(b,l,2,2)};
+
+            // 相邻残基原子 (越界用本残基占位, mask=0 由下面控制)
+            float Np[3], Cp_1[3];  // N[l+1], C[l-1]
+            {
+                if (l+1 < L) { Np[0]=atom(b,l+1,0,0); Np[1]=atom(b,l+1,0,1); Np[2]=atom(b,l+1,0,2); }
+                else         { Np[0]=N[0]; Np[1]=N[1]; Np[2]=N[2]; }
+                if (l-1 >= 0) { Cp_1[0]=atom(b,l-1,2,0); Cp_1[1]=atom(b,l-1,2,1); Cp_1[2]=atom(b,l-1,2,2); }
+                else          { Cp_1[0]=C[0]; Cp_1[1]=C[1]; Cp_1[2]=C[2]; }
+            }
+
+            // omega[l] = dihedral(CA[l], C[l], N[l+1], CA[l+1])   — 仅 l<L-1 有效
+            if (l < L-1) {
+                float CAn[3] = {atom(b,l+1,1,0), atom(b,l+1,1,1), atom(b,l+1,1,2)};
+                float s, cs;
+                dihedral(CA, C, Np, CAn, s, cs);
+                int64_t base = ((b*L + l)*7 + 0)*2;
+                out_gt_chi.data()[base+0] = s;
+                out_gt_chi.data()[base+1] = cs;
+                out_chi_mask.data()[(b*L + l)*7 + 0] = 1.0f;
+            }
+            // phi[l] = dihedral(C[l-1], N[l], CA[l], C[l])   — 仅 l>0 有效
+            if (l > 0) {
+                float s, cs;
+                dihedral(Cp_1, N, CA, C, s, cs);
+                int64_t base = ((b*L + l)*7 + 1)*2;
+                out_gt_chi.data()[base+0] = s;
+                out_gt_chi.data()[base+1] = cs;
+                out_chi_mask.data()[(b*L + l)*7 + 1] = 1.0f;
+            }
+            // psi[l] = dihedral(N[l], CA[l], C[l], N[l+1])   — 仅 l<L-1 有效
+            if (l < L-1) {
+                float s, cs;
+                dihedral(N, CA, C, Np, s, cs);
+                int64_t base = ((b*L + l)*7 + 2)*2;
+                out_gt_chi.data()[base+0] = s;
+                out_gt_chi.data()[base+1] = cs;
+                out_chi_mask.data()[(b*L + l)*7 + 2] = 1.0f;
+            }
+            // chi1-4 (索引 3..6): true_coords 无侧链原子 → mask=0, 值保持 0
+            (void)mask_d;
+        }
+    }
+}
+
+// ============================================================================
+// prepare_distogram_labels — Distogram 监督标签 (从真实坐标 binning)
+// ============================================================================
+// 逐 batch 调用 DistogramBins::compute_all_distogram_onehots (coords (L,3,3)),
+// 并把距离 one-hot 从 61 bins (含溢出) 压缩为 60 bins (溢出 bin 并入 bin 59),
+// 与 distogram_head 输出的 60 bins 对齐。同时构造 pair_mask (残基对均有效=1)。
+void RFAADataLoader::prepare_distogram_labels(
+    const TensorF32& coords,
+    TensorF32& out_D_onehot,
+    TensorF32& out_O_onehot,
+    TensorF32& out_T_onehot,
+    TensorF32& out_P_onehot,
+    TensorF32& out_pair_mask) {
+    const int B = static_cast<int>(coords.shape().dims[0]);
+    const int L = static_cast<int>(coords.shape().dims[1]);
+
+    const int D_BINS = 60, O_BINS = 36, T_BINS = 36, P_BINS = 18;
+    out_D_onehot = TensorF32({B, L, L, D_BINS}, Device::CPU);
+    out_O_onehot = TensorF32({B, L, L, O_BINS}, Device::CPU);
+    out_T_onehot = TensorF32({B, L, L, T_BINS}, Device::CPU);
+    out_P_onehot = TensorF32({B, L, L, P_BINS}, Device::CPU);
+    out_pair_mask = TensorF32({B, L, L}, Device::CPU);
+    out_D_onehot.zero_(); out_O_onehot.zero_(); out_T_onehot.zero_(); out_P_onehot.zero_();
+
+    // 临时 (L,3,3) 坐标 + seq_mask(L,) (全部有效)
+    TensorF32 coord_b({L, 3, 3}, Device::CPU);
+    std::vector<float> seq_mask(L, 1.0f);
+
+    for (int b = 0; b < B; ++b) {
+        // 拷贝当前 batch 的 (L,3,3)
+        for (int i = 0; i < L * 9; ++i) {
+            coord_b.data()[i] = coords.data()[b * (L * 9) + i];
+        }
+
+        // 61-bin D 临时缓冲
+        const int D_BINS_RAW = 61;
+        std::vector<float> D_raw(L * L * D_BINS_RAW, 0.0f);
+        std::vector<float> O_raw(L * L * O_BINS, 0.0f);
+        std::vector<float> T_raw(L * L * T_BINS, 0.0f);
+        std::vector<float> P_raw(L * L * P_BINS, 0.0f);
+
+        compute_all_distogram_onehots(coord_b, seq_mask.data(),
+                                      D_raw.data(), O_raw.data(), T_raw.data(), P_raw.data());
+
+        // 写回输出: D 压缩 61→60 (溢出 bin 60 并入 bin 59)
+        for (int l = 0; l < L; ++l) {
+            for (int lp = 0; lp < L; ++lp) {
+                for (int c = 0; c < D_BINS_RAW; ++c) {
+                    float v = D_raw[(l * L + lp) * D_BINS_RAW + c];
+                    int c_out = std::min(c, D_BINS - 1);  // 溢出归入最后 bin
+                    out_D_onehot.data()[((b * L + l) * L + lp) * D_BINS + c_out] += v;
+                }
+                for (int c = 0; c < O_BINS; ++c) {
+                    out_O_onehot.data()[((b * L + l) * L + lp) * O_BINS + c] = O_raw[(l * L + lp) * O_BINS + c];
+                }
+                for (int c = 0; c < T_BINS; ++c) {
+                    out_T_onehot.data()[((b * L + l) * L + lp) * T_BINS + c] = T_raw[(l * L + lp) * T_BINS + c];
+                }
+                for (int c = 0; c < P_BINS; ++c) {
+                    out_P_onehot.data()[((b * L + l) * L + lp) * P_BINS + c] = P_raw[(l * L + lp) * P_BINS + c];
+                }
+                out_pair_mask.data()[(b * L + l) * L + lp] = 1.0f;  // 所有残基对有效
+            }
+        }
+    }
+}
+
+// ============================================================================
+// prepare_ca_mask — CA 原子有效掩码
+// ============================================================================
+// 从真实骨架坐标 (B,L,3,3) 判断每个残基 CA 是否有效 (坐标不全为零)。
+void RFAADataLoader::prepare_ca_mask(
+    const TensorF32& coords,
+    TensorF32& out_ca_mask) {
+    const int B = static_cast<int>(coords.shape().dims[0]);
+    const int L = static_cast<int>(coords.shape().dims[1]);
+    out_ca_mask = TensorF32({B, L}, Device::CPU);
+    out_ca_mask.zero_();
+
+    for (int b = 0; b < B; ++b) {
+        for (int l = 0; l < L; ++l) {
+            // CA 原子索引 = 1, xyz 3 维; coords[b,l,1,0..2]
+            const float* d = coords.data();
+            float cx = d[((b * L + l) * 3 + 1) * 3 + 0];
+            float cy = d[((b * L + l) * 3 + 1) * 3 + 1];
+            float cz = d[((b * L + l) * 3 + 1) * 3 + 2];
+            bool valid = (cx != 0.0f || cy != 0.0f || cz != 0.0f);
+            out_ca_mask.data()[(b * L + l)] = valid ? 1.0f : 0.0f;
+        }
+    }
 }
 
 TensorF32 RFAADataLoader::prepare_msa_full(const A3MData& a3m_data) {

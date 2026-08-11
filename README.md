@@ -140,6 +140,7 @@ make -j$(nproc)
 - Replace all graph node constructors
 - Move modules into models
 - Homo-oligomer support
+- residx 目前是理想化连续索引 0..L-1，未用 CSV/PDB 的真实 ResNum；单链连续场景够用，但多链/缺残基(gap)/非标准编号时会丢失真实序列间隔信息（gap 应拉开但当前视为相邻）。CSV 已有 PDB_ResNum 列，尚未用于构建 residx。
 
 ### Torsion Indices Reference
 - Negative index indicates the previous residue

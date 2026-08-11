@@ -1605,6 +1605,28 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
     temp_stack_t1d_proj_  = LinearLayer::create(D_T1D, D_STATE);                    // 80 → 32
     temp_stack_norm_      = LayerNorm::create(64);                                   // 64
 
+    // ===== 输出头参数 (全局单份) =====
+    // Masked MSA head: LayerNorm(D_MSA) → Linear(D_MSA→D_MSA) → ReLU → Linear(D_MSA→23)
+    // 输入 msa 特征 (B,N,L,D_MSA)，输出 logits (B,N,L,23)（每个序列位置/残基的 aatype 预测）
+    msa_head_ln_      = LayerNorm::create(D_MSA);        // 256
+    msa_head_linear1_ = LinearLayer::create(D_MSA, D_MSA);   // 256 → 256
+    msa_head_linear2_ = LinearLayer::create(D_MSA, 23);      // 256 → 23
+
+    // Chi (扭转角) head: LayerNorm(D_STATE) → Linear(D_STATE→D_STATE) → ReLU → Linear(D_STATE→14)
+    // 输入 state (B,L,D_STATE)，输出 alpha (B,L,7,2)（omega/phi/psi/chi1-4 未归一化 sin/cos）
+    chi_head_ln_      = LayerNorm::create(D_STATE);      // 32
+    chi_head_linear1_ = LinearLayer::create(D_STATE, D_STATE);  // 32 → 32
+    chi_head_linear2_ = LinearLayer::create(D_STATE, 7 * 2);    // 32 → 14
+
+    // Distogram head: 从 pair 特征投影 4 组 logits (D/Ω/Θ/Φ)
+    distogram_d_head_ = LinearLayer::create(D_PAIR, 60);  // 距离 60 bins
+    distogram_o_head_ = LinearLayer::create(D_PAIR, 36);  // Ω 36 bins
+    distogram_t_head_ = LinearLayer::create(D_PAIR, 36);  // Θ 36 bins
+    distogram_p_head_ = LinearLayer::create(D_PAIR, 18);  // Φ 18 bins
+
+    // pLDDT head: state → lddt logits (B,L,50)
+    plddt_head_       = LinearLayer::create(D_STATE, 50);
+
     // ===== TemplatePairStack 子层创建 =====
     // 直接层
     tps_rbf_proj_   = LinearLayer::create(D_RBF, D_PAIR);                            // 64 → 128
@@ -1870,7 +1892,97 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     output.state.copy_from(state);  // 简化
     //output.coords = coords;
     output.coords.copy_from(coords);  // 简化
-    
+
+    // ===== Masked MSA head: msa (B,N,L,D_MSA) → logits (B,N,L,23) =====
+    //   LayerNorm(D_MSA) → Linear(D_MSA→D_MSA) → ReLU → Linear(D_MSA→23)
+    //   msa 值布局 (B,N,L,D_MSA)；LinearLayer::forward 输入须展平为 (B*N*L, D_MSA)
+    {
+        int msa_B = msa.shape().dims[0];
+        int msa_N = msa.shape().dims[1];
+        int msa_L = msa.shape().dims[2];
+        int64_t flat_rows = (int64_t)msa_B * msa_N * msa_L;
+
+        // 1) LayerNorm (逐 token 归一化, 保持 (B,N,L,D_MSA))
+        auto* ln_out = msa_head_ln_->forward(&msa);                       // (B,N,L,256)
+
+        // 2) view 展平 → Linear1 → ReLU → view 回 4D
+        TensorF32 ln_flat(Shape({flat_rows, D_MSA}), ln_out->device());
+        ln_flat.copy_from(*ln_out);
+        auto lin1  = msa_head_linear1_->forward(ln_flat);                 // (flat_rows, 256)
+        auto* relu1 = relu(&lin1);
+        // 3) view 回 (B,N,L,256) → Linear2 → logits (B*N*L, 23)
+        TensorF32 relu4(Shape({msa_B, msa_N, msa_L, D_MSA}), relu1->device());
+        relu4.copy_from(*relu1);
+        auto lin2  = msa_head_linear2_->forward(relu4);                   // (flat_rows, 23)
+        // 4) view 回 (B,N,L,23)
+        TensorF32 logits4(Shape({msa_B, msa_N, msa_L, 23}), lin2.device());
+        logits4.copy_from(lin2);
+        output.msa_logits = std::move(logits4);
+    }
+
+    // ===== Chi (扭转角) head: state (B,L,D_STATE) → alpha (B,L,7,2) =====
+    //   LayerNorm(D_STATE) → Linear(D_STATE→D_STATE) → ReLU → Linear(D_STATE→14)
+    //   state 值布局 (B,L,D_STATE)；LinearLayer::forward 输入须展平为 (B*L, D_STATE)
+    if (state.numel() > 0) {
+        int ch_B = state.shape().dims[0];
+        int ch_L = state.shape().dims[1];
+        int64_t ch_rows = (int64_t)ch_B * ch_L;
+
+        // 1) LayerNorm (逐 token, 保持 (B,L,D_STATE))
+        auto* ch_ln = chi_head_ln_->forward(&state);                    // (B,L,32)
+
+        // 2) view 扁平 → Linear1 → ReLU → view 回 (B,L,32)
+        TensorF32 ch_flat(Shape({ch_rows, D_STATE}), ch_ln->device());
+        ch_flat.copy_from(*ch_ln);
+        auto ch_lin1 = chi_head_linear1_->forward(ch_flat);             // (B*L, 32)
+        auto* ch_relu = relu(&ch_lin1);
+        // 3) view 回 (B,L,32) → Linear2 → logits (B*L, 14)
+        TensorF32 ch_relu4(Shape({ch_B, ch_L, D_STATE}), ch_relu->device());
+        ch_relu4.copy_from(*ch_relu);
+        auto ch_lin2 = chi_head_linear2_->forward(ch_relu4);            // (B*L, 14)
+        // 4) view 回 (B,L,7,2)
+        TensorF32 alpha4(Shape({ch_B, ch_L, 7, 2}), ch_lin2.device());
+        alpha4.copy_from(ch_lin2);
+        output.alpha = std::move(alpha4);
+    }
+
+    // ===== Distogram head: pair (B,L,L,D_PAIR) → 4 组 logits =====
+    //   distogram (B,L,L,60), omega (B,L,L,36), theta (B,L,L,36), phi (B,L,L,18)
+    if (pair.numel() > 0) {
+        int dg_B = pair.shape().dims[0];
+        int dg_L = pair.shape().dims[1];
+        int64_t dg_rows = (int64_t)dg_B * dg_L * dg_L;
+
+        // pair (B,L,L,D_PAIR) → 展平 (B*L*L, D_PAIR) 送入各 head
+        TensorF32 pair_flat(Shape({dg_rows, D_PAIR}), pair.device());
+        pair_flat.copy_from(pair);
+
+        auto project_logits = [&](LinearLayer* head, int bins) {
+            auto logits2 = head->forward(pair_flat);              // (B*L*L, bins)
+            TensorF32 logits4(Shape({dg_B, dg_L, dg_L, bins}), logits2.device());
+            logits4.copy_from(logits2);
+            return logits4;
+        };
+        output.distogram = std::move(project_logits(distogram_d_head_, 60));
+        output.omega     = std::move(project_logits(distogram_o_head_, 36));
+        output.theta     = std::move(project_logits(distogram_t_head_, 36));
+        output.phi       = std::move(project_logits(distogram_p_head_, 18));
+    }
+
+    // ===== pLDDT head: state (B,L,D_STATE) → lddt logits (B,L,50) =====
+    if (state.numel() > 0) {
+        int pl_B = state.shape().dims[0];
+        int pl_L = state.shape().dims[1];
+        int64_t pl_rows = (int64_t)pl_B * pl_L;
+
+        TensorF32 pl_flat(Shape({pl_rows, D_STATE}), state.device());
+        pl_flat.copy_from(state);
+        auto pl_logits2 = plddt_head_->forward(pl_flat);          // (B*L, 50)
+        TensorF32 lddt4(Shape({pl_B, pl_L, 50}), pl_logits2.device());
+        lddt4.copy_from(pl_logits2);
+        output.lddt = std::move(lddt4);
+    }
+
     return output;
 }
 
@@ -2026,6 +2138,19 @@ void RFAAModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
     collect_linear(emb_t1d_t2d_, "emb_t1d_t2d");
     collect_linear(temp_stack_t1d_proj_, "temp_stack_t1d_proj");
     collect_layernorm(temp_stack_norm_, "temp_stack_norm");
+
+    // ===== 输出头参数 =====
+    collect_layernorm(msa_head_ln_, "msa_head.ln");
+    collect_linear(msa_head_linear1_, "msa_head.linear1");
+    collect_linear(msa_head_linear2_, "msa_head.linear2");
+    collect_layernorm(chi_head_ln_, "chi_head.ln");
+    collect_linear(chi_head_linear1_, "chi_head.linear1");
+    collect_linear(chi_head_linear2_, "chi_head.linear2");
+    collect_linear(distogram_d_head_, "distogram_head.dist");
+    collect_linear(distogram_o_head_, "distogram_head.omega");
+    collect_linear(distogram_t_head_, "distogram_head.theta");
+    collect_linear(distogram_p_head_, "distogram_head.phi");
+    collect_linear(plddt_head_, "plddt_head");
 
     // ===== TemplatePairStack 参数 =====
     collect_linear(tps_rbf_proj_, "tps.rbf_proj");

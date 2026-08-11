@@ -6,6 +6,7 @@
 #include "rfaa/ONNXExporter.h"
 #include "rfaa/GradientClipper.h"
 #include "rfaa/GGUF.h"
+#include "rfaa/LDDT.h"
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -291,18 +292,115 @@ int main(int argc, char* argv[]) {
         TensorF32* loss_fape_node =
             loss(fape_loss(pred_node, true_node, frame_idx, frames_mask, positions_mask, fape_cfg));
 
-        // 2) Chi (扭转角) loss — 当前无真实扭转角监督, 用标量 0 占位
-        //    接入真实 gt 时替换为: supervised_chi_loss(unnormed, gt, chi_mask, seq_mask)
-        TensorF32* loss_chi_node       = loss(constant_scalar(0.0f));
+        // 2) Chi (扭转角) loss — 接入 supervised_chi_loss(unnormed, gt, chi_mask, seq_mask)
+        //    unnormed : output.alpha (B,L,7,2) → view (B*L,7,2) → wrap 图 {2,7,N}
+        //    gt       : input.gt_chi  (B,L,7,2) → view (B*L,7,2) → wrap 图 {2,7,N}
+        //    chi_mask : input.chi_mask(B,L,7)   → view (B*L,7)   → wrap 图 {7,N}
+        //    seq_mask : 全 1 (B*L,1) → wrap 图 {1,N}
+        TensorF32* loss_chi_node = loss(constant_scalar(0.0f));
+        if (input.gt_chi.numel() > 0 && output.alpha.numel() > 0) {
+            int64_t chi_N = input.gt_chi.shape().dims[0] * input.gt_chi.shape().dims[1]; // B*L
+            TensorF32 chi_unnormed = output.alpha.view({chi_N, 7, 2});
+            TensorF32 chi_gt       = input.gt_chi.view({chi_N, 7, 2});
+            TensorF32 chi_mask_2d  = input.chi_mask.view({chi_N, 7});
+            TensorF32 seq_mask_2d  = TensorF32({chi_N, 1}, Device::CPU);
+            seq_mask_2d.zero_();
+            for (int64_t i = 0; i < chi_N; ++i) seq_mask_2d.data()[i] = 1.0f;  // 全残基有效
+            TensorF32* unnormed_node = wrap_value_as_leaf(chi_unnormed, {2, 7, chi_N});
+            TensorF32* gt_node       = wrap_value_as_leaf(chi_gt,       {2, 7, chi_N});
+            TensorF32* cmask_node    = wrap_value_as_leaf(chi_mask_2d,  {7, chi_N});
+            TensorF32* smask_node    = wrap_value_as_leaf(seq_mask_2d,  {1, chi_N});
+            loss_chi_node = loss(supervised_chi_loss(unnormed_node, gt_node, cmask_node, smask_node, 0.5f, 0.5f));
+        }
 
-        // 3) Distogram loss — 当前无 distogram 标签, 用标量 0 占位
+        // 3) Distogram loss — 接入 distogram_loss(4 logits, 4 onehot, pair_mask)
+        //    布局: 值 (B*L*L, bins) 行主序(bins 最内) → wrap 图 {bins, B*L*L}
+        //          pair_mask (B*L*L) → wrap 图 {B*L*L}
+        //    distogram_loss 内 sum_rows 沿 dims[0]=bins(最内) 求和 → per-pair CE
         TensorF32* loss_distogram_node = loss(constant_scalar(0.0f));
+        if (input.D_onehot.numel() > 0 && output.distogram.numel() > 0) {
+            int64_t dg_N = input.D_onehot.shape().dims[0]
+                         * input.D_onehot.shape().dims[1]
+                         * input.D_onehot.shape().dims[2];  // B*L*L
+            TensorF32 dg_dist = output.distogram.view({dg_N, 60});
+            TensorF32 dg_omg  = output.omega.view({dg_N, 36});
+            TensorF32 dg_tht  = output.theta.view({dg_N, 36});
+            TensorF32 dg_phi  = output.phi.view({dg_N, 18});
+            TensorF32 dg_D    = input.D_onehot.view({dg_N, 60});
+            TensorF32 dg_O    = input.O_onehot.view({dg_N, 36});
+            TensorF32 dg_T    = input.T_onehot.view({dg_N, 36});
+            TensorF32 dg_P    = input.P_onehot.view({dg_N, 18});
+            TensorF32 dg_mask = input.pair_mask.view({dg_N});
+            TensorF32* l_dist = wrap_value_as_leaf(dg_dist, {60, dg_N});
+            TensorF32* l_omg  = wrap_value_as_leaf(dg_omg,  {36, dg_N});
+            TensorF32* l_tht  = wrap_value_as_leaf(dg_tht,  {36, dg_N});
+            TensorF32* l_phi  = wrap_value_as_leaf(dg_phi,  {18, dg_N});
+            TensorF32* l_D    = wrap_value_as_leaf(dg_D,    {60, dg_N});
+            TensorF32* l_O    = wrap_value_as_leaf(dg_O,    {36, dg_N});
+            TensorF32* l_T    = wrap_value_as_leaf(dg_T,    {36, dg_N});
+            TensorF32* l_P    = wrap_value_as_leaf(dg_P,    {18, dg_N});
+            TensorF32* l_pm   = wrap_value_as_leaf(dg_mask, {dg_N});
+            loss_distogram_node = loss(distogram_loss(l_dist, l_omg, l_tht, l_phi,
+                                                       l_D, l_O, l_T, l_P, l_pm));
+        }
 
-        // 4) Masked MSA loss — 当前无 MSA 掩码监督, 用标量 0 占位
-        TensorF32* loss_msa_node       = loss(constant_scalar(0.0f));
+        // 4) Masked MSA loss — 接入 masked_msa_loss(logits, true_msa, bert_mask)
+        //    logits   : output.msa_logits (B=1, N, L, 23) → view (N, L, 23)
+        //               wrap 图 dims={23, L, N} (dims[0]=类别最内), 匹配 masked_msa_loss 期望
+        //    true_msa : input.true_msa   (B=1, N, L)      → view (N, L) → 图 {L, N}
+        //    bert_mask: input.bert_mask  (B=1, N, L)      → view (N, L) → 图 {L, N}
+        //    布局: masked_msa_loss 期望 logits[N_seq,N_res,23], true_msa[N_seq,N_res]
+        //          (ggml: logits dims={23,L,N}, true_msa dims={L,N} → N_res=L, N_seq=N)
+        TensorF32* loss_msa_node = loss(constant_scalar(0.0f));
+        if (input.true_msa.numel() > 0 && output.msa_logits.numel() > 0) {
+            int N_seq_msa = static_cast<int>(input.true_msa.shape().dims[1]);  // N_seq
+            TensorF32 msa_logits_2d = output.msa_logits.view({N_seq_msa, L, 23});  // (N,L,23)
+            TensorF32 msa_true_2d   = input.true_msa.view({N_seq_msa, L});         // (N,L)
+            TensorF32 msa_mask_2d   = input.bert_mask.view({N_seq_msa, L});        // (N,L)
+            TensorF32* logits_node = wrap_value_as_leaf(msa_logits_2d, {23, L, N_seq_msa});
+            TensorF32* true_node   = wrap_value_as_leaf(msa_true_2d,   {L, N_seq_msa});
+            TensorF32* mask_node   = wrap_value_as_leaf(msa_mask_2d,   {L, N_seq_msa});
+            loss_msa_node = loss(masked_msa_loss(logits_node, true_node, mask_node));
+        }
 
-        // 5) Confidence (pLDDT) loss — 当前无 LDDT 标签, 用标量 0 占位
-        TensorF32* loss_conf_node      = loss(constant_scalar(0.0f));
+        // 5) Confidence (pLDDT) loss — 接入 plddt_loss(logits, lddt_onehot, ca_mask)
+        //    logits    : output.lddt (B,L,50) → view (B*L,50) → 图 {50, B*L}
+        //    ca_mask   : input.ca_mask(B,L)   → view (B*L)     → 图 {B*L}
+        //    lddt_onehot: 用 output.coords(预测) vs input.true_coords(真实) 动态计算
+        //                 (compute_lddt_ca + lddt_to_onehot), → (B*L,50) → 图 {50, B*L}
+        TensorF32* loss_conf_node = loss(constant_scalar(0.0f));
+        if (input.ca_mask.numel() > 0 && output.lddt.numel() > 0 && output.coords.numel() > 0) {
+            int64_t pl_N = output.lddt.shape().dims[0] * output.lddt.shape().dims[1];  // B*L
+            // 提取 CA 坐标 (B,L,3,3)→(B*L,3), 真值 CA (先转 CPU 以便 .data() 访问)
+            TensorF32 pred_coords_cpu = output.coords.cpu();
+            TensorF32 true_coords_cpu = input.true_coords.cpu();
+            TensorF32 ca_mask_cpu     = input.ca_mask.cpu();
+            std::vector<float> pred_ca(pl_N * 3, 0.0f), true_ca(pl_N * 3, 0.0f);
+            std::vector<float> ca_m(pl_N, 0.0f);
+            for (int64_t i = 0; i < pl_N; ++i) {
+                // CA 原子索引=1
+                pred_ca[i*3+0] = pred_coords_cpu.data()[i*9 + 1*3 + 0];
+                pred_ca[i*3+1] = pred_coords_cpu.data()[i*9 + 1*3 + 1];
+                pred_ca[i*3+2] = pred_coords_cpu.data()[i*9 + 1*3 + 2];
+                true_ca[i*3+0] = true_coords_cpu.data()[i*9 + 1*3 + 0];
+                true_ca[i*3+1] = true_coords_cpu.data()[i*9 + 1*3 + 1];
+                true_ca[i*3+2] = true_coords_cpu.data()[i*9 + 1*3 + 2];
+                ca_m[i] = ca_mask_cpu.data()[i];
+            }
+            const int N_BINS = 50;
+            std::vector<float> lddt(pl_N, 0.0f), onehot(pl_N * N_BINS, 0.0f);
+            compute_lddt_ca(pred_ca.data(), true_ca.data(), ca_m.data(),
+                            static_cast<int>(pl_N), 15.0f, lddt.data());
+            lddt_to_onehot(lddt.data(), static_cast<int>(pl_N), N_BINS, onehot.data());
+
+            TensorF32 pl_logits = output.lddt.view({pl_N, N_BINS});
+            TensorF32 pl_onehot(Shape({pl_N, N_BINS}), onehot.data(), Device::CPU, false);
+            TensorF32 pl_camask = input.ca_mask.view({pl_N});
+            TensorF32* l_lddt  = wrap_value_as_leaf(pl_logits, {N_BINS, pl_N});
+            TensorF32* l_oh    = wrap_value_as_leaf(pl_onehot, {N_BINS, pl_N});
+            TensorF32* l_cam   = wrap_value_as_leaf(pl_camask, {pl_N});
+            loss_conf_node = loss(plddt_loss(l_lddt, l_oh, l_cam));
+        }
 
         // --- total_loss: 0.5*FAPE + 0.5*Chi + 0.3*Distogram + 2.0*MSA + 0.01*Conf ---
         TensorF32* total_node = loss(total_loss(
