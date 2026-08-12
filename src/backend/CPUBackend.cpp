@@ -75,6 +75,10 @@ bool CPUBackend::supports_op(TensorF32* node) const {
         case OP_SCATTER_ADD:
         case OP_PER_EDGE_MATMUL_BACK_KERNEL:
         case OP_PER_EDGE_MATMUL_BACK_GATHERED:
+        case OP_OUTER_PROD_MEAN:
+        case OP_OUTER_PROD_MEAN_BACK:
+        case OP_OUTER_PROD:
+        case OP_OUTER_PROD_BACK:
         // ggml IQ quantize
         // now only have F32
             return true;

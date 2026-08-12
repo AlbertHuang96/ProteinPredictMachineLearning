@@ -162,4 +162,44 @@ TensorF32 outer_product(const TensorF32& left, const TensorF32& right);
  */
 TensorF32 triangle_mult(const TensorF32& left, const TensorF32& right, float L, bool outgoing);
 
+/**
+ * @brief msa2pair outer-product-mean（值版）。
+ *
+ * einsum('bikd,bjkd->bijd(de)', left, right/N) — 收缩 seq 维 N（dims[1]），
+ * 保留残基 i,j，且特征维做笛卡尔积 D×D→D*D（与 msa2pair_out_proj_ 输入 D*D 匹配）。
+ *
+ *   left  (B, N, L, D)   —— dims[1]=N 为被收缩的序列维，dims[2]=L 为残基
+ *   right (B, N, L, D)
+ *   dst   (B, L, L, D*D) —— dst[b,i,j,(d1*D+d2)] = (1/N)*sum_n left[b,n,i,d1]*right[b,n,j,d2]
+ *
+ * 注：这与 outer_product((B,1,L,D),(B,L,1,D)) 不同——后者是纯外积且特征维不扩展。
+ * 此前 msa2pair 误用 outer_product(left(B,N,L,D), right(B,N,L,D)) 造成签名不符，应改用本函数。
+ *
+ * @param left  Left tensor, shape (B, N, L, D)
+ * @param right Right tensor, shape (B, N, L, D)
+ * @return Result tensor, shape (B, L, L, D*D)
+ * @throws RFAAError If inputs are not 4D tensors, or batch/feature dims mismatch
+ */
+TensorF32 outer_product_mean(const TensorF32& left, const TensorF32& right);
+
+/**
+ * @brief pair2pair gate 的 outer product（值版，纯外积，特征维笛卡尔积）。
+ *
+ * gate[(d1*D+d2), i, j, b] = left[b,i,d1] * right[b,j,d2] —— 无收缩，特征维 D×D→D*D。
+ *
+ *   left  (B, L, D)   —— dims[1]=L 为残基
+ *   right (B, L, D)
+ *   dst   (B, L, L, D*D) —— 与 pair2pair_gate_proj_ 输入 D*D 匹配
+ *
+ * 注：这与 outer_product((B,1,L,D),(B,L,1,D)) 不同——后者不扩展特征维（输出 D 而非 D*D），
+ * 与 gate_proj 的 D*D 输入不匹配；此前值版 gate 误用 `outer_product((B,L,16),(B,L,16))`
+ * 既签名不符（3D vs 4D）又语义不符（特征维不扩展），应改用本函数。
+ *
+ * @param left  Left tensor, shape (B, L, D)
+ * @param right Right tensor, shape (B, L, D)
+ * @return Result tensor, shape (B, L, L, D*D)
+ * @throws RFAAError If inputs are not 3D tensors, or batch/feature dims mismatch
+ */
+TensorF32 outer_product_cartesian(const TensorF32& left, const TensorF32& right);
+
 } // namespace rfaa

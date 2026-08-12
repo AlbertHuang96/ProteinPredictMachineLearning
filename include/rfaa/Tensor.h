@@ -148,6 +148,18 @@ enum tensor_op {
     OP_FAPE_BACK,
     OP_TRI_MUL,
     OP_TRI_MUL_BACK,
+    // msa2pair outer-product-mean: einsum('bikd,bjkd->bijd', left, right/N)
+    //   left [D,L,N,B], right [D,L,N,B] → dst [D,L,L,B]，收缩 seq 维 N（dims[2]）
+    //   反向由 compute_backward 组合现有图 op 完成（见 ComputeGraph.cpp）。
+    OP_OUTER_PROD_MEAN,
+    // outer_product_mean 的反向：dL/dleft = grad⊗rightᵀ / N, dL/dright = gradᵀ⊗left / N
+    OP_OUTER_PROD_MEAN_BACK,
+    // gate 的 outer product（纯外积，无收缩）：left [D,L,B] × right [D,L,B] → [D*D,L,L,B]
+    //   gate[(d1*D+d2), i, j, b] = left[d1,i,b] * right[d2,j,b]（特征维笛卡尔积 D×D→D*D）
+    // 反向由 compute_backward 组合现有图 op 完成（见 ComputeGraph.cpp）。
+    OP_OUTER_PROD,
+    // outer_product 的反向
+    OP_OUTER_PROD_BACK,
     // SE3 消息传递三件套（方案 B）
     // 按 edge_index 从节点特征取源节点行（gather）
     OP_EDGE_GATHER_ROWS,

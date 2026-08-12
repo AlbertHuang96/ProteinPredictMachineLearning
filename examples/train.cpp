@@ -195,17 +195,20 @@ int main(int argc, char* argv[]) {
     // }
     
     // ============================================================
-    // 数据加载: 通过 RFAADataLoader 从 A3M + CSV mapping 加载
-    // CSV 提供真实坐标 (true_coords), 作为 FAPE 的 ground truth
-    // hhr 模板文件暂时没有, 放在最后, 默认为空 (暂未接入模板)
+    // 数据加载: 通过 RFAADataLoader 从 A3M + CSV mapping + 模板目录加载
+    // CSV 提供真实坐标 (true_coords), 作为 FAPE 的 ground truth。
+    // csv_path 可以是单个 CSV 文件, 也可以是含多个 *_mapping_results.csv
+    // 的目录 (一个 uniprot 序列可能被多个 PDB 结构域覆盖, 自动合并)。
+    // template_dir: 模板结构目录 (cif/pdb), 自动过滤与真实值重复的 PDB id。
     // ============================================================
-    // 命令行参数: train <a3m> <fasta> <csv_mapping> [hhr]
-    // 例如: train 1a00.a3m data/P04637.fasta data/1a00_P69905_mapping.csv
-    //       或带 hhr: train 1a00.a3m data/P04637.fasta data/1a00_P69905_mapping.csv 1a00.hhr
-    std::string a3m_path    = (argc > 1) ? argv[1] : "query.a3m";
-    std::string fasta_path  = (argc > 2) ? argv[2] : "data/P04637.fasta";
-    std::string csv_path    = (argc > 3) ? argv[3] : "data/1a00_P69905_mapping.csv";
-    std::string hhr_path    = (argc > 4) ? argv[4] : "";  // hhr 放最后, 默认为空
+    // 命令行参数: train <a3m> <fasta> <csv_mapping|dir> [template_dir] [hhr]
+    // 例如(单 CSV): train query.a3m data/P04637.fasta data/P04637.csv data/P04637_template_coords
+    //       或(多 CSV 目录): train query.a3m data/P04637.fasta data/P04637_pdbs data/P04637_template_coords
+    std::string a3m_path       = (argc > 1) ? argv[1] : "query.a3m";
+    std::string fasta_path     = (argc > 2) ? argv[2] : "data/P04637.fasta";
+    std::string csv_path       = (argc > 3) ? argv[3] : "data/P04637_pdbs";  // CSV 文件或目录
+    std::string template_dir   = (argc > 4) ? argv[4] : "data/P04637_template_coords";
+    std::string hhr_path       = (argc > 5) ? argv[5] : "";  // hhr 放最后, 默认为空
 
     // 从 FASTA 文件读取查询序列 (只读第一条)
     std::string sequence;
@@ -219,12 +222,18 @@ int main(int argc, char* argv[]) {
     }
 
     RFAADataLoader loader("", "", 512, 4, 2048);
-    ModelInput input = loader.load_from_files(a3m_path, sequence, csv_path, hhr_path);
+    ModelInput input = loader.load_from_files(a3m_path, sequence, csv_path, template_dir, hhr_path);
     int L = static_cast<int>(sequence.length());
 
     std::cout << "Loaded data. L=" << L
               << " true_coords shape=(" << (input.true_coords.numel() > 0 ? 1 : 0)
-              << "," << L << ",3,3)" << std::endl;
+              << "," << L << ",3,3)"
+              << " templates=" << input.template_coords.size() << std::endl;
+    for (size_t ti = 0; ti < input.template_coords.size(); ++ti) {
+        std::cout << "  template[" << ti << "] id=" << input.template_ids[ti]
+                  << " chain=" << input.template_chains[ti]
+                  << " residues=" << input.template_residue_counts[ti] << std::endl;
+    }
 
     // 若没有真实坐标, 用一个占位 coords 供前向使用
     if (input.coords.numel() == 0) {

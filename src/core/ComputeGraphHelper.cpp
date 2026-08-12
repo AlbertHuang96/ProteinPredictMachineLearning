@@ -147,12 +147,26 @@ TensorF32* transpose(TensorF32* a) {
 }
 
 // triangle_mul(left, right, L, outgoing)
-//   outgoing=true:  einsum('bikd,bjkd->bijd', left, right/L)   → result: (B, I, J, D)
-//   outgoing=false: einsum('bkid,bkjd->bijd', left, right/L)  → result: (B, I, J, D)
+// 【ggml 布局 dims[0]=最内维】输出 dst [D, I, J, B]
+//   outgoing=true:  einsum('bikd,bjkd->bijd', left, right/L)
+//     left [D,I,K,B], right [D,J,K,B] → dst [D,I,J,B]（I=left.dims[1], J=right.dims[1]）
+//   outgoing=false: einsum('bkid,bkjd->bijd', left, right/L)
+//     left [D,K,I,B], right [D,K,J,B] → dst [D,I,J,B]（I=left.dims[2], J=right.dims[2]）
 TensorF32* triangle_mul(TensorF32* left, TensorF32* right, float L, bool outgoing) {
     assert(left->shape().ndim() == 4 && right->shape().ndim() == 4);
-    // result shape: (B, I, J, D) where I=dim[1] for both
-    int64_t ne[4] = {left->shape().dims[0], left->shape().dims[1], right->shape().dims[1], left->shape().dims[3]};
+    // result shape: [D, I, J, B]
+    int64_t ne[4];
+    if (outgoing) {
+        ne[0] = left->shape().dims[0];   // D（最内特征维）
+        ne[1] = left->shape().dims[1];   // I
+        ne[2] = right->shape().dims[1];  // J
+        ne[3] = left->shape().dims[3];   // B
+    } else {
+        ne[0] = left->shape().dims[0];   // D（最内特征维）
+        ne[1] = left->shape().dims[2];   // I（incoming 时 i 在 dims[2]）
+        ne[2] = right->shape().dims[2];  // J（incoming 时 j 在 dims[2]）
+        ne[3] = left->shape().dims[3];   // B
+    }
     TensorF32* result = context().new_tensor<float>(4, ne);
     result->op      = OP_TRI_MUL;
     result->src[0]  = left;
@@ -1235,6 +1249,52 @@ TensorF32* outer_sum_graph(TensorF32* left, TensorF32* right) {
     auto* l = repeat(left, target);   // [D,1,L,B] → [D,L,L,B]
     auto* r = repeat(right, target);  // [D,L,1,B] → [D,L,L,B]
     return add_impl(l, r, /*inplace=*/false);
+}
+
+// outer_product_mean — msa2pair 的 outer-product-mean（图节点版本）
+//   einsum('bikd,bjkd->bijd(de)', left, right/N) — 收缩 seq 维 N（dims[2]），特征维笛卡尔积 D×D→D*D
+//   left  [D, L, N, B]（ggml 布局 dims[0]=最内维）
+//   right [D, L, N, B]
+//   dst   [D*D, L, L, B]；dst[(d1*D+d2), i, j, b] = (1/N)*sum_n left[d1,i,n,b]*right[d2,j,n,b]
+// 收缩维是 seq 维 N（dims[2]）。out_prod 只收缩 dims[1]，故用专用 op OP_OUTER_PROD_MEAN。
+TensorF32* outer_product_mean(TensorF32* left, TensorF32* right, int N) {
+    assert(left->shape().ndim() == 4 && right->shape().ndim() == 4);
+    // dst dims: [D*D, L, L, B]
+    int64_t ne[4] = {
+        left->shape().dims[0] * left->shape().dims[0],  // D*D（特征笛卡尔积）
+        left->shape().dims[1],      // L（残基 i）
+        right->shape().dims[1],     // L（残基 j）
+        left->shape().dims[3]       // B
+    };
+    TensorF32* result = context().new_tensor<float>(4, ne);
+    result->op     = OP_OUTER_PROD_MEAN;
+    result->src[0] = left;
+    result->src[1] = right;
+    // op_params[0..1]: N（seq 数，float 位模式），供 CPU kernel 做 1/N 均值
+    reinterpret_cast<float&>(result->op_params[0]) = static_cast<float>(N);
+    return result;
+}
+
+// outer_product_graph — pair2pair gate 的 outer product（图节点版本）
+//   纯外积，无收缩：gate[(d1*D+d2), i, j, b] = left[d1,i,b] * right[d2,j,b]
+//   left  [D, L, B]（ggml 布局 dims[0]=最内维）
+//   right [D, L, B]
+//   dst   [D*D, L, L, B]（特征维笛卡尔积 D×D→D*D）
+// 与 msa2pair 的 outer_product_mean 不同：此处不收缩任何维（state 无 seq 维）。
+TensorF32* outer_product_graph(TensorF32* left, TensorF32* right) {
+    assert(left->shape().ndim() == 3 && right->shape().ndim() == 3);
+    // dst dims: [D*D, L, L, B]
+    int64_t ne[4] = {
+        left->shape().dims[0] * left->shape().dims[0],  // D*D（特征笛卡尔积）
+        left->shape().dims[1],                          // L（残基 i）
+        right->shape().dims[1],                         // L（残基 j）
+        left->shape().dims[2]                           // B
+    };
+    TensorF32* result = context().new_tensor<float>(4, ne);
+    result->op     = OP_OUTER_PROD;
+    result->src[0] = left;
+    result->src[1] = right;
+    return result;
 }
 
 } // namespace rfaa

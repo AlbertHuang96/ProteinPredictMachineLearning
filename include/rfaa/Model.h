@@ -69,6 +69,14 @@ struct ModelInput {
 
     // ---- pLDDT 监督 ----
     TensorF32 ca_mask;       // (B, L)        - CA 原子有效掩码 (1.0=有效)
+
+    // ---- 模板结构数据 (从 cif/pdb 目录加载) ----
+    // 每个模板为一个独立结构域, 残基数可不同, 故用 vector 存储原始骨架坐标。
+    // 已自动过滤掉与真实值 (ground truth) 相同的 PDB id, 不再作为模板。
+    std::vector<TensorF32>  template_coords;        // 每个模板: (N_res, 4, 3) = [N, CA, C, O] × [x,y,z]
+    std::vector<std::string> template_ids;          // 模板 PDB id (小写, 不含链), 如 "2bim"
+    std::vector<std::string> template_chains;       // 模板链 id, 如 "B"
+    std::vector<int>         template_residue_counts; // 每个模板的残基数
 };
 
 // 模型输出
@@ -157,12 +165,31 @@ public:
     // SE3(3D) track 图模式子流程。
     // 可微部分（node 度0：msa 沿 Nseq 均值 + seq1hot → embed_x_ → norm_node_3d_）走图 op；
     // 结构常量由调用方值版预处理后以 G（make_graph 产物）与 basis 注入。
-    // 调用 se3_->forward_graph，把 state（度0）经引用回写，坐标更新落到 xyz_new_（图外值回落）。
+    // 调用 se3_->forward_graph，把 state（度0）经引用回写。
+    // 返回 se3_out 图节点：se3_out[0]=state（度0）、se3_out[1]=offset（度1，坐标更新用，图外回落）。
     // msa/pair/rbf 为图节点（最新 track 输出）；G/basis/coords/seq1hot 为结构常量。
-    void run_se3_graph(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
-                       TensorF32*& state,
-                       const se3::GraphData& G, const SE3Basis& basis,
-                       const TensorF32& coords, const TensorF32& seq1hot);
+    std::vector<TensorF32*> run_se3_graph(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                                          TensorF32*& state,
+                                          const se3::GraphData& G, const SE3Basis& basis,
+                                          const TensorF32& coords, const TensorF32& seq1hot);
+
+    // 训练入口驱动：SE3 图块的"图外值回落" + 坐标更新。
+    //   Phase A（结构常量）：pair 值 → norm_pair_3d_? 否 → embed_e_ → norm_edge_3d_ → make_graph
+    //                        → G；basis.compute(G.edge_d, 2)。pair_value 为前一 track graph_compute 后的值。
+    //   Phase B（图块）：run_se3_graph(...) 追加 SE3 图节点，state 经引用回写为图节点。
+    //   Phase C（坐标更新）：由调用方对返回的 offset 图节点 graph_compute 后调用
+    //                        apply_coord_update(offset_value, coords) → xyz_new_。
+    void run_se3_structural(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                            TensorF32*& state,
+                            const TensorF32& pair_value,
+                            const TensorF32& coords,
+                            const TensorI64& residx,
+                            const TensorF32& seq1hot);
+
+    // 坐标更新（图外值回落）：把 SE3 度1 offset 值叠加到 coords → xyz_new_（值版 Step4k）。
+    // offset_value 布局 (B*L, 3, 3)，[N,CA,C] 通道；CA 为绝对位移。供训练入口在 graph_compute
+    // 出 offset 值后调用。
+    void apply_coord_update(const TensorF32& offset_value, const TensorF32& coords);
 
     static TensorF32 compute_rbf_feature(const TensorF32& coords);
     static TensorF32 compute_l1_features(const TensorF32& coords);

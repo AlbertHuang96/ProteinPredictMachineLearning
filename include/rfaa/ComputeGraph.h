@@ -242,6 +242,20 @@ TensorF32* one_hot_seq_graph(TensorF32* seq, int num_classes = 21);
 // 用 repeat 广播 + add_impl 组装。依赖 repeat / add_impl（均已有 kernel）。返回图节点。
 TensorF32* outer_sum_graph(TensorF32* left, TensorF32* right);
 
+// outer_product_mean 图版（msa2pair）：einsum('bikd,bjkd->bijd(de)', left, right/N)
+//   left  [D, L, N, B]（ggml 布局 dims[0]=最内维；N=seq 维在 dims[2]）
+//   right [D, L, N, B]
+//   dst   [D*D, L, L, B]（特征笛卡尔积）
+//   dst[(d1*D+d2), i, j, b] = (1/N) * sum_n left[d1,i,n,b] * right[d2,j,n,b]
+// 注意：out_prod 只收缩 dims[1]，无法表达此处收缩 dims[2] 的 N 维，故新增 OP_OUTER_PROD_MEAN。
+// N 为收缩维长度（seq 数），由调用方传入（== left->dims[2]）。
+TensorF32* outer_product_mean(TensorF32* left, TensorF32* right, int N);
+
+// outer_product_graph（gate 纯外积）：left [D,L,B] × right [D,L,B] → [D*D,L,L,B]
+//   gate[(d1*D+d2), i, j, b] = left[d1,i,b] * right[d2,j,b]（无收缩，特征笛卡尔积）
+// ggml 布局 dims[0]=最内维。对应值版 `MathUtils::outer_product` 的纯外积语义（但特征维扩展为 D*D）。
+TensorF32* outer_product_graph(TensorF32* left, TensorF32* right);
+
 // 8. 特殊
 TensorF32* diag_mask_inf (TensorF32* a, int n_past);
 TensorF32* diag_mask_zero(TensorF32* a, int n_past);

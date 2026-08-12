@@ -4,6 +4,8 @@
 #include "Tensor.h"
 #include <string>
 #include <vector>
+#include <set>
+#include <utility>
 #include <memory>
 
 namespace rfaa {
@@ -199,8 +201,9 @@ public:
     ModelInput load_from_files(
         const std::string& a3m_path,
         const std::string& sequence,
-        const std::string& csv_path = "",  // 可选: CSV mapping 文件 → true_coords
-        const std::string& hhr_path = ""   // 可选: HHR 模板文件 → 默认空
+        const std::string& csv_path = "",   // 可选: CSV mapping 文件 (或含多个 *_mapping_results.csv 的目录) → true_coords
+        const std::string& template_dir = "", // 可选: 模板结构目录 (cif/pdb), 自动过滤与真实值重复的 PDB id
+        const std::string& hhr_path = ""    // 可选: HHR 模板文件 → 默认空
     );
 
     /**
@@ -221,6 +224,40 @@ public:
     static TensorF32 parse_csv_true_coords(
         const std::string& csv_path,
         int expected_L = -1);  // expected_L < 0 表示以 CSV 行数为准
+
+    // 列出目录下所有 *_mapping_results.csv 文件 (供多结构域 ground truth 合并)
+    static std::vector<std::string> list_csv_mapping_files(const std::string& dir);
+
+    // 合并多个 CSV mapping 为单个 (1, L, 3, 3) 真实坐标。
+    // 每个 CSV 代表一个 PDB 结构域, 覆盖查询序列的一段 (FASTA_Pos 为 1 索引)。
+    // 重叠残基: 以第一个覆盖该残基的 CSV 为准 (取首个非零有效坐标)。
+    // 未被任何 CSV 覆盖的残基坐标保持 0 (供 ca_mask 排除)。
+    static TensorF32 parse_csv_true_coords_multi(
+        const std::vector<std::string>& csv_paths,
+        int L);
+
+    // 从目录收集所有 PDB id (小写, 用于模板过滤): 扫描 csv 文件名 / *.pdb / *.cif
+    static std::set<std::string> collect_ground_truth_pdb_ids(const std::string& dir);
+
+    // 列出目录下所有结构文件 (*.cif / *.pdb), 返回 {路径, 扩展名}
+    static std::vector<std::pair<std::string, std::string>> list_structure_files(const std::string& dir);
+
+    // 解析单个结构文件 (cif/pdb), 提取指定链的骨架坐标 (N, CA, C, O) 与残基数。
+    // out_coords: (N_res*4*3) 展平 [res][atom(0..3)][xyz(0..2)]
+    static void parse_template_structure(
+        const std::string& path,           // *.cif 或 *.pdb
+        const std::string& chain,          // 目标链 id (大小写不敏感), 空则取第一条链
+        std::vector<float>& out_coords,
+        int& out_nres);
+
+    // 从模板目录加载模板结构, 过滤掉与真实值重复的 PDB id。
+    // 填充 input.template_coords / template_ids / template_chains / template_residue_counts。
+    // 链: 优先从同目录 <pdb>_<chain>_coords.npy 推断, 否则取文件第一条链。
+    static void load_templates_from_dir(
+        const std::string& template_dir,
+        const std::set<std::string>& exclude_pdb_ids,
+        ModelInput& input,
+        int max_templates = 4);
 
     ReadTemplatesResult read_templates(
     int qlen,                      // 查询序列长度

@@ -770,8 +770,9 @@ TensorF32 TriangleMultiplication::forward(const TensorF32& pair, bool bOutgoing)
     auto rgv   = right_gate_->forward(*pair_norm);
     auto left_gate  = sigmoid(&lgv);
     auto right_gate = sigmoid(&rgv);
-    auto left_gated  = out_prod(&left, left_gate);
-    auto right_gated = out_prod(&right, right_gate);
+    // gate 为逐元素缩放（非 out_prod 收缩），与 forward_graph 保持一致。
+    auto left_gated  = mul(&left, left_gate);
+    auto right_gated = mul(&right, right_gate);
 
     auto tri_mul_forward = triangle_mul(left_gated, right_gated, float(pair.shape().dims[1]), bOutgoing);
 
@@ -780,7 +781,7 @@ TensorF32 TriangleMultiplication::forward(const TensorF32& pair, bool bOutgoing)
 
     auto gv = gate_->forward(*pair_norm);
     auto gate_out = sigmoid(&gv);
-    auto tri_mul_forward_gated = out_prod(gate_out, &tri_mul_forward_proj);
+    auto tri_mul_forward_gated = mul(gate_out, &tri_mul_forward_proj);
 
     return std::move(*tri_mul_forward_gated);
 }
@@ -795,8 +796,10 @@ TensorF32* TriangleMultiplication::forward_graph(TensorF32* pair, bool bOutgoing
     auto rgv        = right_gate_->forward_graph(pair_norm);
     auto left_gate  = sigmoid(lgv);
     auto right_gate = sigmoid(rgv);
-    auto left_gated  = out_prod(left, left_gate);
-    auto right_gated = out_prod(right, right_gate);
+    // gate 应为逐元素缩放（AF2: left * left_gate），而非 out_prod 收缩（会把残基维缩掉，
+    // 使 tri_mul 收到非标准 [16,16,L,B]，导致维度不一致）。→ 改用逐元素 mul。
+    auto left_gated  = mul(left, left_gate);
+    auto right_gated = mul(right, right_gate);
 
     auto tri_mul_forward = triangle_mul(left_gated, right_gated, float(pair->shape().dims[1]), bOutgoing);
 
@@ -805,7 +808,7 @@ TensorF32* TriangleMultiplication::forward_graph(TensorF32* pair, bool bOutgoing
 
     auto gv = gate_->forward_graph(pair_norm);
     auto gate_out = sigmoid(gv);
-    auto tri_mul_forward_gated = out_prod(gate_out, tri_mul_forward_proj);
+    auto tri_mul_forward_gated = mul(gate_out, tri_mul_forward_proj);
 
     return tri_mul_forward_gated;   // 返回图节点
 }

@@ -384,6 +384,103 @@ TensorF32 outer_product(const TensorF32& left, const TensorF32& right) {
     return result;
 }
 
+TensorF32 outer_product_mean(const TensorF32& left, const TensorF32& right) {
+    const auto& ls = left.shape().dims;
+    const auto& rs = right.shape().dims;
+
+    if (ls.size() != 4 || rs.size() != 4) {
+        throw RFAAError("outer_product_mean expects 4D tensors");
+    }
+    // left/right: (B, N, L, D)，收缩 N（dims[1]），保留 L（dims[2]），特征维做笛卡尔积 D×D→D*D
+    if (ls[0] != rs[0] || ls[2] != rs[2] || ls[3] != rs[3]) {
+        throw RFAAError("outer_product_mean dimension mismatch: batch/residue/feature dims differ");
+    }
+
+    const int64_t B = ls[0];
+    const int64_t N = ls[1];   // 被收缩的序列维
+    const int64_t L = ls[2];
+    const int64_t D = ls[3];
+    const int64_t D2 = D * D;
+
+    // 结果 (B, L, L, D*D) —— 特征维笛卡尔积（与 msa2pair_out_proj_ 输入 256 匹配）
+    TensorF32 result({B, L, L, D2}, left.device());
+
+    const float* ldata = left.data();
+    const float* rdata = right.data();
+    float* odata = result.data();
+
+    const float inv_N = 1.0f / float(N);
+
+    // dst[b,i,j,(d1*D+d2)] = (1/N)*sum_n left[b,n,i,d1]*right[b,n,j,d2]
+    // left[b,n,i,d1]  idx = ((b*N + n)*L + i)*D + d1
+    // right[b,n,j,d2] idx = ((b*N + n)*L + j)*D + d2
+    // dst[b,i,j,(d1*D+d2)] idx = ((b*L + i)*L + j)*D2 + (d1*D + d2)
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t i = 0; i < L; ++i) {
+            for (int64_t j = 0; j < L; ++j) {
+                for (int64_t d1 = 0; d1 < D; ++d1) {
+                    for (int64_t d2 = 0; d2 < D; ++d2) {
+                        float sum = 0.0f;
+                        for (int64_t n = 0; n < N; ++n) {
+                            const float lv = ldata[((b * N + n) * L + i) * D + d1];
+                            const float rv = rdata[((b * N + n) * L + j) * D + d2];
+                            sum += lv * rv;
+                        }
+                        odata[((b * L + i) * L + j) * D2 + (d1 * D + d2)] = sum * inv_N;
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
+TensorF32 outer_product_cartesian(const TensorF32& left, const TensorF32& right) {
+    const auto& ls = left.shape().dims;
+    const auto& rs = right.shape().dims;
+
+    if (ls.size() != 3 || rs.size() != 3) {
+        throw RFAAError("outer_product_cartesian expects 3D tensors");
+    }
+    // left/right: (B, L, D)，特征维做笛卡尔积 D×D→D*D
+    if (ls[0] != rs[0] || ls[2] != rs[2]) {
+        throw RFAAError("outer_product_cartesian dimension mismatch: batch/feature dims differ");
+    }
+
+    const int64_t B = ls[0];
+    const int64_t L = ls[1];
+    const int64_t D = ls[2];
+    const int64_t D2 = D * D;
+
+    // 结果 (B, L, L, D*D)
+    TensorF32 result({B, L, L, D2}, left.device());
+
+    const float* ldata = left.data();
+    const float* rdata = right.data();
+    float* odata = result.data();
+
+    // dst[b,i,j,(d1*D+d2)] = left[b,i,d1] * right[b,j,d2]
+    // left[b,i,d1]  idx = (b*L + i)*D + d1
+    // right[b,j,d2] idx = (b*L + j)*D + d2
+    // dst[b,i,j,(d1*D+d2)] idx = ((b*L + i)*L + j)*D2 + (d1*D + d2)
+    for (int64_t b = 0; b < B; ++b) {
+        for (int64_t i = 0; i < L; ++i) {
+            for (int64_t j = 0; j < L; ++j) {
+                for (int64_t d1 = 0; d1 < D; ++d1) {
+                    for (int64_t d2 = 0; d2 < D; ++d2) {
+                        const float lv = ldata[(b * L + i) * D + d1];
+                        const float rv = rdata[(b * L + j) * D + d2];
+                        odata[((b * L + i) * L + j) * D2 + (d1 * D + d2)] = lv * rv;
+                    }
+                }
+            }
+        }
+    }
+
+    return result;
+}
+
 TensorF32 triangle_mult(
     const TensorF32& left,
     const TensorF32& right,

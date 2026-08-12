@@ -21,6 +21,11 @@
 #include <algorithm>
 #include <limits>
 
+#include <filesystem>
+#include <set>
+#include <map>
+#include <array>
+
 // ========== FFindex 数据结构 ==========
 
 struct FFindexEntry {
@@ -1435,24 +1440,505 @@ TensorF32 RFAADataLoader::parse_csv_true_coords(
     return coords;
 }
 
+// ============================================================================
+// list_csv_mapping_files — 列出目录下所有 *_mapping_results.csv
+// ============================================================================
+std::vector<std::string> RFAADataLoader::list_csv_mapping_files(const std::string& dir) {
+    namespace fs = std::filesystem;
+    std::vector<std::string> files;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) {
+        return files;  // 非目录, 返回空 (由调用方决定是否报错)
+    }
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        std::string name = entry.path().filename().string();
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+        if (lower.find("_mapping_results.csv") != std::string::npos ||
+            lower.find("_mapping.csv") != std::string::npos) {
+            files.push_back(entry.path().string());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// ============================================================================
+// collect_ground_truth_pdb_ids — 从 ground truth 目录收集 PDB id (小写)
+// 用于模板过滤: 扫描 *_mapping_results.csv 前缀与 *.pdb/*.cif 文件名。
+// 例: "1c26_mapping_results.csv" → "1c26"; "1C26.pdb" → "1c26"
+// ============================================================================
+std::set<std::string> RFAADataLoader::collect_ground_truth_pdb_ids(const std::string& dir) {
+    namespace fs = std::filesystem;
+    std::set<std::string> ids;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return ids;
+
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        std::string name = entry.path().filename().string();
+        std::string stem = entry.path().stem().string();  // 去掉扩展名
+        std::string lower = name;
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+
+        // 优先从 *_mapping_results.csv / *_mapping.csv 提取 pdb 前缀
+        if (lower.find("_mapping_results.csv") != std::string::npos ||
+            lower.find("_mapping.csv") != std::string::npos) {
+            size_t pos = lower.find("_mapping");
+            std::string pdb = stem.substr(0, pos);
+            if (!pdb.empty()) ids.insert(pdb);
+        }
+        // 其次从 *.pdb / *.cif 文件名提取
+        else if (lower.find(".pdb") != std::string::npos ||
+                 lower.find(".cif") != std::string::npos) {
+            std::string pdb = stem;
+            // 若带链后缀 (如 1abc_A), 取 pdb 前缀
+            auto us = pdb.find('_');
+            if (us != std::string::npos) pdb = pdb.substr(0, us);
+            std::transform(pdb.begin(), pdb.end(), pdb.begin(), ::tolower);
+            if (!pdb.empty()) ids.insert(pdb);
+        }
+    }
+    return ids;
+}
+
+// ============================================================================
+// list_structure_files — 列出目录下所有结构文件 (*.cif / *.pdb)
+// 返回: {完整路径, 小写扩展名}
+// ============================================================================
+std::vector<std::pair<std::string, std::string>> RFAADataLoader::list_structure_files(
+    const std::string& dir) {
+    namespace fs = std::filesystem;
+    std::vector<std::pair<std::string, std::string>> files;
+    std::error_code ec;
+    if (!fs::is_directory(dir, ec)) return files;
+    for (const auto& entry : fs::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file()) continue;
+        std::string ext = entry.path().extension().string();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+        if (ext == ".cif" || ext == ".pdb") {
+            files.emplace_back(entry.path().string(), ext);
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// ============================================================================
+// parse_csv_true_coords_multi — 合并多个 CSV mapping 为单个 (1, L, 3, 3) 真实坐标
+//
+// 背景: 一个 uniprot id (如 P04637) 的查询序列可能被多个 PDB 结构域覆盖,
+//       每个 CSV 对应一个 PDB, 记录该 PDB 结构域所覆盖的查询残基坐标。
+//       FASTA_Pos 是 1 索引的查询序列位置。
+//
+// 合并规则:
+//   1. 遍历所有 CSV, 将每个残基的 [N, CA, C] 坐标放入其 FASTA_Pos-1 处。
+//   2. 重叠残基 (多个 CSV 覆盖同一位置): 取首个覆盖且坐标非全零的 CSV。
+//   3. 未被任何 CSV 覆盖的残基坐标保持 0 (供 prepare_ca_mask 排除, 不参与监督)。
+// ============================================================================
+TensorF32 RFAADataLoader::parse_csv_true_coords_multi(
+    const std::vector<std::string>& csv_paths,
+    int L)
+{
+    if (L <= 0) {
+        throw std::runtime_error("parse_csv_true_coords_multi: invalid L=" + std::to_string(L));
+    }
+    // (L, 3, 3): [res][atom 0=N,1=CA,2=C][xyz]
+    TensorF32 coords({1, L, 3, 3}, Device::CPU);
+    coords.zero_();
+    std::vector<char> filled(L, 0);  // 该残基是否已被有效坐标填充
+
+    for (const auto& csv_path : csv_paths) {
+        std::ifstream file(csv_path);
+        if (!file.is_open()) {
+            std::cerr << "[WARN] skip unreadable CSV: " << csv_path << std::endl;
+            continue;
+        }
+
+        struct Atom3D { std::string name; float xyz[3]; };
+        std::string line;
+        bool is_header = true;
+        while (std::getline(file, line)) {
+            if (line.empty()) continue;
+            if (line.back() == '\r') line.pop_back();
+
+            // ===== CSV 字段解析 (兼容引号包裹) =====
+            std::vector<std::string> fields;
+            std::string cur;
+            bool in_quotes = false;
+            for (size_t i = 0; i < line.size(); i++) {
+                char c = line[i];
+                if (c == '"') {
+                    in_quotes = !in_quotes;
+                } else if (c == ',' && !in_quotes) {
+                    fields.push_back(cur);
+                    cur.clear();
+                } else {
+                    cur.push_back(c);
+                }
+            }
+            fields.push_back(cur);
+            if (is_header) { is_header = false; continue; }
+            if (fields.size() < 8) continue;
+
+            // FASTA_Pos (1 索引)
+            int fasta_pos = 0;
+            try { fasta_pos = std::stoi(fields[0]); } catch (...) { continue; }
+            if (fasta_pos < 1 || fasta_pos > L) continue;  // 越界跳过
+            int l = fasta_pos - 1;
+            if (filled[l]) continue;  // 已被更早 CSV 覆盖, 跳过
+
+            // CA 回退列 (字段 4,5,6)
+            float ca_fallback[3] = {0, 0, 0};
+            try {
+                ca_fallback[0] = std::stof(fields[4]);
+                ca_fallback[1] = std::stof(fields[5]);
+                ca_fallback[2] = std::stof(fields[6]);
+            } catch (...) { /* 保持 0 */ }
+
+            // All_Atoms_Coords (字段 7): 提取 N / CA / C
+            float pN[3] = {0,0,0}, pCA[3] = {0,0,0}, pC[3] = {0,0,0};
+            bool hasN=false, hasCA=false, hasC=false;
+            const std::string& all_atoms = fields[7];
+            size_t pos = 0;
+            while (pos < all_atoms.size()) {
+                size_t open = all_atoms.find('(', pos);
+                if (open == std::string::npos) break;
+                std::string name = all_atoms.substr(pos, open - pos);
+                name.erase(0, name.find_first_not_of(" \t"));
+                name.erase(name.find_last_not_of(" \t") + 1);
+                size_t close = all_atoms.find(')', open);
+                if (close == std::string::npos) break;
+                std::string coord_str = all_atoms.substr(open + 1, close - open - 1);
+                float x=0,y=0,z=0;
+                if (sscanf(coord_str.c_str(), "%f,%f,%f", &x, &y, &z) == 3) {
+                    if (name == "N")  { pN[0]=x;pN[1]=y;pN[2]=z; hasN=true; }
+                    if (name == "CA") { pCA[0]=x;pCA[1]=y;pCA[2]=z; hasCA=true; }
+                    if (name == "C")  { pC[0]=x;pC[1]=y;pC[2]=z; hasC=true; }
+                }
+                pos = close + 1;
+            }
+
+            // CA 回退到 CA_X/Y/Z 列; N/C 缺失回退到 CA
+            if (!hasCA) { pCA[0]=ca_fallback[0]; pCA[1]=ca_fallback[1]; pCA[2]=ca_fallback[2]; }
+            if (!hasN)  { pN[0]=pCA[0]; pN[1]=pCA[1]; pN[2]=pCA[2]; }
+            if (!hasC)  { pC[0]=pCA[0]; pC[1]=pCA[1]; pC[2]=pCA[2]; }
+
+            // 校验: CA 坐标非零才视为有效 (避免占位残基污染)
+            if (fabsf(pCA[0]) + fabsf(pCA[1]) + fabsf(pCA[2]) < 1e-6f) continue;
+
+            float* base = coords.data() + (l * 3) * 3;
+            base[0*3+0]=pN[0]; base[0*3+1]=pN[1]; base[0*3+2]=pN[2];
+            base[1*3+0]=pCA[0]; base[1*3+1]=pCA[1]; base[1*3+2]=pCA[2];
+            base[2*3+0]=pC[0]; base[2*3+1]=pC[1]; base[2*3+2]=pC[2];
+            filled[l] = 1;
+        }
+    }
+
+    int covered = 0;
+    for (char f : filled) covered += (f != 0);
+    std::cout << "[DataLoader] merged " << csv_paths.size() << " CSV mapping files: "
+              << covered << "/" << L << " residues covered" << std::endl;
+    return coords;
+}
+
+// ============================================================================
+// parse_template_structure — 解析单个结构文件 (cif/pdb), 提取指定链骨架坐标
+//
+// 输出 out_coords 为展平 (N_res * 4 * 3): [res][atom 0..3 = N,CA,C,O][xyz 0..2]。
+// 只保留骨干重原子完整的标准残基 (与 python extract_template_coords.py 一致)。
+// ============================================================================
+void RFAADataLoader::parse_template_structure(
+    const std::string& path,
+    const std::string& chain,
+    std::vector<float>& out_coords,
+    int& out_nres)
+{
+    out_coords.clear();
+    out_nres = 0;
+    std::string ext = std::filesystem::path(path).extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+
+    // 目标链小写 (用于大小写不敏感比较)
+    std::string target_chain = chain;
+    std::transform(target_chain.begin(), target_chain.end(), target_chain.begin(), ::tolower);
+
+    // ---- 残基级骨架原子缓存: 按 (chain, resseq) 组织 ----
+    // 每个残基: N/CA/C/O 坐标, 记已找到哪些原子
+    struct ResKey { std::string chain; std::string resseq; std::string comp; };
+    auto key_less = [](const ResKey& a, const ResKey& b) {
+        if (a.chain != b.chain) return a.chain < b.chain;
+        return a.resseq < b.resseq;
+    };
+    std::map<ResKey, std::array<float,4*3>, decltype(key_less)> res_atoms(key_less);
+    std::map<ResKey, std::array<char,4>, decltype(key_less)> res_found(key_less);
+
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        throw std::runtime_error("Cannot open structure file: " + path);
+    }
+
+    auto store_atom = [&](const std::string& ch, const std::string& resseq,
+                          const std::string& comp, const std::string& atom,
+                          float x, float y, float z) {
+        ResKey k{ch, resseq, comp};
+        // 标准氨基酸 (20 AA)
+        static const std::string AA = "ARNDCQEGHILKMFPSTWYV";
+        if (comp.size() == 1 && AA.find(comp[0]) == std::string::npos) return;
+        if (comp.size() == 3) {
+            // 三字母转单字母 (常用子集)
+            static const char* tri[20] = {"ALA","ARG","ASN","ASP","CYS","GLN","GLU",
+                "GLY","HIS","ILE","LEU","LYS","MET","PHE","PRO","SER","THR","TRP","TYR","VAL"};
+            bool ok = false;
+            for (int i = 0; i < 20; i++) if (comp == tri[i]) { ok = true; break; }
+            if (!ok) return;
+        }
+        int atom_idx = -1;
+        if (atom == "N") atom_idx = 0;
+        else if (atom == "CA") atom_idx = 1;
+        else if (atom == "C") atom_idx = 2;
+        else if (atom == "O") atom_idx = 3;
+        if (atom_idx < 0) return;
+        auto& a = res_atoms[k];
+        a[atom_idx*3+0]=x; a[atom_idx*3+1]=y; a[atom_idx*3+2]=z;
+        res_found[k][atom_idx] = 1;
+    };
+
+    std::string line;
+    if (ext == ".cif") {
+        // ---- CIF: 逐行解析 _atom_site loop ----
+        bool in_atom_site = false;
+        // col_indices[i] = 第 i 个目标列的列位置 (i: 0=group_PDB,1=label_atom_id,
+        // 2=label_comp_id,3=label_asym_id,4=label_seq_id,5/6/7=Cartn_x/y/z)
+        std::vector<int> col_indices(8, -1);
+        std::vector<std::string> col_headers;
+        while (std::getline(file, line)) {
+            if (line.back() == '\r') line.pop_back();
+            std::istringstream iss(line);
+            std::string tok;
+            std::vector<std::string> cols;
+            while (iss >> tok) cols.push_back(tok);
+            if (cols.empty()) continue;
+
+            // 进入 / 退出 atom_site 段落
+            if (cols[0].rfind("_atom_site.", 0) == 0) {
+                in_atom_site = true;
+                col_headers.push_back(cols[0].substr(std::string("_atom_site.").size()));
+                // 记录列索引
+                int idx = static_cast<int>(col_headers.size()) - 1;
+                const std::string& h = col_headers.back();
+                if (h == "group_PDB") col_indices[0]=idx;
+                else if (h == "label_atom_id") col_indices[1]=idx;
+                else if (h == "label_comp_id") col_indices[2]=idx;
+                else if (h == "label_asym_id") col_indices[3]=idx;
+                else if (h == "label_seq_id") col_indices[4]=idx;
+                else if (h == "Cartn_x") col_indices[5]=idx;
+                else if (h == "Cartn_y") col_indices[6]=idx;
+                else if (h == "Cartn_z") col_indices[7]=idx;
+                continue;
+            }
+            if (in_atom_site && cols[0] == "#") { in_atom_site = false; continue; }
+            if (!in_atom_site) continue;
+            if (cols[0] == "loop_") continue;
+            if (cols.size() < 8) continue;
+            if (cols[0] != "ATOM") continue;  // 仅标准原子行
+
+            auto cget = [&](int ci)->std::string{
+                if (ci < 0 || ci >= (int)cols.size()) return "";
+                return cols[ci];
+            };
+            std::string atom = cget(col_indices[1]);
+            std::string comp = cget(col_indices[2]);
+            std::string ch   = cget(col_indices[3]);
+            std::string rsq  = cget(col_indices[4]);
+            float x=0,y=0,z=0;
+            try { x=std::stof(cget(col_indices[5])); y=std::stof(cget(col_indices[6])); z=std::stof(cget(col_indices[7])); }
+            catch (...) { continue; }
+            std::string chl = ch;
+            std::transform(chl.begin(), chl.end(), chl.begin(), ::tolower);
+            if (!target_chain.empty() && chl != target_chain) continue;
+            store_atom(ch, rsq, comp, atom, x, y, z);
+        }
+    } else {
+        // ---- PDB: 解析 ATOM 记录 (固定列宽) ----
+        while (std::getline(file, line)) {
+            if (line.size() < 54) continue;
+            std::string record = line.substr(0, 6);
+            if (record.rfind("ATOM", 0) != 0) continue;
+            std::string atom = line.substr(12, 4);
+            atom.erase(0, atom.find_first_not_of(" "));
+            atom.erase(atom.find_last_not_of(" ") + 1);
+            std::string resname = line.substr(17, 3);
+            std::string chain = line.substr(21, 1);
+            std::string resseq = line.substr(22, 4);
+            std::string chl = chain;
+            std::transform(chl.begin(), chl.end(), chl.begin(), ::tolower);
+            if (!target_chain.empty() && chl != target_chain) continue;
+            try {
+                float x = std::stof(line.substr(30, 8));
+                float y = std::stof(line.substr(38, 8));
+                float z = std::stof(line.substr(46, 8));
+                store_atom(chain, resseq, resname, atom, x, y, z);
+            } catch (...) { continue; }
+        }
+    }
+
+    // ---- 组装: 仅保留 4 个骨架原子齐全的残基 ----
+    for (const auto& kv : res_atoms) {
+        const auto& f = res_found[kv.first];
+        if (!(f[0] && f[1] && f[2] && f[3])) continue;  // 缺任一骨架原子则跳过
+        const auto& a = kv.second;
+        for (int i = 0; i < 12; i++) out_coords.push_back(a[i]);
+        out_nres++;
+    }
+}
+
+// ============================================================================
+// load_templates_from_dir — 从目录加载模板结构 (cif/pdb), 过滤真实值重复 PDB
+// ============================================================================
+void RFAADataLoader::load_templates_from_dir(
+    const std::string& template_dir,
+    const std::set<std::string>& exclude_pdb_ids,
+    ModelInput& input,
+    int max_templates)
+{
+    namespace fs = std::filesystem;
+    input.template_coords.clear();
+    input.template_ids.clear();
+    input.template_chains.clear();
+    input.template_residue_counts.clear();
+
+    auto files = list_structure_files(template_dir);
+    if (files.empty()) {
+        std::cout << "[DataLoader] no structure files found in: " << template_dir << std::endl;
+        return;
+    }
+
+    // 预扫描同目录 <pdb>_<chain>_coords.npy 以推断目标链
+    std::map<std::string, std::string> pdb_to_chain;  // pdb(小写) -> chain
+    {
+        std::error_code ec;
+        for (const auto& entry : fs::directory_iterator(template_dir, ec)) {
+            if (ec) break;
+            std::string name = entry.path().filename().string();
+            if (name.size() < 12) continue;
+            if (name.rfind("_coords.npy") != name.size() - 11) continue;
+            std::string stem = entry.path().stem().string();   // "<pdb>_<chain>_coords"
+            if (stem.rfind("_coords") != stem.size() - 7) continue;
+            std::string base = stem.substr(0, stem.size() - 7); // "<pdb>_<chain>"
+            auto us = base.rfind('_');
+            if (us == std::string::npos || us == 0 || us == base.size() - 1) continue;
+            std::string pdb = base.substr(0, us);
+            std::string ch  = base.substr(us + 1);
+            std::transform(pdb.begin(), pdb.end(), pdb.begin(), ::tolower);
+            pdb_to_chain[pdb] = ch;
+        }
+    }
+
+    int loaded = 0;
+    for (const auto& fp : files) {
+        if (loaded >= max_templates) break;
+        std::string stem = fs::path(fp.first).stem().string();
+        std::string pdb = stem;
+        auto us = pdb.find('_');
+        if (us != std::string::npos) pdb = pdb.substr(0, us);
+        std::transform(pdb.begin(), pdb.end(), pdb.begin(), ::tolower);
+
+        // 过滤: 与真实值 (ground truth) 相同的 PDB id 不再作为模板
+        if (exclude_pdb_ids.count(pdb) > 0) {
+            std::cout << "[DataLoader] skip template (duplicate of ground truth): "
+                      << pdb << std::endl;
+            continue;
+        }
+
+        std::string chain;
+        auto it = pdb_to_chain.find(pdb);
+        if (it != pdb_to_chain.end()) chain = it->second;  // 由 _coords.npy 推断, 否则取首链
+
+        std::vector<float> coords;
+        int nres = 0;
+        try {
+            parse_template_structure(fp.first, chain, coords, nres);
+        } catch (const std::exception& e) {
+            std::cerr << "[WARN] parse template failed: " << fp.first
+                      << " (" << e.what() << ")" << std::endl;
+            continue;
+        }
+        if (nres == 0 || coords.empty()) {
+            std::cout << "[DataLoader] template yields no complete backbone residues: "
+                      << fp.first << std::endl;
+            continue;
+        }
+
+        TensorF32 t({nres, 4, 3}, Device::CPU);
+        std::memcpy(t.data(), coords.data(), coords.size() * sizeof(float));
+        input.template_coords.push_back(std::move(t));
+        input.template_ids.push_back(pdb);
+        input.template_chains.push_back(chain.empty() ? "A" : chain);
+        input.template_residue_counts.push_back(nres);
+        loaded++;
+    }
+    std::cout << "[DataLoader] loaded " << loaded << " templates (excluded "
+              << exclude_pdb_ids.size() << " ground-truth pdb ids)" << std::endl;
+}
+
 ModelInput RFAADataLoader::load_from_files(
     const std::string& a3m_path,
     const std::string& sequence,
     const std::string& csv_path,
+    const std::string& template_dir,
     const std::string& hhr_path
 ) {
     ModelInput input;
 
-    // 如果提供了 CSV mapping 文件, 加载真实坐标作为 ground truth
+    // ============================================================
+    // ground truth 真实坐标加载
+    // csv_path 可以是:
+    //   - 单个 CSV mapping 文件 (单一结构域)
+    //   - 一个目录 (含多个 *_mapping_results.csv, 对应多个 PDB 结构域)
+    // 当一个 uniprot 序列被多个 PDB 覆盖时, 目录方式会将它们合并为
+    // 单个 (1, L, 3, 3) 真实坐标 (重叠残基取首个覆盖)。
+    // ============================================================
+    int L = static_cast<int>(sequence.length());
     if (!csv_path.empty()) {
-        int L = (sequence.empty())
-                ? 0   // 无序列时以 CSV 行数为准 (parse_csv_true_coords 内部处理)
-                : static_cast<int>(sequence.length());
-        TensorF32 true_coords = parse_csv_true_coords(csv_path, L);
-        input.true_coords = std::move(true_coords);
-        // 同时用真实坐标初始化 input.coords (推理/初始结构), 复制一份
-        input.coords = TensorF32(input.true_coords.shape(), Device::CPU);
-        input.coords.copy_from(input.true_coords);
+        TensorF32 true_coords;
+        // 判断是目录还是文件
+        bool is_dir = std::filesystem::is_directory(csv_path);
+        if (is_dir) {
+            auto csv_files = list_csv_mapping_files(csv_path);
+            if (csv_files.empty()) {
+                std::cerr << "[WARN] no *_mapping_results.csv found in dir: "
+                          << csv_path << std::endl;
+            } else {
+                true_coords = parse_csv_true_coords_multi(csv_files, L);
+            }
+        } else {
+            true_coords = parse_csv_true_coords(csv_path, L);
+        }
+        if (true_coords.numel() > 0) {
+            input.true_coords = std::move(true_coords);
+            // 同时用真实坐标初始化 input.coords (推理/初始结构), 复制一份
+            input.coords = TensorF32(input.true_coords.shape(), Device::CPU);
+            input.coords.copy_from(input.true_coords);
+        }
+    }
+
+    // ============================================================
+    // 模板结构加载 (可选)
+    // template_dir: 含 *.cif / *.pdb 的目录。自动过滤掉与真实值
+    // (ground truth) 相同 PDB id 的模板 (不再作为模板使用)。
+    // 结果存入 input.template_coords / template_ids / chains / residue_counts。
+    // ============================================================
+    if (!template_dir.empty()) {
+        std::set<std::string> exclude_ids;
+        if (!csv_path.empty() && std::filesystem::is_directory(csv_path)) {
+            exclude_ids = collect_ground_truth_pdb_ids(csv_path);
+        }
+        load_templates_from_dir(template_dir, exclude_ids, input, max_templates_);
     }
     
     // Step 1: 解析 A3M (含插入计数矩阵)

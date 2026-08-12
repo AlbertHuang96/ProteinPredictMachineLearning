@@ -593,6 +593,51 @@ void ComputeGraph::compute_backward(
                     add_or_set(ctx, cgraph, isrc1, grad_right);
             }
         } break;
+        case OP_OUTER_PROD_MEAN: {
+            // dst[(d1*D+d2), i, j, b] = (1/N)*sum_n left[d1,i,n,b]*right[d2,j,n,b]  (特征笛卡尔积+收缩 seq)
+            // dL/dleft [d1,i,n,b] = (1/N) * sum_{d2,j} grad[(d1*D+d2), i, j, b] * right[d2,j,n,b]
+            // dL/dright[d2,j,n,b] = (1/N) * sum_{d1,i} grad[(d1*D+d2), i, j, b] * left[d1,i,n,b]
+            if (src0_needs_grads || src1_needs_grads) {
+                TensorF32* grad_left  = src0_needs_grads ? context().new_tensor<float>(src0->shape().ndim(), src0->shape().dims.data()) : nullptr;
+                TensorF32* grad_right = src1_needs_grads ? context().new_tensor<float>(src1->shape().ndim(), src1->shape().dims.data()) : nullptr;
+
+                TensorF32* back_node = context().new_tensor<float>(tensor->shape().ndim(), tensor->shape().dims.data());
+                back_node->op      = OP_OUTER_PROD_MEAN_BACK;
+                back_node->src[0]  = grad;       // upstream grad [D*D,L,L,B]
+                back_node->src[1]  = src0;       // left  [D,L,N,B]
+                back_node->src[2]  = src1;       // right [D,L,N,B]
+                back_node->src[3]  = grad_left;
+                back_node->src[4]  = grad_right;
+                memcpy(back_node->op_params, tensor->op_params, sizeof(float));  // N
+
+                if (src0_needs_grads && grad_left)
+                    add_or_set(ctx, cgraph, isrc0, grad_left);
+                if (src1_needs_grads && grad_right)
+                    add_or_set(ctx, cgraph, isrc1, grad_right);
+            }
+        } break;
+        case OP_OUTER_PROD: {
+            // dst[(d1*D+d2), i, j, b] = left[d1,i,b]*right[d2,j,b]  (纯外积，特征笛卡尔积)
+            // dL/dleft [d1,i,b] = sum_{d2,j} grad[(d1*D+d2), i, j, b] * right[d2,j,b]
+            // dL/dright[d2,j,b] = sum_{d1,i} grad[(d1*D+d2), i, j, b] * left[d1,i,b]
+            if (src0_needs_grads || src1_needs_grads) {
+                TensorF32* grad_left  = src0_needs_grads ? context().new_tensor<float>(src0->shape().ndim(), src0->shape().dims.data()) : nullptr;
+                TensorF32* grad_right = src1_needs_grads ? context().new_tensor<float>(src1->shape().ndim(), src1->shape().dims.data()) : nullptr;
+
+                TensorF32* back_node = context().new_tensor<float>(tensor->shape().ndim(), tensor->shape().dims.data());
+                back_node->op      = OP_OUTER_PROD_BACK;
+                back_node->src[0]  = grad;       // upstream grad [D*D,L,L,B]
+                back_node->src[1]  = src0;       // left  [D,L,B]
+                back_node->src[2]  = src1;       // right [D,L,B]
+                back_node->src[3]  = grad_left;
+                back_node->src[4]  = grad_right;
+
+                if (src0_needs_grads && grad_left)
+                    add_or_set(ctx, cgraph, isrc0, grad_left);
+                if (src1_needs_grads && grad_right)
+                    add_or_set(ctx, cgraph, isrc1, grad_right);
+            }
+        } break;
         case OP_GET_ROWS: {
             // 前向: y = get_rows(src0=W, src1=idx) = W[idx]
             // 反向: dL/dW = get_rows_back(grad, idx, W) — 按 idx 散点累加
@@ -637,6 +682,12 @@ void ComputeGraph::compute_backward(
         } break;
         case OP_PER_EDGE_MATMUL_BACK_GATHERED: {
             // 同上：其 src 已是梯度节点，无需继续求导。
+        } break;
+        case OP_OUTER_PROD_MEAN_BACK: {
+            // 该反向 op 的 src 已是梯度节点，无需继续求导。
+        } break;
+        case OP_OUTER_PROD_BACK: {
+            // 该反向 op 的 src 已是梯度节点，无需继续求导。
         } break;
         case OP_DIAG_MASK_INF: {
             if (src0_needs_grads) {

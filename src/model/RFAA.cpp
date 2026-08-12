@@ -315,20 +315,14 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // msa (B,N,L,256) -> Linear -> (B,N,L,16)
         // outer product + mean -> (B,L,L,256) -> Linear -> (B,L,L,128)
         {
-            // msa2pair
-            int N = msa.shape().dims[1];
-            // 旧栈上变量: LayerNorm msa_norm(D_MSA); → msa2pair_norm_
+            // msa2pair: einsum('bikd,bjkd->bijd', left, right/N) — 收缩 seq 维 N(dims[1])
+            // 值版须用 outer_product_mean（outer_product 签名 (B,1,L,D)×(B,L,1,D) 是纯外积，
+            // 与此处的"外积+对 N 求均值"不符，且输入形状 (B,N,L,16) 不匹配 → 修正为 outer_product_mean）。
             auto& msa_normed = *msa2pair_norm_->forward(&msa);
-            // 旧栈上变量: LinearLayer left_proj(D_MSA, 16); → msa2pair_left_proj_
-            // 旧栈上变量: LinearLayer right_proj(D_MSA, 16); → msa2pair_right_proj_
-            TensorF32 left = msa2pair_left_proj_->forward(msa_normed);   // (B,N,L,16)
-            TensorF32 right = msa2pair_right_proj_->forward(msa_normed); // (B,N,L,16)
-            auto& right_mean = *scale(&right, 1.0f / float(N));  // right / N
-            // a tensor divide a scalar
-            TensorF32 pair_update = outer_product(left, right_mean);  // (B,L,L,256)
-            // dim of pair_update?
-            // reshape to (B, L, L, 16*16) = (B, L, L, 256)?
-            // 旧栈上变量: LinearLayer out_proj(16 * 16, D_PAIR); → msa2pair_out_proj_
+            TensorF32 left  = msa2pair_left_proj_->forward(msa_normed);   // (B,N,L,16)
+            TensorF32 right = msa2pair_right_proj_->forward(msa_normed);  // (B,N,L,16)
+            // dst[b,i,j,d] = (1/N)*sum_n left[b,n,i,d]*right[b,n,j,d] → (B,L,L,16)
+            TensorF32 pair_update = outer_product_mean(left, right);
             pair_update = msa2pair_out_proj_->forward(pair_update);  // (B,L,L,128)
             pair.copy_from(*add_impl(&pair, &pair_update, /*inplace=*/false));  // residual
         }
@@ -354,7 +348,8 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             // different weights for left and right?
             TensorF32 left = pair2pair_left_proj_->forward(state_normed);   // (B,L,16)
             TensorF32 right = pair2pair_right_proj_->forward(state_normed); // (B,L,16)
-            TensorF32 gate = outer_product(left, right);  // (B,L,L,256)
+            // gate 纯外积，特征笛卡尔积 (B,L,L,256)，与 gate_proj 输入 256 匹配
+            TensorF32 gate = outer_product_cartesian(left, right);  // (B,L,L,256)
             // 旧栈上变量: LinearLayer gate_proj(16 * 16, D_PAIR); → pair2pair_gate_proj_
             // d_hidden_gate = 16
             gate = pair2pair_gate_proj_->forward(gate);  // (B,L,L,128)
@@ -602,17 +597,16 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
     msa = msa_ff_->forward_graph(msa);
 
     // ------------ 2D track: msa2pair (outer-product-mean) ------------
-    // TODO(入口驱动): msa2pair 的 outer-product-mean = einsum('bikd,bjkd->bijd',
-    //                left, right) 需要收缩 N_seq 维，当前图 out_prod 只收缩 dims[1]，
-    //                无对应 einsum 图 op；且值版 outer_product(B,N,L,16)×(B,N,L,16)
-    //                与 MathUtils::outer_product 签名 (B,1,L,D)×(B,L,1,D) 不符，
-    //                属待修。此处以图节点骨架 + 回落 TODO 标注:
-    //   auto msa_normed = msa2pair_norm_->forward(msa);            // [D_MSA, L, N, B]
-    //   auto left  = msa2pair_left_proj_->forward_graph(msa_normed);   // [16, L, N, B]
-    //   auto right = msa2pair_right_proj_->forward_graph(msa_normed);  // [16, L, N, B]
-    //   auto right_mean = scale(right, 1.0f / N);                 // right / N
-    //   auto pair_update = outer_product_mean_graph(left, right_mean);  // [128,L,L,B]
-    //   pair = add_impl(pair, pair_update, /*inplace=*/false);    // residual
+    // einsum('bikd,bjkd->bijd(de)', left, right/N) — 收缩 seq 维 N（dims[2]），特征笛卡尔积 D×D→D*D。
+    // msa 图 [D_MSA,L,N,B]：N = dims[2]（seq），L = dims[1]（残基）。
+    // 用专用图 op OP_OUTER_PROD_MEAN（out_prod 只收缩 dims[1]，无法收缩 N 维）。
+    const int64_t Nseq_msa2pair = msa->shape().dims[2];
+    auto msa_normed  = msa2pair_norm_->forward(msa);                 // [D_MSA, L, N, B]
+    auto left        = msa2pair_left_proj_->forward_graph(msa_normed);   // [16, L, N, B]
+    auto right       = msa2pair_right_proj_->forward_graph(msa_normed);  // [16, L, N, B]
+    auto pair_update = outer_product_mean(left, right, static_cast<int>(Nseq_msa2pair));  // [256,L,L,B]
+    pair_update      = msa2pair_out_proj_->forward_graph(pair_update);   // [D_PAIR,L,L,B]
+    pair             = add_impl(pair, pair_update, /*inplace=*/false);   // residual
 
     // Triangle Multiplication (out/in) + residual
     pair = add_impl(pair, tri_mul_out_->forward_graph(pair, /*bOutgoing=*/true),
@@ -625,13 +619,14 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
     // rbf -> rbf_proj (bias 注入 pair row/col attention)
     TensorF32* rbf_proj = pair2pair_rbf_proj_->forward_graph(rbf);   // [128, L, L, B]
     // gate = sigmoid(gate_proj(outer_product(state)))
-    // TODO(入口驱动): gate 的 outer_product(left,right)->gate_proj->sigmoid 亦需
-    //                einsum 图 op（同 msa2pair 注），先跳过，rbf_proj 直接作 bias。
-    //   TensorF32* state_normed = pair2pair_state_norm_->forward(state);
-    //   TensorF32* left  = pair2pair_left_proj_->forward_graph(state_normed);   // [16,L,B]
-    //   TensorF32* right = pair2pair_right_proj_->forward_graph(state_normed);  // [16,L,B]
-    //   TensorF32* gate  = gate_outer_mean_graph(left, right);                   // TODO
-    //   rbf_proj = mul(rbf_proj, gate);
+    // state 图 [D_STATE, L, B]；gate 用 OP_OUTER_PROD（纯外积，特征笛卡尔积 D*D→256）
+    TensorF32* state_normed  = pair2pair_state_norm_->forward(state);           // [D_STATE, L, B]
+    TensorF32* gate_left  = pair2pair_left_proj_->forward_graph(state_normed);  // [16, L, B]
+    TensorF32* gate_right = pair2pair_right_proj_->forward_graph(state_normed); // [16, L, B]
+    TensorF32* gate       = outer_product_graph(gate_left, gate_right);         // [256, L, L, B]
+    gate = pair2pair_gate_proj_->forward_graph(gate);                           // [128, L, L, B]
+    gate = sigmoid(gate);                                                       // [0,1]
+    rbf_proj = mul(rbf_proj, gate);                                             // element-wise gate
 
     // Biased Axial Attention (row/col) + residual
     pair = add_impl(pair, pair_row_attn_->forward_graph(pair, rbf_proj),
@@ -641,14 +636,19 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
     // TODO: pair_ff residual（值版 forward 中 pair_ff 亦未激活，后续补齐）
 
     // ------------ 3D track: SE3 Transformer ------------
-    // 当提供结构输入（coords/seq1hot）时，追加 SE3 等变更新。
-    // 结构常量（make_graph → 边 src/tgt/d/w、basis）依赖"更新后 pair 的值"，而 pair 在此为图节点，
-    //    需训练入口在 block 边界回落值后经值版 embed_e_/norm_edge_3d_/make_graph 计算，再注入
-    //    run_se3_graph。因此此处 forward_graph 本身不构造 G/basis，SE3 由训练入口调用
-    //    run_se3_graph(G, basis, coords, seq1hot) 驱动（图外值回落），见 run_se3_graph 说明。
-    // TODO(入口驱动): 训练入口在每次 block 前回落 pair → edge_out → make_graph → basis，
-    //   然后调用 run_se3_graph 完成 SE3 图块与 state 回写。
-    (void)coords; (void)residx; (void)seq1hot;
+    // SE3 图块由"训练入口"驱动（图外值回落）：
+    //   forward_graph 只构建 msa/pair/rbf 图节点并返回 pair；SE3 的结构常量（make_graph → G、
+    //   basis）依赖"更新后 pair 的值"，而 pair 在此为图节点、未 graph_compute，故不能在
+    //   forward_graph 内部构造 G/basis。
+    //   训练入口在每个 block 边界需：
+    //     1) graph_compute(pair) 得到 pair_value；
+    //     2) 调用 run_se3_structural(msa, pair, rbf, state, pair_value, coords, residx, seq1hot)，
+    //        其内部 Phase A 回落 pair_value → embed_e_ → norm_edge_3d_ → make_graph → basis；
+    //        Phase B 调用 run_se3_graph 追加可微 SE3 图节点并把 state 回写为图节点；
+    //     3) graph_compute 返回的 offset 图节点（se3_out[1]）后，调用
+    //        apply_coord_update(offset_value, coords) 更新骨架坐标 → xyz_new_。
+    //   当未提供结构输入（coords/seq1hot==nullptr）时跳过 SE3，等价纯 1D/2D track。
+    //(void)coords; (void)residx; (void)seq1hot;
 
     return pair;
 }
@@ -662,11 +662,13 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
 //   state    = out[0].view({B,L,D_STATE})（引用回写）
 // 说明：结构预处理（make_graph 需 edge_out 值张量）属"图外"，由训练入口在 block 边界
 //       回落值计算后传入 G/basis/coords；此处仅做可微 node 嵌入 + se3_ 调用。
-void IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
-                              TensorF32*& state,
-                              const se3::GraphData& G, const SE3Basis& basis,
-                              const TensorF32& coords, const TensorF32& seq1hot) {
-    (void)pair; (void)rbf;
+// 返回 se3_out 图节点：[0]=state(度0), [1]=offset(度1，坐标更新用，训练入口 graph_compute 后
+//      回落值 + apply_coord_update 更新骨架坐标)。
+std::vector<TensorF32*> IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                                                 TensorF32*& state,
+                                                 const se3::GraphData& G, const SE3Basis& basis,
+                                                 const TensorF32& coords, const TensorF32& seq1hot) {
+    //(void)pair; (void)rbf;
     const int B = seq1hot.shape().dims[0];
     const int L = seq1hot.shape().dims[1];
     const int64_t N = static_cast<int64_t>(B) * L;   // 图节点数
@@ -703,7 +705,7 @@ void IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
     const int64_t E = G.edge_index.numel() > 0 ? G.edge_index.shape().dims[1] : 0;
     if (E <= 0) {
         // 无有效边图（结构常量未注入），SE3 图块无法执行；仅回写 state=输入（等价跳过）。
-        return;
+        return {};
     }
     std::vector<float> src_d(static_cast<size_t>(E)), tgt_d(static_cast<size_t>(E));
     for (int64_t e = 0; e < E; ++e) {
@@ -734,8 +736,75 @@ void IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
     // se3_out[0] 为 [32, B*L]（度0 输出），节点序 n=b*L+l → view [D_STATE, L, B]
     state = view(se3_out[0], Shape({D_STATE, L, B}));
 
-    // TODO(入口驱动): 坐标更新 = offset(se3_out[1]) 回落值后叠加到 coords → xyz_new_。
-    //   属"图外"值回落，需训练入口先 graph_compute(se3_out[1]) 再按值版 Step4k 计算。
+    // 返回 se3_out：se3_out[1] 为度1 offset 图节点 [3*3, B*L]（坐标更新需"图外"回落其值）。
+    // 训练入口在此后 graph_compute，再用 apply_coord_update 把 offset 值叠加到 coords → xyz_new_。
+    return se3_out;
+}
+
+// ===== 训练入口驱动：SE3 图块（图外值回落 + state 回写）=====
+// Phase A（结构常量，图外值回落）：由前一 track graph_compute 得到的 pair_value
+//   经值版 embed_e_/norm_edge_3d_ 得 edge_out，再 make_graph(coords, edge_out, residx) → G，
+//   并 basis.compute(G.edge_d, 2)。此阶段非可微（make_graph 是离散拓扑），故走值版。
+// Phase B（可微图块）：调用 run_se3_graph，追加 node 嵌入 + se3_->forward_graph 到计算图，
+//   state 经引用回写为图节点（度0）。返回的 offset 图节点由训练入口 graph_compute 后做坐标更新。
+void IterBlock::run_se3_structural(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                                   TensorF32*& state,
+                                   const TensorF32& pair_value,
+                                   const TensorF32& coords,
+                                   const TensorI64& residx,
+                                   const TensorF32& seq1hot) {
+    // ---- Phase A: pair 值 → edge_out → make_graph → basis ----
+    // 值版 pair 布局 (B,L,L,D_PAIR)。embed_e_ (D_PAIR→ITER_EDGE_3D_OUT) → norm_edge_3d_。
+    // Tensor 为 move-only，避免拷贝。LayerNorm::forward 返回 TensorF32*，
+    // LinearLayer::forward 返回 TensorF32（move 到临时值再取址）。
+    TensorF32* pair_normed = norm_pair_3d_->forward(&const_cast<TensorF32&>(pair_value));  // (B,L,L,D_PAIR)
+    TensorF32  edge_emb    = embed_e_->forward(*pair_normed);            // (B,L,L,ITER_EDGE_3D_OUT)
+    TensorF32* edge_out    = norm_edge_3d_->forward(&edge_emb);          // (B,L,L,ITER_EDGE_3D_OUT)
+    se3::GraphData G       = se3::make_graph(coords, *edge_out, residx, 64, 9);
+    SE3Basis basis;
+    basis.compute(G.edge_d, 2);
+
+    // ---- Phase B: run_se3_graph（可微图块，state 回写）----
+    // 返回的 se3_out[1]（offset 图节点）由训练入口 graph_compute 后调用 apply_coord_update。
+    run_se3_graph(msa, pair, rbf, state, G, basis, coords, seq1hot);
+}
+
+// ===== 坐标更新（图外值回落）=====
+// offset_value: 度1 SE3 输出，值布局 (B*L, 3, 3)（[N,CA,C] 相对 CA 位移；CA 通道为绝对位移）。
+// 与值版 Step4k 一致：CA_new = coords_CA + offset[:,:,1]；N_new = CA_new + offset[:,:,0]；
+// C_new = CA_new + offset[:,:,2]。结果写 xyz_new_。
+void IterBlock::apply_coord_update(const TensorF32& offset_value, const TensorF32& coords) {
+    const int B = coords.shape().dims[0];
+    const int L = coords.shape().dims[1];
+    const float* xyz_data = coords.data();
+    const float* off_data = offset_value.data();
+
+    TensorF32 xyz_new({B, L, 3, 3}, coords.device());
+    float* xyz_out = xyz_new.data();
+    for (int b = 0; b < B; ++b) {
+        for (int l = 0; l < L; ++l) {
+            const int base = (b * L + l) * 9;
+            const float ca_x0 = xyz_data[base + 3];
+            const float ca_y0 = xyz_data[base + 4];
+            const float ca_z0 = xyz_data[base + 5];
+            const float dca_x = off_data[base + 3];
+            const float dca_y = off_data[base + 4];
+            const float dca_z = off_data[base + 5];
+            const float ca_x_new = ca_x0 + dca_x;
+            const float ca_y_new = ca_y0 + dca_y;
+            const float ca_z_new = ca_z0 + dca_z;
+            xyz_out[base + 0] = ca_x_new + off_data[base + 0];
+            xyz_out[base + 1] = ca_y_new + off_data[base + 1];
+            xyz_out[base + 2] = ca_z_new + off_data[base + 2];
+            xyz_out[base + 3] = ca_x_new;
+            xyz_out[base + 4] = ca_y_new;
+            xyz_out[base + 5] = ca_z_new;
+            xyz_out[base + 6] = ca_x_new + off_data[base + 6];
+            xyz_out[base + 7] = ca_y_new + off_data[base + 7];
+            xyz_out[base + 8] = ca_z_new + off_data[base + 8];
+        }
+    }
+    xyz_new_.copy_from(xyz_new);
 }
 
 void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
@@ -806,22 +875,14 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
     }
     // ------------ 1D track update ------------
 
-    // msa2pair
+    // msa2pair: einsum('bikd,bjkd->bijd', left, right/N) — 收缩 seq 维 N(dims[1])
+    // 值版用 outer_product_mean（原 outer_product 签名 (B,1,L,D)×(B,L,1,D) 不符且为纯外积）。
     {
-        int N = msa_full.shape().dims[1];
-        // 旧栈上变量: LayerNorm msa_norm(D_MSA); → msa2pair_norm_
         auto& msa_normed = *msa2pair_norm_->forward(&msa_full);
-        // 旧栈上变量: LinearLayer left_proj(D_MSA, 16); → msa2pair_left_proj_
-        // 旧栈上变量: LinearLayer right_proj(D_MSA, 16); → msa2pair_right_proj_
-        TensorF32 left = msa2pair_left_proj_->forward(msa_normed);   // (B,N,L,16)
-        TensorF32 right = msa2pair_right_proj_->forward(msa_normed); // (B,N,L,16)
-        auto& right_mean = *scale(&right, 1.0f / float(N));  // right / N
-        // a tensor divide a scalar
-        TensorF32 pair_update = outer_product(left, right_mean);  // (B,L,L,256)
-        // dim of pair_update?
-        // reshape to (B, L, L, 16*16) = (B, L, L, 256)?
-        // 旧栈上变量: LinearLayer out_proj(16 * 16, D_PAIR); → msa2pair_out_proj_
-        pair_update = msa2pair_out_proj_->forward(pair_update);  // (B,L,L,128)
+        TensorF32 left  = msa2pair_left_proj_->forward(msa_normed);   // (B,N,L,16)
+        TensorF32 right = msa2pair_right_proj_->forward(msa_normed);  // (B,N,L,16)
+        TensorF32 pair_update = outer_product_mean(left, right);      // (B,L,L,16)
+        pair_update = msa2pair_out_proj_->forward(pair_update);       // (B,L,L,128)
         pair.copy_from(*add_impl(&pair, &pair_update, /*inplace=*/false));  // residual
     }
 
@@ -844,7 +905,8 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         // different weights for left and right?
         TensorF32 left = pair2pair_left_proj_->forward(state_normed);   // (B,L,16)
         TensorF32 right = pair2pair_right_proj_->forward(state_normed); // (B,L,16)
-        TensorF32 gate = outer_product(left, right);  // (B,L,L,256)
+        // gate 纯外积，特征笛卡尔积 (B,L,L,256)，与 gate_proj 输入 256 匹配
+        TensorF32 gate = outer_product_cartesian(left, right);  // (B,L,L,256)
         // 旧栈上变量: LinearLayer gate_proj(16 * 16, D_PAIR); → pair2pair_gate_proj_
         // d_hidden_gate = 16
         gate = pair2pair_gate_proj_->forward(gate);  // (B,L,L,128)
@@ -999,14 +1061,17 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
     msa_full = msa_ff_->forward_graph(msa_full);
 
     // ------------ 2D track: msa2pair (outer-product-mean) ------------
-    // TODO(入口驱动): 同 IterBlock::forward_graph，einsum 'bikd,bjkd->bijd' 需
-    //                einsum 图 op，暂以回落 TODO 标注。
-    //   auto msa_normed = msa2pair_norm_->forward(msa_full);
-    //   auto left  = msa2pair_left_proj_->forward_graph(msa_normed);   // [16,L,N,B]
-    //   auto right = msa2pair_right_proj_->forward_graph(msa_normed);  // [16,L,N,B]
-    //   auto right_mean = scale(right, 1.0f / N);
-    //   auto pair_update = outer_product_mean_graph(left, right_mean); // [128,L,L,B]
-    //   pair = add_impl(pair, pair_update, /*inplace=*/false);
+    // einsum('bikd,bjkd->bijd(de)', left, right/N) — 收缩 seq 维 N（dims[2]），特征笛卡尔积 D×D→D*D。
+    // msa_full 图 [D_MSA,L,N,B]：N = dims[2]（seq），L = dims[1]（残基）。
+    // 用专用图 op OP_OUTER_PROD_MEAN（out_prod 只收缩 dims[1]，无法收缩 N 维）。同 IterBlock::forward_graph。
+    const int64_t Nseq_msa2pair_full = msa_full->shape().dims[2];
+    auto msa_normed_full  = msa2pair_norm_->forward(msa_full);                  // [D_MSA, L, N, B]
+    auto left_full        = msa2pair_left_proj_->forward_graph(msa_normed_full);   // [16, L, N, B]
+    auto right_full       = msa2pair_right_proj_->forward_graph(msa_normed_full);  // [16, L, N, B]
+    auto pair_update_full = outer_product_mean(left_full, right_full,
+                                               static_cast<int>(Nseq_msa2pair_full));  // [256,L,L,B]
+    pair_update_full      = msa2pair_out_proj_->forward_graph(pair_update_full);      // [D_PAIR,L,L,B]
+    pair                  = add_impl(pair, pair_update_full, /*inplace=*/false);      // residual
 
     // Triangle Multiplication (out/in) + residual
     pair = add_impl(pair, tri_mul_out_->forward_graph(pair, /*bOutgoing=*/true),
@@ -1017,13 +1082,14 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
 
     // ------------ pair2pair ------------
     TensorF32* rbf_proj = pair2pair_rbf_proj_->forward_graph(rbf);   // [128, L, L, B]
-    // TODO(入口驱动): gate = sigmoid(gate_proj(outer_product(state))) 需 einsum 图
-    //                op，先跳过，rbf_proj 直接作 bias（同 IterBlock::forward_graph）。
-    //   TensorF32* state_normed = pair2pair_state_norm_->forward(state);
-    //   TensorF32* left  = pair2pair_left_proj_->forward_graph(state_normed);   // [16,L,B]
-    //   TensorF32* right = pair2pair_right_proj_->forward_graph(state_normed);  // [16,L,B]
-    //   TensorF32* gate  = gate_outer_mean_graph(left, right);                   // TODO
-    //   rbf_proj = mul(rbf_proj, gate);
+    // gate = sigmoid(gate_proj(outer_product(state)))——与 IterBlock::forward_graph 相同
+    TensorF32* state_normed  = pair2pair_state_norm_->forward(state);           // [D_STATE, L, B]
+    TensorF32* gate_left  = pair2pair_left_proj_->forward_graph(state_normed);  // [16, L, B]
+    TensorF32* gate_right = pair2pair_right_proj_->forward_graph(state_normed); // [16, L, B]
+    TensorF32* gate       = outer_product_graph(gate_left, gate_right);         // [256, L, L, B]
+    gate = pair2pair_gate_proj_->forward_graph(gate);                           // [128, L, L, B]
+    gate = sigmoid(gate);                                                       // [0,1]
+    rbf_proj = mul(rbf_proj, gate);                                             // element-wise gate
 
     // Biased Axial Attention (row/col) + residual
     pair = add_impl(pair, pair_row_attn_->forward_graph(pair, rbf_proj),
@@ -1033,8 +1099,12 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
     // TODO: pair_ff residual（值版 forward 中 pair_ff 亦未激活，后续补齐）
 
     // ------------ 3D track: SE3 Transformer ------------
-    // 同 IterBlock::forward_graph：SE3 结构常量由训练入口值版回落 make_graph 后
-    // 调用 run_se3_graph 驱动；此处预留调用位。
+    // 同 IterBlock::forward_graph：SE3 由训练入口驱动（图外值回落）。
+    // 训练入口在每个 block 边界：graph_compute(pair)→pair_value 后调用
+    //   run_se3_structural(msa_full, pair, rbf, state, pair_value, coords, residx, seq1hot)
+    //   （内部 Phase A 回落 pair_value→edge_out→make_graph→basis；Phase B run_se3_graph 追加
+    //     SE3 图节点并回写 state；返回 offset 图节点），再 graph_compute 出 offset 后调用
+    //   apply_coord_update(offset_value, coords) 更新骨架坐标。
     //(void)coords; (void)residx; (void)seq1hot;
 
     return pair;
@@ -1837,7 +1907,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     TensorF32 coords;
     coords.copy_from(input.coords);
     
-    // need to modify :
+    // need to modify : (already finished)
     // the block in the 4 full block was different from the main block
     // full/extra block use global column attention
 

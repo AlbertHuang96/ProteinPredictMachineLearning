@@ -77,6 +77,10 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_FAPE_BACK: compute_forward_fape_back(p, node); break;
         case OP_TRI_MUL:   kernel_tri_mul(node, p);            break;
         case OP_TRI_MUL_BACK: kernel_tri_mul_back(node, p);    break;
+        case OP_OUTER_PROD_MEAN: kernel_outer_prod_mean(node, p); break;
+        case OP_OUTER_PROD_MEAN_BACK: kernel_outer_prod_mean_back(node, p); break;
+        case OP_OUTER_PROD:      kernel_outer_prod(node, p);      break;
+        case OP_OUTER_PROD_BACK: kernel_outer_prod_back(node, p); break;
         case OP_UNARY:  {
             const unary_op uop = get_unary_op(node);
             switch (uop) {
@@ -287,9 +291,21 @@ void CPUBackend::kernel_out_prod(TensorF32 * node, ComputeParams * p) {
 // ===== triangle multiplication =====
 // outgoing=true:  einsum('bikd,bjkd->bijd', left, right/L)
 // outgoing=false: einsum('bkid,bkjd->bijd', left, right/L)
-// left:  (B, I, K, D) for outgoing, (B, K, I, D) for incoming
-// right: (B, J, K, D) for outgoing, (B, K, J, D) for incoming
-// dst:   (B, I, J, D)
+//
+// 【ggml 布局（dims[0]=最内维）】  —— 与 kernel_out_prod / kernel_outer_prod_mean 一致
+//   outgoing:
+//     left  [D, I, K, B]：left[d,i,k,b] = data[((d*I + i)*K + k)*B + b]
+//     right [D, J, K, B]：right[d,j,k,b] = data[((d*J + j)*K + k)*B + b]
+//     dst   [D, I, J, B]：dst[d,i,j,b]  = data[((d*I + i)*J + j)*B + b]
+//     dst[d,i,j,b] = (1/L) * sum_k left[d,i,k,b] * right[d,j,k,b]
+//   incoming:
+//     left  [D, K, I, B]：left[d,k,i,b] = data[((d*K + k)*I + i)*B + b]
+//     right [D, K, J, B]：right[d,k,j,b] = data[((d*K + k)*J + j)*B + b]
+//     dst   [D, I, J, B]
+//     dst[d,i,j,b] = (1/L) * sum_k left[d,k,i,b] * right[d,k,j,b]
+//
+// 注意：此前 kernel 误用值布局（B=dst.dims[0], D=dst.dims[3]），而图张量是 ggml 布局
+//   （特征维最内），导致 outgoing/incoming 索引错乱 → 已改为 ggml 布局。
 void CPUBackend::kernel_tri_mul(TensorF32 * node, ComputeParams * p) {
     ThreadPool * tp = p->threadpool;
 
@@ -297,11 +313,10 @@ void CPUBackend::kernel_tri_mul(TensorF32 * node, ComputeParams * p) {
     const TensorF32 * src1 = node->src[1];  // right
     TensorF32       * dst  = node;
 
-    const int64_t B = dst->shape().dims[0];
-    const int64_t I = dst->shape().dims[1];  // = src0 dim[1]
-    const int64_t J = dst->shape().dims[2];  // = src1 dim[1]
-    const int64_t D = dst->shape().dims[3];  // inner dim
-    const int64_t K = src0->shape().dims[2]; // contraction dim
+    const int64_t D = dst->shape().dims[0];  // 最内特征维
+    const int64_t I = dst->shape().dims[1];
+    const int64_t J = dst->shape().dims[2];
+    const int64_t B = dst->shape().dims[3];
 
     float L;
     bool  outgoing;
@@ -319,25 +334,29 @@ void CPUBackend::kernel_tri_mul(TensorF32 * node, ComputeParams * p) {
     const int64_t end   = (start + per < total) ? (start + per) : total;
 
     for (int64_t idx = start; idx < end; idx++) {
-        int64_t tmp  = idx;
-        int64_t d    = tmp % D;  tmp /= D;
-        int64_t j    = tmp % J;  tmp /= J;
-        int64_t i    = tmp % I;
-        int64_t b    = tmp / I;
+        int64_t tmp = idx;
+        int64_t b   = tmp % B; tmp /= B;
+        int64_t j   = tmp % J; tmp /= J;
+        int64_t i   = tmp % I;
+        int64_t d   = tmp / I;
 
         float sum = 0.0f;
-        for (int64_t k = 0; k < K; k++) {
-            float lv, rv;
-            if (outgoing) {
-                // left(b,i,k,d) * right(b,j,k,d)
-                lv = left_data[((b * I + i) * K + k) * D + d];
-                rv = right_data[((b * J + j) * K + k) * D + d];
-            } else {
-                // left(b,k,i,d) * right(b,k,j,d)
-                lv = left_data[((b * K + k) * I + i) * D + d];
-                rv = right_data[((b * K + k) * J + j) * D + d];
+        if (outgoing) {
+            // 收缩 k = src0.dims[2]（left/right 的 dims[2] 相同）
+            const int64_t K = src0->shape().dims[2];
+            for (int64_t k = 0; k < K; k++) {
+                const float lv = left_data[((d * I + i) * K + k) * B + b];
+                const float rv = right_data[((d * J + j) * K + k) * B + b];
+                sum += lv * rv;
             }
-            sum += lv * rv;
+        } else {
+            // incoming: k = src0.dims[1]（left/right 的 dims[1] 相同）
+            const int64_t K = src0->shape().dims[1];
+            for (int64_t k = 0; k < K; k++) {
+                const float lv = left_data[((d * K + k) * I + i) * B + b];
+                const float rv = right_data[((d * K + k) * J + j) * B + b];
+                sum += lv * rv;
+            }
         }
         dst_data[idx] = sum * inv_L;
     }
@@ -345,27 +364,285 @@ void CPUBackend::kernel_tri_mul(TensorF32 * node, ComputeParams * p) {
     tp->barrier_wait();
 }
 
+// ===== outer_product_mean (msa2pair) =====
+// einsum('bikd,bjkd->bijd(de)', left, right/N) —— 收缩 seq 维 N（dims[2]），
+//   且特征维做笛卡尔积：D × D → D*D（AF2 outer_product_mean 语义）。
+// ggml 布局（dims[0]=最内维）:
+//   left  [D, L, N, B]：left[d1,i,n,b] = left_data[((d1*L + i)*N + n)*B + b]
+//   right [D, L, N, B]：right[d2,j,n,b] = right_data[((d2*L + j)*N + n)*B + b]
+//   dst   [D*D, L, L, B]：dst[(d1*D+d2), i, j, b]
+//       = (1/N) * sum_n left[d1,i,n,b] * right[d2,j,n,b]
+// 索引：dst[(((d1*D+d2)*L + i)*L + j)*B + b]
+// op_params[0] 存 N（float 位模式，实际以 shape 为准）。
+void CPUBackend::kernel_outer_prod_mean(TensorF32 * node, ComputeParams * p) {
+    ThreadPool * tp = p->threadpool;
+
+    const TensorF32 * src0 = node->src[0];  // left [D,L,N,B]
+    const TensorF32 * src1 = node->src[1];  // right [D,L,N,B]
+    TensorF32       * dst  = node;          // [D*D, L, L, B]
+
+    const int64_t D = src0->shape().dims[0];
+    const int64_t L = src0->shape().dims[1];
+    const int64_t N = src0->shape().dims[2];
+    const int64_t B = src0->shape().dims[3];
+    const int64_t D2 = D * D;
+
+    const float inv_N = 1.0f / float(N);   // 以实际 N 为准
+
+    const float * left_data  = static_cast<const float*>(src0->data());
+    const float * right_data = static_cast<const float*>(src1->data());
+    float       * dst_data   = static_cast<float*>(dst->data());
+
+    const int64_t total = D2 * L * L * B;
+    const int64_t per  = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        int64_t tmp = idx;
+        int64_t b   = tmp % B; tmp /= B;
+        int64_t j   = tmp % L; tmp /= L;
+        int64_t i   = tmp % L;
+        int64_t d2  = tmp % D; tmp /= D;
+        int64_t d1  = tmp / D;
+
+        float sum = 0.0f;
+        for (int64_t n = 0; n < N; n++) {
+            const float lv = left_data[((d1 * L + i) * N + n) * B + b];
+            const float rv = right_data[((d2 * L + j) * N + n) * B + b];
+            sum += lv * rv;
+        }
+        dst_data[idx] = sum * inv_N;
+    }
+
+    tp->barrier_wait();
+}
+
+// ===== outer_product_mean 反向 =====
+// 前向: dst[(d1*D+d2), i, j, b] = (1/N)*sum_n left[d1,i,n,b]*right[d2,j,n,b]
+//   dL/dleft [d1,i,n,b] = (1/N) * sum_{d2,j} grad[(d1*D+d2), i, j, b] * right[d2,j,n,b]
+//   dL/dright[d2,j,n,b] = (1/N) * sum_{d1,i} grad[(d1*D+d2), i, j, b] * left[d1,i,n,b]
+// 节点 src: [0]=grad [D*D,L,L,B], [1]=left [D,L,N,B], [2]=right [D,L,N,B]
+//          [3]=grad_left [D,L,N,B], [4]=grad_right [D,L,N,B]
+void CPUBackend::kernel_outer_prod_mean_back(TensorF32 * node, ComputeParams * p) {
+    ThreadPool * tp = p->threadpool;
+
+    const TensorF32 * grad  = node->src[0];  // [D*D,L,L,B]
+    const TensorF32 * left  = node->src[1];  // [D,L,N,B]
+    const TensorF32 * right = node->src[2];  // [D,L,N,B]
+    TensorF32 * grad_left  = node->src[3];   // [D,L,N,B]
+    TensorF32 * grad_right = node->src[4];   // [D,L,N,B]
+
+    if (!grad_left || !grad_right) { tp->barrier_wait(); return; }
+
+    const int64_t D = left->shape().dims[0];
+    const int64_t L = left->shape().dims[1];
+    const int64_t N = left->shape().dims[2];
+    const int64_t B = left->shape().dims[3];
+
+    const float inv_N = 1.0f / float(N);
+
+    const float * gdata  = static_cast<const float*>(grad->data());
+    const float * ldata  = static_cast<const float*>(left->data());
+    const float * rdata  = static_cast<const float*>(right->data());
+    float * gl_out = static_cast<float*>(grad_left->data());
+    float * gr_out = static_cast<float*>(grad_right->data());
+
+    // dL/dleft [d1,i,n,b] = (1/N)*sum_{d2,j} grad[(d1*D+d2),i,j,b]*right[d2,j,n,b]
+    {
+        const int64_t total = D * L * N * B;
+        const int64_t per  = (total + p->nth - 1) / p->nth;
+        const int64_t start = per * p->ith;
+        const int64_t end   = (start + per < total) ? (start + per) : total;
+        for (int64_t idx = start; idx < end; idx++) {
+            int64_t tmp = idx;
+            int64_t b   = tmp % B; tmp /= B;
+            int64_t n   = tmp % N; tmp /= N;
+            int64_t i   = tmp % L;
+            int64_t d1  = tmp / L;
+            float sum = 0.0f;
+            for (int64_t j = 0; j < L; j++) {
+                for (int64_t d2 = 0; d2 < D; d2++) {
+                    const float gv = gdata[(((d1 * D + d2) * L + i) * L + j) * B + b];
+                    const float rv = rdata[((d2 * L + j) * N + n) * B + b];
+                    sum += gv * rv;
+                }
+            }
+            gl_out[idx] = sum * inv_N;
+        }
+    }
+
+    // dL/dright [d2,j,n,b] = (1/N)*sum_{d1,i} grad[(d1*D+d2), i, j, b]*left[d1,i,n,b]
+    {
+        const int64_t total = D * L * N * B;
+        const int64_t per  = (total + p->nth - 1) / p->nth;
+        const int64_t start = per * p->ith;
+        const int64_t end   = (start + per < total) ? (start + per) : total;
+        for (int64_t idx = start; idx < end; idx++) {
+            int64_t tmp = idx;
+            int64_t b   = tmp % B; tmp /= B;
+            int64_t n   = tmp % N; tmp /= N;
+            int64_t j   = tmp % L;
+            int64_t d2  = tmp / L;
+            float sum = 0.0f;
+            for (int64_t i = 0; i < L; i++) {
+                for (int64_t d1 = 0; d1 < D; d1++) {
+                    const float gv = gdata[(((d1 * D + d2) * L + i) * L + j) * B + b];
+                    const float lv = ldata[((d1 * L + i) * N + n) * B + b];
+                    sum += gv * lv;
+                }
+            }
+            gr_out[idx] = sum * inv_N;
+        }
+    }
+
+    tp->barrier_wait();
+}
+
+// ===== outer_product (pair2pair gate，纯外积，无收缩) =====
+// 前向: gate[(d1*D+d2), i, j, b] = left[d1,i,b] * right[d2,j,b]（特征笛卡尔积 D×D→D*D）
+// ggml 布局（dims[0]=最内维）:
+//   left  [D, L, B]：left[d1,i,b] = left_data[((d1*L + i)*B + b)]
+//   right [D, L, B]：right[d2,j,b] = right_data[((d2*L + j)*B + b)]
+//   dst   [D*D, L, L, B]：dst[(((d1*D+d2)*L + i)*L + j)*B + b]
+void CPUBackend::kernel_outer_prod(TensorF32 * node, ComputeParams * p) {
+    ThreadPool * tp = p->threadpool;
+
+    const TensorF32 * src0 = node->src[0];  // left [D,L,B]
+    const TensorF32 * src1 = node->src[1];  // right [D,L,B]
+    TensorF32       * dst  = node;          // [D*D, L, L, B]
+
+    const int64_t D = src0->shape().dims[0];
+    const int64_t L = src0->shape().dims[1];
+    const int64_t B = src0->shape().dims[2];
+    const int64_t D2 = D * D;
+
+    const float * left_data  = static_cast<const float*>(src0->data());
+    const float * right_data = static_cast<const float*>(src1->data());
+    float       * dst_data   = static_cast<float*>(dst->data());
+
+    const int64_t total = D2 * L * L * B;
+    const int64_t per  = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t idx = start; idx < end; idx++) {
+        int64_t tmp = idx;
+        int64_t b   = tmp % B; tmp /= B;
+        int64_t j   = tmp % L; tmp /= L;
+        int64_t i   = tmp % L;
+        int64_t d2  = tmp % D; tmp /= D;
+        int64_t d1  = tmp / D;
+
+        const float lv = left_data[((d1 * L + i) * B + b)];
+        const float rv = right_data[((d2 * L + j) * B + b)];
+        dst_data[idx] = lv * rv;
+    }
+
+    tp->barrier_wait();
+}
+
+// ===== outer_product 反向 =====
+// 前向: dst[(d1*D+d2), i, j, b] = left[d1,i,b]*right[d2,j,b]
+//   dL/dleft [d1,i,b] = sum_{d2,j} grad[(d1*D+d2), i, j, b] * right[d2,j,b]
+//   dL/dright[d2,j,b] = sum_{d1,i} grad[(d1*D+d2), i, j, b] * left[d1,i,b]
+// 节点 src: [0]=grad [D*D,L,L,B], [1]=left [D,L,B], [2]=right [D,L,B]
+//          [3]=grad_left [D,L,B], [4]=grad_right [D,L,B]
+void CPUBackend::kernel_outer_prod_back(TensorF32 * node, ComputeParams * p) {
+    ThreadPool * tp = p->threadpool;
+
+    const TensorF32 * grad  = node->src[0];  // [D*D,L,L,B]
+    const TensorF32 * left  = node->src[1];  // [D,L,B]
+    const TensorF32 * right = node->src[2];  // [D,L,B]
+    TensorF32 * grad_left  = node->src[3];   // [D,L,B]
+    TensorF32 * grad_right = node->src[4];   // [D,L,B]
+
+    if (!grad_left || !grad_right) { tp->barrier_wait(); return; }
+
+    const int64_t D = left->shape().dims[0];
+    const int64_t L = left->shape().dims[1];
+    const int64_t B = left->shape().dims[2];
+
+    const float * gdata  = static_cast<const float*>(grad->data());
+    const float * ldata  = static_cast<const float*>(left->data());
+    const float * rdata  = static_cast<const float*>(right->data());
+    float * gl_out = static_cast<float*>(grad_left->data());
+    float * gr_out = static_cast<float*>(grad_right->data());
+
+    // dL/dleft [d1,i,b] = sum_{d2,j} grad[(d1*D+d2), i, j, b]*right[d2,j,b]
+    {
+        const int64_t total = D * L * B;
+        const int64_t per  = (total + p->nth - 1) / p->nth;
+        const int64_t start = per * p->ith;
+        const int64_t end   = (start + per < total) ? (start + per) : total;
+        for (int64_t idx = start; idx < end; idx++) {
+            int64_t tmp = idx;
+            int64_t b   = tmp % B; tmp /= B;
+            int64_t i   = tmp % L;
+            int64_t d1  = tmp / L;
+            float sum = 0.0f;
+            for (int64_t j = 0; j < L; j++) {
+                for (int64_t d2 = 0; d2 < D; d2++) {
+                    const float gv = gdata[(((d1 * D + d2) * L + i) * L + j) * B + b];
+                    const float rv = rdata[((d2 * L + j) * B + b)];
+                    sum += gv * rv;
+                }
+            }
+            gl_out[idx] = sum;
+        }
+    }
+    tp->barrier_wait();
+
+    // dL/dright [d2,j,b] = sum_{d1,i} grad[(d1*D+d2), i, j, b]*left[d1,i,b]
+    {
+        const int64_t total = D * L * B;
+        const int64_t per  = (total + p->nth - 1) / p->nth;
+        const int64_t start = per * p->ith;
+        const int64_t end   = (start + per < total) ? (start + per) : total;
+        for (int64_t idx = start; idx < end; idx++) {
+            int64_t tmp = idx;
+            int64_t b   = tmp % B; tmp /= B;
+            int64_t j   = tmp % L;
+            int64_t d2  = tmp / L;
+            float sum = 0.0f;
+            for (int64_t i = 0; i < L; i++) {
+                for (int64_t d1 = 0; d1 < D; d1++) {
+                    const float gv = gdata[(((d1 * D + d2) * L + i) * L + j) * B + b];
+                    const float lv = ldata[((d1 * L + i) * B + b)];
+                    sum += gv * lv;
+                }
+            }
+            gr_out[idx] = sum;
+        }
+    }
+    tp->barrier_wait();
+}
+
 // backward: dL/dleft 和 dL/dright 分别对 left 和 right 求导
 void CPUBackend::kernel_tri_mul_back(TensorF32 * node, ComputeParams * p) {
     // grad from upstream
-    const TensorF32 * grad = node->src[0];  // dL/ddst: (B, I, J, D)
+    const TensorF32 * grad = node->src[0];  // dL/ddst: [D, I, J, B]（ggml）
     const TensorF32 * left  = node->src[1]; // left
     const TensorF32 * right = node->src[2]; // right
-    TensorF32 * grad_left  = node->src[3];  // dL/dleft
-    TensorF32 * grad_right = node->src[4];  // dL/dright
+    TensorF32 * grad_left  = node->src[3];  // dL/dleft（形状同 left）
+    TensorF32 * grad_right = node->src[4];  // dL/dright（形状同 right）
 
     if (!grad_left || !grad_right) return;
 
-    const int64_t B = left->shape().dims[0];
-    const int64_t I = left->shape().dims[1];
-    const int64_t J = right->shape().dims[1];
-    const int64_t D = left->shape().dims[3];
-    const int64_t K = left->shape().dims[2];
+    // ggml 布局：特征维最内
+    const int64_t D = left->shape().dims[0];
+    const int64_t B = left->shape().dims[3];
 
     float L;
     bool  outgoing;
     memcpy(&L,        node->op_params,      sizeof(float));
     memcpy(&outgoing, node->op_params + 4,  sizeof(bool));
+
+    // I/J 的位置取决于 outgoing：
+    //   outgoing: left [D,I,K,B] → I=left.dims[1]；right [D,J,K,B] → J=right.dims[1]
+    //   incoming: left [D,K,I,B] → I=left.dims[2]；right [D,K,J,B] → J=right.dims[2]
+    const int64_t I = outgoing ? left->shape().dims[1]  : left->shape().dims[2];
+    const int64_t J = outgoing ? right->shape().dims[1] : right->shape().dims[2];
 
     const float inv_L = 1.0f / L;
     const float * grad_data = static_cast<const float*>(grad->data());
@@ -376,61 +653,103 @@ void CPUBackend::kernel_tri_mul_back(TensorF32 * node, ComputeParams * p) {
 
     ThreadPool * tp = p->threadpool;
 
-    // dL/dleft: for outgoing: einsum('bijd,bjkd->bikd', grad, right/L)
-    //           for incoming: einsum('bijd,bkjd->bkid', grad, right/L)
-    {
-        const int64_t total = B * I * K * D;
-        const int64_t per  = (total + p->nth - 1) / p->nth;
-        const int64_t start = per * p->ith;
-        const int64_t end   = (start + per < total) ? (start + per) : total;
-        for (int64_t idx = start; idx < end; idx++) {
-            int64_t tmp = idx;
-            const int64_t d = tmp % D; tmp /= D;
-            const int64_t k = tmp % K; tmp /= K;
-            const int64_t i = tmp % I;
-            const int64_t b = tmp / I;
-            float sum = 0.0f;
-            for (int64_t j = 0; j < J; j++) {
-                float gv = grad_data[((b * I + i) * J + j) * D + d];
-                float rv;
-                if (outgoing)
-                    rv = right_data[((b * J + j) * K + k) * D + d];
-                else
-                    rv = right_data[((b * K + k) * J + j) * D + d];
-                sum += gv * rv;
+    if (outgoing) {
+        // forward: dst[d,i,j,b] = (1/L)*sum_k left[d,i,k,b]*right[d,j,k,b]
+        //   left [D,I,K,B], right [D,J,K,B], K = left.dims[2]
+        const int64_t K = left->shape().dims[2];
+        // dL/dleft[d,i,k,b] = (1/L)*sum_j grad[d,i,j,b]*right[d,j,k,b]
+        {
+            const int64_t total = D * I * K * B;
+            const int64_t per  = (total + p->nth - 1) / p->nth;
+            const int64_t start = per * p->ith;
+            const int64_t end   = (start + per < total) ? (start + per) : total;
+            for (int64_t idx = start; idx < end; idx++) {
+                int64_t tmp = idx;
+                int64_t b   = tmp % B; tmp /= B;
+                int64_t k   = tmp % K; tmp /= K;
+                int64_t i   = tmp % I;
+                int64_t d   = tmp / I;
+                float sum = 0.0f;
+                for (int64_t j = 0; j < J; j++) {
+                    const float gv = grad_data[((d * I + i) * J + j) * B + b];
+                    const float rv = right_data[((d * J + j) * K + k) * B + b];
+                    sum += gv * rv;
+                }
+                gleft_data[idx] = sum * inv_L;
             }
-            gleft_data[idx] = sum * inv_L;
         }
-    }
-    tp->barrier_wait();
-
-    // dL/dright: for outgoing: einsum('bijd,bikd->bjkd', grad, left/L)
-    //            for incoming: einsum('bijd,bkid->bkjd', grad, left/L)
-    {
-        const int64_t total = B * J * K * D;
-        const int64_t per  = (total + p->nth - 1) / p->nth;
-        const int64_t start = per * p->ith;
-        const int64_t end   = (start + per < total) ? (start + per) : total;
-        for (int64_t idx = start; idx < end; idx++) {
-            int64_t tmp = idx;
-            const int64_t d = tmp % D; tmp /= D;
-            const int64_t k = tmp % K; tmp /= K;
-            const int64_t j = tmp % J;
-            const int64_t b = tmp / J;
-            float sum = 0.0f;
-            for (int64_t i = 0; i < I; i++) {
-                float gv = grad_data[((b * I + i) * J + j) * D + d];
-                float lv;
-                if (outgoing)
-                    lv = left_data[((b * I + i) * K + k) * D + d];
-                else
-                    lv = left_data[((b * K + k) * I + i) * D + d];
-                sum += gv * lv;
+        tp->barrier_wait();
+        // dL/dright[d,j,k,b] = (1/L)*sum_i grad[d,i,j,b]*left[d,i,k,b]
+        {
+            const int64_t total = D * J * K * B;
+            const int64_t per  = (total + p->nth - 1) / p->nth;
+            const int64_t start = per * p->ith;
+            const int64_t end   = (start + per < total) ? (start + per) : total;
+            for (int64_t idx = start; idx < end; idx++) {
+                int64_t tmp = idx;
+                int64_t b   = tmp % B; tmp /= B;
+                int64_t k   = tmp % K; tmp /= K;
+                int64_t j   = tmp % J;
+                int64_t d   = tmp / J;
+                float sum = 0.0f;
+                for (int64_t i = 0; i < I; i++) {
+                    const float gv = grad_data[((d * I + i) * J + j) * B + b];
+                    const float lv = left_data[((d * I + i) * K + k) * B + b];
+                    sum += gv * lv;
+                }
+                gright_data[idx] = sum * inv_L;
             }
-            gright_data[idx] = sum * inv_L;
         }
+        tp->barrier_wait();
+    } else {
+        // incoming: forward dst[d,i,j,b] = (1/L)*sum_k left[d,k,i,b]*right[d,k,j,b]
+        //   left [D,K,I,B], right [D,K,J,B], K = left.dims[1]
+        const int64_t K = left->shape().dims[1];
+        // dL/dleft[d,k,i,b] = (1/L)*sum_j grad[d,i,j,b]*right[d,k,j,b]
+        {
+            const int64_t total = D * K * I * B;
+            const int64_t per  = (total + p->nth - 1) / p->nth;
+            const int64_t start = per * p->ith;
+            const int64_t end   = (start + per < total) ? (start + per) : total;
+            for (int64_t idx = start; idx < end; idx++) {
+                int64_t tmp = idx;
+                int64_t b   = tmp % B; tmp /= B;
+                int64_t i   = tmp % I; tmp /= I;
+                int64_t k   = tmp % K;
+                int64_t d   = tmp / K;
+                float sum = 0.0f;
+                for (int64_t j = 0; j < J; j++) {
+                    const float gv = grad_data[((d * I + i) * J + j) * B + b];
+                    const float rv = right_data[((d * K + k) * J + j) * B + b];
+                    sum += gv * rv;
+                }
+                gleft_data[idx] = sum * inv_L;
+            }
+        }
+        tp->barrier_wait();
+        // dL/dright[d,k,j,b] = (1/L)*sum_i grad[d,i,j,b]*left[d,k,i,b]
+        {
+            const int64_t total = D * K * J * B;
+            const int64_t per  = (total + p->nth - 1) / p->nth;
+            const int64_t start = per * p->ith;
+            const int64_t end   = (start + per < total) ? (start + per) : total;
+            for (int64_t idx = start; idx < end; idx++) {
+                int64_t tmp = idx;
+                int64_t b   = tmp % B; tmp /= B;
+                int64_t j   = tmp % J; tmp /= J;
+                int64_t k   = tmp % K;
+                int64_t d   = tmp / K;
+                float sum = 0.0f;
+                for (int64_t i = 0; i < I; i++) {
+                    const float gv = grad_data[((d * I + i) * J + j) * B + b];
+                    const float lv = left_data[((d * K + k) * I + i) * B + b];
+                    sum += gv * lv;
+                }
+                gright_data[idx] = sum * inv_L;
+            }
+        }
+        tp->barrier_wait();
     }
-    tp->barrier_wait();
 }
 
 // ===== softmax =====

@@ -579,6 +579,10 @@ private:
     static void kernel_out_prod(TensorF32 * node, ComputeParams * p);
     static void kernel_tri_mul (TensorF32 * node, ComputeParams * p);
     static void kernel_tri_mul_back(TensorF32 * node, ComputeParams * p);
+    static void kernel_outer_prod_mean(TensorF32 * node, ComputeParams * p);
+    static void kernel_outer_prod_mean_back(TensorF32 * node, ComputeParams * p);
+    static void kernel_outer_prod(TensorF32 * node, ComputeParams * p);
+    static void kernel_outer_prod_back(TensorF32 * node, ComputeParams * p);
     static void kernel_softmax (TensorF32 * node, ComputeParams * p);
     static void kernel_softmax_back(TensorF32 * node, ComputeParams * p);
     static void kernel_rms_norm (TensorF32 * node, ComputeParams * p);
