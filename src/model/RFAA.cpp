@@ -6,6 +6,7 @@
 
 #include "rfaa/Dropout.h"
 #include "rfaa/Context.h"
+#include <cuda_runtime.h>   // cudaGetDeviceCount 用于 GPU 可用性探测
 
 namespace rfaa {
 
@@ -371,9 +372,9 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             pair.copy_from(*add_impl(&pair, &row_out, /*inplace=*/false));
             auto col_out = drop_col.forward(pair_col_attn_->forward(pair, rbf_feature));
             pair.copy_from(*add_impl(&pair, &col_out, /*inplace=*/false));
-            // FeedForward
-            //FeedForward pair_ff(D_PAIR, D_PAIR * 2);
-            //pair = pair + pair_ff.forward(pair);  // residual
+            // FeedForward (pair_ff) + residual
+            auto pair_ff_out = pair_ff_->forward(pair);
+            pair.copy_from(*add_impl(&pair, &pair_ff_out, /*inplace=*/false));
         }
 
     }
@@ -608,12 +609,15 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
     pair_update      = msa2pair_out_proj_->forward_graph(pair_update);   // [D_PAIR,L,L,B]
     pair             = add_impl(pair, pair_update, /*inplace=*/false);   // residual
 
-    // Triangle Multiplication (out/in) + residual
-    pair = add_impl(pair, tri_mul_out_->forward_graph(pair, /*bOutgoing=*/true),
-                    /*inplace=*/false);
-    pair = add_impl(pair, tri_mul_in_->forward_graph(pair, /*bOutgoing=*/false),
-                    /*inplace=*/false);
-    // TODO: dropout drop_row 0.15 图 drop 后续补
+    // Triangle Multiplication (out/in) + dropout + residual
+    // 图 dropout 用 Dropout::forward_graph（random mask 常量叶子 + mul），值版语义一致。
+    {
+        Dropout drop_row(1, 0.15);
+        TensorF32* tri_out = drop_row.forward_graph(tri_mul_out_->forward_graph(pair, /*bOutgoing=*/true));
+        pair = add_impl(pair, tri_out, /*inplace=*/false);
+        TensorF32* tri_in = drop_row.forward_graph(tri_mul_in_->forward_graph(pair, /*bOutgoing=*/false));
+        pair = add_impl(pair, tri_in, /*inplace=*/false);
+    }
 
     // ------------ pair2pair ------------
     // rbf -> rbf_proj (bias 注入 pair row/col attention)
@@ -633,7 +637,8 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
                     /*inplace=*/false);
     pair = add_impl(pair, pair_col_attn_->forward_graph(pair, rbf_proj),
                     /*inplace=*/false);
-    // TODO: pair_ff residual（值版 forward 中 pair_ff 亦未激活，后续补齐）
+    // FeedForward (pair_ff) + residual — 值版 forward 同步补齐（见 IterBlock::forward）
+    pair = add_impl(pair, pair_ff_->forward_graph(pair), /*inplace=*/false);
 
     // ------------ 3D track: SE3 Transformer ------------
     // SE3 图块由"训练入口"驱动（图外值回落）：
@@ -919,9 +924,9 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         pair.copy_from(*add_impl(&pair, &row_out2, /*inplace=*/false));
         auto col_out2 = drop_col.forward(pair_col_attn_->forward(pair, rbf_feature));
         pair.copy_from(*add_impl(&pair, &col_out2, /*inplace=*/false));
-        // FeedForward
-        //FeedForward pair_ff(D_PAIR, D_PAIR * 2);
-        //pair = pair + pair_ff.forward(pair);  // residual
+        // FeedForward (pair_ff) + residual
+        auto pair_ff_out = pair_ff_->forward(pair);
+        pair.copy_from(*add_impl(&pair, &pair_ff_out, /*inplace=*/false));
     }
 
     // 3D track update — same logic as IterBlock, but uses msa_full
@@ -1073,12 +1078,14 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
     pair_update_full      = msa2pair_out_proj_->forward_graph(pair_update_full);      // [D_PAIR,L,L,B]
     pair                  = add_impl(pair, pair_update_full, /*inplace=*/false);      // residual
 
-    // Triangle Multiplication (out/in) + residual
-    pair = add_impl(pair, tri_mul_out_->forward_graph(pair, /*bOutgoing=*/true),
-                    /*inplace=*/false);
-    pair = add_impl(pair, tri_mul_in_->forward_graph(pair, /*bOutgoing=*/false),
-                    /*inplace=*/false);
-    // TODO: dropout drop_row 0.15 图 drop 后续补
+    // Triangle Multiplication (out/in) + dropout + residual (同 IterBlock::forward_graph)
+    {
+        Dropout drop_row(1, 0.15);
+        TensorF32* tri_out = drop_row.forward_graph(tri_mul_out_->forward_graph(pair, /*bOutgoing=*/true));
+        pair = add_impl(pair, tri_out, /*inplace=*/false);
+        TensorF32* tri_in = drop_row.forward_graph(tri_mul_in_->forward_graph(pair, /*bOutgoing=*/false));
+        pair = add_impl(pair, tri_in, /*inplace=*/false);
+    }
 
     // ------------ pair2pair ------------
     TensorF32* rbf_proj = pair2pair_rbf_proj_->forward_graph(rbf);   // [128, L, L, B]
@@ -1096,7 +1103,8 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
                     /*inplace=*/false);
     pair = add_impl(pair, pair_col_attn_->forward_graph(pair, rbf_proj),
                     /*inplace=*/false);
-    // TODO: pair_ff residual（值版 forward 中 pair_ff 亦未激活，后续补齐）
+    // FeedForward (pair_ff) + residual — 值版 forward 同步补齐（见 FullBlock::forward）
+    pair = add_impl(pair, pair_ff_->forward_graph(pair), /*inplace=*/false);
 
     // ------------ 3D track: SE3 Transformer ------------
     // 同 IterBlock::forward_graph：SE3 由训练入口驱动（图外值回落）。
@@ -1363,6 +1371,18 @@ void RefineBlock::forward(TensorF32& msa,
     // state.copy_from(state_new_);
 }
 
+// ===== GPU 可用性探测 =====
+// 返回 true 表示当前环境可用的 CUDA 设备数 > 0 (且 device_id 合法)。
+// 用于 ensure_backend_ready 在创建 CUDABackend 前探测: 无 GPU 时给出警告并回退 CPU。
+bool cuda_available() {
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count <= 0) {
+        return false;
+    }
+    return true;
+}
+
 // RFAAModel 实现
 RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
     int n_iter = N_EXTRA_BLOCKS + N_MAIN_BLOCKS;  // ITER_N_BLOCKS = 12
@@ -1488,6 +1508,13 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         msa_global_col_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));
         msa_global_col_to_g_.push_back( LinearLayer::create(D_MSA, N_HEAD * D_MSA));
         msa_global_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));
+    }
+
+    // ===== PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer) =====
+    // 必须先于下方 block 构造循环分配 (1575/1649 处按 idx 访问 pos_enc_emb_res_[idx])
+    for (int i = 0; i < N_ITER; ++i) {
+        pos_enc_emb_res_.push_back(EmbeddingLayer::create(65, D_PAIR));     // (65, 128)  residue dist
+        pos_enc_emb_atom_.push_back(EmbeddingLayer::create(17, D_PAIR));    // (17, 128)  atom bond dist
     }
 
     // ===== 创建迭代块 + 注入指针 =====
@@ -1765,12 +1792,6 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         &tps_tri_mul_out_, &tps_tri_mul_in_,
         &tps_pair_row_attn_, &tps_pair_col_attn_,
         &tps_pair_ff_);
-
-    // ===== PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer) =====
-    for (int i = 0; i < N_ITER; ++i) {
-        pos_enc_emb_res_.push_back(EmbeddingLayer::create(65, D_PAIR));     // (65, 128)  residue dist
-        pos_enc_emb_atom_.push_back(EmbeddingLayer::create(17, D_PAIR));    // (17, 128)  atom bond dist
-    }
 }
 
 RFAAModel::~RFAAModel() = default;
@@ -2104,12 +2125,26 @@ void RFAAModel::ensure_backend_ready() {
     if (!scheduler_) {
         scheduler_ = std::make_unique<BackendScheduler>();
         scheduler_->add_backend(cpu_backend_.get());
-        // 将来 device_ == CUDA 时:
-        //   cuda_backend_ = std::make_unique<CUDABackend>(0);
-        //   scheduler_->add_backend(cuda_backend_.get());
+        // 3. 若模型目标设备为 CUDA, 先探测 GPU 可用性; 无 GPU 则警告并回退 CPU
+        if (device_ == Device::CUDA) {
+            if (!cuda_available()) {
+                std::cerr << "[WARN] CUDA device not available; "
+                          << "falling back to CPU backend." << std::endl;
+                device_ = Device::CPU;   // 回退: 模型按 CPU 运行
+            } else if (!cuda_backend_) {
+                // scheduler 按 priority 排序, CUDA 优先调度到 GPU;
+                // 不支持的 op 自动跨后端拷贝回 CPU
+                cuda_backend_ = std::make_unique<CUDABackend>(0);  // device 0
+                scheduler_->add_backend(cuda_backend_.get());
+            }
+        }
     }
 
     backend_ready_ = true;
+
+    // 4. 后端就绪后将参数迁移到 backend buffer (权重/偏置等)
+    //    在模型构造后 / to() 时调用; load_weights 内部也调用 (见下)
+    transfer_params_to_backend();
 }
 
 Device RFAAModel::device() const {
@@ -2395,6 +2430,18 @@ std::vector<TensorF32*> RFAAModel::params() {
 
 void RFAAModel::transfer_params_to_backend() {
     if (!scheduler_ || !cpu_backend_) return;
+
+    // 幂等保护: 若参数已被分配进 backend buffer (buffer_ != nullptr), 跳过。
+    // 这样 ensure_backend_ready / load_weights 多次调用不会重复搬迁覆盖 data_ 指针。
+    {
+        std::vector<TensorF32*> probe;
+        collect_all_params(probe);
+        for (auto* t : probe) {
+            if (t->data() != nullptr && t->buffer_ != nullptr) {
+                return;  // 已搬迁过
+            }
+        }
+    }
 
     const BufferType* cpu_buft = cpu_backend_->buffer_type();
 

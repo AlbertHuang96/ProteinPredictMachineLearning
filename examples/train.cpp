@@ -185,7 +185,7 @@ int main(int argc, char* argv[]) {
     model.to(Device::CUDA);
     model.train();
     
-    std::cout << "Model created and moved to CUDA" << std::endl;
+    std::cout << "Model created and CPU and CUDA Backend init" << std::endl;
     
     // 4. 加载预训练权重 (通过 Python 桥接)
     // 暂时没有预训练权重, 先注释掉, 待有权重文件后再启用

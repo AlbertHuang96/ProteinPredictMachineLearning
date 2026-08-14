@@ -838,13 +838,13 @@ TensorF32 FeedForward::forward(const TensorF32& x) {
 }
 
 // ===== FeedForward::forward_graph (图模式) =====
-// 输入输出均为图节点指针。训练时 dropout 以 identity 处理（图 drop 后续补充）
+// 输入输出均为图节点指针。dropout 用 Dropout::forward_graph (mask 常量叶子 + mul) 实现。
 TensorF32* FeedForward::forward_graph(TensorF32* x) {
     auto x_norm    = layernorm_->forward(x);              // TensorF32*
     auto x_hidden  = linear1_->forward_graph(x_norm);     // TensorF32*
     auto x_relu    = relu(x_hidden);                       // relu 返回指针
-    // dropout 图模式暂以 identity 处理（训练时图 drop 需后续专用 op）
-    auto x_out     = linear2_->forward_graph(x_relu);
+    auto x_dropped = dropout_.forward_graph(x_relu);      // 图 dropout
+    auto x_out     = linear2_->forward_graph(x_dropped);
     return x_out;
 }
 

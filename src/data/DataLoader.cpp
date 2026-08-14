@@ -1172,10 +1172,11 @@ rfaa::TensorF32 xyz_to_t2d(
                     int class_idx = dist_to_bin_single(dist_val, params);
                     class_idx = std::max(0, std::min(num_classes-1, class_idx));
                     
-                    // one-hot
-                    dist_onehot.data()[((b*T + t)*L + i)*L*num_classes + j*num_classes + class_idx] 
-                    = dist_val * mask_val;
-                    // ? dist = one hot float * mask
+                    // one-hot (Python: dist = dist_to_onehot(c6d[...,0], params)*mask)
+                    // 仅当该 bin 命中时置 1.0, 再由 mask 屏蔽无效对
+                    if (mask_val > 0.0f) {
+                        dist_onehot.data()[((b*T + t)*L + i)*L*num_classes + j*num_classes + class_idx] = 1.0f;
+                    }
                 }
             }
         }
@@ -1886,6 +1887,270 @@ void RFAADataLoader::load_templates_from_dir(
               << exclude_pdb_ids.size() << " ground-truth pdb ids)" << std::endl;
 }
 
+// ============================================================================
+// build_template_features — 从 *_mapped.csv 构建模板特征 t1d/t2d/tor_feat/template_mask
+//
+// *_mapped.csv 每行:
+//   uniprot_pos, uniprot_aa, template_orig_pos, template_aa, x, y, z
+//   - uniprot_pos: 模板残基在全长查询序列中的 1 索引位置 (对齐结果)
+//   - x,y,z: 该残基的 CA 坐标 (Å)
+//
+// 关键点 (对应需求描述):
+//   - 模板残基必须按 uniprot_pos 放到全长查询序列的正确位置, 否则 RFAA 会把模板坐标
+//     错放到 N 端 (residues 1-200) 而非 DNA-binding 域 (102-292), 严重干扰空间 loss。
+//   - 未映射/缺失的位置全部 0 填充, 并用 template_mask 标记 (False), 使模型忽略这些位置。
+//   - 每个模板 T 独立构建, 特征尺寸与模型硬编码匹配: t1d(80), tor_feat(30), t2d(64)。
+// ============================================================================
+void RFAADataLoader::build_template_features(
+    const std::string& template_dir,
+    const std::vector<std::string>& template_ids,
+    const std::string& query_sequence,
+    ModelInput& input,
+    int max_templates)
+{
+    namespace fs = std::filesystem;
+    const int L = static_cast<int>(query_sequence.length());
+    const int B = 1;
+    if (L <= 0) { input.t1d = TensorF32(); return; }
+
+    // aatype → one-hot 索引 (standard 20 AA, 未知/非标准 = 20)
+    auto aa_index = [](char aa) -> int {
+        static const char* AA = "ARNDCQEGHILKMFPSTWYV";
+        aa = static_cast<char>(std::toupper(aa));
+        const char* p = std::strchr(AA, aa);
+        return p ? static_cast<int>(p - AA) : 20;
+    };
+
+    // 收集已过滤后的模板 (id 与 load_templates_from_dir 一致的过滤条件)
+    std::vector<std::string> use_ids = template_ids;
+    // 若没传, 从目录自动列 (仅 mapped csv 前缀, 不包含 ground truth 过滤 —— 调用方负责传过滤后的)
+    if (use_ids.empty()) {
+        for (auto& f : list_structure_files(template_dir)) {
+            std::string pdb = fs::path(f.first).stem().string();
+            auto us = pdb.find('_');
+            if (us != std::string::npos) pdb = pdb.substr(0, us);
+            std::transform(pdb.begin(), pdb.end(), pdb.begin(), ::tolower);
+            use_ids.push_back(pdb);
+        }
+    }
+    if (use_ids.size() > static_cast<size_t>(max_templates)) use_ids.resize(max_templates);
+    const int T = static_cast<int>(use_ids.size());
+
+    // 初始化输出张量
+    input.t1d          = TensorF32({B, T, L, D_T1D}, Device::CPU);
+    input.t2d          = TensorF32({B, T, L, L, D_T2D}, Device::CPU);
+    input.tor_feat     = TensorF32({B, T, L, 30}, Device::CPU);
+    input.template_mask= TensorF32({B, T, L}, Device::CPU);
+    input.t1d.zero_(); input.t2d.zero_(); input.tor_feat.zero_(); input.template_mask.zero_();
+
+    for (int t = 0; t < T; ++t) {
+        const std::string& pdb = use_ids[t];
+        // 匹配 *_mapped.csv (文件名前缀 = pdb id, 大小写不敏感)
+        std::string mapped_csv;
+        {
+            std::error_code ec;
+            for (const auto& entry : fs::directory_iterator(template_dir, ec)) {
+                if (ec) break;
+                std::string name = entry.path().filename().string();
+                std::string lower = name;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                std::string want = pdb + "_mapped.csv";
+                if (lower == want) { mapped_csv = entry.path().string(); break; }
+            }
+        }
+        if (mapped_csv.empty()) {
+            std::cout << "[DataLoader] no mapped csv for template: " << pdb << std::endl;
+            continue;
+        }
+
+        // ---- 解析 mapped csv: 查询位置 → CA 坐标 ----
+        // pos_to_ca[uniprot_pos-1] = {x,y,z}, pos_filled[] 标记
+        std::vector<std::array<float,3>> pos_ca(L, {0,0,0});
+        std::vector<char> pos_filled(L, 0);
+        {
+            std::ifstream file(mapped_csv);
+            std::string line;
+            bool header = true;
+            while (std::getline(file, line)) {
+                if (line.empty()) continue;
+                if (line.back() == '\r') line.pop_back();
+                std::vector<std::string> f;
+                std::string cur; bool inq = false;
+                for (size_t i = 0; i < line.size(); i++) {
+                    char c = line[i];
+                    if (c == '"') inq = !inq;
+                    else if (c == ',' && !inq) { f.push_back(cur); cur.clear(); }
+                    else cur.push_back(c);
+                }
+                f.push_back(cur);
+                if (header) { header = false; continue; }
+                if (f.size() < 7) continue;
+                int pos = 0;
+                try { pos = std::stoi(f[0]); } catch (...) { continue; }
+                if (pos < 1 || pos > L) continue;
+                float x=0,y=0,z=0;
+                try { x=std::stof(f[4]); y=std::stof(f[5]); z=std::stof(f[6]); } catch (...) { continue; }
+                pos_ca[pos-1] = {x,y,z};
+                pos_filled[pos-1] = 1;
+            }
+        }
+
+        // ---- 填充 t1d ----
+        // t1d 维度 D_T1D=80, 其前 79 维与标准 80 类 one-hot token (见 DataLoader.h 顶部注释)
+        // 的索引布局一致 —— 即 aa one-hot 打在 [0:20], 20=UNK, 21=MAS:
+        //   [0:20]  aatype one-hot (aa_index, 未知/非标准=20 UNK)
+        //   [20]    template_mask 标记 (值 1, 该残基被模板覆盖)
+        //   [21:24] 伪 β(CA) 坐标 (x,y,z)   <- 覆盖原 MASK(21) 槽位, t1d 未使用 MASK token
+        //   [24]    has_pseudo_beta (1=该残基有 CA 坐标)
+        //   [25:80] 0
+        float* t1d_t = input.t1d.data() + (t*L)*D_T1D;
+        float* mask_t = input.template_mask.data() + t*L;
+        for (int l = 0; l < L; ++l) {
+            if (!pos_filled[l]) continue;
+            float* row = t1d_t + l*D_T1D;
+            int aai = aa_index(query_sequence[l]);
+            row[aai] = 1.0f;                    // [0:20] aatype one-hot
+            row[20] = 1.0f;                     // [20] template_mask
+            row[21] = pos_ca[l][0];             // [21:24] 伪 β(CA) 坐标
+            row[22] = pos_ca[l][1];
+            row[23] = pos_ca[l][2];
+            row[24] = 1.0f;                     // [24] has_pseudo_beta
+            mask_t[l] = 1.0f;
+        }
+
+        // ---- 填充 t2d (基于完整 N/CA/C 骨架坐标, RF2 标准 68 维) ----
+        // 布局 (与 xyz_to_t2d / xyz_to_c6d 对齐):
+        //   [0:61]  Cb-Cb 距离 one-hot (DBINS1+DBINS2+1 = 30+30+1, DMIN=1/DMID=4/DMAX=20)
+        //   [61:67] 3 个二面/夹角 (omega,theta,phi) 的 sin+cos = 6 维
+        //   [67]    有效残基对 mask
+        // 坐标来源: input.template_coords[t] (nres,4,3) = [N,CA,C,O], 模板残基顺序。
+        // 用 *_mapped.csv 的 template_orig_pos → uniprot_pos 对齐到查询序列位置。
+        // 注: 旧 CA-based 简化版 (RBF+单位向量+残基对) 已注释, 见下。
+        {
+            // 1) 解析 mapped csv 得到 模板残基索引(0-based) -> 查询位置(0-based)
+            //    orig_idx = template_orig_pos - min_orig_pos (模板残基连续递增)
+            std::vector<int> qpos_of_orig;          // 长度 = n_mapped
+            std::vector<int> orig_idx;              // 长度 = n_mapped
+            std::vector<int> qpos_of_tpl;           // orig_idx -> 查询位置 (-1 = 无)
+            int min_orig = std::numeric_limits<int>::max(), max_orig = -1;
+            std::ifstream mfile(mapped_csv);
+            std::string mline; bool mheader = true;
+            while (std::getline(mfile, mline)) {
+                if (mline.empty()) continue;
+                if (mline.back() == '\r') mline.pop_back();
+                std::vector<std::string> f; std::string cur; bool inq=false;
+                for (size_t k = 0; k < mline.size(); k++) {
+                    char c = mline[k];
+                    if (c == '"') inq = !inq;
+                    else if (c == ',' && !inq) { f.push_back(cur); cur.clear(); }
+                    else cur.push_back(c);
+                }
+                f.push_back(cur);
+                if (mheader) { mheader = false; continue; }
+                if (f.size() < 7) continue;
+                int upos=0, opos=0;
+                try { upos=std::stoi(f[0]); opos=std::stoi(f[2]); } catch (...) { continue; }
+                if (upos<1 || upos>L) continue;
+                qpos_of_orig.push_back(upos-1);
+                orig_idx.push_back(opos);
+                min_orig = std::min(min_orig, opos);
+                max_orig = std::max(max_orig, opos);
+            }
+            // 2) 填充 xyz_full: (1, L, 3, 3) = 查询位置 -> [N,CA,C]
+            //    从 input.template_coords[t] 取 N/CA/C (原子序 0/1/2)
+            TensorF32 xyz_full({1, L, 3, 3}, Device::CPU);
+            xyz_full.zero_();
+            if (!orig_idx.empty() && t < static_cast<int>(input.template_coords.size())) {
+                const TensorF32& tc = input.template_coords[t];
+                int nres_t = static_cast<int>(tc.shape().dims[0]);
+                qpos_of_tpl.assign(max_orig - min_orig + 1, -1);
+                for (size_t r = 0; r < orig_idx.size(); r++) {
+                    int oi = orig_idx[r] - min_orig;
+                    if (oi < 0 || oi >= (int)qpos_of_tpl.size()) continue;
+                    qpos_of_tpl[oi] = qpos_of_orig[r];
+                }
+                // 模板残基行索引 = orig_idx - min_orig (假定连续递增)
+                for (int oi = 0; oi < (int)qpos_of_tpl.size(); oi++) {
+                    int qp = qpos_of_tpl[oi];
+                    if (qp < 0 || qp >= L) continue;
+                    if (oi < nres_t) {
+                        const float* r = tc.data() + oi*4*3;
+                        float* d = xyz_full.data() + qp*3*3;
+                        d[0]=r[0]; d[1]=r[1]; d[2]=r[2];  // N
+                        d[3]=r[3]; d[4]=r[4]; d[5]=r[5];  // CA
+                        d[6]=r[6]; d[7]=r[7]; d[8]=r[8];  // C
+                    }
+                }
+            }
+            // 3) 构建有效对掩码 (1, L, L): i/j 都有效
+            TensorF32 mask_ll({1, L, L}, Device::CPU);
+            mask_ll.zero_();
+            for (int qp : qpos_of_orig) if (qp>=0 && qp<L) mask_ll.data()[qp*L+qp] = 1.0f;
+            for (int i = 0; i < L; ++i)
+                for (int j = 0; j < L; ++j)
+                    if (mask_ll.data()[i*L+i] > 0 && mask_ll.data()[j*L+j] > 0)
+                        mask_ll.data()[i*L+j] = 1.0f;
+            // 4) 调用 xyz_to_t2d (68 维): (1,1,L,3,3) + (1,1,L,L) -> (1,1,L,L,68)
+            TensorF32 xyz_bt({1, 1, L, 3, 3}, Device::CPU);
+            std::memcpy(xyz_bt.data(), xyz_full.data(), xyz_full.numel()*sizeof(float));
+            TensorF32 mask_bt({1, 1, L, L}, Device::CPU);
+            std::memcpy(mask_bt.data(), mask_ll.data(), mask_ll.numel()*sizeof(float));
+            TensorF32 t2d_full = xyz_to_t2d(xyz_bt, mask_bt, DistParams());  // 68 维版 (显式传 params 避免重载歧义)
+            // 5) 写入 input.t2d[:, t]
+            if (t2d_full.numel() == L*L*D_T2D) {
+                float* dst = input.t2d.data() + (t*L*L)*D_T2D;
+                std::memcpy(dst, t2d_full.data(), L*L*D_T2D*sizeof(float));
+            }
+        }
+        // ---- 旧 CA-based t2d 简化版 (已注释保留) ----
+        // 布局 (简化的伪 β t2d):
+        //   [0:12]  距离 RBF (12 个径向基, 覆盖 0~~20 Å)
+        //   [12:15] CA-CA 单位向量 (3)
+        //   [15:18] 相对方向 (3)
+        //   [18:22] 残基类型对 (20×20 聚合 4 块)
+        //   [22:64] 保留 0 (后续可按模型权重布局填充)
+        // float* t2d_t = input.t2d.data() + (t*L*L)*D_T2D;
+        // for (int i = 0; i < L; ++i) {
+        //     if (!pos_filled[i]) continue;
+        //     for (int j = 0; j < L; ++j) {
+        //         if (!pos_filled[j]) continue;
+        //         float* cell = t2d_t + (i*L + j)*D_T2D;
+        //         float dx = pos_ca[i][0] - pos_ca[j][0];
+        //         float dy = pos_ca[i][1] - pos_ca[j][1];
+        //         float dz = pos_ca[i][2] - pos_ca[j][2];
+        //         float d  = std::sqrt(dx*dx + dy*dy + dz*dz) + 1e-8f;
+        //         // RBF
+        //         for (int k = 0; k < 12; ++k) {
+        //             float c = 0.5f + k * (20.0f / 12.0f);
+        //             float bw = 1.5f;
+        //             float diff = (d - c) / bw;
+        //             cell[k] = std::exp(-diff*diff);
+        //         }
+        //         // 单位向量 (i→j)
+        //         cell[12] = dx/d; cell[13] = dy/d; cell[14] = dz/d;
+        //         // 相对方向 (j→i)
+        //         cell[15] = -dx/d; cell[16] = -dy/d; cell[17] = -dz/d;
+        //         // 残基类型对 (i,j) 的低维聚合
+        //         cell[18] = static_cast<float>(aa_index(query_sequence[i]));
+        //         cell[19] = static_cast<float>(aa_index(query_sequence[j]));
+        //         cell[20] = cell[18]/20.0f;
+        //         cell[21] = cell[19]/20.0f;
+        //     }
+        // }
+        // // [22:64] 保持 0
+
+        // ---- 填充 tor_feat (30 = 10 扭转角 × (sin,cos,mask)) ----
+        // 此处仅有 CA 坐标, 无法计算真实扭转角 → 全部 0 + mask=0。
+        // 若要计算真实扭转角, 需 N/CA/C/O backbone (见 parse_template_structure),
+        // 后续可扩展: 对每个模板用 backbone 计算 10 个 torsion 的 sin/cos 填入。
+        // (tor_feat 已 zero_() 初始化)
+
+        std::cout << "[DataLoader] template " << pdb << ": mapped "
+                  << std::count(pos_filled.begin(), pos_filled.end(), (char)1) << "/" << L
+                  << " residues -> t1d/t2d filled" << std::endl;
+    }
+}
+
 ModelInput RFAADataLoader::load_from_files(
     const std::string& a3m_path,
     const std::string& sequence,
@@ -1939,6 +2204,9 @@ ModelInput RFAADataLoader::load_from_files(
             exclude_ids = collect_ground_truth_pdb_ids(csv_path);
         }
         load_templates_from_dir(template_dir, exclude_ids, input, max_templates_);
+        // 构建模板特征 t1d/t2d/tor_feat/template_mask (基于 *_mapped.csv 对齐)
+        // 仅对已过滤后的模板 id 构建 (排除与真实值重复的 PDB)
+        build_template_features(template_dir, input.template_ids, sequence, input, max_templates_);
     }
     
     // Step 1: 解析 A3M (含插入计数矩阵)

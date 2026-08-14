@@ -818,7 +818,9 @@ const TensorF32& SE3Basis::get_basis(int d_in, int d_out) const {
         }
     }
 
-    cache_[key].copy_from(result);
+    // 注意: 不可用 cache_[key].copy_from(result) —— operator[] 默认构造 1 元素 Tensor。
+    // 用移动赋值替换。
+    cache_[key] = std::move(result);
     return cache_[key];
 }
 
@@ -958,8 +960,9 @@ SE3Features G1x1SE3::forward(const SE3Features& x) {
 
         // matmul: (m_out×m_in) @ (batch, ..., m_in, 2d+1) → (batch, ..., m_out, 2d+1)
         // LinearLayer::forward 内部做矩阵乘法，自动处理广播
-        TensorF32 result = W->forward(v);
-        output.features[i].copy_from(result);
+        // 注意: 不可用 output.features[i].copy_from(result) —— resize 默认构造 1 元素 Tensor,
+        // copy_from 要求 numel 完全一致。用移动赋值替换。
+        output.features[i] = W->forward(v);
     }
 
     return output;
@@ -1562,8 +1565,9 @@ SE3Features GConvSE3Partial::forward(
         const TensorF32& basis_pair = basis.get_basis(d_in, d_out);
 
         // 生成等变卷积核: (E, m_out·d_dim_out, m_in·d_dim_in)
-        TensorF32 K = pc->forward(feat, basis_pair);
-        kernels_map[kv.first].copy_from(K);
+        // 注意: 不可用 kernels_map[key].copy_from(K) —— operator[] 默认构造 1 元素 Tensor。
+        // 用移动赋值替换。
+        kernels_map[kv.first] = pc->forward(feat, basis_pair);
     }
 
     // ================================================================
@@ -2382,10 +2386,12 @@ GNormSE3::GNormSE3(const Fiber& fiber, float eps)
 
 SE3Features GNormSE3::forward(const SE3Features& x) {
     // 简化：逐 feature 复制
+    // 注意: 不可用 default-constructed 的 copy.copy_from(f) —— 默认 Tensor numel==1,
+    // copy_from 要求 numel 完全一致。须按源 shape 构造。
     SE3Features out;
     out.features.reserve(x.features.size());
     for (const auto& f : x.features) {
-        TensorF32 copy;
+        TensorF32 copy(f.shape(), f.device());
         copy.copy_from(f);
         out.features.push_back(std::move(copy));
     }
@@ -2419,7 +2425,9 @@ GNormBias::GNormBias(const Fiber& fiber)
             b_data[c] = dist(gen);
         }
 
-        bias_[d].copy_from(b);
+        // 注意: 不可用 bias_[d].copy_from(b) —— operator[] 默认构造 1 元素 Tensor,
+        // 而 copy_from 要求 numel 完全一致 (m>1 时 shape mismatch)。用移动赋值替换。
+        bias_[d] = std::move(b);   // bias_[d]: (1, m)
     }
 }
 
@@ -2485,7 +2493,9 @@ SE3Features GNormBias::forward(const SE3Features& x) {
             }
         }
 
-        output.features[i].copy_from(out);
+        // 注意: 不可用 output.features[i].copy_from(out) —— resize 默认构造 1 元素 Tensor。
+        // 用移动赋值替换。
+        output.features[i] = std::move(out);
     }
 
     return output;
@@ -2559,9 +2569,12 @@ SE3Features TFN::forward(const SE3Features& x,
     // 3. 偏置加法
     
     // TODO: conv_ 未实现，暂时返回空
+    // 注意: 不可用 out.features[i].copy_from(...) —— resize 默认构造 1 元素 Tensor。
+    // 按源 shape 构造再复制。
     SE3Features out;
     out.features.resize(x.features.size());
     for (size_t i = 0; i < x.features.size(); ++i) {
+        out.features[i] = TensorF32(x.features[i].shape(), x.features[i].device());
         out.features[i].copy_from(x.features[i]);
     }
     // SE3Features out = conv_->forward(x, basis, edge_index);
@@ -2649,10 +2662,12 @@ SE3Features SE3Transformer::forward(const SE3Features& h,
     //       h = layer(h, G=G, r=r, basis=basis)
 
     // deep copy data since tensor was not allowed to copy
+    // 注意: 不可用 default-constructed 的 copy.copy_from(f) —— 默认 Tensor numel==1。
+    // 按源 shape 构造再复制。
     SE3Features out;
     out.features.reserve(h.features.size());
     for (const auto& f : h.features) {
-        TensorF32 copy;
+        TensorF32 copy(f.shape(), f.device());
         copy.copy_from(f);
         out.features.push_back(std::move(copy));
     }

@@ -1,5 +1,37 @@
 #pragma once
 
+// ============================================================================
+// RF2/RFAA 80 类 one-hot token 类型 (ChemicalData::num2aa, NAATOKENS = 20+2+10+1+47)
+// RF2/RFAA 80 one-hot token types (ChemicalData::num2aa, NAATOKENS = 20+2+10+1+47)
+// 这是 aatype / t1d 等 one-hot 特征的单一事实来源, 与 Python rf2aa/chemical.py 对齐:
+// This is the single source of truth for one-hot features such as aatype/t1d, aligned with Python rf2aa/chemical.py:
+//
+//   Range      | Count | Content
+//   -----------|-------|----------------------------------------------------------
+//   0–19       | 20    | 标准氨基酸: ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE
+//             |       |   Standard amino acids: ALA ARG ASN ASP CYS GLN GLU GLY HIS ILE
+//             |       |   LEU LYS MET PHE PRO SER THR TRP TYR VAL
+//   20         | 1     | UNK  (未知残基)  / UNK (unknown residue)
+//   21         | 1     | MAS  (蛋白质 mask token)  / MAS (protein mask token)
+//   22–26      | 5     | DNA 碱基 + 未知:  DA DC DG DT DX
+//             |       |   DNA bases + unknown: DA DC DG DT DX
+//   27–31      | 5     | RNA 碱基 + 未知:  RA RC RG RU RX
+//             |       |   RNA bases + unknown: RA RC RG RU RX
+//   32         | 1     | HIS_D (仅用于 cart_bonded)  / HIS_D (only used for cart_bonded)
+//   33–79      | 47    | 重原子元素 (配体/小分子): Al As Au B Be Br C Ca Cl Co Cr Cu
+//             |       |   Heavy-atom element types (ligands/small molecules): Al As Au B Be Br C Ca Cl Co Cr Cu
+//             |       |   F Fe Hg I Ir K Li Mg Mn Mo N Ni O Os P Pb Pd Pr Pt Re Rh
+//             |       |   Ru S Sb Se Si Sn Tb Te U W V Y Zn ATM
+//
+//  索引常量: UNKINDEX=20, MASKINDEX=21 (蛋白), MASKINDEXDNA=26, MASKINDEXRNA=31。
+//  Index constants: UNKINDEX=20, MASKINDEX=21 (protein), MASKINDEXDNA=26, MASKINDEXRNA=31.
+//  类别分组 (nucleic_compatibility_utils.mol_class_3letter):
+//  Class grouping (nucleic_compatibility_utils.mol_class_3letter):
+//    protein = [0:22]+HIS_D(32),  dna = [22:27],  rna = [27:32],  atom = [33:80]。
+//  模板特征 t1d 使用其中前 22 类 (aa one-hot 0:20 + UNK/MASK), 见 build_template_features。
+//  The template feature t1d uses the first 22 classes (aa one-hot 0:20 + UNK/MASK), see build_template_features.
+// ============================================================================
+
 #include "Model.h"
 #include "Tensor.h"
 #include <string>
@@ -256,6 +288,27 @@ public:
     static void load_templates_from_dir(
         const std::string& template_dir,
         const std::set<std::string>& exclude_pdb_ids,
+        ModelInput& input,
+        int max_templates = 4);
+
+    // ===== 模板特征构建 (t1d / t2d / tor_feat / template_mask) =====
+    // 从 *_mapped.csv (uniprot_pos → CA 坐标, 即模板残基到全长查询序列的对齐) 构建模板特征,
+    // 填充 input.t1d (B,T,L,80) / input.t2d (B,T,L,L,64) / input.tor_feat (B,T,L,30) /
+    // input.template_mask (B,T,L)。
+    //
+    // 处理逻辑:
+    //   1. 对每个模板的 *_mapped.csv, 逐行读取 (uniprot_pos, template_orig_pos, x,y,z) →
+    //      建立 "查询序列位置 → 模板残基 + CA 坐标" 的对齐映射。
+    //   2. t1d: [0:20] aatype one-hot(模板残基, 放到对应查询位置), [20] template_mask,
+    //      [21:24] 伪 β(CA) 坐标, [24] has_pseudo_beta, [25:80] 0(扭转角独立在 tor_feat)。
+    //   3. tor_feat: 10 个扭转角 × (sin, cos, mask) = 30 (从结构 backbone 计算; 仅有 CA 时置 0)。
+    //   4. t2d: 伪 β 距离/方向特征 (CA-based) 填 64 维, 未覆盖残基对全 0。
+    //   5. template_mask: 被 mapped 覆盖的残基 = 1, 其余 = 0。
+    //   unmapped 位置全部零填充并用 template_mask 标记 (0), 避免把模板坐标错放到 N 端。
+    static void build_template_features(
+        const std::string& template_dir,
+        const std::vector<std::string>& template_ids,   // 已过滤后的模板 id (小写)
+        const std::string& query_sequence,              // 全长查询序列
         ModelInput& input,
         int max_templates = 4);
 

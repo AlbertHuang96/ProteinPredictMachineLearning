@@ -43,10 +43,11 @@ struct ModelInput {
     TensorF32 msa_full;      // (B, N_extra, L, 83) - optional
     TensorF32 seq_tokens;    // (B, L) - 查询序列 token
     TensorF32 t1d;           // (B, T, L, 80) - 模板特征
-    TensorF32 t2d;           // (B, T, L, L, ...) - 模板 2D 特征
+    TensorF32 t2d;           // (B, T, L, L, 64) - 模板 2D 特征
     TensorF32 coords;        // (B, L, 3, 3) - 初始 Ca 坐标 (可选)
     TensorF32 true_coords;   // (B, L, 3, 3) - 真实坐标 (ground truth, 从 CSV 加载) ← 新增
-    TensorF32 tor_feat;
+    TensorF32 tor_feat;      // (B, T, L, 30) - 模板扭转角特征 (10 torsion × sin/cos/mask)
+    TensorF32 template_mask; // (B, T, L)   - 模板有效掩码 (1.0=该残基有模板坐标, 0.0=缺失/零填充)
     TensorF32 bond_feats;    // (B, L, L, d_bond) - 键特征
     TensorF32 dist_matrix;   // (B, L, L) - 距离矩阵
     TensorF32 same_chain;    // (B, L, L) - 同链掩码
@@ -632,6 +633,7 @@ private:
 
     // ===== 后端基础设施 =====
     std::unique_ptr<CPUBackend>       cpu_backend_;
+    std::unique_ptr<CUDABackend>      cuda_backend_;
     std::unique_ptr<BackendScheduler> scheduler_;
     bool backend_ready_ = false;
 

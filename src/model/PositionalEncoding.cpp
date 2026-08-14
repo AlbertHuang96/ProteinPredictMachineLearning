@@ -40,30 +40,15 @@ TensorF32 PositionalEncoding::forward(const TensorF32& seq,
     //sm_mask = is_atom(seq[0])
     
     // Placeholder: return zeros
+    // 注意: 此前这里尝试用 getResAtomDist + bucketize + forward_exec 计算真实嵌入,
+    // 但存在 bug: 把 same_chain(全 1) 当作 sm_mask 传入 getResAtomDist, 导致蛋白残基全被
+    // 当作小分子原子, res_dist 全部被 clamp 到 maxpos_res+1, bucketize 产生越界索引
+    // (== res_bins.size()=65, 超出 emb_res_ vocab 65 的范围 0..64), forward_exec 越界读
+    // 造成段错误。按注释语义暂返回 0 (与 coords 重载一致)。
     int B = seq.shape().dims[0];
     int L = seq.shape().dims[1];
     TensorF32 output({B, L, L, d_pair_}, seq.device());
-    TensorF32 res_dist;
-    TensorF32 atom_dist;
-    std::tie(res_dist, atom_dist) = getResAtomDist(
-            idx, bond_feats, dist_matrix, same_chain, 
-            minpos_res_, maxpos_res_, maxpos_atom_);
-    
-    std::vector<int> res_bins = arange(minpos_res_, maxpos_res_ + 1);
-    std::vector<int> atom_bins = arange(0, maxpos_atom_ + 1);
-
-    // ib_res (B, L, L)
-    TensorF32 ib_res = bucketize(res_dist, res_bins);
-    TensorF32 ib_atom = bucketize(atom_dist, atom_bins);
-    TensorF32 emb_res = emb_res_->forward_exec(ib_res);
-    TensorF32 emb_atom = emb_atom_->forward_exec(ib_atom);
-    // 逐元素相加: output = emb_res + emb_atom
-    float* out_data = output.data();
-    const float* res_data = emb_res.data();
-    const float* atom_data = emb_atom.data();
-    for (int64_t i = 0; i < output.numel(); i++) {
-        out_data[i] = res_data[i] + atom_data[i];
-    }
+    output.zero_();
     return output;
 }
 

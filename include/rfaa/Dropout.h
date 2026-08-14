@@ -2,6 +2,7 @@
 
 #include "Tensor.h"
 #include <random>
+#include <vector>
 
 namespace rfaa {
 
@@ -48,12 +49,24 @@ public:
      * @return TensorF32 Output tensor (same shape as input)
      */
     TensorF32 forward(const TensorF32& x);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入/输出均为图节点指针 (ggml 布局 dims[0]=最内维)。
+    // 用现有图 op 实现: 生成随机掩码常量叶子 (broadcast_dim 语义同 forward), 经
+    // mul(x, mask_scale) 完成 dropout。mask 为叶子 → mul 反向只会把 grad_out*mask 回传给 x,
+    // 对掩码本身不求梯度, 与值版 dropout 语义一致。
+    TensorF32* forward_graph(TensorF32* x);
+
 private:
     int broadcast_dim_;   // -1 means no broadcast (independent dropout per element)
     float p_drop_;        // Dropout probability
     bool training_;       // Training mode flag
-    
+
+    // 生成 dropout 掩码 (host 侧), 语义与 forward 一致:
+    //   out_mask[i] = {0, scale} 其中 scale=1/(1-p), 0 以概率 p, scale 以概率 1-p。
+    // 已把缩放因子 scale 烘焙进掩码值, 直接 mul(x, mask) 即得 dropout 输出。
+    void generate_mask(const Shape& shape, std::vector<float>& out_mask);
+
     // Random number generator for Bernoulli sampling
     std::mt19937 rng_;
     std::bernoulli_distribution dist_;
