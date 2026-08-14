@@ -363,8 +363,18 @@ public:
 
     void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
     
-    // 前向传播
+    // 前向传播 (值模式, 既有实现, 不改动)
     ModelOutput forward(const ModelInput& input);
+
+    // ===== 图模式前向（新增入口，不改 forward）=====
+    // 预处理 embedding 与 block 前向均使用 forward_graph 版本（ggml 布局 dims[0]=最内维）。
+    // 输入值张量包装为图 leaf；内部 graph_compute 回落为 ModelOutput 值张量（供 loss/训练）。
+    // 注:
+    //   - PositionalEncoding 的图版本当前为占位（返回零图节点），故 pair 初始化不含位置编码；
+    //   - rbf 特征用值版 compute_rbf_feature 后注入为常量图 leaf；
+    //   - SE3 3D track 需"图外值回落"驱动（graph_compute(pair)→run_se3_structural），
+    //     本入口在 block 循环边界以相同方式驱动（与训练入口约定一致）。
+    ModelOutput forward_graph(const ModelInput& input);
 
     TensorF32 get_templ_emb(const TensorF32& t1d, const TensorF32& t2d);
     
@@ -389,7 +399,11 @@ public:
     void train();
     void eval();
     bool is_training() const;
-    
+
+    // 后端访问器：返回当前可用的执行后端（CUDA 若就绪则优先，否则 CPU）。
+    // 供训练循环调用 backend->graph_compute(cgraph) 执行反向/更新。
+    Backend* active_backend();
+
 private:
     RFAAConfig config_;
     Device device_ = Device::CPU;

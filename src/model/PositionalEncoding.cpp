@@ -4,6 +4,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <cstring>
 
 
 namespace rfaa {
@@ -65,6 +66,33 @@ TensorF32 PositionalEncoding::forward(const TensorF32& coords) {
 
     //output.zero_();
     return output;
+}
+
+// ===== PositionalEncoding::forward_graph (图版，留后实现，当前返回零占位) =====
+// 输入/输出均为图节点指针（ggml 布局 dims[0]=最内维）：
+//   seq        : 图 [L, B]
+//   idx        : 图 [L, B]
+//   bond_feats : 图 [L, L, B]
+//   dist_matrix: 图 [L, L, B]
+//   same_chain : 图 [L, L, B]（可选）
+// 返回: pair bias 图节点 [D_PAIR, L, L, B]。
+// TODO(实现): 需把值版 getResAtomDist/bucketize/emb_res_/emb_atom_ 改写为图 op：
+//   - getResAtomDist/bucketize: 逐元素距离→桶索引，需 OP_SUB/OP_DIV/OP_CAST 等（尚未有图版）；
+//   - emb_res_/emb_atom_: 可用 EmbeddingLayer::forward_graph（get_rows）查表；
+//   - 汇总 emb_res(res_bucket) + emb_atom(atom_bucket) → add_impl。
+// 当前以零常量图节点占位，保证 block forward_graph 的 pair 图不断链。
+TensorF32* PositionalEncoding::forward_graph(TensorF32* seq, TensorF32* idx,
+                                             TensorF32* bond_feats,
+                                             TensorF32* dist_matrix,
+                                             TensorF32* same_chain) {
+    (void)idx; (void)bond_feats; (void)dist_matrix; (void)same_chain;
+    // seq 图 [L, B] → L=dims[0], B=dims[1]
+    const int64_t L = seq->shape().dims[0];
+    const int64_t B = seq->shape().dims[1];
+    int64_t ne[4] = {d_pair_, L, L, B};
+    TensorF32* out = context().new_tensor<float>(4, ne);
+    std::memset(out->data(), 0, static_cast<size_t>(out->numel()) * sizeof(float));
+    return out;
 }
 
 std::pair<TensorF32, TensorF32> PositionalEncoding::getResAtomDist(

@@ -5,6 +5,7 @@
 #include "rfaa/PythonBridge.h"
 #include "rfaa/ONNXExporter.h"
 #include "rfaa/GradientClipper.h"
+#include "rfaa/AdamW.h"
 #include "rfaa/GGUF.h"
 #include "rfaa/LDDT.h"
 #include <iostream>
@@ -13,6 +14,7 @@
 #include <fstream>
 #include <filesystem>
 #include <sstream>
+#include <iomanip>
 
 using namespace rfaa;
 
@@ -235,6 +237,57 @@ int main(int argc, char* argv[]) {
                   << " residues=" << input.template_residue_counts[ti] << std::endl;
     }
 
+    // ============================================================
+    // 打印加载到的所有输入张量形状与大小 (debug 辅助)
+    // ============================================================
+    auto print_tensor = [](const char* name, const TensorF32& t) {
+        std::ostringstream oss;
+        oss << "  " << std::setw(18) << std::left << name << " shape=(";
+        for (int d = 0; d < t.shape().ndim(); ++d) {
+            if (d) oss << ",";
+            oss << t.shape().dims[d];
+        }
+        oss << ") numel=" << t.numel()
+            << " bytes=" << (t.nbytes() / 1024.0) << "KB";
+        std::cout << oss.str() << std::endl;
+    };
+    std::cout << "[Data sizes] per-input tensor:" << std::endl;
+    print_tensor("msa_latent",   input.msa_latent);
+    print_tensor("msa_full",     input.msa_full);
+    print_tensor("seq_tokens",   input.seq_tokens);
+    print_tensor("t1d",          input.t1d);
+    print_tensor("t2d",          input.t2d);
+    print_tensor("coords",       input.coords);
+    print_tensor("true_coords",  input.true_coords);
+    print_tensor("tor_feat",     input.tor_feat);
+    print_tensor("template_mask",input.template_mask);
+    print_tensor("bond_feats",   input.bond_feats);
+    print_tensor("dist_matrix",  input.dist_matrix);
+    print_tensor("same_chain",   input.same_chain);
+    print_tensor("true_msa",     input.true_msa);
+    print_tensor("bert_mask",    input.bert_mask);
+    print_tensor("gt_chi",       input.gt_chi);
+    print_tensor("chi_mask",     input.chi_mask);
+    print_tensor("D_onehot",     input.D_onehot);
+    print_tensor("O_onehot",     input.O_onehot);
+    print_tensor("T_onehot",     input.T_onehot);
+    print_tensor("P_onehot",     input.P_onehot);
+    print_tensor("pair_mask",    input.pair_mask);
+    print_tensor("ca_mask",      input.ca_mask);
+    std::cout << "  [Data sizes] total input memory="
+              << (input.msa_latent.nbytes() + input.msa_full.nbytes()
+                  + input.seq_tokens.nbytes() + input.t1d.nbytes()
+                  + input.t2d.nbytes() + input.coords.nbytes()
+                  + input.true_coords.nbytes() + input.tor_feat.nbytes()
+                  + input.template_mask.nbytes() + input.bond_feats.nbytes()
+                  + input.dist_matrix.nbytes() + input.same_chain.nbytes()
+                  + input.true_msa.nbytes() + input.bert_mask.nbytes()
+                  + input.gt_chi.nbytes() + input.chi_mask.nbytes()
+                  + input.D_onehot.nbytes() + input.O_onehot.nbytes()
+                  + input.T_onehot.nbytes() + input.P_onehot.nbytes()
+                  + input.pair_mask.nbytes() + input.ca_mask.nbytes()) / 1024.0
+              << " KB" << std::endl;
+
     // 若没有真实坐标, 用一个占位 coords 供前向使用
     if (input.coords.numel() == 0) {
         input.coords = zeros<float>({1, L, 3, 3}, Device::CPU);
@@ -257,6 +310,12 @@ int main(int argc, char* argv[]) {
     //             例: 解析 argc/argv 后 ckpt_interval = atoi(argv[k])。
     int ckpt_interval = 2;                     // 默认每 2 个 epoch 保存一次
     const std::string ckpt_dir = "checkpoints"; // checkpoint 输出目录
+
+    // ---- AdamW 优化器配置 (decoupled weight decay) ----
+    const float learning_rate   = 1e-4f;   // 峰值学习率
+    const float weight_decay    = 0.01f;   // 权重衰减系数（仅对 Linear/Embedding 的 weight 生效）
+    AdamW optimizer(learning_rate, weight_decay);
+    bool  optimizer_inited = false;
 
     // 可选: 开发期统计所有权重的内存占用 (不写文件)
     // 若要打印初始权重占用的内存, 取消下面一行注释:
@@ -423,12 +482,20 @@ int main(int argc, char* argv[]) {
         cgraph->build_forward_expand(total_node);
         cgraph->build_backward_expand(ctx, nullptr);
 
-        // 若已接入 backend, 可在此调用 graph_compute + clip_grad_norm + optimizer
-        // backend->graph_compute(cgraph);
-        // float grad_norm = clip_grad_norm(cgraph, 0.1f);
+        // ---- 反向计算 + 梯度裁剪 + AdamW 参数更新 ----
+        Backend* backend = model.active_backend();
+        backend->graph_compute(cgraph);                    // 执行前向+反向，写入参数梯度
+        float grad_norm = clip_grad_norm(cgraph, 0.1f);    // 全局梯度裁剪 (AF2 推荐 0.1)
 
-        // 读取 total loss 数值 (FAPE 项已正确构造, 其余项为 0)
-        // 注: 需要 backend->graph_compute 后 total_node->data() 才有值
+        if (!optimizer_inited) {
+            optimizer.init_from_graph(cgraph);             // 首次收集参数并分配 m/v
+            optimizer_inited = true;
+            std::cout << "[AdamW] initialized, params=" << optimizer.param_count()
+                      << std::endl;
+        }
+        optimizer.step(cgraph);                            // 更新权重 (decoupled weight decay)
+
+        // 读取 total loss 数值 (graph_compute 后才有值)
         float batch_loss = 0.0f;
         if (total_node->data() != nullptr && total_node->numel() == 1) {
             batch_loss = total_node->data()[0];
@@ -445,7 +512,8 @@ int main(int argc, char* argv[]) {
         std::cout << "Epoch " << epoch + 1 << "/" << num_epochs
                   << " completed in " << epoch_ms << " ms"
                   << " (forward " << fwd_ms << " ms)"
-                  << ", loss: " << batch_loss << std::endl;
+                  << ", loss: " << batch_loss
+                  << ", grad_norm: " << grad_norm << std::endl;
 
         // ============================================================
         // Checkpoint 保存: 每隔 ckpt_interval 个 epoch, 以及最后一个 epoch

@@ -18,6 +18,7 @@ enum tensor_flag {
     TENSOR_FLAG_PARAM   = 4,
     TENSOR_FLAG_LOSS    = 8,
     TENSOR_FLAG_COMPUTE = 16,
+    TENSOR_FLAG_NO_WEIGHT_DECAY = 32,   // 权重衰减豁免（bias / LayerNorm 的 gamma、beta）
 };
 
 enum tensor_type {

@@ -101,7 +101,7 @@ namespace rfaa {
         if (bias) {
             int64_t b_dims[] = {out_features};
             layer->bias_ = context().new_tensor<float>(1, b_dims);
-            layer->bias_->flag = TENSOR_FLAG_PARAM;  // ← 标记为可训练
+            layer->bias_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_NO_WEIGHT_DECAY;  // ← 可训练但不做 weight decay
         }
 
         // ===== Xavier 初始化 =====
@@ -175,8 +175,8 @@ namespace rfaa {
         int64_t dims[] = {normalized_shape};
         layer->gamma_ = context().new_tensor<float>(1, dims);
         layer->beta_  = context().new_tensor<float>(1, dims);
-        layer->gamma_->flag = TENSOR_FLAG_PARAM;
-        layer->beta_->flag  = TENSOR_FLAG_PARAM;
+        layer->gamma_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_NO_WEIGHT_DECAY;
+        layer->beta_->flag  = TENSOR_FLAG_PARAM | TENSOR_FLAG_NO_WEIGHT_DECAY;
 
         // gamma = 1, beta = 0
         for (int i = 0; i < normalized_shape; i++)

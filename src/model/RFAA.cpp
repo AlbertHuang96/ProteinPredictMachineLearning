@@ -51,6 +51,39 @@ TensorF32* query_row_add_graph(TensorF32* msa, TensorF32* proj_state) {
     // 7) msa + addend（同形 [D,L,N,B] 逐元素加）
     return add_impl(msa, addend, /*inplace=*/false);
 }
+
+// ===== 把值张量包装为图节点 leaf（图模式 forward_graph 用）=====
+// 布局约定: 值 row-major (B, ..., C) 最内维 C 连续，与图 ggml dims[0]=C 存储兼容，
+// 故可直接把扁平数据拷入图节点。dims 传图维度（dims[0]=最内维），即值维度的逆序。
+// 例如: 值 (B,N,L,164) → 图 dims {164, L, N, B}。
+TensorF32* wrap_input_as_leaf(const TensorF32& t, const std::vector<int64_t>& dims) {
+    int64_t ne[4] = {1, 1, 1, 1};
+    for (size_t i = 0; i < dims.size() && i < 4; i++) ne[i] = dims[i];
+    TensorF32* leaf = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
+    if (t.device() == Device::CUDA) {
+        TensorF32 tcpu = t.cpu();
+        std::memcpy(leaf->data(), tcpu.data(), tcpu.numel() * sizeof(float));
+    } else {
+        std::memcpy(leaf->data(), t.data(), t.numel() * sizeof(float));
+    }
+    return leaf;
+}
+
+// ===== 图节点回落为值张量（build + compute + 读 data）=====
+// 图节点 dims [C, L, N, B]（dims[0]=最内维）扁平数据 == 值张量 (B,N,L,C) 扁平数据，
+// 存储兼容，直接 memcpy 到目标值张量。
+void compute_and_read(TensorF32* node, TensorF32& dst,
+                      ComputeGraph* cgraph, Backend* backend) {
+    if (!node) return;
+    cgraph->build_forward_expand(node);
+    backend->graph_compute(cgraph);
+    if (node->data() != nullptr) {
+        size_t bytes = static_cast<size_t>(node->numel()) * sizeof(float);
+        if (dst.numel() == node->numel()) {
+            std::memcpy(dst.data(), node->data(), bytes);
+        }
+    }
+}
 } // namespace
 
 RFAAConfig::RFAAConfig() {
@@ -2077,6 +2110,149 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     return output;
 }
 
+// ===== RFAAModel::forward_graph (图模式前向，新增入口，不改 forward) =====
+// 预处理 embedding 与 block 前向均使用 forward_graph 版本。
+// 布局约定（ggml dims[0]=最内维）：
+//   msa        : 图 [D_MSA, L, N, B]     = 值 (B, N, L, D_MSA)
+//   pair       : 图 [D_PAIR, L, L, B]    = 值 (B, L, L, D_PAIR)
+//   state      : 图 [D_STATE, L, B]      = 值 (B, L, D_STATE)
+//   rbf        : 图 [D_RBF, L, L, B]     = 值 (B, L, L, D_RBF)
+// 输入值张量包装为图 leaf；内部对输出头 graph_compute 回落为 ModelOutput 值张量。
+// 注:
+//   - PositionalEncoding::forward_graph 当前为占位（返回零图节点），pair 初始化不含位置编码；
+//   - SE3 3D track 需"图外值回落"驱动（graph_compute(pair) → run_se3_structural），本入口
+//     暂未驱动 SE3（block 的 forward_graph 在无结构输入时只跑 msa/pair 两条 track）。
+ModelOutput RFAAModel::forward_graph(const ModelInput& input) {
+    ModelOutput output;
+
+    const int B = input.msa_latent.shape().dims[0];
+    const int N = input.msa_latent.shape().dims[1];
+    const int L = input.msa_latent.shape().dims[2];
+    const int64_t D_init = input.msa_latent.shape().dims[3];   // 164
+
+    // ==== 1. 输入包装为图 leaf (ggml dims[0]=最内维) ====
+    TensorF32* msa      = wrap_input_as_leaf(input.msa_latent, {D_init, L, N, B});  // [164,L,N,B]
+    // seq_tokens (B,L) row-major → 扁平一维 [B*L]（k=b*L+l），供 get_rows 查表
+    TensorF32* seq_flat = wrap_input_as_leaf(input.seq_tokens, {B * L});            // [B*L]
+    TensorF32* seq2d    = wrap_input_as_leaf(input.seq_tokens, {L, B});             // [L,B]（PositionalEncoding 占位用）
+    TensorF32* bond     = wrap_input_as_leaf(input.bond_feats, {L, L, B});          // [L,L,B]
+    TensorF32* dist     = wrap_input_as_leaf(input.dist_matrix, {L, L, B});         // [L,L,B]
+    // residx (TensorI64) → float 图 leaf [L,B]
+    TensorF32 residx_f32(input.residx.shape());
+    for (int64_t i = 0; i < input.residx.numel(); ++i)
+        residx_f32.data()[i] = static_cast<float>(input.residx.data()[i]);
+    TensorF32* residx = wrap_input_as_leaf(residx_f32, {L, B});                     // [L,B]
+
+    // ==== 2. 预处理 embedding (forward_graph) ====
+    // get_rows 查表: [D, B*L] → view 为 block 布局（存储兼容，k=b*L+l 与 [D,L,B] 扁平一致）
+    // state = state_emb(seq) → [D_STATE, L, B]
+    TensorF32* state = view(state_emb_->forward_graph(seq_flat), Shape{D_STATE, L, B});
+    // msa = msa_emb(msa_latent) → [D_MSA, L, N, B]
+    msa = msa_emb_->forward_graph(msa);
+    // pair = left_emb(seq) ⊕ right_emb(seq) → [D_PAIR, L, L, B]
+    TensorF32* left  = view(pair_left_emb_->forward_graph(seq_flat),  Shape{D_PAIR, L, B});   // [D_PAIR,L,B]
+    TensorF32* right = view(pair_right_emb_->forward_graph(seq_flat), Shape{D_PAIR, L, B});
+    TensorF32* pair  = outer_sum_graph(unsqueeze(left, 1), unsqueeze(right, 2)); // [D_PAIR,L,L,B]
+    // PositionalEncoding（图版占位，返回零图节点）— 留后实现
+    TensorF32* pos_out = pair_init_pos_enc_->forward_graph(seq2d, residx, bond, dist);
+    pair = add_impl(pair, pos_out, /*inplace=*/false);
+
+    // msa_full embedding (FullBlock / extra blocks 用) — 仅当输入有 msa_full
+    TensorF32* msa_full = nullptr;
+    if (input.msa_full.numel() > 0) {
+        const int64_t D_full = input.msa_full.shape().dims[3];   // 83
+        const int N_full     = input.msa_full.shape().dims[1];
+        TensorF32* msa_full_g = wrap_input_as_leaf(input.msa_full, {D_full, L, N_full, B});
+        FullEmbedding full_emb;
+        full_emb.set_params(full_linear_, full_emb_, D_MSA_FULL);
+        msa_full = full_emb.forward_graph(msa_full_g, seq_flat, residx);
+    }
+
+    // ==== 3. rbf 特征注入（值版 compute_rbf_feature → 常量图 leaf）====
+    TensorF32 rbf_val;
+    if (input.coords.numel() > 0) {
+        rbf_val = IterBlock::compute_rbf_feature(input.coords);  // (B,L,L,D_RBF)
+    } else {
+        rbf_val = zeros<float>({B, L, L, D_RBF}, Device::CPU);
+    }
+    TensorF32* rbf = constant_tensor({D_RBF, L, L, B}, rbf_val.data());   // [D_RBF,L,L,B]
+
+    // ==== 4. block 前向 (forward_graph) ====
+    // 结构常量（coords/residx/seq1hot）暂传 nullptr：block 的 SE3 track 由训练入口经
+    // "图外值回落"驱动，本入口先只跑 msa/pair 两条 track。
+    if (msa_full != nullptr) {
+        for (auto& block : extra_blocks_)   // FullBlock: global column attention
+            block->forward_graph(msa_full, pair, rbf, state, nullptr, nullptr, nullptr);
+    }
+    for (auto& block : main_blocks_)
+        block->forward_graph(msa, pair, rbf, state, nullptr, nullptr, nullptr);
+    for (auto& block : refine_blocks_)
+        block->forward_graph(msa, pair, rbf, state, nullptr, nullptr, nullptr);
+
+    // ==== 5. 输出头 (forward_graph) + graph_compute 回落值 ====
+    ensure_backend_ready();
+    RFAAContext* ctx = &context();
+    Backend* backend = cpu_backend_.get();
+
+    // Masked MSA head: LN(D_MSA) → Linear(D_MSA→D_MSA) → ReLU → Linear(D_MSA→23) → [23,L,N,B]
+    TensorF32* ln_msa  = msa_head_ln_->forward(msa);
+    TensorF32* lin1    = msa_head_linear1_->forward_graph(ln_msa);
+    TensorF32* relu1   = relu(lin1);
+    TensorF32* logits  = msa_head_linear2_->forward_graph(relu1);
+    output.msa_logits = zeros<float>({B, N, L, 23}, Device::CPU);
+    {
+        ComputeGraph* cg = ComputeGraph::new_graph(ctx);
+        compute_and_read(logits, output.msa_logits, cg, backend);
+    }
+
+    // Chi head: state [32,L,B] → LN → Linear → ReLU → Linear(→14) → [14,L,B] = (B,L,7,2)
+    output.alpha = zeros<float>({B, L, 7, 2}, Device::CPU);
+    {
+        TensorF32* ch_ln   = chi_head_ln_->forward(state);
+        TensorF32* ch1     = chi_head_linear1_->forward_graph(ch_ln);
+        TensorF32* ch_relu = relu(ch1);
+        TensorF32* alpha   = chi_head_linear2_->forward_graph(ch_relu);   // [14,L,B]
+        ComputeGraph* cg = ComputeGraph::new_graph(ctx);
+        compute_and_read(alpha, output.alpha, cg, backend);
+    }
+
+    // Distogram heads: pair → 4 组 logits
+    output.distogram = zeros<float>({B, L, L, 60}, Device::CPU);
+    output.omega     = zeros<float>({B, L, L, 36}, Device::CPU);
+    output.theta     = zeros<float>({B, L, L, 36}, Device::CPU);
+    output.phi       = zeros<float>({B, L, L, 18}, Device::CPU);
+    {
+        ComputeGraph* cg = ComputeGraph::new_graph(ctx);
+        compute_and_read(distogram_d_head_->forward_graph(pair), output.distogram, cg, backend);
+        compute_and_read(distogram_o_head_->forward_graph(pair), output.omega,     cg, backend);
+        compute_and_read(distogram_t_head_->forward_graph(pair), output.theta,     cg, backend);
+        compute_and_read(distogram_p_head_->forward_graph(pair), output.phi,       cg, backend);
+    }
+
+    // pLDDT head: state → [50,L,B] = (B,L,50)
+    output.lddt = zeros<float>({B, L, 50}, Device::CPU);
+    {
+        ComputeGraph* cg = ComputeGraph::new_graph(ctx);
+        compute_and_read(plddt_head_->forward_graph(state), output.lddt, cg, backend);
+    }
+
+    // 回落 msa/pair/state 值（供训练/调试）
+    output.msa   = zeros<float>({B, N, L, D_MSA},  Device::CPU);
+    output.pair  = zeros<float>({B, L, L, D_PAIR}, Device::CPU);
+    output.state = zeros<float>({B, L, D_STATE},   Device::CPU);
+    {
+        ComputeGraph* cg = ComputeGraph::new_graph(ctx);
+        compute_and_read(msa,   output.msa,   cg, backend);
+        compute_and_read(pair,  output.pair,  cg, backend);
+        compute_and_read(state, output.state, cg, backend);
+    }
+
+    // SE3 未驱动，坐标保持输入
+    output.coords.copy_from(input.coords);
+
+    return output;
+}
+
 //The t1d feature has shape (B, T, L, d_t1d) where B is batch size,
 // T is number of templates, L is sequence length, 
 //and d_t1d is the feature dimension that varies by model configuration
@@ -2149,6 +2325,13 @@ void RFAAModel::ensure_backend_ready() {
 
 Device RFAAModel::device() const {
     return device_;
+}
+
+Backend* RFAAModel::active_backend() {
+    ensure_backend_ready();
+    // CUDA 若就绪则优先（模型目标设备为 CUDA 且 GPU 可用），否则回退 CPU
+    if (device_ == Device::CUDA && cuda_backend_) return cuda_backend_.get();
+    return cpu_backend_.get();
 }
 
 void RFAAModel::train() {
