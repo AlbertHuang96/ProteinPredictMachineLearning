@@ -57,17 +57,17 @@ public:
     TensorF32 forward(const TensorF32& coords);
     
     /**
-     * @brief Forward pass (graph version) — 留后实现（当前返回零占位图节点）
+     * @brief Forward pass (graph version) — 常数注入方案
      * 
      * 与 forward 语义一致，但输入/输出均为图节点指针（ggml 布局 dims[0]=最内维）：
-     *   seq        : 值 (B, L)         = 图 [L, B]
+     *   seq        : 值 (B, L)         = 图 [L, B]（SM 原子 token ∈ [33,80)）
      *   idx        : 值 (B, L)         = 图 [L, B]
      *   bond_feats : 值 (B, L, L)      = 图 [L, L, B]
      *   dist_matrix: 值 (B, L, L)      = 图 [L, L, B]
-     *   same_chain : 值 (B, L, L)      = 图 [L, L, B]
-     * 返回: pair bias 图节点 [D_PAIR, L, L, B]（当前为零占位，待实现真实位置编码图）。
-     * 注: 完整实现需把 getResAtomDist/bucketize/emb_res_/emb_atom_ 等改写为图 op
-     *     （bucketize/embedding lookup 等），暂以 constant 零节点占位，避免 block 图断链。
+     *   same_chain : 值 (B, L, L)      = 图 [L, L, B]（本实现未使用）
+     * 返回: pair bias 图节点 [D_PAIR, L, L, B]。
+     * 实现: 几何预处理（getResAtomDist + bucketize）走值版，结果桶索引以 constant_tensor
+     *       注入图；emb_res_/emb_atom_ 用 forward_graph（get_rows）查表，add_impl 汇总。
      */
     TensorF32* forward_graph(TensorF32* seq, TensorF32* idx,
                              TensorF32* bond_feats, TensorF32* dist_matrix,

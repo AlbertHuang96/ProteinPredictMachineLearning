@@ -5,6 +5,7 @@
 #include <cstring>
 #include <cmath>
 #include <vector>
+#include <array>
 
 //#include <omp.h>
 
@@ -1238,12 +1239,17 @@ void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
     const int64_t ne2 = nd > 2 ? node->shape().dims[2] : 1;
     const int64_t ne3 = nd > 3 ? node->shape().dims[3] : 1;
 
-    const int n_src = static_cast<int>(node->src.size());
+    // src 为固定大小数组(GGML_MAX_SRC)，仅统计非空输入，空位跳过
+    int n_src = 0;
+    std::array<const TensorF32*, GGML_MAX_SRC> srcs{};
+    for (int s = 0; s < GGML_MAX_SRC; s++) {
+        if (node->src[s]) srcs[n_src++] = node->src[s];
+    }
     if (n_src < 2) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
 
     // 各 src 在 dim 维的长度与累积起点
     std::vector<int64_t> len(n_src), start(n_src, 0);
-    for (int s = 0; s < n_src; s++) len[s] = node->src[s]->shape().dims[dim];
+    for (int s = 0; s < n_src; s++) len[s] = srcs[s]->shape().dims[dim];
     for (int s = 1; s < n_src; s++) start[s] = start[s - 1] + len[s - 1];
 
     float * d = node->data();
@@ -1276,7 +1282,7 @@ void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
         }
         const int64_t local = gd - start[s];
 
-        const TensorF32* src = node->src[s];
+        const TensorF32* src = srcs[s];
         const int64_t s0 = src->shape().ndim() > 0 ? src->shape().dims[0] : 1;
         const int64_t s1 = src->shape().ndim() > 1 ? src->shape().dims[1] : 1;
         const int64_t s2 = src->shape().ndim() > 2 ? src->shape().dims[2] : 1;

@@ -5,7 +5,7 @@
 
 #define GGML_MAX_DIMS           4
 #define GGML_MAX_PARAMS         2048
-#define GGML_MAX_SRC            10
+// GGML_MAX_SRC 定义移至 Tensor.h（Tensor.h 的 src 数组依赖它）
 #define GGML_MAX_N_THREADS      512
 //#define GGML_MAX_OP_PARAMS      64
 

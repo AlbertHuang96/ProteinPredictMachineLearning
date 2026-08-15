@@ -60,8 +60,8 @@ bool CUDABackend::supports_buffer_type(const BufferType* buft) const {
 
 // ===== supports_op — 仅声明有 .cu kernel 实际实现的 op =====
 bool CUDABackend::supports_op(TensorF32* node) const {
-    const TensorF32* src0 = node->src.empty() ? nullptr : node->src[0];
-    const TensorF32* src1 = node->src.size() < 2 ? nullptr : node->src[1];
+    const TensorF32* src0 = node->src[0];
+    const TensorF32* src1 = node->src[1];
 
     // no-op / view ops 始终支持（不需要 kernel）
     if (node->op == OP_NONE    || node->op == OP_RESHAPE ||
@@ -92,7 +92,9 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             // N-ary concat：遍历所有 src。
             // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致，
             // 该约束在 kernel_concat_cuda 内强制校验。
-            if (node->src.size() < 2) return false;
+            int n_src = 0;
+            for (const auto* s : node->src) if (s) n_src++;
+            if (n_src < 2) return false;
             for (const auto* s : node->src) {
                 if (!s || s->type != TENSOR_TYPE_F32) return false;
             }

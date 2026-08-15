@@ -58,8 +58,8 @@ std::unique_ptr<CPUBackend> CPUBackend::create(int n_threads) {
 }
 
 bool CPUBackend::supports_op(TensorF32* node) const {
-    const TensorF32* src0 = node->src.empty() ? nullptr : node->src[0];
-    const TensorF32* src1 = node->src.size() < 2 ? nullptr : node->src[1];
+    const TensorF32* src0 = node->src[0];
+    const TensorF32* src1 = node->src[1];
     
     if (node->op == OP_NONE   || node->op == OP_RESHAPE ||
         node->op == OP_VIEW   || node->op == OP_PERMUTE ||

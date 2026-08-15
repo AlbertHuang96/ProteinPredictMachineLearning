@@ -2,6 +2,7 @@
 #include "rfaa/Embedding.h"
 #include "rfaa/MathUtils.h"
 #include <random>
+#include <vector>
 
 #include "rfaa/ComputeGraph.h"
 #include "rfaa/Context.h"
@@ -112,10 +113,33 @@ namespace rfaa {
     // zeros_weight / ones_bias 已在 Embedding.h 中 inline 定义，此处不重复
 
     // ===== 图模式前向（训练用）=====
+    // x 可为任意维（图布局 dims[0]=最内特征维）：[D_in, d1, d2, d3]
+    // 由于 mul_mat/kernel 只支持 2D，这里把 batch 维展平为 [D_in, M] 做矩阵乘，
+    // 再把 bias 广播为 [D_out, M] 逐元素相加，最后 view 还原为 [D_out, d1, d2, d3]。
     TensorF32* LinearLayer::forward_graph(TensorF32* x) {
-        TensorF32* y = mul_mat(x, weight_);
+        const int x_ndim = x->shape().ndim();
+        // 展平 batch 维（除最内特征维外）为 M
+        int64_t M = 1;
+        for (int i = 1; i < x_ndim; i++) M *= x->shape().dims[i];
+
+        // 统一 view 成 2D [D_in, M]（1D [D_in] 视为 M=1），再 mul_mat → [D_out, M]
+        TensorF32* x_flat = (x_ndim == 2) ? x : view(x, Shape{in_features_, M});
+        TensorF32* y = mul_mat(x_flat, weight_);                  // [D_out, M]
+
         if (has_bias_) {
-            y = add_impl(y, bias_, /*inplace=*/false);  // broadcast bias
+            // bias [D_out] 广播到 [D_out, M]（kernel_repeat 尾部对齐，1D→2D）
+            int64_t btgt[2] = {out_features_, M};
+            TensorF32* btarget = context().new_tensor<float>(2, btgt);
+            TensorF32* bias_br = repeat(bias_, btarget);
+            y = add_impl(y, bias_br, /*inplace=*/false);  // 逐元素（形状相同）
+        }
+
+        // 还原多维形状 [D_out, d1, d2, d3]
+        if (x_ndim > 2) {
+            std::vector<int64_t> out_dims;
+            out_dims.push_back(out_features_);
+            for (int i = 1; i < x_ndim; i++) out_dims.push_back(x->shape().dims[i]);
+            y = view(y, Shape(out_dims));
         }
         return y;
     }

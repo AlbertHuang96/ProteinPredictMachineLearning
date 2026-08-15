@@ -351,11 +351,16 @@ void CUDABackend::kernel_per_edge_matmul_back_gathered_cuda(TensorF32 * node, Co
 
 void CUDABackend::kernel_concat_cuda(TensorF32 * node, ComputeParams * p) {
     (void)p;
-    const int n_src = static_cast<int>(node->src.size());
-    if (n_src < 2) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
-
     const int dim = node->op_params[0];
     if (dim < 0 || dim >= 4) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+
+    // src 为固定大小数组(GGML_MAX_SRC)，仅统计非空输入，空位跳过
+    int n_src = 0;
+    TensorF32* srcs_tmp[GGML_MAX_SRC];
+    for (int s = 0; s < GGML_MAX_SRC; s++) {
+        if (node->src[s]) srcs_tmp[n_src++] = node->src[s];
+    }
+    if (n_src < 2) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
 
     // ============================================================
     // concat 不支持广播语义：强制要求所有 src 的非拼接维与 dst 一致
@@ -367,8 +372,8 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, ComputeParams * p) {
         if (d == dim) continue; // 拼接维可不同，由 start/len 表处理
         const int64_t dst_d = (d < nd) ? node->shape().dims[d] : 1;
         for (int s = 0; s < n_src; s++) {
-            const int      sd    = node->src[s]->shape().ndim();
-            const int64_t  src_d = (d < sd) ? node->src[s]->shape().dims[d] : 1;
+            const int      sd    = srcs_tmp[s]->shape().ndim();
+            const int64_t  src_d = (d < sd) ? srcs_tmp[s]->shape().dims[d] : 1;
             if (src_d != dst_d) {
                 p->threadpool->ec = Status::NOT_SUPPORTED;
                 return;
@@ -386,8 +391,8 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, ComputeParams * p) {
     std::vector<int64_t>    len(n_src), start(n_src, 0);
     std::vector<const float*> srcs(n_src);
     for (int s = 0; s < n_src; s++) {
-        len[s]   = node->src[s]->shape().dims[dim];
-        srcs[s]  = node->src[s]->data();
+        len[s]   = srcs_tmp[s]->shape().dims[dim];
+        srcs[s]  = srcs_tmp[s]->data();
     }
     for (int s = 1; s < n_src; s++) start[s] = start[s - 1] + len[s - 1];
 

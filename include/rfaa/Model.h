@@ -100,6 +100,32 @@ struct ModelOutput {
     TensorF32 pae;           // (B, L, L) - 预测对齐误差
 };
 
+// 图模式前向输出：携带可微图节点（供 loss 直接组装计算图，梯度可回传模型参数）与回落值。
+// 图节点为 ggml 布局（dims[0]=最内维），loss 用 view 到其期望布局后接图：
+//   msa        [D_MSA, L, N, B]   → masked_msa_loss 需 {23, L, N}
+//   pair       [D_PAIR, L, L, B]  → distogram_loss 上游
+//   state      [D_STATE, L, B]    → plddt_loss 上游
+//   msa_logits [23, L, N, B]      → view {23, L, N}  (B=1 丢弃批维)
+//   alpha      [14, L, B]         → view {2, 7, N}   (N=B*L, 14=7*2, sin/cos 最内)
+//   lddt       [50, L, B]         → view {50, L}
+//   distogram/omega/theta/phi [bins, L, L, B] → view {bins, L, L}
+// coords 为值张量（SE3 图外坐标更新，非可微），FAPE/conf 等坐标相关 loss 沿用原值版方式。
+struct GraphOutput {
+    TensorF32* msa         = nullptr; // [D_MSA, L, N, B]   最终 block msa 图节点
+    TensorF32* pair        = nullptr; // [D_PAIR, L, L, B]  最终 block pair 图节点
+    TensorF32* state       = nullptr; // [D_STATE, L, B]    SE3 后 state 图节点
+    TensorF32* msa_logits  = nullptr; // [23, L, N, B]      masked-msa head 图节点
+    TensorF32* alpha       = nullptr; // [14, L, B]         chi head 图节点
+    TensorF32* lddt        = nullptr; // [50, L, B]         plddt head 图节点
+    TensorF32* distogram   = nullptr; // [60, L, L, B]      distogram d head
+    TensorF32* omega       = nullptr; // [36, L, L, B]
+    TensorF32* theta       = nullptr; // [36, L, L, B]
+    TensorF32* phi         = nullptr; // [18, L, L, B]
+
+    // SE3 更新后的骨架坐标（值，图外量；未驱动 SE3 时即输入坐标）
+    TensorF32 coords;                  // (B, L, 3, 3)
+};
+
 // 迭代块 (IterBlock)
 class IterBlock {
 public:
@@ -180,12 +206,15 @@ public:
     //   Phase B（图块）：run_se3_graph(...) 追加 SE3 图节点，state 经引用回写为图节点。
     //   Phase C（坐标更新）：由调用方对返回的 offset 图节点 graph_compute 后调用
     //                        apply_coord_update(offset_value, coords) → xyz_new_。
-    void run_se3_structural(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
-                            TensorF32*& state,
-                            const TensorF32& pair_value,
-                            const TensorF32& coords,
-                            const TensorI64& residx,
-                            const TensorF32& seq1hot);
+    // 返回 run_se3_graph 的 se3_out：se3_out[0]=state 度0 图节点、se3_out[1]=offset 度1 图节点
+    //   （调用方 graph_compute se3_out[1] 得 offset 值后 apply_coord_update 更新坐标）。空 vector
+    //   表示无有效边图（跳过 SE3）。
+    std::vector<TensorF32*> run_se3_structural(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                                               TensorF32*& state,
+                                               const TensorF32& pair_value,
+                                               const TensorF32& coords,
+                                               const TensorI64& residx,
+                                               const TensorF32& seq1hot);
 
     // 坐标更新（图外值回落）：把 SE3 度1 offset 值叠加到 coords → xyz_new_（值版 Step4k）。
     // offset_value 布局 (B*L, 3, 3)，[N,CA,C] 通道；CA 为绝对位移。供训练入口在 graph_compute
@@ -302,7 +331,48 @@ public:
                  const TensorF32& same_chain  = TensorF32(),
                  const TensorI64& residx       = TensorI64()) override;
 
-                 // 设置额外输入（在 forward 调用前设置）
+    // ===== 图模式前向（override：RefineBlock 语义）=====
+    // update_msa_pair_=false：RefineBlock 不改 msa/pair，仅做 3D 结构更新。
+    // 故本 override 为 pass-through（直接返回 pair），结构更新由训练入口调用
+    // run_se3_structural_refine 驱动（见 RFAAModel::forward_graph 的 refine 循环）。
+    // 参数布局同 IterBlock::forward_graph。
+    TensorF32* forward_graph(TensorF32*& msa, TensorF32*& pair,
+                             TensorF32* rbf, TensorF32*& state,
+                             const TensorF32* coords = nullptr,
+                             const TensorI64* residx = nullptr,
+                             const TensorF32* seq1hot = nullptr) override;
+
+    // ===== RefineBlock 专属 SE3 图模式子流程 =====
+    // 语义对齐值版 RefineBlock::forward，但用图 op 构建可微部分：
+    //   node 度0 = norm_node_(embed_x_(cat(norm_msa(msa 沿 Nseq 均值), seq1hot, norm_state(state))))
+    //   node 度1 = l1_feats (compute_l1_features(coords)) 常量叶子
+    //   edges    = G.edge_index / edge_d / edge_w → src/tgt/d/w 常量叶子（调用方值版 make_graph 注入）
+    //   basis    = 调用方预计算（SE3Basis.compute(G.edge_d, 2)）
+    //   out      = se3_->forward_graph({node0,node1}, src, tgt, d, w, basis, N=B*L)
+    //   state    = out[0].view({B,L,D_STATE})（引用回写）
+    // 返回 se3_out：se3_out[0]=state(度0)、se3_out[1]=offset(度1，坐标更新用，训练入口 graph_compute
+    //       后回落值 + apply_coord_update 更新骨架坐标)。空 vector = 无有效边图（跳过 SE3）。
+    std::vector<TensorF32*> run_se3_graph_refine(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                                                 TensorF32*& state,
+                                                 const se3::GraphData& G, const SE3Basis& basis,
+                                                 const TensorF32& coords, const TensorF32& seq1hot);
+
+    // 训练入口驱动：RefineBlock SE3 图块（图外值回落 + state 回写）。
+    //   Phase A（结构常量，图外值回落）：pair_value → norm_pair_ → embed_e1_ → norm_edge1_
+    //       → cat(rbf_feat=compute_rbf_feature(coords), neighbor=get_bonded_neigh(residx))
+    //       → embed_e2_ → norm_edge2_ → make_graph(coords, edge_out, residx, 64, 9) → G；
+    //       basis.compute(G.edge_d, 2)。
+    //   Phase B（可微图块）：调用 run_se3_graph_refine(...)，state 经引用回写为图节点（度0）。
+    // 返回 run_se3_graph_refine 的 se3_out：se3_out[0]=state 度0 图节点、se3_out[1]=offset 度1
+    //       图节点（训练入口 graph_compute 后 apply_coord_update 更新坐标）。
+    std::vector<TensorF32*> run_se3_structural_refine(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
+                                                      TensorF32*& state,
+                                                      const TensorF32& pair_value,
+                                                      const TensorF32& coords,
+                                                      const TensorI64& residx,
+                                                      const TensorF32& seq1hot);
+
+    // 设置额外输入（在 forward 调用前设置）
     //void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
 
     // 获取 SE3 更新后的坐标
@@ -368,13 +438,14 @@ public:
 
     // ===== 图模式前向（新增入口，不改 forward）=====
     // 预处理 embedding 与 block 前向均使用 forward_graph 版本（ggml 布局 dims[0]=最内维）。
-    // 输入值张量包装为图 leaf；内部 graph_compute 回落为 ModelOutput 值张量（供 loss/训练）。
+    // 返回 GraphOutput：可微图节点（供 loss 组装计算图，反向可回传模型参数）+ coords 回落值。
     // 注:
     //   - PositionalEncoding 的图版本当前为占位（返回零图节点），故 pair 初始化不含位置编码；
     //   - rbf 特征用值版 compute_rbf_feature 后注入为常量图 leaf；
-    //   - SE3 3D track 需"图外值回落"驱动（graph_compute(pair)→run_se3_structural），
-    //     本入口在 block 循环边界以相同方式驱动（与训练入口约定一致）。
-    ModelOutput forward_graph(const ModelInput& input);
+    //   - SE3 3D track 需"图外值回落"驱动（graph_compute(pair)→run_se3_structural→graph_compute
+    //     offset→apply_coord_update），本入口在 block 循环边界以相同方式驱动；
+    //   - 输出头图节点只构建不 graph_compute，由调用方（如 train.cpp）对总 loss 图一次性计算。
+    GraphOutput forward_graph(const ModelInput& input);
 
     TensorF32 get_templ_emb(const TensorF32& t1d, const TensorF32& t2d);
     

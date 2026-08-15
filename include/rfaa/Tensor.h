@@ -2,9 +2,11 @@
 
 #include "Core.h"
 #include <cstring>
+#include <array>
 #include <cuda_fp16.h>
 
 #define GGML_MAX_OP_PARAMS      64
+#define GGML_MAX_SRC            10
 
 namespace rfaa {
 
@@ -273,6 +275,7 @@ public:
         data_ = static_cast<T*>(data_ptr);
         device_ = Device::CPU;
         own_data_ = false;  // Context 管理生命周期
+        src.fill(nullptr);  // 显式清空 src，避免残留脏指针
     }
 
     //tensor flag
@@ -285,8 +288,8 @@ public:
     // op_params: 存储 op 特定参数 (如 UNARY 的 subtype, RMS_NORM 的 eps 等)
     int32_t op_params[GGML_MAX_OP_PARAMS] = {0};
 
-    //src GGML_MAX_SRC
-    std::vector<Tensor*> src;
+    //src GGML_MAX_SRC (固定大小数组，语义与 ggml 一致：src[i]=a，i<GGML_MAX_SRC，空位为 nullptr)
+    std::array<Tensor*, GGML_MAX_SRC> src{};  // 默认初始化为全 nullptr
 
     // ==== buffer 分配相关 ====
     Buffer*     buffer_      = nullptr;  // 所属的 backend buffer
