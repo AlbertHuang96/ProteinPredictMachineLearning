@@ -1,11 +1,11 @@
-#include "rfaa/AdamW.h"
-#include "rfaa/Backend.h"
+#include "ppml/AdamW.h"
+#include "ppml/Backend.h"
 
 #include <cmath>
 #include <algorithm>
 #include <cstring>
 
-namespace rfaa {
+namespace ppml {
 
 AdamW::AdamW(float lr, float weight_decay, float beta1, float beta2,
              float eps, bool bias_correction)
@@ -127,4 +127,4 @@ void AdamW::zero_grad(ComputeGraph* cgraph) {
     }
 }
 
-} // namespace rfaa
+} // namespace ppml

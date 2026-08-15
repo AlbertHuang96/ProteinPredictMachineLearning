@@ -1,10 +1,10 @@
 
 
 
-#include "rfaa/Backend.h"
+#include "ppml/Backend.h"
 #include <cstdlib>
 
-namespace rfaa {
+namespace ppml {
 
 // ===== CPUBufferType 实现 =====
 CPUBufferType* CPUBufferType::instance() {
@@ -251,7 +251,7 @@ size_t CPUBackend::estimate_work_size(TensorF32 * node, int n_threads, int n_tas
         case OP_ADD:
         case OP_ADD1:
         case OP_MUL:
-            // RFAA 目前只支持 F32，暂不要反量化缓冲
+            // PPML 目前只支持 F32，暂不要反量化缓冲
             // 如果将来支持 F16/I8，这里需要：
             // if (is_quantized(node->src[0]->type))
             //     cur = sizeof(float) * node->src[0]->dims()[0] * n_tasks;
@@ -285,7 +285,7 @@ size_t CPUBackend::estimate_work_size(TensorF32 * node, int n_threads, int n_tas
             // mxDn: 取 max 是为了用较大的维度兜底，×2 因为 S + SM 两份
             const int64_t mxDn = std::max(D, ne11) * 2;
 
-            // RFAA 目前只支持 F32，直接计算
+            // PPML 目前只支持 F32，直接计算
             cur  = sizeof(float) * mxDn * n_tasks;   // S: softmax 分数缓冲
             cur += sizeof(float) * mxDn * n_tasks;   // SM: max 缓冲 (高估 ×2)
             
@@ -330,4 +330,4 @@ size_t CPUBackend::estimate_work_size(TensorF32 * node, int n_threads, int n_tas
     return cur;
 }
 
-} // namespace rfaa
+} // namespace ppml

@@ -1,8 +1,8 @@
-#include "rfaa/Track.h"
+#include "ppml/Track.h"
 
-#include "rfaa/Embedding.h"
+#include "ppml/Embedding.h"
 
-namespace rfaa {
+namespace ppml {
 
 StateTrack::StateTrack(int seq_len, int dim, Device device)
     : seq_len_(seq_len), dim_(dim) {
@@ -24,7 +24,7 @@ void StateTrack::init_from_embedding(const TensorF32& seq_tokens) {
 // deprecated
 void StateTrack::inject_template(const TensorF32& t1d, const TensorF32& tor_feat) {
     // TODO: LinearLayer 值类型构造已删除，需迁移到 create() + 指针模式
-    // 此函数已内联到 RFAAModel::forward() 中
+    // 此函数已内联到 PPMLModel::forward() 中
     /*
     LinearLayer emb_t1d(D_T1D + D_TOR, 64);
     LinearLayer proj_t1d(64, 64);
@@ -58,4 +58,4 @@ TensorF32 StateTrack::get_gate(int gate_dim) const {
     //return repr_;  // 占位
 }
 
-} // namespace rfaa
+} // namespace ppml

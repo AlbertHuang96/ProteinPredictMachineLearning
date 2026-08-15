@@ -5,10 +5,10 @@
 #include <cstdint>
 #include <cmath>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
-// Distogram Binning 常量 (RFAA Section 2.5.4)
+// Distogram Binning 常量 (PPML Section 2.5.4)
 // ============================================================================
 
 // 距离 binning 参数
@@ -32,7 +32,7 @@ constexpr int   PHI_N_BINS   = 18;     // Φ (phi)   平面角: [0, π)  → 18 
 /**
  * @brief 从 backbone 坐标 (N, CA, C) 构造 pseudo-Cβ 坐标
  * 
- * 使用 Rosetta 默认参数 (RFAA Section 2.5.4):
+ * 使用 Rosetta 默认参数 (PPML Section 2.5.4):
  *   x = b - a
  *   y = c - b
  *   z = x × y
@@ -88,7 +88,7 @@ inline float vec_norm(float x, float y, float z) {
 /**
  * @brief 计算二面角 Dihedral(a, b, c, d)
  * 
- * 数学公式 (RFAA Section 2.5.4):
+ * 数学公式 (PPML Section 2.5.4):
  *   v1 = b - a,  v2 = c - b,  v3 = d - c
  *   n1 = v1 × v2,  n2 = v2 × v3
  *   dihedral = atan2(|v2| * (n1 × n2) · (v2/|v2|), |v2| * n1 · n2)
@@ -166,7 +166,7 @@ inline float planar_angle(
 // ============================================================================
 
 /**
- * @brief 非均匀距离 binning (RFAA Section 2.5.4)
+ * @brief 非均匀距离 binning (PPML Section 2.5.4)
  * 
  * bin 0:    [0,       1.2)           ← 超短距离
  * bin 1-29: [1.2 + (4-1.2)*(i-1)/29,  1.2 + (4-1.2)*i/29)  细粒度 0.097Å/bin
@@ -300,4 +300,4 @@ void compute_all_distogram_onehots(
     float* Θ_onehot,
     float* Φ_onehot);
 
-} // namespace rfaa
+} // namespace ppml

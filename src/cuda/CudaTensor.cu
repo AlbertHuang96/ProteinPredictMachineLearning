@@ -1,8 +1,8 @@
-#include "rfaa/Tensor.h"
+#include "ppml/Tensor.h"
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-namespace rfaa {
+namespace ppml {
 
 // CUDA 核函数示例
 
@@ -84,4 +84,4 @@ private:
 template class Tensor<float>;
 template class Tensor<int64_t>;
 
-} // namespace rfaa
+} // namespace ppml

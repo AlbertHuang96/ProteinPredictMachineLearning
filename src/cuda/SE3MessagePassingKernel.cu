@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================
 // SE3 消息传递三件套 CUDA 核（方案 B）
@@ -193,4 +193,4 @@ void per_edge_matmul_back_gathered_cuda(
     per_edge_matmul_back_gathered_kernel<<<grid, BLOCK>>>(grad, kernel, dst, M, K, E);
 }
 
-} // namespace rfaa
+} // namespace ppml

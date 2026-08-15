@@ -5,12 +5,12 @@
 #include "ComputeGraph.h"
 #include "Dropout.h"
 
-namespace rfaa {
+namespace ppml {
 class LinearLayer;
 class LayerNorm;
 }
 
-namespace rfaa {
+namespace ppml {
 
 // Attention 配置
 struct AttnConfig {
@@ -24,7 +24,7 @@ struct AttnConfig {
     AttnConfig(int d, int h, float drop = 0.0f, bool bias = true)
         : dim(d), n_head(h), head_dim(d / h), dropout(drop), use_bias(bias) {
         if (dim % n_head != 0) {
-            throw RFAAError("dim must be divisible by n_head");
+            throw PPMLError("dim must be divisible by n_head");
         }
     }
 };
@@ -296,7 +296,7 @@ public:
     // TemplatePairStack();
     TemplatePairStack() = default;
 
-    // 由 RFAAModel 注入已创建的参数指针
+    // 由 PPMLModel 注入已创建的参数指针
     void set_params(
         LinearLayer* rbf_proj,
         LayerNorm*   state_norm,
@@ -337,4 +337,4 @@ private:
     FeedForward*      pair_ff_       = nullptr;
 };
 
-} // namespace rfaa
+} // namespace ppml

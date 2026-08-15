@@ -1,12 +1,12 @@
-#include "rfaa/SE3Transformer.h"
-#include "rfaa/Tensor.h"
-#include "rfaa/ComputeGraph.h"
+#include "ppml/SE3Transformer.h"
+#include "ppml/Tensor.h"
+#include "ppml/ComputeGraph.h"
 #include <iostream>
 #include <cmath>
 #include <algorithm>
 #include <vector>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // se3 命名空间：数学工具函数实现
@@ -2727,4 +2727,4 @@ std::vector<TensorF32*> SE3Transformer::parameters() {
 }
 
 
-} // namespace rfaa
+} // namespace ppml

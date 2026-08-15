@@ -1,10 +1,10 @@
-#include "rfaa/Ops.h"
+#include "ppml/Ops.h"
 #include <algorithm>
 #include <cmath>
 #include <vector>
 #include <omp.h>
 
-namespace rfaa {
+namespace ppml {
 
 TensorF32 softmax(const TensorF32& input, int dim) {
     if (dim < 0) dim += input.shape().ndim();
@@ -117,4 +117,4 @@ void softmax_backward(const TensorF32& grad_output, const TensorF32& output,
     }
 }
 
-} // namespace rfaa
+} // namespace ppml

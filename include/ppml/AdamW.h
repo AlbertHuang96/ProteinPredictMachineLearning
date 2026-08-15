@@ -6,7 +6,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================
 // AdamW — 解耦权重衰减（decoupled weight decay）优化器
@@ -61,4 +61,4 @@ private:
     int   step_count_ = 0;
 };
 
-} // namespace rfaa
+} // namespace ppml

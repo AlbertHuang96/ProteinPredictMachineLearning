@@ -1,8 +1,8 @@
 #pragma once
 
 // ============================================================================
-// RF2/RFAA 80 类 one-hot token 类型 (ChemicalData::num2aa, NAATOKENS = 20+2+10+1+47)
-// RF2/RFAA 80 one-hot token types (ChemicalData::num2aa, NAATOKENS = 20+2+10+1+47)
+// RF2/PPML 80 类 one-hot token 类型 (ChemicalData::num2aa, NAATOKENS = 20+2+10+1+47)
+// RF2/PPML 80 one-hot token types (ChemicalData::num2aa, NAATOKENS = 20+2+10+1+47)
 // 这是 aatype / t1d 等 one-hot 特征的单一事实来源, 与 Python rf2aa/chemical.py 对齐:
 // This is the single source of truth for one-hot features such as aatype/t1d, aligned with Python rf2aa/chemical.py:
 //
@@ -40,7 +40,7 @@
 #include <utility>
 #include <memory>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // 数据结构定义
@@ -89,11 +89,11 @@ struct HHRData {
 struct FFindexDB;  // 前向声明，实现在 DataLoader.cpp
 
 struct TemplateDataInternal {
-    rfaa::TensorF32 xyz;      // (total_atoms, 3)
-    rfaa::TensorF32 masks;    // (total_atoms, 1)
-    rfaa::TensorF32 qmap;     // (total_alignments, 2) - [query_idx, template_hit_idx]
-    rfaa::TensorF32 f0d;      // (n_templates, 8) - per-hit stats
-    rfaa::TensorF32 f1d;      // (total_alignments, 3) - per-position scores
+    ppml::TensorF32 xyz;      // (total_atoms, 3)
+    ppml::TensorF32 masks;    // (total_atoms, 1)
+    ppml::TensorF32 qmap;     // (total_alignments, 2) - [query_idx, template_hit_idx]
+    ppml::TensorF32 f0d;      // (n_templates, 8) - per-hit stats
+    ppml::TensorF32 f1d;      // (total_alignments, 3) - per-position scores
     std::vector<std::string> ids;  // template names
 };
 
@@ -102,16 +102,16 @@ struct TemplateHitInput {
     std::vector<std::pair<int, int>> alignments;  // (query_idx, template_idx)
     std::vector<std::array<float, 3>> position_scores;  // (score1, score2, score3)
     std::vector<float> stats;  // [Probab, E-value, Score, Aligned_cols, Identities, Similarity, Sum_probs, Template_Neff]
-    rfaa::TensorF32 xyz;  // (N_atoms, 3)
-    rfaa::TensorF32 mask;  // (N_atoms,)
+    ppml::TensorF32 xyz;  // (N_atoms, 3)
+    ppml::TensorF32 mask;  // (N_atoms,)
 };
 
 // 对应 Python: read_templates(qlen, ffdb, hhr_fn, atab_fn, n_templ=10)
 struct ReadTemplatesResult {
-    rfaa::TensorF32 xyz;   // (npick, qlen, 3, 3) - N,CA,C 坐标
-    rfaa::TensorF32 masks; // (npick, qlen, 1) - 掩码
-    rfaa::TensorF32 f1d;   // (npick, qlen, 3) - 位置特征
-    rfaa::TensorF32 f0d;   // (npick, 3) - 全局特征 [Probab/100, Identities/100, Similarity]
+    ppml::TensorF32 xyz;   // (npick, qlen, 3, 3) - N,CA,C 坐标
+    ppml::TensorF32 masks; // (npick, qlen, 1) - 掩码
+    ppml::TensorF32 f1d;   // (npick, qlen, 3) - 位置特征
+    ppml::TensorF32 f0d;   // (npick, 3) - 全局特征 [Probab/100, Identities/100, Similarity]
     std::vector<std::string> ids;  // 模板 ID
 };
 
@@ -129,10 +129,10 @@ struct TemplateData {
 };
 
 struct TorsionResult {
-    rfaa::TensorF32 torsions;      // (B, L, 10, 2)
-    rfaa::TensorF32 torsions_alt;  // (B, L, 10, 2)
-    rfaa::TensorF32 tors_mask;     // (B, L, 10)
-    rfaa::TensorF32 tors_planar;   // (B, L, 10) bool
+    ppml::TensorF32 torsions;      // (B, L, 10, 2)
+    ppml::TensorF32 torsions_alt;  // (B, L, 10, 2)
+    ppml::TensorF32 tors_mask;     // (B, L, 10)
+    ppml::TensorF32 tors_planar;   // (B, L, 10) bool
 };
 
 
@@ -186,7 +186,7 @@ private:
 // ============================================================================
 
 /**
- * @brief RFAA 数据加载器
+ * @brief PPML 数据加载器
  * 
  * 协调整个数据准备流程：
  * 1. 运行 HHblits 获取 MSA
@@ -194,7 +194,7 @@ private:
  * 3. 解析 A3M 和 HHR 文件
  * 4. 提取特征并组装 ModelInput
  */
-class RFAADataLoader {
+class PPMLDataLoader {
 public:
     /**
      * @brief 构造数据加载器
@@ -205,7 +205,7 @@ public:
      * @param max_templates 最大模板数
      * @param max_length 最大序列长度
      */
-    RFAADataLoader(
+    PPMLDataLoader(
         const std::string& hhblits_db,
         const std::string& hhsearch_db,
         int max_seqs = 512,
@@ -441,4 +441,4 @@ private:
         TensorF32& out_ca_mask);            // (B,L)
 };
 
-} // namespace rfaa
+} // namespace ppml

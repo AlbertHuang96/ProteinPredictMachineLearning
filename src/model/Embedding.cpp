@@ -1,13 +1,13 @@
-#include "rfaa/Model.h"
-#include "rfaa/Embedding.h"
-#include "rfaa/MathUtils.h"
+#include "ppml/Model.h"
+#include "ppml/Embedding.h"
+#include "ppml/MathUtils.h"
 #include <random>
 #include <vector>
 
-#include "rfaa/ComputeGraph.h"
-#include "rfaa/Context.h"
+#include "ppml/ComputeGraph.h"
+#include "ppml/Context.h"
 
-namespace rfaa {
+namespace ppml {
 
 // Embedding 层实现
 
@@ -349,7 +349,7 @@ namespace rfaa {
     //   seq_emb : [d_msa, B*L]      (emb_q_->forward_graph 输出, get_rows, 一维扁平索引)
     // 广播路径: seq_emb -> view [d_msa, L, 1, B] -> repeat 到 msa_emb 形状 -> add
     // ⚠️ 依赖: view / repeat / add_impl 图 op。其中 view 图节点当前缺 dispatch kernel，
-    //    需先补 view/unsqueeze kernel 才能执行。布局以 RFAAModel 图化后的上游约定为准。
+    //    需先补 view/unsqueeze kernel 才能执行。布局以 PPMLModel 图化后的上游约定为准。
     TensorF32* FullEmbedding::forward_graph(TensorF32* msa, TensorF32* seq, TensorF32* idx) {
         // msa : (B, N, L, d_init) → emb 线性投影
         auto* msa_emb = emb_->forward_graph(msa);              // [d_msa, L, N, B]
@@ -358,7 +358,7 @@ namespace rfaa {
         auto* seq_emb = emb_q_->forward_graph(seq);            // [d_msa, B*L]
 
         // 广播: seq_emb [d_msa, B*L] → view [d_msa, L, 1, B] → repeat → [d_msa, L, N, B]
-        // 注: 依赖上游 msa_emb 的 ggml 布局 (dims[1]=L, dims[3]=B), 需与 RFAAModel 图化一致
+        // 注: 依赖上游 msa_emb 的 ggml 布局 (dims[1]=L, dims[3]=B), 需与 PPMLModel 图化一致
         const int64_t L = msa_emb->shape().dims[1];
         const int64_t B = msa_emb->shape().dims[3];
         auto* seq_b     = view(seq_emb, Shape{seq_emb->shape().dims[0], L, 1, B});  // [d_msa, L, 1, B]
@@ -388,4 +388,4 @@ namespace rfaa {
         return (msa) */
 
 
-} // namespace rfaa
+} // namespace ppml

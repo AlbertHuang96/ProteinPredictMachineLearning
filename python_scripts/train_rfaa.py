@@ -1,5 +1,5 @@
 """
-RFAA 训练脚本 (Python 端)
+PPML 训练脚本 (Python 端)
 与 C++ 框架配合进行混合训练
 """
 
@@ -7,13 +7,13 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'build', 'lib'))
 
-import pyrfaa
+import pyppml
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 import numpy as np
 
-class RFAADataLoader:
+class PPMLDataLoader:
     """数据加载器：从 C++ 获取批次数据"""
     
     def __init__(self, data_dir, batch_size=2):
@@ -25,12 +25,12 @@ class RFAADataLoader:
         for batch_file in sorted(os.listdir(self.data_dir)):
             data = np.load(os.path.join(self.data_dir, batch_file))
             
-            # 转换为 pyrfaa.Tensor
-            input_data = pyrfaa.ModelInput()
-            input_data.msa_latent = pyrfaa.numpy_to_tensor(data['msa_latent'])
-            input_data.seq_tokens = pyrfaa.numpy_to_tensor(data['seq_tokens'])
-            input_data.t1d = pyrfaa.numpy_to_tensor(data['t1d'])
-            input_data.coords = pyrfaa.numpy_to_tensor(data['coords'])
+            # 转换为 pyppml.Tensor
+            input_data = pyppml.ModelInput()
+            input_data.msa_latent = pyppml.numpy_to_tensor(data['msa_latent'])
+            input_data.seq_tokens = pyppml.numpy_to_tensor(data['seq_tokens'])
+            input_data.t1d = pyppml.numpy_to_tensor(data['t1d'])
+            input_data.coords = pyppml.numpy_to_tensor(data['coords'])
             
             targets = {
                 'coords': data['true_coords'],
@@ -44,7 +44,7 @@ def train_with_cpp_model():
     """使用 C++ 模型进行训练"""
     
     # 创建 C++ 模型
-    config = pyrfaa.RFAAConfig()
+    config = pyppml.PPMLConfig()
     config.d_msa = 256
     config.d_pair = 128
     config.d_state = 32
@@ -52,20 +52,20 @@ def train_with_cpp_model():
     config.n_main_blocks = 8
     config.n_refine_blocks = 4
     
-    model = pyrfaa.RFAAModel(config)
-    model.to(pyrfaa.Device.CUDA)
+    model = pyppml.PPMLModel(config)
+    model.to(pyppml.Device.CUDA)
     model.train()
     
     # 加载预训练权重
-    if os.path.exists("rfaa_weights.bin"):
-        model.load_weights("rfaa_weights.bin")
+    if os.path.exists("ppml_weights.bin"):
+        model.load_weights("ppml_weights.bin")
     
     # 优化器 (Python 端)
     # 注意：这里需要自定义优化器或把梯度传回 Python
     optimizer = torch.optim.Adam([], lr=1e-4)  # 占位
     
     # 数据加载
-    dataloader = RFAADataLoader("data/train", batch_size=2)
+    dataloader = PPMLDataLoader("data/train", batch_size=2)
     
     # 训练循环
     for epoch in range(10):
@@ -103,12 +103,12 @@ def train_with_cpp_model():
         print(f"Epoch {epoch} completed. Avg loss: {avg_loss:.4f}")
         
         # 保存权重
-        model.save_weights(f"rfaa_weights_epoch_{epoch}.bin")
+        model.save_weights(f"ppml_weights_epoch_{epoch}.bin")
     
     # 导出 ONNX
-    exporter = pyrfaa.ONNXExporter()
-    onnx_config = pyrfaa.ONNXExportConfig()
-    onnx_config.output_path = "rfaa_model.onnx"
+    exporter = pyppml.ONNXExporter()
+    onnx_config = pyppml.ONNXExportConfig()
+    onnx_config.output_path = "ppml_model.onnx"
     onnx_config.opset_version = 17
     
     exporter.export_model(model, onnx_config)

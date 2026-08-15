@@ -5,12 +5,12 @@
 #include <memory>
 #include <vector>
 
-namespace rfaa {
+namespace ppml {
 
 class EmbeddingLayer;  // 前向声明
 
 /**
- * @brief Positional Encoding module for RFAA
+ * @brief Positional Encoding module for PPML
  * 
  * This module computes positional encoding based on residue and atom distances.
  * It is used in the pair bias computation in IterBlock.
@@ -49,7 +49,7 @@ public:
      * @brief Forward pass (simplified version using only coords)
      * 
      * This is a convenience method that computes positional encoding
-     * using only coordinates. Used in RFAA.cpp line 196.
+     * using only coordinates. Used in PPML.cpp line 196.
      * 
      * @param coords Coordinates (B, L, A, 3)
      * @return Positional encoding tensor (B, L, L, d_pair)
@@ -120,4 +120,4 @@ private:
     EmbeddingLayer* emb_atom_ = nullptr; // (17, D_PAIR)
 };
 
-} // namespace rfaa
+} // namespace ppml

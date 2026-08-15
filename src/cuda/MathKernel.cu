@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
 
-namespace rfaa {
+namespace ppml {
 
 // 通用数学运算 CUDA 核
 
@@ -83,4 +83,4 @@ __global__ void kernel_bmm(const float* A, const float* B, float* C,
     C[(b * M + m) * N + n] = sum;
 }
 
-} // namespace rfaa
+} // namespace ppml

@@ -1,13 +1,13 @@
-#include "rfaa/Model.h"
-#include "rfaa/ONNXExporter.h"
+#include "ppml/Model.h"
+#include "ppml/ONNXExporter.h"
 #include <iostream>
 
-using namespace rfaa;
+using namespace ppml;
 
 int main(int argc, char* argv[]) {
     // 1. 创建模型
-    RFAAConfig config;
-    RFAAModel model(config);
+    PPMLConfig config;
+    PPMLModel model(config);
     
     // 2. 加载权重
     if (argc > 1) {

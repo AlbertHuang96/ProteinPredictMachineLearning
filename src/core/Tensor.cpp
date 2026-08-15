@@ -1,16 +1,16 @@
-#include "rfaa/Tensor.h"
+#include "ppml/Tensor.h"
 #include <cuda_runtime.h>
 #include <cstring>
 #include <sstream>
 
-namespace rfaa {
+namespace ppml {
 
 // TODO : memory pool
 // CPU 内存分配
 static void* cpu_alloc(size_t size) {
     void* ptr = nullptr;
     ptr = malloc(size);
-    if (!ptr) throw RFAAError("CPU memory allocation failed");
+    if (!ptr) throw PPMLError("CPU memory allocation failed");
     return ptr;
 }
 
@@ -23,7 +23,7 @@ static void* cuda_alloc(size_t size) {
     void* ptr = nullptr;
     cudaError_t err = cudaMalloc(&ptr, size);
     if (err != cudaSuccess) {
-        throw RFAAError(std::string("CUDA memory allocation failed: ") + 
+        throw PPMLError(std::string("CUDA memory allocation failed: ") + 
                        cudaGetErrorString(err));
     }
     return ptr;
@@ -36,7 +36,7 @@ static void cuda_free(void* ptr) {
 static void cuda_copy(void* dst, const void* src, size_t size, cudaMemcpyKind kind) {
     cudaError_t err = cudaMemcpy(dst, src, size, kind);
     if (err != cudaSuccess) {
-        throw RFAAError(std::string("CUDA memcpy failed: ") + cudaGetErrorString(err));
+        throw PPMLError(std::string("CUDA memcpy failed: ") + cudaGetErrorString(err));
     }
 }
 
@@ -144,7 +144,7 @@ void Tensor<T>::zero_() {
 template<typename T>
 void Tensor<T>::copy_from(const Tensor& other) {
     if (shape_.numel() != other.shape_.numel()) {
-        throw RFAAError("Tensor shape mismatch in copy");
+        throw PPMLError("Tensor shape mismatch in copy");
     }
     
     if (device_ == other.device_) {
@@ -164,7 +164,7 @@ void Tensor<T>::copy_from(const Tensor& other) {
 template<typename T>
 Tensor<T> Tensor<T>::view(const Shape& new_shape) const {
     if (new_shape.numel() != shape_.numel()) {
-        throw RFAAError("View shape size mismatch");
+        throw PPMLError("View shape size mismatch");
     }
     return Tensor<T>(new_shape, data_, device_, false);  // 不拥有数据
 }
@@ -173,7 +173,7 @@ template<typename T>
 Tensor<T> Tensor<T>::slice(int dim, int64_t start, int64_t end) const {
     // 简化实现：仅支持 CPU，返回拷贝
     if (dim < 0 || dim >= shape_.ndim()) {
-        throw RFAAError("Invalid slice dimension");
+        throw PPMLError("Invalid slice dimension");
     }
     
     Shape new_shape = shape_;
@@ -188,7 +188,7 @@ Tensor<T> Tensor<T>::slice(int dim, int64_t start, int64_t end) const {
 template<typename T>
 Tensor<T> Tensor<T>::select(int dim, int64_t index) const {
     if (dim < 0 || dim >= shape_.ndim()) {
-        throw RFAAError("Invalid select dimension");
+        throw PPMLError("Invalid select dimension");
     }
     
     Shape new_shape;
@@ -215,7 +215,7 @@ Tensor<T> Tensor<T>::unsqueeze(int dim) const {
     }
     
     if (dim < 0 || dim > shape_.ndim()) {
-        throw RFAAError("Invalid unsqueeze dimension: " + std::to_string(dim) + 
+        throw PPMLError("Invalid unsqueeze dimension: " + std::to_string(dim) + 
                         " for tensor with " + std::to_string(shape_.ndim()) + " dimensions");
     }
     
@@ -238,7 +238,7 @@ template<typename T>
 Tensor<T> Tensor<T>::permute(const std::vector<int>& dims) const {
     // 检查dims长度是否与张量维度一致
     if (static_cast<int>(dims.size()) != shape_.ndim()) {
-        throw RFAAError("permute: dims size (" + std::to_string(dims.size()) + 
+        throw PPMLError("permute: dims size (" + std::to_string(dims.size()) + 
                         ") != tensor ndim (" + std::to_string(shape_.ndim()) + ")");
     }
     
@@ -246,11 +246,11 @@ Tensor<T> Tensor<T>::permute(const std::vector<int>& dims) const {
     std::vector<bool> used(shape_.ndim(), false);
     for (int dim : dims) {
         if (dim < 0 || dim >= shape_.ndim()) {
-            throw RFAAError("permute: dim " + std::to_string(dim) + " out of range [0, " + 
+            throw PPMLError("permute: dim " + std::to_string(dim) + " out of range [0, " + 
                             std::to_string(shape_.ndim() - 1) + "]");
         }
         if (used[dim]) {
-            throw RFAAError("permute: dim " + std::to_string(dim) + " repeated");
+            throw PPMLError("permute: dim " + std::to_string(dim) + " repeated");
         }
         used[dim] = true;
     }
@@ -370,4 +370,4 @@ template class Tensor<int64_t>;
 template<> DType Tensor<float>::dtype() const { return DType::F32; }
 template<> DType Tensor<int64_t>::dtype() const { return DType::I64; }
 
-} // namespace rfaa
+} // namespace ppml

@@ -3,7 +3,7 @@
 #include "Tensor.h"
 #include <vector>
 
-namespace rfaa {
+namespace ppml {
 
 /**
  * @brief Create a vector containing integers from start to end-1
@@ -35,8 +35,8 @@ TensorF32 mean(const TensorF32& input, int dim);
  * @param a Left operand, shape (M, K)
  * @param b Right operand, shape (K, N)
  * @return TensorF32 Result tensor, shape (M, N)
- * @throws RFAAError If inputs are not 2D tensors
- * @throws RFAAError If dimensions don't match (a.shape[1] != b.shape[0])
+ * @throws PPMLError If inputs are not 2D tensors
+ * @throws PPMLError If dimensions don't match (a.shape[1] != b.shape[0])
  */
 TensorF32 matmul(const TensorF32& a, const TensorF32& b);
 
@@ -50,8 +50,8 @@ TensorF32 matmul(const TensorF32& a, const TensorF32& b);
  * @param a Left operand, shape (B, M, K)
  * @param b Right operand, shape (B, K, N)
  * @return TensorF32 Result tensor, shape (B, M, N)
- * @throws RFAAError If inputs are not 3D tensors
- * @throws RFAAError If batch dimension B or inner dimension K doesn't match
+ * @throws PPMLError If inputs are not 3D tensors
+ * @throws PPMLError If batch dimension B or inner dimension K doesn't match
  */
 TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b);
 
@@ -70,7 +70,7 @@ TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b);
  * @param indices Vector of indices (each index should be in [0, num_classes-1])
  * @param num_classes Number of classes (length of one-hot vector, default 8)
  * @return TensorF32 One-hot encoded tensor, shape (indices.size(), num_classes)
- * @throws RFAAError If any index is out of range [0, num_classes-1]
+ * @throws PPMLError If any index is out of range [0, num_classes-1]
  */
 TensorF32 one_hot(const std::vector<int>& indices, int num_classes = 8);
 
@@ -82,7 +82,7 @@ TensorF32 one_hot(const std::vector<int>& indices, int num_classes = 8);
  * @param index Index to encode (should be in [0, num_classes-1])
  * @param num_classes Number of classes (length of one-hot vector, default 8)
  * @return TensorF32 One-hot encoded tensor, shape (1, num_classes)
- * @throws RFAAError If index is out of range [0, num_classes-1]
+ * @throws PPMLError If index is out of range [0, num_classes-1]
  */
 TensorF32 one_hot(int index, int num_classes = 8);
 
@@ -100,8 +100,8 @@ TensorF32 one_hot(int index, int num_classes = 8);
  * @param seq Input sequence tensor, shape (B, L) with integer indices in [0, num_classes-1]
  * @param num_classes Number of classes (default 21 for amino acids)
  * @return TensorF32 One-hot encoded tensor, shape (B, L, num_classes)
- * @throws RFAAError If seq is not 2D tensor
- * @throws RFAAError If any index is out of range [0, num_classes-1]
+ * @throws PPMLError If seq is not 2D tensor
+ * @throws PPMLError If any index is out of range [0, num_classes-1]
  */
 TensorF32 one_hot_seq(const TensorF32& seq, int num_classes = 21);
 
@@ -122,9 +122,9 @@ TensorF32 one_hot_seq(const TensorF32& seq, int num_classes = 21);
  * @param left Left tensor, shape (B, 1, L, D)
  * @param right Right tensor, shape (B, L, 1, D)
  * @return TensorF32 Result tensor, shape (B, L, L, D)
- * @throws RFAAError If inputs are not 4D tensors
- * @throws RFAAError If batch dimension B or feature dimension D doesn't match
- * @throws RFAAError If left shape[1] != 1 or right shape[2] != 1
+ * @throws PPMLError If inputs are not 4D tensors
+ * @throws PPMLError If batch dimension B or feature dimension D doesn't match
+ * @throws PPMLError If left shape[1] != 1 or right shape[2] != 1
  */
 TensorF32 outer_sum(const TensorF32& left, const TensorF32& right);
 
@@ -142,9 +142,9 @@ TensorF32 outer_sum(const TensorF32& left, const TensorF32& right);
  * @param left Left tensor, shape (B, 1, L, D)
  * @param right Right tensor, shape (B, L, 1, D)
  * @return TensorF32 Result tensor, shape (B, L, L, D)
- * @throws RFAAError If inputs are not 4D tensors
- * @throws RFAAError If batch dimension B or feature dimension D doesn't match
- * @throws RFAAError If left shape[1] != 1 or right shape[2] != 1
+ * @throws PPMLError If inputs are not 4D tensors
+ * @throws PPMLError If batch dimension B or feature dimension D doesn't match
+ * @throws PPMLError If left shape[1] != 1 or right shape[2] != 1
  */
 TensorF32 outer_product(const TensorF32& left, const TensorF32& right);
 
@@ -178,7 +178,7 @@ TensorF32 triangle_mult(const TensorF32& left, const TensorF32& right, float L, 
  * @param left  Left tensor, shape (B, N, L, D)
  * @param right Right tensor, shape (B, N, L, D)
  * @return Result tensor, shape (B, L, L, D*D)
- * @throws RFAAError If inputs are not 4D tensors, or batch/feature dims mismatch
+ * @throws PPMLError If inputs are not 4D tensors, or batch/feature dims mismatch
  */
 TensorF32 outer_product_mean(const TensorF32& left, const TensorF32& right);
 
@@ -198,8 +198,8 @@ TensorF32 outer_product_mean(const TensorF32& left, const TensorF32& right);
  * @param left  Left tensor, shape (B, L, D)
  * @param right Right tensor, shape (B, L, D)
  * @return Result tensor, shape (B, L, L, D*D)
- * @throws RFAAError If inputs are not 3D tensors, or batch/feature dims mismatch
+ * @throws PPMLError If inputs are not 3D tensors, or batch/feature dims mismatch
  */
 TensorF32 outer_product_cartesian(const TensorF32& left, const TensorF32& right);
 
-} // namespace rfaa
+} // namespace ppml

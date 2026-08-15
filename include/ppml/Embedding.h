@@ -1,18 +1,18 @@
-//#include "rfaa/Tensor.h"
+//#include "ppml/Tensor.h"
 
 #pragma once
 #include "Tensor.h"
 
 
-//#include "rfaa/Model.h"
+//#include "ppml/Model.h"
 
-#include "rfaa/MathUtils.h"
+#include "ppml/MathUtils.h"
 #include <random>
 
-#include "rfaa/ComputeGraph.h"
-#include "rfaa/Context.h"
+#include "ppml/ComputeGraph.h"
+#include "ppml/Context.h"
 
-namespace rfaa {
+namespace ppml {
 
 // Embedding 层实现
 
@@ -158,7 +158,7 @@ public:
     // BondEmbedding(int d_init, int d_pair);
     BondEmbedding() = default;
 
-    // 由 RFAAModel 注入已创建的参数指针
+    // 由 PPMLModel 注入已创建的参数指针
     void set_params(LinearLayer* emb, int d_pair);
         
     // ChemData().NBTYPES represents the number of categorical bond types the model recognizes, 
@@ -180,7 +180,7 @@ public:
     // FullEmbedding(int d_init, int d_msa);
     FullEmbedding() = default;
 
-    // 由 RFAAModel 注入已创建的参数指针
+    // 由 PPMLModel 注入已创建的参数指针
     void set_params(LinearLayer* emb, EmbeddingLayer* emb_q, int d_msa);
     
     TensorF32 forward(const TensorF32& msa, const TensorF32& seq, const TensorF32& idx);
@@ -219,5 +219,5 @@ private:
     int d_msa_ = 0;
 };
 
-} // namespace rfaa
+} // namespace ppml
 

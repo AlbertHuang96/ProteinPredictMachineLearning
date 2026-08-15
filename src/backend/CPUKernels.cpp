@@ -1,7 +1,7 @@
 
-#include "rfaa/Backend.h"
-#include "rfaa/ComputeGraph.h"
-#include "rfaa/FAPE.h"
+#include "ppml/Backend.h"
+#include "ppml/ComputeGraph.h"
+#include "ppml/FAPE.h"
 #include <cstring>
 #include <cmath>
 #include <vector>
@@ -9,7 +9,7 @@
 
 //#include <omp.h>
 
-namespace rfaa {
+namespace ppml {
 
 // ===== unary op 计算函数前向声明 =====
 static void compute_forward_abs(ComputeParams* p, TensorF32* dst);
@@ -1305,7 +1305,7 @@ void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
 //   b(src[1]): 行索引 (K,)（float 编码的整数）
 //   c(src[2]): 值源 (K, M)，每行对应一个要写入的行
 // dst(node): (N, M) — 先整体拷贝 a（保留未覆盖行），再把 c 的第 k 行覆写到 b[k] 指定的行。
-// 对应 ggml set_rows 的 scatter 语义（但 RFAA 版本 a 为已含值的目标，仅覆盖 b 指定行）。
+// 对应 ggml set_rows 的 scatter 语义（但 PPML 版本 a 为已含值的目标，仅覆盖 b 指定行）。
 void CPUBackend::kernel_set_rows(TensorF32 * node, ComputeParams * p) {
     const TensorF32 * a = node->src[0];   // 目标 (N, M)
     const TensorF32 * b = node->src[1];   // 行索引 (K,)
@@ -2228,4 +2228,4 @@ static void compute_forward_fape_back(ComputeParams* p, TensorF32* dst) {
     tp->barrier_wait();
 }
 
-} // namespace rfaa
+} // namespace ppml

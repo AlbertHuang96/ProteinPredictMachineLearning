@@ -1,5 +1,5 @@
-#include "rfaa/DataLoader.h"
-#include "rfaa/DistogramBins.h"
+#include "ppml/DataLoader.h"
+#include "ppml/DistogramBins.h"
 #include <fstream>
 #include <sstream>
 #include <cassert>
@@ -308,9 +308,9 @@ const std::vector<std::string>& aa2long(int aa_num) {
 
 // 返回: (xyz, mask, idx_s)
 struct ParsePDBResult {
-    rfaa::TensorF32 xyz;      // (N_res, 14, 3)
-    rfaa::TensorF32 mask;     // (N_res, 14)
-    rfaa::TensorF32 idx_s;    // (N_res,) - 残基序号
+    ppml::TensorF32 xyz;      // (N_res, 14, 3)
+    ppml::TensorF32 mask;     // (N_res, 14)
+    ppml::TensorF32 idx_s;    // (N_res,) - 残基序号
 };
 ParsePDBResult parse_pdb_lines(const std::vector<std::string>& lines) {
     // ========== 1. 提取有 CA 原子的残基索引 ==========
@@ -334,14 +334,14 @@ ParsePDBResult parse_pdb_lines(const std::vector<std::string>& lines) {
     if (N_res == 0) {
         // 返回空结果
         ParsePDBResult result;
-        result.xyz = rfaa::TensorF32({0, 14, 3});
-        result.mask = rfaa::TensorF32({0, 14});
-        result.idx_s = rfaa::TensorF32({0});
+        result.xyz = ppml::TensorF32({0, 14, 3});
+        result.mask = ppml::TensorF32({0, 14});
+        result.idx_s = ppml::TensorF32({0});
         return result;
     }
     
     // ========== 2. 初始化坐标数组 (N_res, 14, 3) 为 NaN ==========
-    rfaa::TensorF32 xyz({N_res, 14, 3});
+    ppml::TensorF32 xyz({N_res, 14, 3});
     float* xyz_data = xyz.data();
     int64_t total_elements = N_res * 14 * 3;
     
@@ -391,7 +391,7 @@ ParsePDBResult parse_pdb_lines(const std::vector<std::string>& lines) {
     }
     
     // ========== 4. 生成掩码 ==========
-    rfaa::TensorF32 mask({N_res, 14});
+    ppml::TensorF32 mask({N_res, 14});
     float* mask_data = mask.data();
     
     for (int i = 0; i < N_res; i++) {
@@ -410,7 +410,7 @@ ParsePDBResult parse_pdb_lines(const std::vector<std::string>& lines) {
     }
     
     // ========== 6. 构建 idx_s 张量 ==========
-    rfaa::TensorF32 idx_s_tensor({N_res});
+    ppml::TensorF32 idx_s_tensor({N_res});
     float* idx_s_data = idx_s_tensor.data();
     for (int i = 0; i < N_res; i++) {
         idx_s_data[i] = static_cast<float>(idx_s_vec[i]);
@@ -425,7 +425,7 @@ ParsePDBResult parse_pdb_lines(const std::vector<std::string>& lines) {
     return result;
 }
 
-namespace rfaa {
+namespace ppml {
 
 
 // ============================================================================
@@ -439,13 +439,13 @@ std::string ExternalTools::run_hhblits(
     float e_value
 ) {
     // 写入临时 FASTA 文件
-    std::string temp_fasta = "/tmp/rfaa_query.fasta";
+    std::string temp_fasta = "/tmp/ppml_query.fasta";
     std::ofstream fasta_file(temp_fasta);
     fasta_file << ">query\n" << sequence << "\n";
     fasta_file.close();
     
     // 运行 HHblits
-    std::string output_a3m = "/tmp/rfaa_output.a3m";
+    std::string output_a3m = "/tmp/ppml_output.a3m";
     std::string cmd = "hhblits -i " + temp_fasta + 
                      " -d " + database_path +
                      " -n " + std::to_string(n_iter) +
@@ -455,7 +455,7 @@ std::string ExternalTools::run_hhblits(
     
     int ret = system(cmd.c_str());
     if (ret != 0) {
-        throw RFAAError("ExternalTools: hhblits failed with return code " + std::to_string(ret));
+        throw PPMLError("ExternalTools: hhblits failed with return code " + std::to_string(ret));
     }
     
     return output_a3m;
@@ -467,7 +467,7 @@ std::string ExternalTools::run_hhsearch(
     int n_templates
 ) {
     // 运行 HHsearch
-    std::string output_hhr = "/tmp/rfaa_output.hhr";
+    std::string output_hhr = "/tmp/ppml_output.hhr";
     std::string cmd = "hhsearch -i " + a3m_path + 
                      " -d " + database_path +
                      " -o " + output_hhr +
@@ -475,17 +475,17 @@ std::string ExternalTools::run_hhsearch(
     
     int ret = system(cmd.c_str());
     if (ret != 0) {
-        throw RFAAError("ExternalTools: hhsearch failed with return code " + std::to_string(ret));
+        throw PPMLError("ExternalTools: hhsearch failed with return code " + std::to_string(ret));
     }
     
     return output_hhr;
 }
 
 // ============================================================================
-// RFAADataLoader 实现
+// PPMLDataLoader 实现
 // ============================================================================
 
-RFAADataLoader::RFAADataLoader(
+PPMLDataLoader::PPMLDataLoader(
     const std::string& hhblits_db,
     const std::string& hhsearch_db,
     int max_seqs,
@@ -498,7 +498,7 @@ RFAADataLoader::RFAADataLoader(
     max_length_(max_length) {
 }
 
-ModelInput RFAADataLoader::load(const std::string& sequence) {
+ModelInput PPMLDataLoader::load(const std::string& sequence) {
     // Step 1: 运行 HHblits
     std::string a3m_path = ExternalTools::run_hhblits(sequence, hhblits_db_);
     
@@ -511,7 +511,7 @@ ModelInput RFAADataLoader::load(const std::string& sequence) {
 
 // ========== 辅助函数：torch.where(qmap[:,1] == nt) ==========
 // 返回 qmap[:,1] == nt 的索引
-std::vector<int64_t> where_qmap_equals(const rfaa::TensorF32& qmap, int nt) {
+std::vector<int64_t> where_qmap_equals(const ppml::TensorF32& qmap, int nt) {
     std::vector<int64_t> result;
     int64_t n = qmap.shape().dims[0];  // 总对齐数
     
@@ -526,9 +526,9 @@ std::vector<int64_t> where_qmap_equals(const rfaa::TensorF32& qmap, int nt) {
 }
 
 // 计算两个向量的叉积: a x b
-rfaa::TensorF32 cross(const rfaa::TensorF32& a, const rfaa::TensorF32& b) {
+ppml::TensorF32 cross(const ppml::TensorF32& a, const ppml::TensorF32& b) {
     // a, b: (..., 3)
-    rfaa::TensorF32 result(a.shape());
+    ppml::TensorF32 result(a.shape());
     float* rdata = result.data();
     const float* adata = a.data();
     const float* bdata = b.data();
@@ -546,14 +546,14 @@ rfaa::TensorF32 cross(const rfaa::TensorF32& a, const rfaa::TensorF32& b) {
 }
 
 // 计算点对之间的距离矩阵: dist[i,j] = ||a[i] - b[j]||
-rfaa::TensorF32 get_pair_dist(const rfaa::TensorF32& a, const rfaa::TensorF32& b) {
+ppml::TensorF32 get_pair_dist(const ppml::TensorF32& a, const ppml::TensorF32& b) {
     // a: (batch, N, 3), b: (batch, M, 3)
     // 返回: (batch, N, M)
     int batch = static_cast<int>(a.shape().dims[0]);
     int N = static_cast<int>(a.shape().dims[1]);
     int M = static_cast<int>(b.shape().dims[1]);
     
-    rfaa::TensorF32 dist({batch, N, M});
+    ppml::TensorF32 dist({batch, N, M});
     float* ddata = dist.data();
     
     for (int b_idx = 0; b_idx < batch; b_idx++) {
@@ -571,14 +571,14 @@ rfaa::TensorF32 get_pair_dist(const rfaa::TensorF32& a, const rfaa::TensorF32& b
 }
 
 // 计算二面角 (dihedral angle)
-rfaa::TensorF32 get_dih(const rfaa::TensorF32& a, const rfaa::TensorF32& b,
-                         const rfaa::TensorF32& c, const rfaa::TensorF32& d) {
+ppml::TensorF32 get_dih(const ppml::TensorF32& a, const ppml::TensorF32& b,
+                         const ppml::TensorF32& c, const ppml::TensorF32& d) {
     // a,b,c,d: (..., 3)
     // 返回: (...,) - 二面角（弧度）
     // 创建形状去掉最后一维
     std::vector<int64_t> dih_dims = a.shape().dims;
     dih_dims.pop_back();
-    rfaa::TensorF32 dih(dih_dims, a.device());
+    ppml::TensorF32 dih(dih_dims, a.device());
     
     int64_t n = a.numel() / 3;
     float* result = dih.data();
@@ -633,13 +633,13 @@ rfaa::TensorF32 get_dih(const rfaa::TensorF32& a, const rfaa::TensorF32& b,
 }
 
 // 计算平面角 (angle)
-rfaa::TensorF32 get_ang(const rfaa::TensorF32& a, const rfaa::TensorF32& b,
-                         const rfaa::TensorF32& c) {
+ppml::TensorF32 get_ang(const ppml::TensorF32& a, const ppml::TensorF32& b,
+                         const ppml::TensorF32& c) {
     // a,b,c: (..., 3)
     // 返回: (...,) - 平面角（弧度）
     std::vector<int64_t> ang_dims = a.shape().dims;
     ang_dims.pop_back();
-    rfaa::TensorF32 ang(ang_dims, a.device());
+    ppml::TensorF32 ang(ang_dims, a.device());
     
     int64_t n = a.numel() / 3;
     float* result = ang.data();
@@ -674,20 +674,20 @@ rfaa::TensorF32 get_ang(const rfaa::TensorF32& a, const rfaa::TensorF32& b,
 // ========== xyz_to_c6d 主函数 ==========
 // 对应 Python: xyz_to_c6d(xyz, params=PARAMS)
 struct C6DResult {
-    rfaa::TensorF32 c6d;   // (batch, nres, nres, 4) - [dist, omega, theta, phi]
-    rfaa::TensorF32 mask;  // (batch, nres, nres) - 有效位置掩码
+    ppml::TensorF32 c6d;   // (batch, nres, nres, 4) - [dist, omega, theta, phi]
+    ppml::TensorF32 mask;  // (batch, nres, nres) - 有效位置掩码
 };
 
-C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
+C6DResult xyz_to_c6d(const ppml::TensorF32& xyz, float DMAX = 20.0f) {
     // xyz: (batch, nres, 3, 3) - [N, Ca, C] 坐标
     int batch = static_cast<int>(xyz.shape().dims[0]);
     int nres = static_cast<int>(xyz.shape().dims[1]);
     
     // ========== 1. 提取三个锚原子 ==========
     // N = xyz[:,:,0], Ca = xyz[:,:,1], C = xyz[:,:,2]
-    rfaa::TensorF32 N({batch, nres, 3});
-    rfaa::TensorF32 Ca({batch, nres, 3});
-    rfaa::TensorF32 C({batch, nres, 3});
+    ppml::TensorF32 N({batch, nres, 3});
+    ppml::TensorF32 Ca({batch, nres, 3});
+    ppml::TensorF32 C({batch, nres, 3});
     
     for (int b = 0; b < batch; b++) {
         for (int i = 0; i < nres; i++) {
@@ -703,7 +703,7 @@ C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
     // b = Ca - N, c = C - Ca, a = cross(b, c)
     // Cb = -0.58273431*a + 0.56802827*b - 0.54067466*c + Ca
     // (手动循环实现，因为 Tensor 不支持运算符重载)
-    rfaa::TensorF32 Cb({batch, nres, 3});
+    ppml::TensorF32 Cb({batch, nres, 3});
     for (int b_idx = 0; b_idx < batch; b_idx++) {
         for (int i = 0; i < nres; i++) {
             int offset = (b_idx * nres + i) * 3;
@@ -731,11 +731,11 @@ C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
     }
     
     // ========== 3. 计算 6D 坐标 ==========
-    rfaa::TensorF32 c6d({batch, nres, nres, 4});
+    ppml::TensorF32 c6d({batch, nres, nres, 4});
     c6d.zero_();
     
     // dist = get_pair_dist(Cb, Cb)
-    rfaa::TensorF32 dist = get_pair_dist(Cb, Cb);
+    ppml::TensorF32 dist = get_pair_dist(Cb, Cb);
     
     // dist[isnan(dist)] = 999.9
     for (int i = 0; i < dist.numel(); i++) {
@@ -775,9 +775,9 @@ C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
         int n_valid = static_cast<int>(valid_positions.size());
         
         // 创建索引张量
-        rfaa::TensorF32 b_idx_tensor({n_valid});
-        rfaa::TensorF32 i_tensor({n_valid});
-        rfaa::TensorF32 j_tensor({n_valid});
+        ppml::TensorF32 b_idx_tensor({n_valid});
+        ppml::TensorF32 i_tensor({n_valid});
+        ppml::TensorF32 j_tensor({n_valid});
         
         for (int idx = 0; idx < n_valid; idx++) {
             auto [b_val, i_val, j_val] = valid_positions[idx];
@@ -788,11 +788,11 @@ C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
         
         // 提取有效位置的坐标
         // Ca[b,i], Cb[b,i], Cb[b,j], Ca[b,j]
-        rfaa::TensorF32 Ca_bi({n_valid, 3});
-        rfaa::TensorF32 Cb_bi({n_valid, 3});
-        rfaa::TensorF32 Cb_bj({n_valid, 3});
-        rfaa::TensorF32 Ca_bj({n_valid, 3});
-        rfaa::TensorF32 N_bi({n_valid, 3});
+        ppml::TensorF32 Ca_bi({n_valid, 3});
+        ppml::TensorF32 Cb_bi({n_valid, 3});
+        ppml::TensorF32 Cb_bj({n_valid, 3});
+        ppml::TensorF32 Ca_bj({n_valid, 3});
+        ppml::TensorF32 N_bi({n_valid, 3});
         
         for (int idx = 0; idx < n_valid; idx++) {
             auto [b_val, i_val, j_val] = valid_positions[idx];
@@ -823,9 +823,9 @@ C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
         }
         
         // 计算角度
-        rfaa::TensorF32 omega = get_dih(Ca_bi, Cb_bi, Cb_bj, Ca_bj);  // (n_valid,)
-        rfaa::TensorF32 theta = get_dih(N_bi, Ca_bi, Cb_bi, Cb_bj);    // (n_valid,)
-        rfaa::TensorF32 phi = get_ang(Ca_bi, Cb_bi, Cb_bj);            // (n_valid,)
+        ppml::TensorF32 omega = get_dih(Ca_bi, Cb_bi, Cb_bj, Ca_bj);  // (n_valid,)
+        ppml::TensorF32 theta = get_dih(N_bi, Ca_bi, Cb_bi, Cb_bj);    // (n_valid,)
+        ppml::TensorF32 phi = get_ang(Ca_bi, Cb_bi, Cb_bj);            // (n_valid,)
         
         // 填入 c6d
         for (int idx = 0; idx < n_valid; idx++) {
@@ -846,7 +846,7 @@ C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
     }
     
     // ========== 7. 创建掩码 ==========
-    rfaa::TensorF32 mask({batch, nres, nres});
+    ppml::TensorF32 mask({batch, nres, nres});
     mask.zero_();
     for (auto [b_val, i_val, j_val] : valid_positions) {
         mask.data()[(b_val*nres + i_val)*nres + j_val] = 1.0f;
@@ -868,8 +868,8 @@ C6DResult xyz_to_c6d(const rfaa::TensorF32& xyz, float DMAX = 20.0f) {
 // old version of RosettaFold
 // d_t2d = 10 is old version
 // RF2 d_t2d = 68
-rfaa::TensorF32 xyz_to_t2d(const rfaa::TensorF32& xyz_t, 
-                            const rfaa::TensorF32& t0d, 
+ppml::TensorF32 xyz_to_t2d(const ppml::TensorF32& xyz_t, 
+                            const ppml::TensorF32& t0d, 
                             float DMAX = 20.0f) {
     // ========== 参数检查 ==========
     if (xyz_t.shape().dims.size() != 5 || xyz_t.shape().dims[3] != 3 || xyz_t.shape().dims[4] != 3) {
@@ -885,21 +885,21 @@ rfaa::TensorF32 xyz_to_t2d(const rfaa::TensorF32& xyz_t,
     
     // ========== 1. 转换为 6D 坐标 ==========
     // xyz_t.view(B*T, L, 3, 3)
-    rfaa::TensorF32 xyz_t_reshaped({B * T, L, 3, 3});
+    ppml::TensorF32 xyz_t_reshaped({B * T, L, 3, 3});
     std::memcpy(xyz_t_reshaped.data(), xyz_t.data(), xyz_t.numel() * sizeof(float));
     
     // 调用 xyz_to_c6d
     C6DResult c6d_result = xyz_to_c6d(xyz_t_reshaped, DMAX);
     // c6d.view(B, T, L, L, 4)
     // mask.view(B, T, L, L)
-    rfaa::TensorF32 c6d({B, T, L, L, 4});
-    rfaa::TensorF32 mask({B, T, L, L});
+    ppml::TensorF32 c6d({B, T, L, L, 4});
+    ppml::TensorF32 mask({B, T, L, L});
     std::memcpy(c6d.data(), c6d_result.c6d.data(), c6d_result.c6d.numel() * sizeof(float));
     std::memcpy(mask.data(), c6d_result.mask.data(), c6d_result.mask.numel() * sizeof(float));
     
     // ========== 2. 归一化距离 ==========
     // dist = c6d[...,:1] * mask / DMAX  -> (B, T, L, L, 1)
-    rfaa::TensorF32 dist({B, T, L, L, 1});
+    ppml::TensorF32 dist({B, T, L, L, 1});
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int i = 0; i < L; i++) {
@@ -916,7 +916,7 @@ rfaa::TensorF32 xyz_to_t2d(const rfaa::TensorF32& xyz_t,
     // orien = cat(sin(c6d[...,1:]), cos(c6d[...,1:])) * mask  -> (B, T, L, L, 6)
     // c6d[...,1:] = omega, theta, phi (3个角度)
     // sin + cos = 6维
-    rfaa::TensorF32 orien({B, T, L, L, 6});
+    ppml::TensorF32 orien({B, T, L, L, 6});
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int i = 0; i < L; i++) {
@@ -938,7 +938,7 @@ rfaa::TensorF32 xyz_to_t2d(const rfaa::TensorF32& xyz_t,
     // ========== 4. 扩展 t0d ==========
     // t0d: (B, T, 3) -> (B, T, L, L, 3)
     // t0d.unsqueeze(2).unsqueeze(3).expand(-1,-1,L,L,-1)
-    rfaa::TensorF32 t0d_expanded({B, T, L, L, 3});
+    ppml::TensorF32 t0d_expanded({B, T, L, L, 3});
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int i = 0; i < L; i++) {
@@ -955,7 +955,7 @@ rfaa::TensorF32 xyz_to_t2d(const rfaa::TensorF32& xyz_t,
     // ========== 5. 拼接 ==========
     // t2d = cat(dist, orien, t0d, dim=-1)  -> (B, T, L, L, 10)
     // 10 = 1 (dist) + 6 (orien) + 3 (t0d)
-    rfaa::TensorF32 t2d({B, T, L, L, 10});
+    ppml::TensorF32 t2d({B, T, L, L, 10});
     
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
@@ -1008,9 +1008,9 @@ struct DistParams {
 // 对应 Python: dist_to_bins(dist, params=PARAMS)
 // 输入: dist (...,) - 距离矩阵
 // 输出: db (...,) - bin 索引 (long/int64)
-rfaa::TensorI64 dist_to_bins(const rfaa::TensorF32& dist, const DistParams& params = DistParams()) {
+ppml::TensorI64 dist_to_bins(const ppml::TensorF32& dist, const DistParams& params = DistParams()) {
     // ========== 1. 处理 NaN ==========
-    rfaa::TensorF32 dist_clean(dist.shape(), dist.device());
+    ppml::TensorF32 dist_clean(dist.shape(), dist.device());
     dist_clean.copy_from(dist);
     for (int64_t i = 0; i < dist_clean.numel(); i++) {
         if (std::isnan(dist_clean.data()[i])) {
@@ -1044,7 +1044,7 @@ rfaa::TensorI64 dist_to_bins(const rfaa::TensorF32& dist, const DistParams& para
     
     // ========== 3. bucketize: 离散化 ==========
     // torch.bucketize(dist, dbins) -> 返回 dist[i] 应该插入 dbins 的位置
-    rfaa::TensorI64 db(dist.shape());  // 假设 TensorI64 是 int64_t 张量
+    ppml::TensorI64 db(dist.shape());  // 假设 TensorI64 是 int64_t 张量
     
     for (int64_t i = 0; i < dist.numel(); i++) {
         float d = dist_clean.data()[i];
@@ -1063,9 +1063,9 @@ rfaa::TensorI64 dist_to_bins(const rfaa::TensorF32& dist, const DistParams& para
 // 对应 Python: dist_to_onehot(dist, params=PARAMS)
 // 输入: dist (...,) - 距离矩阵
 // 输出: onehot (..., num_classes) - one-hot 编码
-rfaa::TensorF32 dist_to_onehot(const rfaa::TensorF32& dist, const DistParams& params = DistParams()) {
+ppml::TensorF32 dist_to_onehot(const ppml::TensorF32& dist, const DistParams& params = DistParams()) {
     // ========== 1. 离散化 ==========
-    rfaa::TensorI64 db = dist_to_bins(dist, params);
+    ppml::TensorI64 db = dist_to_bins(dist, params);
     int num_classes = params.num_classes();
     
     // ========== 2. One-hot 编码 ==========
@@ -1073,7 +1073,7 @@ rfaa::TensorF32 dist_to_onehot(const rfaa::TensorF32& dist, const DistParams& pa
     std::vector<int64_t> out_dims = dist.shape().dims;
     out_dims.push_back(num_classes);
     
-    rfaa::TensorF32 onehot(out_dims);
+    ppml::TensorF32 onehot(out_dims);
     onehot.zero_();
     
     // 计算总元素数（排除最后一维）
@@ -1124,9 +1124,9 @@ int dist_to_bin_single(float dist, const DistParams& params) {
 //   mask: (B, T, L, L) - 有效对掩码
 // 输出:
 //   t2d: (B, T, L, L, D) - 模板 2D 特征 (D = num_classes + 6 + 1) = 61 + 7 = 68
-rfaa::TensorF32 xyz_to_t2d(
-    const rfaa::TensorF32& xyz_t,
-    const rfaa::TensorF32& mask,
+ppml::TensorF32 xyz_to_t2d(
+    const ppml::TensorF32& xyz_t,
+    const ppml::TensorF32& mask,
     const DistParams& params = DistParams()
 ) {
     // ========== 参数检查 ==========
@@ -1144,20 +1144,20 @@ rfaa::TensorF32 xyz_to_t2d(
     
     // ========== 1. 计算 6D 坐标 ==========
     // xyz_t[:,:,:,:3].view(B*T, L, 3, 3)
-    rfaa::TensorF32 xyz_reshaped({B*T, L, 3, 3});
+    ppml::TensorF32 xyz_reshaped({B*T, L, 3, 3});
     std::memcpy(xyz_reshaped.data(), xyz_t.data(), xyz_t.numel() * sizeof(float));
     
     //auto [c6d_flat, mask_flat] = xyz_to_c6d_simple(xyz_reshaped, params);
     C6DResult xyz_to_c6d_result = xyz_to_c6d(xyz_reshaped, params.DMAX);
     
     // c6d.view(B, T, L, L, 4)
-    rfaa::TensorF32 c6d({B, T, L, L, 4});
+    ppml::TensorF32 c6d({B, T, L, L, 4});
     std::memcpy(c6d.data(), xyz_to_c6d_result.c6d.data(), xyz_to_c6d_result.c6d.numel() * sizeof(float));
     
     // ========== 2. 距离 one-hot 编码 ==========
     // mask[...,None] -> (B, T, L, L, 1)
     // dist = dist_to_onehot(c6d[...,0]) * mask
-    rfaa::TensorF32 dist_onehot({B, T, L, L, num_classes});
+    ppml::TensorF32 dist_onehot({B, T, L, L, num_classes});
     dist_onehot.zero_();
     
     for (int b = 0; b < B; b++) {
@@ -1185,7 +1185,7 @@ rfaa::TensorF32 xyz_to_t2d(
     // ========== 3. 方向编码 (sin/cos) ==========
     // orien = cat(sin(c6d[...,1:]), cos(c6d[...,1:])) * mask
     // c6d[...,1:] = omega, theta, phi (3个角度) -> sin+cos = 6维
-    rfaa::TensorF32 orien({B, T, L, L, 6});
+    ppml::TensorF32 orien({B, T, L, L, 6});
     orien.zero_();
     
     for (int b = 0; b < B; b++) {
@@ -1207,7 +1207,7 @@ rfaa::TensorF32 xyz_to_t2d(
     
     // ========== 4. 扩展 mask 到最后维 ==========
     // mask 已经是 (B,T,L,L)，需要扩展为 (B,T,L,L,1)
-    rfaa::TensorF32 mask_expanded({B, T, L, L, 1});
+    ppml::TensorF32 mask_expanded({B, T, L, L, 1});
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int i = 0; i < L; i++) {
@@ -1223,7 +1223,7 @@ rfaa::TensorF32 xyz_to_t2d(
     // t2d = cat(dist, orien, mask, dim=-1)
     // 维度: num_classes + 6 + 1 = num_classes + 7
     int D = num_classes + 6 + 1;
-    rfaa::TensorF32 t2d({B, T, L, L, D});
+    ppml::TensorF32 t2d({B, T, L, L, D});
     t2d.zero_();
     
     for (int b = 0; b < B; b++) {
@@ -1257,7 +1257,7 @@ rfaa::TensorF32 xyz_to_t2d(
 // ============================================================================
 // read_fasta_first_sequence — 从 FASTA 文件读取第一条查询序列
 // ============================================================================
-std::string RFAADataLoader::read_fasta_first_sequence(const std::string& fasta_path) {
+std::string PPMLDataLoader::read_fasta_first_sequence(const std::string& fasta_path) {
     std::ifstream file(fasta_path);
     if (!file.is_open()) {
         throw std::runtime_error("Cannot open FASTA file: " + fasta_path);
@@ -1309,7 +1309,7 @@ std::string RFAADataLoader::read_fasta_first_sequence(const std::string& fasta_p
 //   2. CA 缺失时回退到 CA_X / CA_Y / CA_Z 列 (每个残基必有)
 //   3. N 或 C 缺失时用 CA 坐标回退 (避免零坐标导致 FAPE 异常)
 // 返回: (B=1, L, 3, 3) — [N, CA, C] × [x, y, z]
-TensorF32 RFAADataLoader::parse_csv_true_coords(
+TensorF32 PPMLDataLoader::parse_csv_true_coords(
     const std::string& csv_path,
     int expected_L)
 {
@@ -1444,7 +1444,7 @@ TensorF32 RFAADataLoader::parse_csv_true_coords(
 // ============================================================================
 // list_csv_mapping_files — 列出目录下所有 *_mapping_results.csv
 // ============================================================================
-std::vector<std::string> RFAADataLoader::list_csv_mapping_files(const std::string& dir) {
+std::vector<std::string> PPMLDataLoader::list_csv_mapping_files(const std::string& dir) {
     namespace fs = std::filesystem;
     std::vector<std::string> files;
     std::error_code ec;
@@ -1471,7 +1471,7 @@ std::vector<std::string> RFAADataLoader::list_csv_mapping_files(const std::strin
 // 用于模板过滤: 扫描 *_mapping_results.csv 前缀与 *.pdb/*.cif 文件名。
 // 例: "1c26_mapping_results.csv" → "1c26"; "1C26.pdb" → "1c26"
 // ============================================================================
-std::set<std::string> RFAADataLoader::collect_ground_truth_pdb_ids(const std::string& dir) {
+std::set<std::string> PPMLDataLoader::collect_ground_truth_pdb_ids(const std::string& dir) {
     namespace fs = std::filesystem;
     std::set<std::string> ids;
     std::error_code ec;
@@ -1510,7 +1510,7 @@ std::set<std::string> RFAADataLoader::collect_ground_truth_pdb_ids(const std::st
 // list_structure_files — 列出目录下所有结构文件 (*.cif / *.pdb)
 // 返回: {完整路径, 小写扩展名}
 // ============================================================================
-std::vector<std::pair<std::string, std::string>> RFAADataLoader::list_structure_files(
+std::vector<std::pair<std::string, std::string>> PPMLDataLoader::list_structure_files(
     const std::string& dir) {
     namespace fs = std::filesystem;
     std::vector<std::pair<std::string, std::string>> files;
@@ -1541,7 +1541,7 @@ std::vector<std::pair<std::string, std::string>> RFAADataLoader::list_structure_
 //   2. 重叠残基 (多个 CSV 覆盖同一位置): 取首个覆盖且坐标非全零的 CSV。
 //   3. 未被任何 CSV 覆盖的残基坐标保持 0 (供 prepare_ca_mask 排除, 不参与监督)。
 // ============================================================================
-TensorF32 RFAADataLoader::parse_csv_true_coords_multi(
+TensorF32 PPMLDataLoader::parse_csv_true_coords_multi(
     const std::vector<std::string>& csv_paths,
     int L)
 {
@@ -1653,7 +1653,7 @@ TensorF32 RFAADataLoader::parse_csv_true_coords_multi(
 // 输出 out_coords 为展平 (N_res * 4 * 3): [res][atom 0..3 = N,CA,C,O][xyz 0..2]。
 // 只保留骨干重原子完整的标准残基 (与 python extract_template_coords.py 一致)。
 // ============================================================================
-void RFAADataLoader::parse_template_structure(
+void PPMLDataLoader::parse_template_structure(
     const std::string& path,
     const std::string& chain,
     std::vector<float>& out_coords,
@@ -1801,7 +1801,7 @@ void RFAADataLoader::parse_template_structure(
 // ============================================================================
 // load_templates_from_dir — 从目录加载模板结构 (cif/pdb), 过滤真实值重复 PDB
 // ============================================================================
-void RFAADataLoader::load_templates_from_dir(
+void PPMLDataLoader::load_templates_from_dir(
     const std::string& template_dir,
     const std::set<std::string>& exclude_pdb_ids,
     ModelInput& input,
@@ -1896,12 +1896,12 @@ void RFAADataLoader::load_templates_from_dir(
 //   - x,y,z: 该残基的 CA 坐标 (Å)
 //
 // 关键点 (对应需求描述):
-//   - 模板残基必须按 uniprot_pos 放到全长查询序列的正确位置, 否则 RFAA 会把模板坐标
+//   - 模板残基必须按 uniprot_pos 放到全长查询序列的正确位置, 否则 PPML 会把模板坐标
 //     错放到 N 端 (residues 1-200) 而非 DNA-binding 域 (102-292), 严重干扰空间 loss。
 //   - 未映射/缺失的位置全部 0 填充, 并用 template_mask 标记 (False), 使模型忽略这些位置。
 //   - 每个模板 T 独立构建, 特征尺寸与模型硬编码匹配: t1d(80), tor_feat(30), t2d(64)。
 // ============================================================================
-void RFAADataLoader::build_template_features(
+void PPMLDataLoader::build_template_features(
     const std::string& template_dir,
     const std::vector<std::string>& template_ids,
     const std::string& query_sequence,
@@ -2151,7 +2151,7 @@ void RFAADataLoader::build_template_features(
     }
 }
 
-ModelInput RFAADataLoader::load_from_files(
+ModelInput PPMLDataLoader::load_from_files(
     const std::string& a3m_path,
     const std::string& sequence,
     const std::string& csv_path,
@@ -2326,7 +2326,7 @@ ModelInput RFAADataLoader::load_from_files(
     return input;
 }
 
-ReadTemplatesResult RFAADataLoader::read_templates(
+ReadTemplatesResult PPMLDataLoader::read_templates(
     int qlen,
     const FFindexDB& ffdb,
     const std::string& hhr_fn,
@@ -2335,10 +2335,10 @@ ReadTemplatesResult RFAADataLoader::read_templates(
 ) {
     // TODO: 完整实现需要 FFindexDB 完整类型 + parse_templates 完善
     ReadTemplatesResult result;
-    result.xyz = rfaa::TensorF32({0, qlen, 3, 3});
-    result.f1d = rfaa::TensorF32({0, qlen, 3});
-    result.f0d = rfaa::TensorF32({0, 3});
-    result.masks = rfaa::TensorF32({0, qlen, 1});
+    result.xyz = ppml::TensorF32({0, qlen, 3, 3});
+    result.f1d = ppml::TensorF32({0, qlen, 3});
+    result.f0d = ppml::TensorF32({0, 3});
+    result.masks = ppml::TensorF32({0, qlen, 1});
     return result;
 }
 
@@ -2346,16 +2346,16 @@ ReadTemplatesResult RFAADataLoader::read_templates(
 #if 0
     // int npick = std::min(n_templ, static_cast<int>(parsed.ids.size()));
     // ...
-    rfaa::TensorF32 xyz({npick, qlen, 3, 3});
+    ppml::TensorF32 xyz({npick, qlen, 3, 3});
     for (int64_t i = 0; i < xyz_size; i++) {
         xyz_data[i] = nan_val;
     }
     
     // f1d: (npick, qlen, 3) - 初始化为 0
-    rfaa::TensorF32 f1d({npick, qlen, 3});
+    ppml::TensorF32 f1d({npick, qlen, 3});
     
     // f0d: 先收集到 vector，最后 stack
-    std::vector<rfaa::TensorF32> f0d_list;
+    std::vector<ppml::TensorF32> f0d_list;
     
     // ========== 3. 填充数据 ==========
     // sample = range(npick) - 选择前 npick 个模板
@@ -2424,7 +2424,7 @@ ReadTemplatesResult RFAADataLoader::read_templates(
         
         // f0d.append([t0d[nt,0]/100, t0d[nt,4]/100, t0d[nt,5]])
         // t0d: (n_templates, 8) - [Probab, E-value, Score, Aligned_cols, Identities, Similarity, ...]
-        rfaa::TensorF32 f0d_row({1, 3});
+        ppml::TensorF32 f0d_row({1, 3});
         f0d_row.data()[0] = parsed.f0d.data()[nt * 8 + 0] / 100.0f;  // Probab/100
         f0d_row.data()[1] = parsed.f0d.data()[nt * 8 + 4] / 100.0f;  // Identities/100
         f0d_row.data()[2] = parsed.f0d.data()[nt * 8 + 5] / 100.0f;  // Similarity / 100
@@ -2432,7 +2432,7 @@ ReadTemplatesResult RFAADataLoader::read_templates(
     }
     
     // ========== 4. Stack f0d ==========
-    rfaa::TensorF32 f0d_stacked({npick, 3});
+    ppml::TensorF32 f0d_stacked({npick, 3});
     float* f0d_data = f0d_stacked.data();
     for (int i = 0; i < npick; i++) {
         std::memcpy(f0d_data + i * 3, f0d_list[i].data(), 3 * sizeof(float));
@@ -2450,14 +2450,14 @@ ReadTemplatesResult RFAADataLoader::read_templates(
 }
 #endif
 
-std::vector<TemplateHit> RFAADataLoader::parse_atab(const std::string& atab_fn) {
+std::vector<TemplateHit> PPMLDataLoader::parse_atab(const std::string& atab_fn) {
     // 解析 .atab 文件，提取模板命中信息
     std::vector<TemplateHit> hits;
     // TODO: 完整实现
     return hits;
 }
 
-TemplateDataInternal RFAADataLoader::parse_templates(
+TemplateDataInternal PPMLDataLoader::parse_templates(
     const std::string& db_prefix,
     const std::string& hhr_fn,
     const std::string& atab_fn,
@@ -2470,7 +2470,7 @@ TemplateDataInternal RFAADataLoader::parse_templates(
 }
 
 // ========== 2. 解析 .hhr 文件 ==========
-HHRData RFAADataLoader::parse_hhr(const std::string& hhr_path) {
+HHRData PPMLDataLoader::parse_hhr(const std::string& hhr_path) {
     HHRData result;
     std::ifstream file(hhr_path);
     if (!file.is_open()) {
@@ -2519,7 +2519,7 @@ HHRData RFAADataLoader::parse_hhr(const std::string& hhr_path) {
     return result;
 }
 
-std::vector<std::vector<uint8_t>> RFAADataLoader::parse_a3m(
+std::vector<std::vector<uint8_t>> PPMLDataLoader::parse_a3m(
     const std::string& a3m_path,
     std::vector<std::vector<uint8_t>>* ins_matrix) {
     std::vector<std::vector<uint8_t>> msa;
@@ -2550,7 +2550,7 @@ std::vector<std::vector<uint8_t>> RFAADataLoader::parse_a3m(
         }
         if (line.empty()) continue;
         
-        // 转换：移除小写，大写转整数; 同时统计每列的插入计数 (RFAA 算法)
+        // 转换：移除小写，大写转整数; 同时统计每列的插入计数 (PPML 算法)
         std::vector<uint8_t> seq;
         std::vector<uint8_t> ins_row;  // 长度 = 清洗后对齐列数
         seq.reserve(line.size());
@@ -2569,7 +2569,7 @@ std::vector<std::vector<uint8_t>> RFAADataLoader::parse_a3m(
         if (!seq.empty()) {
             // 插入计数: 对每个小写 (插入) 位置, collapsed = pos - 出现次序,
             // 相同 collapsed 的连续插入归到同一对齐列, 计数为该列插入长度。
-            // 等价于 RFAA data_loader_utils.py: a=pos-arange(pos.size()); i[unique]=count
+            // 等价于 PPML data_loader_utils.py: a=pos-arange(pos.size()); i[unique]=count
             std::vector<int> pos;
             for (size_t k = 0; k < line.size(); ++k) {
                 if (std::islower(static_cast<unsigned char>(line[k]))) pos.push_back((int)k);
@@ -2596,7 +2596,7 @@ std::vector<std::vector<uint8_t>> RFAADataLoader::parse_a3m(
     return msa;
 }
 
-TensorF32 RFAADataLoader::a3m_to_msa_features(const std::vector<std::vector<uint8_t>>& a3m_data, int max_seqs, int max_length) {
+TensorF32 PPMLDataLoader::a3m_to_msa_features(const std::vector<std::vector<uint8_t>>& a3m_data, int max_seqs, int max_length) {
 
     // 简化实现：返回零张量
     // 实际实现需要：
@@ -2617,7 +2617,7 @@ TensorF32 RFAADataLoader::a3m_to_msa_features(const std::vector<std::vector<uint
 }
 
 
-TemplateData RFAADataLoader::hhr_extract_template_features(
+TemplateData PPMLDataLoader::hhr_extract_template_features(
     const HHRData& hhr_data,
     const std::string& query_sequence,
     int num_templates,
@@ -2642,9 +2642,9 @@ TemplateData RFAADataLoader::hhr_extract_template_features(
     return result;
 }
 
-TorsionResult RFAADataLoader::get_torsions(
-    const rfaa::TensorF32& xyz_in,           // (B, L, 14, 3)
-    const rfaa::TensorF32& seq,              // (B, L)
+TorsionResult PPMLDataLoader::get_torsions(
+    const ppml::TensorF32& xyz_in,           // (B, L, 14, 3)
+    const ppml::TensorF32& seq,              // (B, L)
     const std::vector<std::vector<std::vector<int>>>& torsion_indices, // (21, 7, 4)
     const std::vector<std::vector<bool>>& torsion_can_flip,            // (21, 7)
     const std::vector<std::vector<std::array<float, 2>>>& ref_angles  // (21, 3, 2)
@@ -2653,13 +2653,13 @@ TorsionResult RFAADataLoader::get_torsions(
     int L = static_cast<int>(xyz_in.shape().dims[1]);
     
     // ========== 1. 计算 tors_mask (简化：假设所有都有效) ==========
-    rfaa::TensorF32 tors_mask({B, L, 10});
+    ppml::TensorF32 tors_mask({B, L, 10});
     // fill with 1.0
     float* mask_data = tors_mask.data();
     for (int i = 0; i < tors_mask.numel(); i++) mask_data[i] = 1.0f;
     
     // ========== 2. tors_planar: TYR chi 3 should be planar ==========
-    rfaa::TensorF32 tors_planar({B, L, 10});
+    ppml::TensorF32 tors_planar({B, L, 10});
     tors_planar.zero_();
     for (int b = 0; b < B; b++) {
         for (int l = 0; l < L; l++) {
@@ -2671,18 +2671,18 @@ TorsionResult RFAADataLoader::get_torsions(
     }
     
     // ========== 3. 理想化坐标 ==========
-    rfaa::TensorF32 xyz(xyz_in.shape(), xyz_in.device());
+    ppml::TensorF32 xyz(xyz_in.shape(), xyz_in.device());
     xyz.copy_from(xyz_in);
     
     // Rs, Ts = rigid_from_3_points(N, Ca, C)
-    rfaa::TensorF32 N = xyz.select(2, 0);  // (B, L, 3)
-    rfaa::TensorF32 Ca = xyz.select(2, 1);
-    rfaa::TensorF32 C = xyz.select(2, 2);
+    ppml::TensorF32 N = xyz.select(2, 0);  // (B, L, 3)
+    ppml::TensorF32 Ca = xyz.select(2, 1);
+    ppml::TensorF32 C = xyz.select(2, 2);
     
     // rigid_from_3_points: 从 N, CA, C 计算旋转矩阵和平移向量
     // Rs: (B, L, 3, 3) 旋转矩阵, Ts: (B, L, 3) 平移向量
-    rfaa::TensorF32 Rs({B, L, 3, 3});
-    rfaa::TensorF32 Ts({B, L, 3});
+    ppml::TensorF32 Rs({B, L, 3, 3});
+    ppml::TensorF32 Ts({B, L, 3});
     Rs.zero_(); Ts.zero_();
     // TODO: 实现完整的 rigid_from_3_points
     
@@ -2719,7 +2719,7 @@ TorsionResult RFAADataLoader::get_torsions(
     }
     
     // ========== 4. 计算 torsions ==========
-    rfaa::TensorF32 torsions({B, L, 10, 2});
+    ppml::TensorF32 torsions({B, L, 10, 2});
     torsions.zero_();
     
     // 辅助: 获取原子 xyz 坐标指针
@@ -2904,7 +2904,7 @@ TorsionResult RFAADataLoader::get_torsions(
     }
     
     // ========== 6. torsions_alt = torsions * -1 (可翻转的) ==========
-    rfaa::TensorF32 torsions_alt(torsions.shape(), torsions.device());
+    ppml::TensorF32 torsions_alt(torsions.shape(), torsions.device());
     torsions_alt.copy_from(torsions);
     for (int b = 0; b < B; b++) {
         for (int l = 0; l < L; l++) {
@@ -2927,7 +2927,7 @@ TorsionResult RFAADataLoader::get_torsions(
     return result;
 }
 
-void RFAADataLoader::init_torsion_indices() {
+void PPMLDataLoader::init_torsion_indices() {
     for (int i = 0; i < NPROTAAS; i++) {
         const auto& i_l = aa2long[i];
         const auto& i_a = aa2longalt[i];
@@ -3072,7 +3072,7 @@ void RFAADataLoader::init_torsion_indices() {
     }
 }
 
-TensorF32 RFAADataLoader::get_protein_bond_feats(int protein_L) {
+TensorF32 PPMLDataLoader::get_protein_bond_feats(int protein_L) {
     // 创建 L x L 的零矩阵
     TensorF32 bond_feats({protein_L, protein_L});
     bond_feats.zero_();
@@ -3090,9 +3090,9 @@ TensorF32 RFAADataLoader::get_protein_bond_feats(int protein_L) {
 // ========== 辅助函数：BFS 计算最短路径 ==========
 // 输入: adj (L, L) - 邻接矩阵 (bool)
 // 输出: dist (L, L) - 最短路径矩阵
-rfaa::TensorF32 compute_shortest_path(const rfaa::TensorF32& adj) {
+ppml::TensorF32 compute_shortest_path(const ppml::TensorF32& adj) {
     int L = static_cast<int>(adj.shape().dims[0]);
-    rfaa::TensorF32 dist({L, L});
+    ppml::TensorF32 dist({L, L});
     float* dist_data = dist.data();
     
     const float* adj_data = adj.data();
@@ -3127,12 +3127,12 @@ rfaa::TensorF32 compute_shortest_path(const rfaa::TensorF32& adj) {
     return dist;
 }
 
-TensorF32 RFAADataLoader::get_bond_distances(const rfaa::TensorF32& bond_feats) {
+TensorF32 PPMLDataLoader::get_bond_distances(const ppml::TensorF32& bond_feats) {
     // Impl
     // ========== 1. 创建邻接矩阵 ==========
     // atom_bonds = (bond_feats > 0) * (bond_feats < 5)
     int L = static_cast<int>(bond_feats.shape().dims[0]);
-    rfaa::TensorF32 atom_bonds({L, L});
+    ppml::TensorF32 atom_bonds({L, L});
     float* bonds_data = atom_bonds.data();
     const float* bf_data = bond_feats.data();
     
@@ -3144,7 +3144,7 @@ TensorF32 RFAADataLoader::get_bond_distances(const rfaa::TensorF32& bond_feats) 
     }
     
     // ========== 2. 计算最短路径 ==========
-    rfaa::TensorF32 dist_matrix = compute_shortest_path(atom_bonds);
+    ppml::TensorF32 dist_matrix = compute_shortest_path(atom_bonds);
     
     // ========== 3. 处理 inf (可选) ==========
     // 将 inf 替换为 4.0 (如果需要的话)
@@ -3159,9 +3159,9 @@ TensorF32 RFAADataLoader::get_bond_distances(const rfaa::TensorF32& bond_feats) 
     
 }
 
-TensorF32 RFAADataLoader::prepare_msa_latent(const A3MData& a3m_data) {
+TensorF32 PPMLDataLoader::prepare_msa_latent(const A3MData& a3m_data) {
     // 准备 msa_latent: (B, N_clust, L, 164)
-    // 参考 RFAA MSAFeaturize (data_loader_utils.py):
+    // 参考 PPML MSAFeaturize (data_loader_utils.py):
     //   msa_seed = cat([msa_clust_onehot(80), msa_clust_profile(80),
     //                   ins_clust(2), term_info(2)], dim=-1)   // 80+80+2+2 = 164
     // - msa_clust_onehot: token 的 one-hot (NAATOKENS=80)
@@ -3236,7 +3236,7 @@ TensorF32 RFAADataLoader::prepare_msa_latent(const A3MData& a3m_data) {
 //   out_bert_mask: (B=1, N_seq, L) — 1.0=被掩码位置, 0.0=未掩码
 // 实现: 以 mask_frac 概率(默认0.15)均匀随机选择位置作为掩码。
 //   query 行(seq 0)不掩码, 保证结构/序列监督稳定。
-void RFAADataLoader::prepare_msa_mask(
+void PPMLDataLoader::prepare_msa_mask(
     const std::vector<std::vector<uint8_t>>& msa_tokens,
     TensorF32& out_true_msa,
     TensorF32& out_bert_mask,
@@ -3284,7 +3284,7 @@ void RFAADataLoader::prepare_msa_mask(
 // 输出:
 //   out_gt_chi   : (B,L,7,2)  — 7 角 (sin,cos)
 //   out_chi_mask : (B,L,7)    — 1.0=有效
-void RFAADataLoader::prepare_chi_labels(
+void PPMLDataLoader::prepare_chi_labels(
     const TensorF32& coords,
     TensorF32& out_gt_chi,
     TensorF32& out_chi_mask) {
@@ -3382,7 +3382,7 @@ void RFAADataLoader::prepare_chi_labels(
 // 逐 batch 调用 DistogramBins::compute_all_distogram_onehots (coords (L,3,3)),
 // 并把距离 one-hot 从 61 bins (含溢出) 压缩为 60 bins (溢出 bin 并入 bin 59),
 // 与 distogram_head 输出的 60 bins 对齐。同时构造 pair_mask (残基对均有效=1)。
-void RFAADataLoader::prepare_distogram_labels(
+void PPMLDataLoader::prepare_distogram_labels(
     const TensorF32& coords,
     TensorF32& out_D_onehot,
     TensorF32& out_O_onehot,
@@ -3447,7 +3447,7 @@ void RFAADataLoader::prepare_distogram_labels(
 // prepare_ca_mask — CA 原子有效掩码
 // ============================================================================
 // 从真实骨架坐标 (B,L,3,3) 判断每个残基 CA 是否有效 (坐标不全为零)。
-void RFAADataLoader::prepare_ca_mask(
+void PPMLDataLoader::prepare_ca_mask(
     const TensorF32& coords,
     TensorF32& out_ca_mask) {
     const int B = static_cast<int>(coords.shape().dims[0]);
@@ -3468,9 +3468,9 @@ void RFAADataLoader::prepare_ca_mask(
     }
 }
 
-TensorF32 RFAADataLoader::prepare_msa_full(const A3MData& a3m_data) {
+TensorF32 PPMLDataLoader::prepare_msa_full(const A3MData& a3m_data) {
     // 准备 msa_full: (B, N_extra, L, 83)
-    // 参考 RFAA MSAFeaturize (data_loader_utils.py):
+    // 参考 PPML MSAFeaturize (data_loader_utils.py):
     //   msa_extra = cat([msa_extra_onehot(80), ins_extra(1), term_info(2)], dim=-1)  // 80+1+2 = 83
     // - msa_extra_onehot: token 的 one-hot (NAATOKENS=80), 处理完整未聚类 MSA (Track 0)。
     // - ins_extra: 插入统计 (1 维), (2/π)·arctan(ins/3), 数据来自 a3m_data.ins_matrix。
@@ -3525,7 +3525,7 @@ TensorF32 RFAADataLoader::prepare_msa_full(const A3MData& a3m_data) {
     return msa_full;
 }
 
-TensorF32 RFAADataLoader::prepare_seq_tokens(const std::string& sequence) {
+TensorF32 PPMLDataLoader::prepare_seq_tokens(const std::string& sequence) {
     // 准备 seq_tokens: (B, L)
     // 将氨基酸字符串转换为 token ID
     int B = 1;
@@ -3571,7 +3571,7 @@ TensorF32 RFAADataLoader::prepare_seq_tokens(const std::string& sequence) {
     return seq_tokens;
 }
 
-TensorF32 RFAADataLoader::prepare_coords(const std::string& sequence) {
+TensorF32 PPMLDataLoader::prepare_coords(const std::string& sequence) {
     // 准备初始坐标: (B, L, 3, 3)
     // 简化：返回零张量或随机初始化
     int B = 1;
@@ -3586,4 +3586,4 @@ TensorF32 RFAADataLoader::prepare_coords(const std::string& sequence) {
     return coords;
 }
 
-} // namespace rfaa
+} // namespace ppml

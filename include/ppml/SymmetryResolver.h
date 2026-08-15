@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <cmath>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // 标准氨基酸类型 (AlphaFold 0-20 序)
@@ -81,7 +81,7 @@ struct SymmetryPair {
 //
 // 参考:
 //   Algorithm 26 (Rename Symmetric Ground Truth Atoms)
-//   RFAA Section 2.5.1 - Level 1: Sidechain 180° Flips
+//   PPML Section 2.5.1 - Level 1: Sidechain 180° Flips
 extern const std::vector<SymmetryPair>& get_symmetric_atoms(int aa_type);
 
 // ============================================================================
@@ -164,4 +164,4 @@ void rename_symmetric_atoms(
 //       const std::vector<std::vector<int>>& sym_classes,
 //       const TensorF32* atom_mask);
 
-} // namespace rfaa
+} // namespace ppml

@@ -5,7 +5,7 @@
 #include <string>
 #include <functional>
 
-namespace rfaa {
+namespace ppml {
 
 // Python 桥接：C++ 调用 Python 库
 // 用途：数据预处理、MSA 搜索、模板检索、训练可视化等
@@ -68,14 +68,14 @@ public:
     static TensorF32 search_templates(const std::string& sequence,
                                        const std::string& pdb_db);
     
-    // 二级结构预测 (可选，RFAA 本身不需要)
+    // 二级结构预测 (可选，PPML 本身不需要)
     static TensorF32 predict_ss(const std::string& sequence);
     
     // 使用 PyTorch 加载预训练权重
-    static bool load_torch_weights(RFAAModel& model, const std::string& pt_path);
+    static bool load_torch_weights(PPMLModel& model, const std::string& pt_path);
     
     // 使用 PyTorch 训练循环
-    static void train_epoch(RFAAModel& model, 
+    static void train_epoch(PPMLModel& model, 
                             const std::vector<ModelInput>& batch,
                             float learning_rate);
     
@@ -84,8 +84,8 @@ public:
 };
 
 // PyBind11 暴露接口 (供 Python 调用 C++)
-#ifdef RFAA_BUILD_PYTHON_MODULE
-void init_rfaa_module(pybind11::module& m);
+#ifdef PPML_BUILD_PYTHON_MODULE
+void init_ppml_module(pybind11::module& m);
 #endif
 
-} // namespace rfaa
+} // namespace ppml

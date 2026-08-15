@@ -1,8 +1,8 @@
-#include "rfaa/Attention.h"
-#include "rfaa/Embedding.h"
-#include "rfaa/Context.h"
+#include "ppml/Attention.h"
+#include "ppml/Embedding.h"
+#include "ppml/Context.h"
 
-namespace rfaa {
+namespace ppml {
 
 namespace {
 
@@ -915,4 +915,4 @@ TensorF32 TemplatePairStack::forward(const TensorF32& pair, TensorF32& rbf_featu
     return result;
 }
 
-} // namespace rfaa
+} // namespace ppml

@@ -1,8 +1,8 @@
-#include "rfaa/Dropout.h"
-#include "rfaa/ComputeGraph.h"
+#include "ppml/Dropout.h"
+#include "ppml/ComputeGraph.h"
 #include <algorithm>
 
-namespace rfaa {
+namespace ppml {
 
 Dropout::Dropout(int broadcast_dim, float p_drop)
     : broadcast_dim_(broadcast_dim)
@@ -12,7 +12,7 @@ Dropout::Dropout(int broadcast_dim, float p_drop)
     , dist_(1.0 - p_drop)  // Bernoulli with success probability (1 - p_drop)
 {
     if (p_drop_ < 0.0f || p_drop_ >= 1.0f) {
-        throw RFAAError("p_drop must be in [0, 1)");
+        throw PPMLError("p_drop must be in [0, 1)");
     }
 }
 
@@ -92,4 +92,4 @@ TensorF32* Dropout::forward_graph(TensorF32* x) {
     return mul(x, mask_node);
 }
 
-} // namespace rfaa
+} // namespace ppml

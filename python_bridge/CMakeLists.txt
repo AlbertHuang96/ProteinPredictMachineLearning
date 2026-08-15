@@ -6,31 +6,31 @@ set(PYTHON_BRIDGE_SOURCES
 )
 
 # Python 桥接动态库
-add_library(rfaa_python SHARED ${PYTHON_BRIDGE_SOURCES})
+add_library(ppml_python SHARED ${PYTHON_BRIDGE_SOURCES})
 
-target_include_directories(rfaa_python PUBLIC
+target_include_directories(ppml_python PUBLIC
     ${CMAKE_SOURCE_DIR}/include
     ${Python3_INCLUDE_DIRS}
 )
 
-target_link_libraries(rfaa_python PUBLIC
-    rfaa_core_static
+target_link_libraries(ppml_python PUBLIC
+    ppml_core_static
     pybind11::module
     ${Python3_LIBRARIES}
 )
 
 # 编译定义
-target_compile_definitions(rfaa_python PRIVATE RFAA_PYTHON_BUILD_DLL)
+target_compile_definitions(ppml_python PRIVATE PPML_PYTHON_BUILD_DLL)
 
 # pybind11 模块 (供 Python import)
-pybind11_add_module(pyrfaa 
+pybind11_add_module(pyppml 
     ../src/python/PyBindModule.cpp
 )
 
-target_link_libraries(pyrfaa PRIVATE rfaa_core_static)
+target_link_libraries(pyppml PRIVATE ppml_core_static)
 
 # 安装
-install(TARGETS rfaa_python pyrfaa
+install(TARGETS ppml_python pyppml
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
 )

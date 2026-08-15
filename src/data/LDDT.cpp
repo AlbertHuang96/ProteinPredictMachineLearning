@@ -1,9 +1,9 @@
-#include "rfaa/LDDT.h"
+#include "ppml/LDDT.h"
 #include <algorithm>
 #include <vector>
 #include <cmath>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // LDDT 距离阈值 (Mariani et al. 2013)
@@ -179,4 +179,4 @@ void logits_to_plddt(
     }
 }
 
-} // namespace rfaa
+} // namespace ppml

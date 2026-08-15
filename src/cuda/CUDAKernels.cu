@@ -2,7 +2,7 @@
 #include <cmath>
 #include <cstdint>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================
 // Helper: ceil_div
@@ -585,4 +585,4 @@ void concat_nary_cuda(
     cudaCheck(cudaGetLastError());
 }
 
-} // namespace rfaa
+} // namespace ppml

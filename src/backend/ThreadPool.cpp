@@ -1,8 +1,8 @@
 
 
-#include "rfaa/Backend.h"
+#include "ppml/Backend.h"
 
-namespace rfaa {
+namespace ppml {
 
 // ===== worker_loop：线程常驻 + sleep/wake =====
 void worker_loop(ThreadState * state) {
@@ -77,4 +77,4 @@ void ThreadPool::barrier_wait() {
     }
 }
 
-} // namespace rfaa
+} // namespace ppml

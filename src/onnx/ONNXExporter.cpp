@@ -1,19 +1,19 @@
-#include "rfaa/ONNXExporter.h"
+#include "ppml/ONNXExporter.h"
 #include <fstream>
 #include <iostream>
 
-namespace rfaa {
+namespace ppml {
 
 ONNXExporter::ONNXExporter() 
-    : env_(ORT_LOGGING_LEVEL_WARNING, "RFAA_ONNX_Exporter") {}
+    : env_(ORT_LOGGING_LEVEL_WARNING, "PPML_ONNX_Exporter") {}
 
 ONNXExporter::~ONNXExporter() = default;
 
-void ONNXExporter::export_model(const RFAAModel& model, const ONNXExportConfig& config) {
-    std::cout << "Exporting RFAA model to ONNX: " << config.output_path << std::endl;
+void ONNXExporter::export_model(const PPMLModel& model, const ONNXExportConfig& config) {
+    std::cout << "Exporting PPML model to ONNX: " << config.output_path << std::endl;
     
     // 创建 ONNX 模型 protobuf
-    // 由于 RFAA 包含自定义 SE3 操作，需要分解为 ONNX 支持的操作
+    // 由于 PPML 包含自定义 SE3 操作，需要分解为 ONNX 支持的操作
     
     // 方案1: 使用 ONNX 的自定义算子
     // 方案2: 将 SE3 部分保留为 Python，其余导出 ONNX
@@ -42,7 +42,7 @@ void ONNXExporter::export_model(const RFAAModel& model, const ONNXExportConfig& 
 void ONNXExporter::export_from_weights(const std::string& weights_path,
                                        const ONNXExportConfig& config) {
     // 从权重文件重建模型并导出
-    RFAAModel model;
+    PPMLModel model;
     model.load_weights(weights_path);
     export_model(model, config);
 }
@@ -110,7 +110,7 @@ std::string ONNXExporter::get_model_info(const std::string& onnx_path) {
 
 // ONNXRuntime 实现
 ONNXRuntime::ONNXRuntime(const std::string& model_path)
-    : env_(ORT_LOGGING_LEVEL_WARNING, "RFAA_ONNX_Runtime"),
+    : env_(ORT_LOGGING_LEVEL_WARNING, "PPML_ONNX_Runtime"),
       session_(env_, model_path.c_str(), Ort::SessionOptions{}),
       memory_info_(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)) {}
 
@@ -186,4 +186,4 @@ std::vector<std::string> ONNXRuntime::get_output_names() const {
     return names;
 }
 
-} // namespace rfaa
+} // namespace ppml

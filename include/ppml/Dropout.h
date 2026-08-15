@@ -4,7 +4,7 @@
 #include <random>
 #include <vector>
 
-namespace rfaa {
+namespace ppml {
 
 /**
  * @brief Dropout layer with optional broadcast dimension
@@ -72,4 +72,4 @@ private:
     std::bernoulli_distribution dist_;
 };
 
-} // namespace rfaa
+} // namespace ppml

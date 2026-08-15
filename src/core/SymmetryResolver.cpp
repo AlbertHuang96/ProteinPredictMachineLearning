@@ -1,8 +1,8 @@
-#include "rfaa/SymmetryResolver.h"
+#include "ppml/SymmetryResolver.h"
 #include <unordered_map>
 #include <algorithm>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // 对称原子映射表 (内部实现)
@@ -164,4 +164,4 @@ void rename_symmetric_atoms(
     }
 }
 
-} // namespace rfaa
+} // namespace ppml

@@ -1,13 +1,13 @@
-#include "rfaa/Tensor.h"
-#include "rfaa/Context.h"
-#include "rfaa/FAPE.h"
-#include "rfaa/SymmetryResolver.h"
+#include "ppml/Tensor.h"
+#include "ppml/Context.h"
+#include "ppml/FAPE.h"
+#include "ppml/SymmetryResolver.h"
 
-#include "rfaa/ComputeGraph.h"
+#include "ppml/ComputeGraph.h"
 
 #include <cassert>
 
-namespace rfaa {
+namespace ppml {
 
 TensorF32 * add_impl( 
         TensorF32  * a,  
@@ -822,7 +822,7 @@ TensorF32* masked_msa_loss(TensorF32* logits, TensorF32* true_msa, TensorF32* be
 //pair_mask 由 seq_mask ⊗ seq_mask 产生mul(unsqueeze(m, 1), unsqueeze(m, 0))
 
 // distogram_loss(pair_feat, coords, pair_mask) — 4-项 inter-residue 2D 结构预测损失
-// 对应 RFAA Section 2.5.4 "Distogram Loss", 基于 AF2 distogram 的通用化版本
+// 对应 PPML Section 2.5.4 "Distogram Loss", 基于 AF2 distogram 的通用化版本
 //
 // 输入:
 //   logits_dist [L, L, 60] — 距离直方图 logits (Linear投影自 pair features)
@@ -1297,4 +1297,4 @@ TensorF32* outer_product_graph(TensorF32* left, TensorF32* right) {
     return result;
 }
 
-} // namespace rfaa
+} // namespace ppml

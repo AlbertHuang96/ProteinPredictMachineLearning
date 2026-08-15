@@ -2,18 +2,18 @@
 
 #include "Track.h"
 #include "Attention.h"
-#include "rfaa/SE3Transformer.h"
-#include "rfaa/PositionalEncoding.h"
+#include "ppml/SE3Transformer.h"
+#include "ppml/PositionalEncoding.h"
 #include <string>
 #include <memory>
 
-#include "rfaa/Embedding.h"
-#include "rfaa/Backend.h"
+#include "ppml/Embedding.h"
+#include "ppml/Backend.h"
 
-namespace rfaa {
+namespace ppml {
 
-// RFAA 模型配置
-struct RFAAConfig {
+// PPML 模型配置
+struct PPMLConfig {
     // 维度
     int d_msa = D_MSA;
     int d_pair = D_PAIR;
@@ -34,7 +34,7 @@ struct RFAAConfig {
     int max_n_seq = 512;
     int max_n_templ = 4;
     
-    RFAAConfig();
+    PPMLConfig();
 };
 
 // 模型输入
@@ -129,9 +129,9 @@ struct GraphOutput {
 // 迭代块 (IterBlock)
 class IterBlock {
 public:
-    IterBlock(const RFAAConfig& config, bool update_msa_pair = true);
+    IterBlock(const PPMLConfig& config, bool update_msa_pair = true);
     
-    // 由 RFAAModel 注入子模块 (non-owning pointers 已在之前注入, 这里是 unique_ptr 所有权转移)
+    // 由 PPMLModel 注入子模块 (non-owning pointers 已在之前注入, 这里是 unique_ptr 所有权转移)
     void set_sub_modules(
         std::unique_ptr<MSARowAttention>          msa_row,
         std::unique_ptr<MSAColAttention>          msa_col,
@@ -239,7 +239,7 @@ protected:
     std::unique_ptr<PositionalEncoding> pos_enc_;
 
 private:
-    RFAAConfig config_;
+    PPMLConfig config_;
     bool update_msa_pair_;
 
 protected:
@@ -250,7 +250,7 @@ protected:
 private:
 
 protected:
-    // ---- 3D SE 参数 (non-owning pointer, 由 RFAAModel 创建, FullBlock 子类访问) ----
+    // ---- 3D SE 参数 (non-owning pointer, 由 PPMLModel 创建, FullBlock 子类访问) ----
     LayerNorm*  norm_msa_3d_  = nullptr; // D_MSA (256)
     LayerNorm*  norm_pair_3d_ = nullptr; // D_PAIR (128)
     LinearLayer* embed_x_     = nullptr; // ITER_NODE_3D_IN (277) → ITER_NODE_3D_OUT (32)
@@ -258,7 +258,7 @@ protected:
     LayerNorm*  norm_node_3d_ = nullptr; // ITER_NODE_3D_OUT (32)
     LayerNorm*  norm_edge_3d_ = nullptr; // ITER_EDGE_3D_OUT (32)
 
-    // ---- forward 内部参数 (non-owning pointer, 由 RFAAModel 创建) ----
+    // ---- forward 内部参数 (non-owning pointer, 由 PPMLModel 创建) ----
     LayerNorm*   state2msa_norm_        = nullptr; // D_STATE (32)
     LinearLayer* state2msa_linear_      = nullptr; // D_STATE (32) → D_MSA (256)
     LayerNorm*   pair2msa_norm_         = nullptr; // D_PAIR (128)
@@ -281,12 +281,12 @@ public:
     const TensorF32& updated_coords() const { return xyz_new_; }
     //void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
 
-    friend class RFAAModel;  // RFAAModel 直接注入 non-owning pointers
+    friend class PPMLModel;  // PPMLModel 直接注入 non-owning pointers
 };
 
 class FullBlock : public IterBlock {
 public:
-    explicit FullBlock(const RFAAConfig& config, bool update_msa_pair = true)
+    explicit FullBlock(const PPMLConfig& config, bool update_msa_pair = true)
         : IterBlock(config, update_msa_pair) {}
 
     // a virtual dtor
@@ -317,7 +317,7 @@ private:
 
 class RefineBlock : public IterBlock {
 public:
-    explicit RefineBlock(const RFAAConfig& config, bool update_msa_pair = true)
+    explicit RefineBlock(const PPMLConfig& config, bool update_msa_pair = true)
         : IterBlock(config, update_msa_pair) {}
 
     // a virtual dtor
@@ -334,7 +334,7 @@ public:
     // ===== 图模式前向（override：RefineBlock 语义）=====
     // update_msa_pair_=false：RefineBlock 不改 msa/pair，仅做 3D 结构更新。
     // 故本 override 为 pass-through（直接返回 pair），结构更新由训练入口调用
-    // run_se3_structural_refine 驱动（见 RFAAModel::forward_graph 的 refine 循环）。
+    // run_se3_structural_refine 驱动（见 PPMLModel::forward_graph 的 refine 循环）。
     // 参数布局同 IterBlock::forward_graph。
     TensorF32* forward_graph(TensorF32*& msa, TensorF32*& pair,
                              TensorF32* rbf, TensorF32*& state,
@@ -422,14 +422,14 @@ private:
     TensorF32 xyz_new_;       // (B, L, 3, 3) 更新后的坐标
     TensorF32 state_new_;     // (B, L, D_STATE) 更新后的 state
 
-    friend class RFAAModel;  // RFAAModel 直接注入 non-owning pointers
+    friend class PPMLModel;  // PPMLModel 直接注入 non-owning pointers
 };
 
-// RFAA 主模型
-class RFAAModel {
+// PPML 主模型
+class PPMLModel {
 public:
-    explicit RFAAModel(const RFAAConfig& config = RFAAConfig{});
-    ~RFAAModel();
+    explicit PPMLModel(const PPMLConfig& config = PPMLConfig{});
+    ~PPMLModel();
 
     void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);
     
@@ -476,7 +476,7 @@ public:
     Backend* active_backend();
 
 private:
-    RFAAConfig config_;
+    PPMLConfig config_;
     Device device_ = Device::CPU;
     bool training_ = false;
 
@@ -647,7 +647,7 @@ private:
     std::vector<EmbeddingLayer*> pos_enc_emb_res_;   // [0..11] (65, D_PAIR=128)  residue dist embedding
     std::vector<EmbeddingLayer*> pos_enc_emb_atom_;  // [0..11] (17, D_PAIR=128)  atom bond dist embedding
 
-    // ===== 3D SE 参数 (per-block, 由 RFAAModel::create 统一创建后将指针注入 block) =====
+    // ===== 3D SE 参数 (per-block, 由 PPMLModel::create 统一创建后将指针注入 block) =====
 
     // --- IterBlock 3D SE (每组 6 个, ITER_N_BLOCKS=12 组) ---
     // 旧值类型 (保留注释):
@@ -732,4 +732,4 @@ private:
     void collect_all_params(std::vector<TensorF32*>& param_tensors);
 };
 
-} // namespace rfaa
+} // namespace ppml

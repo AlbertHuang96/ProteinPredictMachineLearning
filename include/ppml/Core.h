@@ -6,9 +6,9 @@
 #include <string>
 #include <stdexcept>
 
-namespace rfaa {
+namespace ppml {
 
-// 维度常量 (与 RFAA 对齐)
+// 维度常量 (与 PPML 对齐)
 constexpr int NAATOKENS = 80;           // 统一 token 空间
 constexpr int NPROTAAS = 20;            // 标准蛋白质氨基酸种类
 constexpr int NNAPROTAAS = 25;          // 蛋白质 + 核酸氨基酸种类
@@ -69,9 +69,9 @@ struct Shape {
 };
 
 // 运行时异常
-class RFAAError : public std::runtime_error {
+class PPMLError : public std::runtime_error {
 public:
-    explicit RFAAError(const std::string& msg) : std::runtime_error(msg) {}
+    explicit PPMLError(const std::string& msg) : std::runtime_error(msg) {}
 };
 
 // 前向声明
@@ -84,4 +84,4 @@ class MSATrack;
 class PairTrack;
 class StateTrack;
 
-} // namespace rfaa
+} // namespace ppml

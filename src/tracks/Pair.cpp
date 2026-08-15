@@ -1,6 +1,6 @@
-#include "rfaa/Track.h"
+#include "ppml/Track.h"
 
-namespace rfaa {
+namespace ppml {
 
 PairTrack::PairTrack(int seq_len, int dim, Device device)
     : seq_len_(seq_len), dim_(dim) {
@@ -90,4 +90,4 @@ TensorF32 PairTrack::get_attention_bias(int n_head) const {
     return bias;  // 占位 // representation()
 } */
 
-} // namespace rfaa
+} // namespace ppml

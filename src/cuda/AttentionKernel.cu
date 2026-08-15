@@ -1,8 +1,8 @@
-#include "rfaa/Attention.h"
+#include "ppml/Attention.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-namespace rfaa {
+namespace ppml {
 
 // Attention CUDA 核函数
 
@@ -126,4 +126,4 @@ __global__ void kernel_outer_product_mean(const float* msa, float* pair,
     pair[((b * L + i) * L + j) * dim * dim + d_out] = sum / N;
 }
 
-} // namespace rfaa
+} // namespace ppml

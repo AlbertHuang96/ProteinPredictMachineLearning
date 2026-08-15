@@ -4,7 +4,7 @@
 #include <cmath>
 #include <cstring>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // LDDT (Local Distance Difference Test) 计算
@@ -69,4 +69,4 @@ void logits_to_plddt(
     int num_bins,
     float* plddt_out);
 
-} // namespace rfaa
+} // namespace ppml

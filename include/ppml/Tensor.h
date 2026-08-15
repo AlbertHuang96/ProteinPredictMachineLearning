@@ -8,7 +8,7 @@
 #define GGML_MAX_OP_PARAMS      64
 #define GGML_MAX_SRC            10
 
-namespace rfaa {
+namespace ppml {
 
 // 前向声明 — 避免循环依赖
 class Buffer;
@@ -329,4 +329,4 @@ Tensor<T> from_numpy(T* data, const Shape& shape) {
     return Tensor<T>(shape, data, Device::CPU, false);
 }
 
-} // namespace rfaa
+} // namespace ppml

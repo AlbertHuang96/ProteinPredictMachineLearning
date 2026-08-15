@@ -1,7 +1,7 @@
 
-#include "rfaa/Context.h"
-#include "rfaa/Tensor.h"
-#include "rfaa/Core.h"
+#include "ppml/Context.h"
+#include "ppml/Tensor.h"
+#include "ppml/Core.h"
 #include <cstdlib>
 #include <cstring>
 #include <cassert>
@@ -16,28 +16,28 @@
 #include <windows.h>  
 #endif
 
-namespace rfaa {
+namespace ppml {
 
 // ========== 静态全局容器 ==========
 static struct {
     bool used;
-    struct RFAAContext context;
-} g_contexts[RFAA_MAX_CONTEXTS];
+    struct PPMLContext context;
+} g_contexts[PPML_MAX_CONTEXTS];
 
  
-std::mutex rfaa_critical_section_mutex;
+std::mutex ppml_critical_section_mutex;
  
-void rfaa_critical_section_start() {
-    rfaa_critical_section_mutex.lock();
+void ppml_critical_section_start() {
+    ppml_critical_section_mutex.lock();
 }
  
-void rfaa_critical_section_end(void) {
-    rfaa_critical_section_mutex.unlock();
+void ppml_critical_section_end(void) {
+    ppml_critical_section_mutex.unlock();
 }
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 static int64_t timer_freq, timer_start;
-void rfaa_time_init(void) {
+void ppml_time_init(void) {
     LARGE_INTEGER t;
     QueryPerformanceFrequency(&t);
     timer_freq = t.QuadPart;
@@ -48,25 +48,25 @@ void rfaa_time_init(void) {
     QueryPerformanceCounter(&t);
     timer_start = t.QuadPart;
 }
-int64_t rfaa_time_ms(void) {
+int64_t ppml_time_ms(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     return ((t.QuadPart-timer_start) * 1000) / timer_freq;
 }
-int64_t rfaa_time_us(void) {
+int64_t ppml_time_us(void) {
     LARGE_INTEGER t;
     QueryPerformanceCounter(&t);
     return ((t.QuadPart-timer_start) * 1000000) / timer_freq;
 }
 #else
-void rfaa_time_init(void) {}
-int64_t rfaa_time_ms(void) {
+void ppml_time_init(void) {}
+int64_t ppml_time_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec*1000 + (int64_t)ts.tv_nsec/1000000;
 }
  
-int64_t rfaa_time_us(void) {
+int64_t ppml_time_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec*1000000 + (int64_t)ts.tv_nsec/1000;
@@ -74,25 +74,25 @@ int64_t rfaa_time_us(void) {
 #endif
 
 // ========== init() ==========
-RFAAContext* RFAAContext::init(const CtxInitParams& params) {
+PPMLContext* PPMLContext::init(const CtxInitParams& params) {
 
     static bool is_first_call = true;
  
     // thread safe init for time system
-    rfaa_critical_section_start();
+    ppml_critical_section_start();
  
     if (is_first_call) {
         // initialize time system (required on Windows)
-        rfaa_time_init();
+        ppml_time_init();
  
         is_first_call = false;
     }
  
-    rfaa_critical_section_end();
+    ppml_critical_section_end();
 
     // 找个空槽位
-    RFAAContext* ctx = nullptr;
-    for (int i = 0; i < RFAA_MAX_CONTEXTS; i++) {
+    PPMLContext* ctx = nullptr;
+    for (int i = 0; i < PPML_MAX_CONTEXTS; i++) {
         if (!g_contexts[i].used) {
             g_contexts[i].used = true;
             ctx = &g_contexts[i].context;
@@ -102,11 +102,11 @@ RFAAContext* RFAAContext::init(const CtxInitParams& params) {
     if (!ctx) return nullptr;
 
     size_t mem_size = params.mem_size;
-    if (mem_size == 0) mem_size = RFAA_MEM_ALIGN;
+    if (mem_size == 0) mem_size = PPML_MEM_ALIGN;
     // 对齐
-    // RFAA_MEM_ALIGN == 16 standard alignment for a 64 bit system
-    //mem_size = (mem_size + RFAA_MEM_ALIGN - 1) / RFAA_MEM_ALIGN * RFAA_MEM_ALIGN;
-    mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(mem_size, RFAA_MEM_ALIGN);
+    // PPML_MEM_ALIGN == 16 standard alignment for a 64 bit system
+    //mem_size = (mem_size + PPML_MEM_ALIGN - 1) / PPML_MEM_ALIGN * PPML_MEM_ALIGN;
+    mem_size = params.mem_buffer ? params.mem_size : GGML_PAD(mem_size, PPML_MEM_ALIGN);
 
     *ctx = {};
     ctx->mem_size = mem_size;
@@ -119,13 +119,13 @@ RFAAContext* RFAAContext::init(const CtxInitParams& params) {
 }
 
 // ========== free() ==========
-void RFAAContext::free(RFAAContext* ctx) {
+void PPMLContext::free(PPMLContext* ctx) {
     if (!ctx) return;
     if (ctx->mem_buffer_owned && ctx->mem_buffer) {
         ::free(ctx->mem_buffer);
     }
     // 重置槽位
-    for (int i = 0; i < RFAA_MAX_CONTEXTS; i++) {
+    for (int i = 0; i < PPML_MAX_CONTEXTS; i++) {
         if (&g_contexts[i].context == ctx) {
             g_contexts[i].used = false;
             break;
@@ -134,26 +134,26 @@ void RFAAContext::free(RFAAContext* ctx) {
 }
 
 // ========== new_object() ==========
-RFAAObject* RFAAContext::new_object(enum RFAAObjectType type, size_t size) {
-    RFAAObject* obj_cur = objects_end;
+PPMLObject* PPMLContext::new_object(enum PPMLObjectType type, size_t size) {
+    PPMLObject* obj_cur = objects_end;
 
     size_t cur_end = 0;
     if (obj_cur) {
         cur_end = obj_cur->offs + obj_cur->size;
     }
 
-    size_t size_aligned = (size + RFAA_MEM_ALIGN - 1) / RFAA_MEM_ALIGN * RFAA_MEM_ALIGN;
+    size_t size_aligned = (size + PPML_MEM_ALIGN - 1) / PPML_MEM_ALIGN * PPML_MEM_ALIGN;
 
-    if (cur_end + size_aligned + RFAA_OBJECT_SIZE > mem_size) {
+    if (cur_end + size_aligned + PPML_OBJECT_SIZE > mem_size) {
         // 内存不足
         assert(false && "Context memory exhausted");
         return nullptr;
     }
 
     // obj 放在 mem_buffer + cur_end 处
-    RFAAObject* obj_new = (RFAAObject*)((char*)mem_buffer + cur_end);
+    PPMLObject* obj_new = (PPMLObject*)((char*)mem_buffer + cur_end);
     *obj_new = {};
-    obj_new->offs = cur_end + RFAA_OBJECT_SIZE;
+    obj_new->offs = cur_end + PPML_OBJECT_SIZE;
     obj_new->size = size_aligned;
     obj_new->type = type;
     obj_new->next = nullptr;
@@ -171,15 +171,15 @@ RFAAObject* RFAAContext::new_object(enum RFAAObjectType type, size_t size) {
 
 // ========== new_tensor() ==========
 template<typename T>
-Tensor<T>* RFAAContext::new_tensor(int n_dims, const int64_t* ne) {
+Tensor<T>* PPMLContext::new_tensor(int n_dims, const int64_t* ne) {
     // 1. 计算数据大小
     size_t data_size = sizeof(T);
     for (int i = 0; i < n_dims; i++) data_size *= ne[i];
 
     // 2. 创建 object
     size_t obj_alloc_size = data_size;  // tensor 结构体不占额外空间
-    RFAAObject* obj = new_object(RFAA_OBJECT_TYPE_TENSOR,
-                                  RFAA_TENSOR_SIZE + obj_alloc_size);
+    PPMLObject* obj = new_object(PPML_OBJECT_TYPE_TENSOR,
+                                  PPML_TENSOR_SIZE + obj_alloc_size);
     if (!obj) return nullptr;
 
     // 3. tensor 结构体位于 obj->offs 处
@@ -196,7 +196,7 @@ Tensor<T>* RFAAContext::new_tensor(int n_dims, const int64_t* ne) {
 }
 
 // 显式实例化
-template Tensor<float>*  RFAAContext::new_tensor<float>(int, const int64_t*);
-template Tensor<int64_t>* RFAAContext::new_tensor<int64_t>(int, const int64_t*);
+template Tensor<float>*  PPMLContext::new_tensor<float>(int, const int64_t*);
+template Tensor<int64_t>* PPMLContext::new_tensor<int64_t>(int, const int64_t*);
 
-} // namespace rfaa
+} // namespace ppml

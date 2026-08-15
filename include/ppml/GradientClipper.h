@@ -8,7 +8,7 @@
 #include <string>
 #include <limits>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================
 // PerLossClipConfig — 逐项损失 + 全局的梯度裁剪配置
@@ -117,4 +117,4 @@ float apply_per_loss_clip(
     const PerLossClipConfig& config,
     std::vector<LossGradientInfo>* out_info = nullptr);
 
-} // namespace rfaa
+} // namespace ppml

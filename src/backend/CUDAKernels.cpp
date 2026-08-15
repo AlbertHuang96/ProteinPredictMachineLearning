@@ -1,9 +1,9 @@
-#include "rfaa/Backend.h"
-#include "rfaa/ComputeGraph.h"
+#include "ppml/Backend.h"
+#include "ppml/ComputeGraph.h"
 #include <cstring>
 #include <vector>
 
-namespace rfaa {
+namespace ppml {
 
 // ===== CUDA kernel forward declarations (implemented in src/cuda/CUDAKernels.cu) =====
 extern void layernorm_forward_cuda(
@@ -180,7 +180,7 @@ void CUDABackend::kernel_elemwise_div_cuda(TensorF32 * node, ComputeParams * p) 
 }
 
 // doublecheck:
-//原始 kernel 假设 B 是标准 row-major B[K][N]，访问 B[r * N + c]。但 RFAA-Cpp 的 CPU 版本中 B 以转置形式存储：b[j * K + k]（即 B[N][K]）。
+//原始 kernel 假设 B 是标准 row-major B[K][N]，访问 B[r * N + c]。但 PPML-Cpp 的 CPU 版本中 B 以转置形式存储：b[j * K + k]（即 B[N][K]）。
 //因此加载 Bs 时改为：
 void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
     // node->shape().dims: output shape (N, M)  → d is (M, N) stored row-major
@@ -416,4 +416,4 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, ComputeParams * p) {
     cudaFree(d_len);
 }
 
-} // namespace rfaa
+} // namespace ppml

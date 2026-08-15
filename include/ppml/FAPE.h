@@ -6,7 +6,7 @@
 #include <cstdint>
 #include <cmath>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // 4×4 齐次刚体变换矩阵 (SE(3)) — 使用项目 Tensor 作为底层存储
@@ -130,7 +130,7 @@ struct FAPEConfig {
 /**
  * @brief 计算 Frame Aligned Point Error (FAPE) 损失
  * 
- * 对应 RFAA compute_general_fape() 的 6 步流水线:
+ * 对应 PPML compute_general_fape() 的 6 步流水线:
  * 
  * Step 1: gather_frame_atoms()
  *   从全局坐标张量中按帧偏移量采集每个 frame 的 3 个原子坐标
@@ -185,4 +185,4 @@ float compute_fape_simple(
     const FAPEConfig& config = FAPEConfig{}
 );
 
-} // namespace rfaa
+} // namespace ppml

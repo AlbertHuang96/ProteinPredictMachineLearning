@@ -1,11 +1,11 @@
-#include "rfaa/GradientClipper.h"
-#include "rfaa/Tensor.h"
+#include "ppml/GradientClipper.h"
+#include "ppml/Tensor.h"
 
 #include <cmath>
 #include <cstring>
 #include <cassert>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================
 // 内部辅助函数
@@ -266,4 +266,4 @@ float apply_per_loss_clip(
     return result;
 }
 
-} // namespace rfaa
+} // namespace ppml

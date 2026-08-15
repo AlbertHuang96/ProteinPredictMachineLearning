@@ -1,5 +1,5 @@
-#ifndef RFAA_SE3_TRANSFORMER_H
-#define RFAA_SE3_TRANSFORMER_H
+#ifndef PPML_SE3_TRANSFORMER_H
+#define PPML_SE3_TRANSFORMER_H
 
 #include "Tensor.h"
 #include "Embedding.h"
@@ -12,12 +12,12 @@
 #include <set>
 #include <unordered_map>
 
-namespace rfaa {
+namespace ppml {
 
 // 前向声明
 template<typename T> class Tensor;
 
-// SE3 配置 (与 RFAAConfig 对齐)
+// SE3 配置 (与 PPMLConfig 对齐)
 struct SE3Config {
     int num_degrees   = 2;   // SE(3) 表示的 degree 数
     int num_channels  = 32;  // 通道数
@@ -656,6 +656,6 @@ private:
 };
 
 
-} // namespace rfaa
+} // namespace ppml
 
-#endif // RFAA_SE3_TRANSFORMER_H
+#endif // PPML_SE3_TRANSFORMER_H

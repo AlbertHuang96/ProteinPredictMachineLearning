@@ -4,9 +4,9 @@
 #include <string>
 #include <vector>
 
-#include "rfaa/Tensor.h"
+#include "ppml/Tensor.h"
 
-namespace rfaa {
+namespace ppml {
 
     enum class GGUFValueType : uint32_t {
     UINT8   = 0,
@@ -53,4 +53,4 @@ void save_gguf(const std::vector<TensorF32*>& params,
                const std::vector<std::pair<std::string, std::string>>& str_meta,
                const std::vector<std::string>& tensor_names = {});
 
-} // namespace rfaa
+} // namespace ppml

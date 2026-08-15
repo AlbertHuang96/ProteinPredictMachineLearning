@@ -5,7 +5,7 @@
 #include "Attention.h"
 #include "PositionalEncoding.h"
 
-namespace rfaa {
+namespace ppml {
 
 // Track 基类：MSA / Pair / State 的公共接口
 class Track {
@@ -73,7 +73,7 @@ class PairTrack : public Track {
 public:
     PairTrack(int seq_len, int dim = D_PAIR, Device device = Device::CPU);
     
-    // 设置外部注入的层 (由 RFAAModel 管理)
+    // 设置外部注入的层 (由 PPMLModel 管理)
     void set_embeddings(EmbeddingLayer* left_emb, EmbeddingLayer* right_emb,
                         PositionalEncoding* pos_enc);
     
@@ -136,4 +136,4 @@ private:
     //std::unique_ptr<Impl> impl_;
 };
 
-} // namespace rfaa
+} // namespace ppml

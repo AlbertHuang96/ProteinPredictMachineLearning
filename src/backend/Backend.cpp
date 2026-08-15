@@ -1,10 +1,10 @@
 
-#include "rfaa/Backend.h"
-#include "rfaa/Context.h"
+#include "ppml/Backend.h"
+#include "ppml/Context.h"
 #include <algorithm>
 #include <cstring>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================
 // 构造/析构
@@ -814,4 +814,4 @@ ComputeGraph * BackendScheduler::get_split(int i) {
     return current_graph_;
 }
 
-} // namespace rfaa
+} // namespace ppml

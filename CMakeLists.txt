@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.18)
-project(RFAA-Cpp VERSION 1.0.0 LANGUAGES CXX CUDA)
+project(ppml VERSION 1.0.0 LANGUAGES CXX CUDA)
 #
 
 set(CMAKE_CXX_STANDARD 17)

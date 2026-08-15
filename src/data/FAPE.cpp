@@ -1,4 +1,4 @@
-#include "rfaa/FAPE.h"
+#include "ppml/FAPE.h"
 #include <algorithm>
 #include <stdexcept>
 #include <string>
@@ -6,7 +6,7 @@
 #include <cstring>
 #include <vector>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // 辅助宏: 坐标张量索引 (N_atoms, 3) — row-major: coords[i*3 + c]
@@ -403,4 +403,4 @@ float compute_fape_simple(
                         frames_mask, positions_mask, config);
 }
 
-} // namespace rfaa
+} // namespace ppml

@@ -10,7 +10,7 @@ set(CORE_SOURCES
     ../src/core/ContextImpl.cpp
     ../src/model/Embedding.cpp
     ../src/model/IterBlock.cpp
-    ../src/model/RFAA.cpp
+    ../src/model/PPML.cpp
     ../src/tracks/MSA.cpp
     ../src/tracks/Pair.cpp
     ../src/tracks/State.cpp
@@ -54,44 +54,44 @@ set(CORE_SOURCES
 enable_language(CUDA)
 
 # 静态库 (内部使用)
-add_library(rfaa_core_static STATIC ${CORE_SOURCES})
-target_include_directories(rfaa_core_static PUBLIC 
+add_library(ppml_core_static STATIC ${CORE_SOURCES})
+target_include_directories(ppml_core_static PUBLIC 
     ${CMAKE_SOURCE_DIR}/include
 )
-target_link_libraries(rfaa_core_static PUBLIC
+target_link_libraries(ppml_core_static PUBLIC
     CUDA::cudart
     CUDA::cublas
     #CUDA::cudnn
 )
 
 # 动态库 (对外暴露接口)
-add_library(rfaa_core SHARED ${CORE_SOURCES})
-target_include_directories(rfaa_core PUBLIC 
+add_library(ppml_core SHARED ${CORE_SOURCES})
+target_include_directories(ppml_core PUBLIC 
     ${CMAKE_SOURCE_DIR}/include
 )
-target_link_libraries(rfaa_core PUBLIC
+target_link_libraries(ppml_core PUBLIC
     CUDA::cudart
     CUDA::cublas
     #CUDA::cudnn
 )
 
 # 设置 DLL 导出宏
-target_compile_definitions(rfaa_core PRIVATE RFAA_BUILD_DLL)
-target_compile_definitions(rfaa_core PUBLIC RFAA_USE_DLL)
+target_compile_definitions(ppml_core PRIVATE PPML_BUILD_DLL)
+target_compile_definitions(ppml_core PUBLIC PPML_USE_DLL)
 
 # Windows: 导出所有符号
 if(MSVC)
-    set_target_properties(rfaa_core PROPERTIES
+    set_target_properties(ppml_core PROPERTIES
         WINDOWS_EXPORT_ALL_SYMBOLS ON
     )
 endif()
 
 # 安装规则
-install(TARGETS rfaa_core
+install(TARGETS ppml_core
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
 )
-install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/rfaa 
+install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/ppml 
     DESTINATION include
 )

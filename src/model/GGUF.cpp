@@ -1,5 +1,5 @@
-#include "rfaa/Tensor.h"
-#include "rfaa/GGUF.h"
+#include "ppml/Tensor.h"
+#include "ppml/GGUF.h"
 #include <fstream>
 #include <cstring>
 #include <cassert>
@@ -7,7 +7,7 @@
 #include <sstream>
 #include <vector>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================
 // 内部常量/工具
@@ -394,17 +394,17 @@ void load_gguf(const std::string& path,
     ifs.close();
 }
 
-/* void save_model_gguf(RFAAModel& model, const std::string& path, int step) {
+/* void save_model_gguf(PPMLModel& model, const std::string& path, int step) {
     save_gguf(model.params(), path,
-        {{"rfaa.step", float(step)},
-         {"rfaa.d_msa", float(D_MSA)},
-         {"rfaa.d_pair", float(D_PAIR)},
-         {"rfaa.d_state", float(D_STATE)}},
-        {{"rfaa.arch", "rfaa_v1"}}
+        {{"ppml.step", float(step)},
+         {"ppml.d_msa", float(D_MSA)},
+         {"ppml.d_pair", float(D_PAIR)},
+         {"ppml.d_state", float(D_STATE)}},
+        {{"ppml.arch", "ppml_v1"}}
     );
 } */
 
-/* void load_model_gguf(RFAAModel& model, const std::string& path) {
+/* void load_model_gguf(PPMLModel& model, const std::string& path) {
     load_gguf(path, model.params());
 } */
 

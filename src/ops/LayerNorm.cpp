@@ -1,8 +1,8 @@
-#include "rfaa/Ops.h"
+#include "ppml/Ops.h"
 #include <cmath>
 #include <omp.h>
 
-namespace rfaa {
+namespace ppml {
 
 TensorF32 layer_norm(const TensorF32& input, float eps) {
     // 假设最后一个维度是特征维度
@@ -82,4 +82,4 @@ TensorF32 layer_norm(const TensorF32& input, const TensorF32& gamma,
     return output;
 }
 
-} // namespace rfaa
+} // namespace ppml

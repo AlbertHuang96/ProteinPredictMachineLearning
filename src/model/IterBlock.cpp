@@ -1,8 +1,8 @@
-#include "rfaa/Model.h"
+#include "ppml/Model.h"
 
-namespace rfaa {
+namespace ppml {
 
-// IterBlock 的详细实现已在 RFAA.cpp 中
+// IterBlock 的详细实现已在 PPML.cpp 中
 // 这里可以放置额外的辅助函数
 
-} // namespace rfaa
+} // namespace ppml

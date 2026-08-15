@@ -16,12 +16,12 @@ static constexpr int SOFT_MAX_UNROLL = 32;  // SIMD unroll
 
 #define CACHE_LINE_SIZE 64
 
-namespace rfaa {
+namespace ppml {
 
 // ==================== 前向声明 ====================
 class Backend;
 class CPUBackend;
-struct RFAAContext;
+struct PPMLContext;
 struct ThreadPool;
 template<typename T> class Tensor;
 using TensorF32 = Tensor<float>;
@@ -212,7 +212,7 @@ public:
         if (size > 0) {
             ptr_ = static_cast<uint8_t*>(buft->alloc(size));
             if (!ptr_) {
-                throw RFAAError("DefaultBuffer: allocation failed");
+                throw PPMLError("DefaultBuffer: allocation failed");
             }
             own_ptr_ = true;
         }
@@ -519,7 +519,7 @@ private:
     std::unordered_map<CopyKey, TensorF32*, CopyKeyHash> copy_tensor_map_;
 
     // context
-    RFAAContext * ctx_ = nullptr;
+    PPMLContext * ctx_ = nullptr;
 };
 
 // ============================================================
@@ -713,4 +713,4 @@ private:
     static void kernel_exp_cuda    (TensorF32 * node);
 };
 
-} // namespace rfaa
+} // namespace ppml

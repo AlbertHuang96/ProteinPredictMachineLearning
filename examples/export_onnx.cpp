@@ -1,8 +1,8 @@
-#include "rfaa/Model.h"
-#include "rfaa/ONNXExporter.h"
+#include "ppml/Model.h"
+#include "ppml/ONNXExporter.h"
 #include <iostream>
 
-using namespace rfaa;
+using namespace ppml;
 
 /* int main(int argc, char* argv[]) {
     if (argc < 3) {
@@ -14,8 +14,8 @@ using namespace rfaa;
     std::string output_path = argv[2];
     
     // 1. 创建模型
-    RFAAConfig config;
-    RFAAModel model(config);
+    PPMLConfig config;
+    PPMLModel model(config);
     
     // 2. 加载权重
     model.load_weights(weights_path);

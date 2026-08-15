@@ -1,8 +1,8 @@
-#include "rfaa/PositionalEncoding.h"
-#include "rfaa/Embedding.h"
-#include "rfaa/MathUtils.h"
-#include "rfaa/ComputeGraph.h"
-#include "rfaa/Context.h"
+#include "ppml/PositionalEncoding.h"
+#include "ppml/Embedding.h"
+#include "ppml/MathUtils.h"
+#include "ppml/ComputeGraph.h"
+#include "ppml/Context.h"
 #include <cmath>
 #include <algorithm>
 #include <limits>
@@ -10,7 +10,7 @@
 #include <vector>
 
 
-namespace rfaa {
+namespace ppml {
 
 // ===== PositionalEncoding (non-owning pointer 版本) =====
 // 旧构造函数 (保留注释):
@@ -58,7 +58,7 @@ TensorF32 PositionalEncoding::forward(const TensorF32& seq,
 
 TensorF32 PositionalEncoding::forward(const TensorF32& coords) {
     // Simplified version: compute positional encoding from coordinates only
-    // This is used in RFAA.cpp line 196
+    // This is used in PPML.cpp line 196
     
     // TODO: Full implementation
     // For now, return zeros as placeholder
@@ -434,4 +434,4 @@ TensorF32 PositionalEncoding::bucketize(const TensorF32& distances, const std::v
     return result;
 }
 
-} // namespace rfaa
+} // namespace ppml

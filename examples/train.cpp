@@ -1,13 +1,13 @@
-#include "rfaa/Model.h"
-#include "rfaa/DataLoader.h"
-#include "rfaa/ComputeGraph.h"
-#include "rfaa/Context.h"
-#include "rfaa/PythonBridge.h"
-#include "rfaa/ONNXExporter.h"
-#include "rfaa/GradientClipper.h"
-#include "rfaa/AdamW.h"
-#include "rfaa/GGUF.h"
-#include "rfaa/LDDT.h"
+#include "ppml/Model.h"
+#include "ppml/DataLoader.h"
+#include "ppml/ComputeGraph.h"
+#include "ppml/Context.h"
+#include "ppml/PythonBridge.h"
+#include "ppml/ONNXExporter.h"
+#include "ppml/GradientClipper.h"
+#include "ppml/AdamW.h"
+#include "ppml/GGUF.h"
+#include "ppml/LDDT.h"
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -16,11 +16,11 @@
 #include <sstream>
 #include <iomanip>
 
-using namespace rfaa;
+using namespace ppml;
 
 // ============================================================================
 // 工具: 将值张量 (GraphOutput.coords / ModelInput.true_coords / 各 gt onehot) 包装为图节点 leaf。
-// 注意: 训练前向用 RFAAModel::forward_graph（返回可微图节点），loss 的 pred 部分（head logits）
+// 注意: 训练前向用 PPMLModel::forward_graph（返回可微图节点），loss 的 pred 部分（head logits）
 //       直接接图节点，梯度可回传；仅 gt/true 与坐标相关量（coords 为 SE3 图外值更新，非可微）
 //       用 wrap_value_as_leaf 断链（坐标梯度暂不接，见 FAPE/conf）。
 // ============================================================================
@@ -71,11 +71,11 @@ std::vector<float> read_tensor_cpu(const TensorF32* t) {
 // 开发功能: 统计所有权重占用内存大小 (仅计算, 不写文件)
 // 返回字节数。同时打印每个张量的形状与字节数 (便于调优量化/显存)。
 // ============================================================================
-size_t estimate_params_memory(const RFAAModel& model) {
+size_t estimate_params_memory(const PPMLModel& model) {
     // params() 收集的指针顺序固定, 但此处通过尺寸计算内存;
     // 由于 params() 为非 const, 这里用一个 const 转换不了, 故通过 const_cast 调用
     // (仅读取 nbytes/shape, 不修改任何状态, 安全)
-    auto& m = const_cast<RFAAModel&>(model);
+    auto& m = const_cast<PPMLModel&>(model);
     auto params = m.params();
 
     size_t total_bytes = 0;
@@ -114,7 +114,7 @@ size_t total_bytes_of(const std::vector<TensorF32*>& params) {
 //   path: 输出 gguf 文件路径
 //   epoch: 当前已完成 epoch (0-based), total_epochs, loss, elapsed_sec
 // ============================================================================
-void save_checkpoint(RFAAModel& model, const std::string& path,
+void save_checkpoint(PPMLModel& model, const std::string& path,
                      int epoch, int total_epochs, float loss, double elapsed_sec) {
     // 1. 收集参数 (及一一对应的语义名, 含 block/attention 等信息)
     std::vector<TensorF32*> params;
@@ -158,7 +158,7 @@ void save_checkpoint(RFAAModel& model, const std::string& path,
                   {"param_bytes", float(total_bytes_of(params))},
               },
               {
-                  {"arch", "rfaa_v1"},
+                  {"arch", "ppml_v1"},
                   {"checkpoint", "train"},
               },
               param_names);
@@ -173,7 +173,7 @@ int main(int argc, char* argv[]) {
     }
     
     // 2. 创建模型
-    RFAAConfig config;
+    PPMLConfig config;
     config.d_msa = 256;
     config.d_pair = 128;
     config.d_state = 32;
@@ -181,7 +181,7 @@ int main(int argc, char* argv[]) {
     config.n_main_blocks = 8;
     config.n_refine_blocks = 4;
     
-    RFAAModel model(config);
+    PPMLModel model(config);
     
     // 3. 转移到 GPU
     model.to(Device::CUDA);
@@ -197,7 +197,7 @@ int main(int argc, char* argv[]) {
     // }
     
     // ============================================================
-    // 数据加载: 通过 RFAADataLoader 从 A3M + CSV mapping + 模板目录加载
+    // 数据加载: 通过 PPMLDataLoader 从 A3M + CSV mapping + 模板目录加载
     // CSV 提供真实坐标 (true_coords), 作为 FAPE 的 ground truth。
     // csv_path 可以是单个 CSV 文件, 也可以是含多个 *_mapping_results.csv
     // 的目录 (一个 uniprot 序列可能被多个 PDB 结构域覆盖, 自动合并)。
@@ -215,7 +215,7 @@ int main(int argc, char* argv[]) {
     // 从 FASTA 文件读取查询序列 (只读第一条)
     std::string sequence;
     try {
-        sequence = RFAADataLoader::read_fasta_first_sequence(fasta_path);
+        sequence = PPMLDataLoader::read_fasta_first_sequence(fasta_path);
         std::cout << "Read query sequence from " << fasta_path
                   << " (L=" << sequence.length() << ")" << std::endl;
     } catch (const std::exception& e) {
@@ -223,7 +223,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    RFAADataLoader loader("", "", 512, 4, 2048);
+    PPMLDataLoader loader("", "", 512, 4, 2048);
     ModelInput input = loader.load_from_files(a3m_path, sequence, csv_path, template_dir, hhr_path);
     int L = static_cast<int>(sequence.length());
 
@@ -471,7 +471,7 @@ int main(int argc, char* argv[]) {
         // ============================================================
         // 构建 backward 计算图并执行 (全局裁剪)
         // ============================================================
-        RFAAContext* ctx = &context();
+        PPMLContext* ctx = &context();
         ComputeGraph* cgraph = ComputeGraph::new_graph(ctx);
         cgraph->build_forward_expand(total_node);
         cgraph->build_backward_expand(ctx, nullptr);
@@ -549,11 +549,11 @@ int main(int argc, char* argv[]) {
     }
     
     // 6. 保存最终模型 (仍保留原有 .bin 保存, 以便兼容)
-    model.save_weights("rfaa_weights.bin");
+    model.save_weights("ppml_weights.bin");
     
     // 7. 导出 ONNX
     ONNXExportConfig onnx_config;
-    onnx_config.output_path = "rfaa_model.onnx";
+    onnx_config.output_path = "ppml_model.onnx";
     onnx_config.opset_version = 17;
     
     // 设置动态维度

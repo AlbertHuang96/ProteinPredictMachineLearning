@@ -4,7 +4,7 @@
 //#include <onnxruntime_cxx_api.h>
 #include <string>
 
-namespace rfaa {
+namespace ppml {
 
 // ONNX 导出配置
 struct ONNXExportConfig {
@@ -28,9 +28,9 @@ public:
     ONNXExporter();
     ~ONNXExporter();
     
-    // 从 RFAA 模型导出 ONNX
+    // 从 PPML 模型导出 ONNX
     // 方式1: 直接导出 (通过 tracing)
-    void export_model(const RFAAModel& model, const ONNXExportConfig& config);
+    void export_model(const PPMLModel& model, const ONNXExportConfig& config);
     
     // 方式2: 从训练好的权重文件导出
     void export_from_weights(const std::string& weights_path, 
@@ -72,4 +72,4 @@ private:
     std::unique_ptr<Impl> impl_;
 }; */
 
-} // namespace rfaa
+} // namespace ppml

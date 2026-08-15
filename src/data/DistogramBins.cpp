@@ -1,8 +1,8 @@
-#include "rfaa/DistogramBins.h"
+#include "ppml/DistogramBins.h"
 #include <cstring>
 #include <cmath>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // 辅助: 从 (N, 3, 3) 坐标张量中提取原子坐标
@@ -276,4 +276,4 @@ void compute_all_distogram_onehots(
     compute_phi_onehot(coords, seq_mask, Φ_onehot);
 }
 
-} // namespace rfaa
+} // namespace ppml

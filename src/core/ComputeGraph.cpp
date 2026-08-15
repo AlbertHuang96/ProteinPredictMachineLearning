@@ -1,8 +1,8 @@
-#include "rfaa/ComputeGraph.h"
-#include "rfaa/Context.h"
+#include "ppml/ComputeGraph.h"
+#include "ppml/Context.h"
 #include <cassert>
 
-namespace rfaa {
+namespace ppml {
 
 void ComputeGraph::graph_clear() {
     this->n_leafs_ = 0;
@@ -32,9 +32,9 @@ TensorF32 ** ComputeGraph::graph_nodes() {
     return this->nodes;
 }
 
-ComputeGraph * ComputeGraph::new_graph_custom(struct RFAAContext * ctx, size_t size, bool grads) {
+ComputeGraph * ComputeGraph::new_graph_custom(struct PPMLContext * ctx, size_t size, bool grads) {
     const size_t obj_size = graph_nbytes(size, grads);
-    struct RFAAObject * obj = ctx->new_object(RFAA_OBJECT_TYPE_GRAPH, obj_size);
+    struct PPMLObject * obj = ctx->new_object(PPML_OBJECT_TYPE_GRAPH, obj_size);
     ComputeGraph * cgraph = (ComputeGraph *) ((char *) ctx->mem_buffer + obj->offs);
  
     // the size of the hash table is doubled since it needs to hold both nodes and leafs
@@ -75,11 +75,11 @@ ComputeGraph * ComputeGraph::new_graph_custom(struct RFAAContext * ctx, size_t s
     return cgraph;
 }
  
-ComputeGraph * ComputeGraph::new_graph(struct RFAAContext * ctx) {
+ComputeGraph * ComputeGraph::new_graph(struct PPMLContext * ctx) {
     return new_graph_custom(ctx, 2048, false);
 }
 
-ComputeGraph * ComputeGraph::graph_dup(struct RFAAContext * ctx, struct ComputeGraph * cgraph, bool force_grads) {
+ComputeGraph * ComputeGraph::graph_dup(struct PPMLContext * ctx, struct ComputeGraph * cgraph, bool force_grads) {
     ComputeGraph * result = new_graph_custom(ctx, cgraph->size(), cgraph->grads || force_grads);
     cgraph->graph_cpy(cgraph, result);
     // there is no this pointer in the graph_cpy so it behaves like a static function
@@ -170,7 +170,7 @@ void ComputeGraph::build_forward_expand(TensorF32 * tensor) {
 }
 
 void ComputeGraph::build_backward_expand(
-        struct RFAAContext *  ctx,
+        struct PPMLContext *  ctx,
         TensorF32  ** grad_accs) {
     //GGML_ASSERT(cgraph->n_nodes > 0);
     //GGML_ASSERT(cgraph->grads);
@@ -289,7 +289,7 @@ TensorF32 * ComputeGraph::graph_get_grad(const TensorF32 * node) {
 }
 
 void ComputeGraph::compute_backward(
-    struct RFAAContext * ctx, int i, const bool * grads_needed) {
+    struct PPMLContext * ctx, int i, const bool * grads_needed) {
     ComputeGraph * cgraph = this;
     TensorF32 * tensor = this->nodes[i];
     TensorF32 * grad   = graph_get_grad(tensor);
@@ -888,7 +888,7 @@ void ComputeGraph::compute_backward(
 }
 
 void ComputeGraph::add_or_set(
-        struct RFAAContext * ctx,
+        struct PPMLContext * ctx,
         struct ComputeGraph  * cgraph,
         size_t                isrc,
         TensorF32  * tensor) {
@@ -906,7 +906,7 @@ void ComputeGraph::add_or_set(
 }
  
 void ComputeGraph::acc_or_set(
-        struct RFAAContext * ctx,
+        struct PPMLContext * ctx,
         struct ComputeGraph  * cgraph,
         size_t                isrc,
         TensorF32  * tensor,
@@ -927,7 +927,7 @@ void ComputeGraph::acc_or_set(
 }
  
 void ComputeGraph::add1_or_set(
-        struct RFAAContext * ctx,
+        struct PPMLContext * ctx,
         struct ComputeGraph  * cgraph,
         size_t                isrc,
         TensorF32  * tensor) {
@@ -942,7 +942,7 @@ void ComputeGraph::add1_or_set(
 }
  
 void ComputeGraph::sub_or_set(
-        struct RFAAContext * ctx,
+        struct PPMLContext * ctx,
         struct ComputeGraph  * cgraph,
         size_t                isrc,
         TensorF32  * tensor) {
@@ -1045,4 +1045,4 @@ size_t ComputeGraph::graph_nbytes(size_t size, bool grads) {
 
 
 
-} // namespace rfaa
+} // namespace ppml

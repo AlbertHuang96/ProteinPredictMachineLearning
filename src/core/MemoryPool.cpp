@@ -1,10 +1,10 @@
-#include "rfaa/Core.h"
+#include "ppml/Core.h"
 #include <cuda_runtime.h>
 #include <mutex>
 #include <unordered_map>
 #include <list>
 
-namespace rfaa {
+namespace ppml {
 
 // 内存池实现：减少 CUDA malloc/free 开销
 
@@ -133,4 +133,4 @@ MemoryPool::Stats MemoryPool::get_stats() const {
     return stats_;
 }
 
-} // namespace rfaa
+} // namespace ppml

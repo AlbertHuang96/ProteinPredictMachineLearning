@@ -4,7 +4,7 @@
 #include <algorithm>
 #include <vector>
 
-namespace rfaa {
+namespace ppml {
 
 // Softmax 操作
 /* TensorF32 softmax(const TensorF32& input, int dim = -1);
@@ -29,4 +29,4 @@ TensorF32 layer_norm(const TensorF32& input, const TensorF32& gamma,
 // 工具函数
 // Note: matmul and batch_matmul are now in MathUtils.h
 
-} // namespace rfaa
+} // namespace ppml

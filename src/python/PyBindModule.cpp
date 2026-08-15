@@ -1,4 +1,4 @@
-#include "rfaa/PythonBridge.h"
+#include "ppml/PythonBridge.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
@@ -6,7 +6,7 @@
 #include <cuda_runtime.h>
 
 namespace py = pybind11;
-using namespace rfaa;
+using namespace ppml;
 
 // Tensor <-> numpy array 转换
 template<typename T>
@@ -53,7 +53,7 @@ void bind_types(py::module& m) {
         .def("cuda", &TensorF32::cuda);
     
         //pybind11/pybind11.h:2209:68: error: use of deleted function 
-        /* ‘rfaa::Tensor<T>& rfaa::Tensor<T>::operator=(const rfaa::Tensor<T>&) [with T = float]’
+        /* ‘ppml::Tensor<T>& ppml::Tensor<T>::operator=(const ppml::Tensor<T>&) [with T = float]’
               return cpp_function([pm](T &c, const D &value) { c.*pm = value; }, is_method(hdl)); */
     // Tensor default copy constructor was deleted, so we need to define it for pybind11 ?
     /* py::class_<ModelInput>(m, "ModelInput")
@@ -78,23 +78,23 @@ void bind_types(py::module& m) {
 
 // 暴露模型
 void bind_model(py::module& m) {
-    py::class_<RFAAConfig>(m, "RFAAConfig")
+    py::class_<PPMLConfig>(m, "PPMLConfig")
         .def(py::init<>())
-        .def_readwrite("d_msa", &RFAAConfig::d_msa)
-        .def_readwrite("d_pair", &RFAAConfig::d_pair)
-        .def_readwrite("d_state", &RFAAConfig::d_state)
-        .def_readwrite("n_extra_blocks", &RFAAConfig::n_extra_blocks)
-        .def_readwrite("n_main_blocks", &RFAAConfig::n_main_blocks)
-        .def_readwrite("n_refine_blocks", &RFAAConfig::n_refine_blocks);
+        .def_readwrite("d_msa", &PPMLConfig::d_msa)
+        .def_readwrite("d_pair", &PPMLConfig::d_pair)
+        .def_readwrite("d_state", &PPMLConfig::d_state)
+        .def_readwrite("n_extra_blocks", &PPMLConfig::n_extra_blocks)
+        .def_readwrite("n_main_blocks", &PPMLConfig::n_main_blocks)
+        .def_readwrite("n_refine_blocks", &PPMLConfig::n_refine_blocks);
     
-    py::class_<RFAAModel>(m, "RFAAModel")
-        .def(py::init<const RFAAConfig&>(), py::arg("config") = RFAAConfig{})
-        .def("forward", &RFAAModel::forward)
-        .def("load_weights", &RFAAModel::load_weights)
-        .def("save_weights", &RFAAModel::save_weights)
-        .def("to", &RFAAModel::to)
-        .def("train", &RFAAModel::train)
-        .def("eval", &RFAAModel::eval);
+    py::class_<PPMLModel>(m, "PPMLModel")
+        .def(py::init<const PPMLConfig&>(), py::arg("config") = PPMLConfig{})
+        .def("forward", &PPMLModel::forward)
+        .def("load_weights", &PPMLModel::load_weights)
+        .def("save_weights", &PPMLModel::save_weights)
+        .def("to", &PPMLModel::to)
+        .def("train", &PPMLModel::train)
+        .def("eval", &PPMLModel::eval);
 }
 
 // 暴露 ONNX 导出
@@ -111,8 +111,8 @@ void bind_model(py::module& m) {
 } */
 
 // 模块初始化
-PYBIND11_MODULE(pyrfaa, m) {
-    m.doc() = "RFAA C++ Protein Structure Prediction Framework";
+PYBIND11_MODULE(pyppml, m) {
+    m.doc() = "PPML C++ Protein Structure Prediction Framework";
     
     bind_types(m);
     bind_model(m);

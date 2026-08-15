@@ -7,10 +7,10 @@
 #include <cstdint>
 #include <utility>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
-// 元素类型枚举 — 对应 RFAA Table S7 的 Frame Priorities
+// 元素类型枚举 — 对应 PPML Table S7 的 Frame Priorities
 // ============================================================================
 enum class ElementType : int32_t {
     // Metals / Cations (highest priority, most "frame-worthy")
@@ -162,7 +162,7 @@ private:
 /**
  * @brief 为分子图中的每个原子构造局部帧 (Frame)
  * 
- * 对应 Python RFAA 的 get_atom_frames() 逻辑：
+ * 对应 Python PPML 的 get_atom_frames() 逻辑：
  * 
  * 1. 在分子图中搜索所有长度为 2 的路径 (3个原子 A-B-C)
  * 2. 对每个原子 n：
@@ -197,4 +197,4 @@ std::vector<std::vector<AtomFrameOffset>> construct_frames(
     const std::vector<int>& residue_ids
 );
 
-} // namespace rfaa
+} // namespace ppml

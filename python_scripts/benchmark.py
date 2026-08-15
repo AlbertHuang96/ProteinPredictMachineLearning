@@ -1,12 +1,12 @@
 """
-RFAA C++ vs Python 性能对比
+PPML C++ vs Python 性能对比
 """
 
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'build', 'lib'))
 
-import pyrfaa
+import pyppml
 import time
 import numpy as np
 
@@ -14,12 +14,12 @@ def benchmark_inference():
     """对比 C++ 和 Python 推理速度"""
     
     # 创建模型
-    config = pyrfaa.RFAAConfig()
+    config = pyppml.PPMLConfig()
     config.n_extra_blocks = 4
     config.n_main_blocks = 8
     config.n_refine_blocks = 4
     
-    model = pyrfaa.RFAAModel(config)
+    model = pyppml.PPMLModel(config)
     model.eval()
     
     # 测试不同序列长度
@@ -34,22 +34,22 @@ def benchmark_inference():
         print(f"\nBenchmarking seq_len={L}...")
         
         # 构造输入
-        input_data = pyrfaa.ModelInput()
-        input_data.msa_latent = pyrfaa.numpy_to_tensor(
+        input_data = pyppml.ModelInput()
+        input_data.msa_latent = pyppml.numpy_to_tensor(
             np.random.randn(batch_size, n_seq, L, 164).astype(np.float32)
         )
-        input_data.seq_tokens = pyrfaa.numpy_to_tensor(
+        input_data.seq_tokens = pyppml.numpy_to_tensor(
             np.random.randint(0, 80, (batch_size, L)).astype(np.float32)
         )
-        input_data.t1d = pyrfaa.numpy_to_tensor(
+        input_data.t1d = pyppml.numpy_to_tensor(
             np.random.randn(batch_size, n_templ, L, 80).astype(np.float32)
         )
-        input_data.coords = pyrfaa.numpy_to_tensor(
+        input_data.coords = pyppml.numpy_to_tensor(
             np.random.randn(batch_size, L, 3, 3).astype(np.float32)
         )
         
         # CPU 推理
-        model.to(pyrfaa.Device.CPU)
+        model.to(pyppml.Device.CPU)
         
         # warmup
         for _ in range(3):
@@ -61,7 +61,7 @@ def benchmark_inference():
         cpu_time = (time.time() - start) / 10
         
         # CUDA 推理
-        model.to(pyrfaa.Device.CUDA)
+        model.to(pyppml.Device.CUDA)
         input_data.msa_latent = input_data.msa_latent.cuda()
         input_data.seq_tokens = input_data.seq_tokens.cuda()
         input_data.t1d = input_data.t1d.cuda()
@@ -105,18 +105,18 @@ def benchmark_memory():
     """测试内存占用"""
     import torch
     
-    config = pyrfaa.RFAAConfig()
-    model = pyrfaa.RFAAModel(config)
+    config = pyppml.PPMLConfig()
+    model = pyppml.PPMLModel(config)
     
     L = 256
-    input_data = pyrfaa.ModelInput()
-    input_data.msa_latent = pyrfaa.numpy_to_tensor(
+    input_data = pyppml.ModelInput()
+    input_data.msa_latent = pyppml.numpy_to_tensor(
         np.random.randn(1, 64, L, 164).astype(np.float32)
     ).cuda()
     
     torch.cuda.reset_peak_memory_stats()
     
-    model.to(pyrfaa.Device.CUDA)
+    model.to(pyppml.Device.CUDA)
     output = model.forward(input_data)
     
     peak_memory = torch.cuda.max_memory_allocated() / 1024**3  # GB

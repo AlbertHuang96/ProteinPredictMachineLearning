@@ -1,8 +1,8 @@
-/* #include "rfaa/Ops.h"
+/* #include "ppml/Ops.h"
 #include <cmath>
 #include <omp.h>
 
-namespace rfaa {
+namespace ppml {
 
 TensorF32 relu(const TensorF32& input) {
     TensorF32 output = input;
@@ -87,5 +87,5 @@ TensorF32 tanh(const TensorF32& input) {
     return output;
 }
 
-} // namespace rfaa
+} // namespace ppml
  */

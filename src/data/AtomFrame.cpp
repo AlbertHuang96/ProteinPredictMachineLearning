@@ -1,11 +1,11 @@
-#include "rfaa/AtomFrame.h"
+#include "ppml/AtomFrame.h"
 #include <algorithm>
 #include <stdexcept>
 #include <set>
 #include <tuple>
 #include <climits>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================================
 // ChemData 静态成员初始化
@@ -456,4 +456,4 @@ std::vector<std::vector<AtomFrameOffset>> construct_frames(
     return construct_frames(graph, element_types, residue_ids);
 }
 
-} // namespace rfaa
+} // namespace ppml

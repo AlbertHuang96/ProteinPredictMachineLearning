@@ -1,7 +1,7 @@
-#include "rfaa/PythonBridge.h"
+#include "ppml/PythonBridge.h"
 #include <iostream>
 
-namespace rfaa {
+namespace ppml {
 
 PythonBridge& PythonBridge::instance() {
     static PythonBridge instance;
@@ -155,7 +155,7 @@ TensorF32 ProteinTools::run_hhblits(const std::string& sequence,
         PyUnicode_FromString(database_path.c_str())
     );
     
-    PyObject* result = py.call_function("rfaa_tools", "run_hhblits", args);
+    PyObject* result = py.call_function("ppml_tools", "run_hhblits", args);
     Py_DECREF(args);
     
     // 转换 Python numpy array -> C++ Tensor
@@ -164,7 +164,7 @@ TensorF32 ProteinTools::run_hhblits(const std::string& sequence,
     return TensorF32();
 }
 
-bool ProteinTools::load_torch_weights(RFAAModel& model, const std::string& pt_path) {
+bool ProteinTools::load_torch_weights(PPMLModel& model, const std::string& pt_path) {
     auto& py = PythonBridge::instance();
     
     // 使用 torch.load 读取权重，然后转换到 C++
@@ -187,7 +187,7 @@ for name, param in state_dict.items():
     return true;
 }
 
-void ProteinTools::train_epoch(RFAAModel& model,
+void ProteinTools::train_epoch(PPMLModel& model,
                                const std::vector<ModelInput>& batch,
                                float learning_rate) {
     auto& py = PythonBridge::instance();
@@ -207,4 +207,4 @@ def compute_loss(outputs, targets):
     py.run_string(code);
 }
 
-} // namespace rfaa
+} // namespace ppml

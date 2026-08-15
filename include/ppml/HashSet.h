@@ -5,7 +5,7 @@
 //typedef uint32_t bitset_t;
 using bitset_t = uint64_t;
 
-namespace rfaa {
+namespace ppml {
 
 #define BITSET_SHR 5 
 // log2(sizeof(bitset_t)*8)
@@ -90,4 +90,4 @@ static size_t hash_insert(struct HashSet * hash_set, void * key) {
     // GGML_ABORT("fatal error");
 }
 
-} // namespace rfaa
+} // namespace ppml

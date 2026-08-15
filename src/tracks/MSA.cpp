@@ -1,8 +1,8 @@
-#include "rfaa/Track.h"
+#include "ppml/Track.h"
 
-#include "rfaa/Embedding.h"
+#include "ppml/Embedding.h"
 
-namespace rfaa {
+namespace ppml {
 
 MSATrack::MSATrack(int n_seq, int seq_len, int dim, Device device)
     : n_seq_(n_seq), seq_len_(seq_len), dim_(dim) {
@@ -49,4 +49,4 @@ TensorF32 MSATrack::query_row() const {
     return repr_.select(1, 0);  // msa[:, 0]
 }
 
-} // namespace rfaa
+} // namespace ppml

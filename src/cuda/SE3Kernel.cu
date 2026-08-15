@@ -1,8 +1,8 @@
-#include "rfaa/SE3Transformer.h"
+#include "ppml/SE3Transformer.h"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
-namespace rfaa {
+namespace ppml {
 
 // SE3 Transformer CUDA 核函数
 
@@ -113,4 +113,4 @@ __global__ void kernel_update_coords(const float* coords, const float* rot,
     new_coords[base + 2] = nz + trans[trans_base + 2];
 }
 
-} // namespace rfaa
+} // namespace ppml

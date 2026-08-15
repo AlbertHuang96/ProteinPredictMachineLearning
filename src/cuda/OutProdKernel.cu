@@ -1,7 +1,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 
-namespace rfaa {
+namespace ppml {
 
 // ============================================================
 // Helper
@@ -138,4 +138,4 @@ void out_prod_cuda(
         ne0,  ne1,  ne2,  ne3);
 }
 
-} // namespace rfaa
+} // namespace ppml

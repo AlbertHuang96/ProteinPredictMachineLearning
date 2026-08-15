@@ -1,5 +1,5 @@
 """
-RFAA Python 工具模块
+PPML Python 工具模块
 供 C++ 通过 Python C API 调用
 """
 

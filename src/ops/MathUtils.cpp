@@ -1,10 +1,10 @@
-#include "rfaa/MathUtils.h"
+#include "ppml/MathUtils.h"
 #include <numeric>  // for std::iota
 #include <vector>
 #include <stdexcept>
 #include <cassert>
 
-namespace rfaa {
+namespace ppml {
 
 
 
@@ -21,7 +21,7 @@ TensorF32 mean(const TensorF32& input, int dim) {
         dim += input.shape().ndim();
     }
     if (dim < 0 || dim >= input.shape().ndim()) {
-        throw RFAAError("mean: dim " + std::to_string(dim) + " out of range");
+        throw PPMLError("mean: dim " + std::to_string(dim) + " out of range");
     }
     
     // 计算输出形状
@@ -115,7 +115,7 @@ TensorF32 matmul(const TensorF32& a, const TensorF32& b) {
     const auto& b_shape = b.shape().dims;
     
     if (a_shape.size() != 2 || b_shape.size() != 2) {
-        throw RFAAError("matmul expects 2D tensors");
+        throw PPMLError("matmul expects 2D tensors");
     }
     
     int64_t M = a_shape[0];
@@ -123,7 +123,7 @@ TensorF32 matmul(const TensorF32& a, const TensorF32& b) {
     int64_t N = b_shape[1];
     
     if (b_shape[0] != K) {
-        throw RFAAError("matmul dimension mismatch");
+        throw PPMLError("matmul dimension mismatch");
     }
     
     TensorF32 output({M, N}, a.device());
@@ -151,8 +151,8 @@ TensorF32 matmul(const TensorF32& a, const TensorF32& b) {
  * @param a 左操作数，形状为 (B, M, K) 的三维张量
  * @param b 右操作数，形状为 (B, K, N) 的三维张量
  * @return TensorF32 结果张量，形状为 (B, M, N)
- * @throws RFAAError 当输入张量不是三维时抛出
- * @throws RFAAError 当批次维度 B 或内积维度 K 不匹配时抛出
+ * @throws PPMLError 当输入张量不是三维时抛出
+ * @throws PPMLError 当批次维度 B 或内积维度 K 不匹配时抛出
  */
 TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b) {
     // 假设 a: (B, M, K), b: (B, K, N), 输出: (B, M, N)
@@ -160,7 +160,7 @@ TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b) {
     const auto& b_shape = b.shape().dims;
     
     if (a_shape.size() != 3 || b_shape.size() != 3) {
-        throw RFAAError("batch_matmul expects 3D tensors");
+        throw PPMLError("batch_matmul expects 3D tensors");
     }
     
     int64_t B = a_shape[0];
@@ -169,7 +169,7 @@ TensorF32 batch_matmul(const TensorF32& a, const TensorF32& b) {
     int64_t N = b_shape[2];
     
     if (b_shape[0] != B || b_shape[1] != K) {
-        throw RFAAError("batch_matmul dimension mismatch");
+        throw PPMLError("batch_matmul dimension mismatch");
     }
     
     TensorF32 output({B, M, N}, a.device());
@@ -246,7 +246,7 @@ TensorF32 one_hot_seq(const TensorF32& seq, int num_classes) {
     // 检查输入是否为 2D 张量
     const auto& seq_shape = seq.shape().dims;
     if (seq_shape.size() != 2) {
-        throw RFAAError("one_hot_seq expects 2D tensor (B, L)");
+        throw PPMLError("one_hot_seq expects 2D tensor (B, L)");
     }
     
     if (num_classes <= 0) {
@@ -285,18 +285,18 @@ TensorF32 outer_sum(const TensorF32& left, const TensorF32& right) {
     
     // 检查输入是否为 4D 张量
     if (left_shape.size() != 4 || right_shape.size() != 4) {
-        throw RFAAError("outer_sum expects 4D tensors");
+        throw PPMLError("outer_sum expects 4D tensors");
     }
     
     // 检查维度：left (B,1,L,D), right (B,L,1,D)
     if (left_shape[0] != right_shape[0] || left_shape[3] != right_shape[3]) {
-        throw RFAAError("outer_sum dimension mismatch: batch or feature dim doesn't match");
+        throw PPMLError("outer_sum dimension mismatch: batch or feature dim doesn't match");
     }
     if (left_shape[1] != 1) {
-        throw RFAAError("outer_sum: left shape[1] should be 1, got " + std::to_string(left_shape[1]));
+        throw PPMLError("outer_sum: left shape[1] should be 1, got " + std::to_string(left_shape[1]));
     }
     if (right_shape[2] != 1) {
-        throw RFAAError("outer_sum: right shape[2] should be 1, got " + std::to_string(right_shape[2]));
+        throw PPMLError("outer_sum: right shape[2] should be 1, got " + std::to_string(right_shape[2]));
     }
     
     int64_t B = left_shape[0];
@@ -338,18 +338,18 @@ TensorF32 outer_product(const TensorF32& left, const TensorF32& right) {
     
     // 检查输入是否为 4D 张量
     if (left_shape.size() != 4 || right_shape.size() != 4) {
-        throw RFAAError("outer_product expects 4D tensors");
+        throw PPMLError("outer_product expects 4D tensors");
     }
     
     // 检查维度：left (B,1,L,D), right (B,L,1,D)
     if (left_shape[0] != right_shape[0] || left_shape[3] != right_shape[3]) {
-        throw RFAAError("outer_product dimension mismatch: batch or feature dim doesn't match");
+        throw PPMLError("outer_product dimension mismatch: batch or feature dim doesn't match");
     }
     if (left_shape[1] != 1) {
-        throw RFAAError("outer_product: left shape[1] should be 1, got " + std::to_string(left_shape[1]));
+        throw PPMLError("outer_product: left shape[1] should be 1, got " + std::to_string(left_shape[1]));
     }
     if (right_shape[2] != 1) {
-        throw RFAAError("outer_product: right shape[2] should be 1, got " + std::to_string(right_shape[2]));
+        throw PPMLError("outer_product: right shape[2] should be 1, got " + std::to_string(right_shape[2]));
     }
     
     int64_t B = left_shape[0];
@@ -389,11 +389,11 @@ TensorF32 outer_product_mean(const TensorF32& left, const TensorF32& right) {
     const auto& rs = right.shape().dims;
 
     if (ls.size() != 4 || rs.size() != 4) {
-        throw RFAAError("outer_product_mean expects 4D tensors");
+        throw PPMLError("outer_product_mean expects 4D tensors");
     }
     // left/right: (B, N, L, D)，收缩 N（dims[1]），保留 L（dims[2]），特征维做笛卡尔积 D×D→D*D
     if (ls[0] != rs[0] || ls[2] != rs[2] || ls[3] != rs[3]) {
-        throw RFAAError("outer_product_mean dimension mismatch: batch/residue/feature dims differ");
+        throw PPMLError("outer_product_mean dimension mismatch: batch/residue/feature dims differ");
     }
 
     const int64_t B = ls[0];
@@ -441,11 +441,11 @@ TensorF32 outer_product_cartesian(const TensorF32& left, const TensorF32& right)
     const auto& rs = right.shape().dims;
 
     if (ls.size() != 3 || rs.size() != 3) {
-        throw RFAAError("outer_product_cartesian expects 3D tensors");
+        throw PPMLError("outer_product_cartesian expects 3D tensors");
     }
     // left/right: (B, L, D)，特征维做笛卡尔积 D×D→D*D
     if (ls[0] != rs[0] || ls[2] != rs[2]) {
-        throw RFAAError("outer_product_cartesian dimension mismatch: batch/feature dims differ");
+        throw PPMLError("outer_product_cartesian dimension mismatch: batch/feature dims differ");
     }
 
     const int64_t B = ls[0];
@@ -580,7 +580,7 @@ TensorF32 triangle_mult(
 //dim=-1: 沿着最后一个维度拼接（-1表示最后一个维度）
 TensorF32 tensor_concat(const std::vector<TensorF32>& tensors, int dim) {
     if (tensors.empty()) {
-        throw RFAAError("cat: cannot concatenate empty list of tensors");
+        throw PPMLError("cat: cannot concatenate empty list of tensors");
     }
     
     // 获取第一个张量的形状和设备
@@ -592,18 +592,18 @@ TensorF32 tensor_concat(const std::vector<TensorF32>& tensors, int dim) {
         dim += ndim;
     }
     if (dim < 0 || dim >= ndim) {
-        throw RFAAError("cat: dim " + std::to_string(dim) + " out of range");
+        throw PPMLError("cat: dim " + std::to_string(dim) + " out of range");
     }
     
     // 检查所有张量形状是否兼容
     for (size_t i = 1; i < tensors.size(); ++i) {
         const Shape& shape = tensors[i].shape();
         if (shape.ndim() != ndim) {
-            throw RFAAError("cat: all tensors must have same number of dimensions");
+            throw PPMLError("cat: all tensors must have same number of dimensions");
         }
         for (int d = 0; d < ndim; ++d) {
             if (d != dim && shape.dims[d] != first_shape.dims[d]) {
-                throw RFAAError("cat: shape mismatch at dim " + std::to_string(d));
+                throw PPMLError("cat: shape mismatch at dim " + std::to_string(d));
             }
         }
     }
@@ -652,4 +652,4 @@ TensorF32 tensor_concat(const std::vector<TensorF32>& tensors, int dim) {
     return output;
 }
 
-} // namespace rfaa
+} // namespace ppml

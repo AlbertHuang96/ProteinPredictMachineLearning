@@ -10,7 +10,7 @@
 //#define GGML_MAX_OP_PARAMS      64
 
 
-namespace rfaa {
+namespace ppml {
 
 struct FAPEConfig;
 
@@ -81,14 +81,14 @@ public:
 
     void build_forward_expand(TensorF32 * tensor);
     void build_backward_expand(
-        struct RFAAContext *  ctx,
+        struct PPMLContext *  ctx,
         TensorF32  ** grad_accs);
 
-    static ComputeGraph * new_graph_custom(struct RFAAContext * ctx, size_t size, bool grads);
+    static ComputeGraph * new_graph_custom(struct PPMLContext * ctx, size_t size, bool grads);
 
-    static ComputeGraph * new_graph(struct RFAAContext * ctx);
+    static ComputeGraph * new_graph(struct PPMLContext * ctx);
 
-    static ComputeGraph * graph_dup(struct RFAAContext * ctx, ComputeGraph * cgraph, bool force_grads);
+    static ComputeGraph * graph_dup(struct PPMLContext * ctx, ComputeGraph * cgraph, bool force_grads);
 
 private:
     // this -- struct ComputeGraph * cgraph
@@ -96,23 +96,23 @@ private:
     void build_forward_impl(TensorF32 * tensor, bool expand, bool compute);
     void graph_cpy(ComputeGraph * src, ComputeGraph * dst);
     void compute_backward(
-        struct RFAAContext * ctx, int i, const bool * grads_needed);
+        struct PPMLContext * ctx, int i, const bool * grads_needed);
 
     static size_t graph_nbytes(size_t size, bool grads);
     static void * incr_ptr_aligned(void ** p, size_t size, size_t align);
 
     static void sub_or_set(
-        struct RFAAContext * ctx,
+        struct PPMLContext * ctx,
         ComputeGraph  * cgraph,
         size_t                isrc,
         TensorF32  * tensor);
     static void add1_or_set(
-        struct RFAAContext * ctx,
+        struct PPMLContext * ctx,
         ComputeGraph  * cgraph,
         size_t                isrc,
         TensorF32  * tensor);
     static void acc_or_set(
-        struct RFAAContext * ctx,
+        struct PPMLContext * ctx,
         ComputeGraph  * cgraph,
         size_t                isrc,
         TensorF32  * tensor,
@@ -121,7 +121,7 @@ private:
         const  size_t         nb3,
         const  size_t         offset);
     static void add_or_set(
-        struct RFAAContext * ctx,
+        struct PPMLContext * ctx,
         ComputeGraph  * cgraph,
         size_t                isrc,
         TensorF32  * tensor);
@@ -129,7 +129,7 @@ private:
     // 构造只能通过静态工厂
     ComputeGraph() = default;  // placement new 构造
 
-    friend class RFAAContext;        // Context 可以访问私有构造
+    friend class PPMLContext;        // Context 可以访问私有构造
     friend class BackendScheduler;   // Scheduler 可以临时修改 nodes/n_nodes_ 实现子图 view
 
     int size_;
@@ -327,4 +327,4 @@ TensorF32* loss (TensorF32* a);  // 设为损失节点
 // 13. 常量
 TensorF32* arange(float start, float end, float step = 1.0f);
 
-} // namespace rfaa
+} // namespace ppml

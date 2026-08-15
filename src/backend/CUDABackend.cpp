@@ -1,8 +1,8 @@
-#include "rfaa/Backend.h"
-#include "rfaa/ComputeGraph.h"
+#include "ppml/Backend.h"
+#include "ppml/ComputeGraph.h"
 #include <cuda_runtime.h>
 
-namespace rfaa {
+namespace ppml {
 
 // ===== CUDABufferType 实现 =====
 CUDABufferType* CUDABufferType::instance(int device_id) {
@@ -182,4 +182,4 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
     return Status::SUCCESS;
 }
 
-} // namespace rfaa
+} // namespace ppml

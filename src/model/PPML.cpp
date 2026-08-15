@@ -1,14 +1,14 @@
-#include "rfaa/Model.h"
-#include "rfaa/Embedding.h"
-#include "rfaa/PositionalEncoding.h"
-#include "rfaa/MathUtils.h"
+#include "ppml/Model.h"
+#include "ppml/Embedding.h"
+#include "ppml/PositionalEncoding.h"
+#include "ppml/MathUtils.h"
 #include <iostream>
 
-#include "rfaa/Dropout.h"
-#include "rfaa/Context.h"
+#include "ppml/Dropout.h"
+#include "ppml/Context.h"
 #include <cuda_runtime.h>   // cudaGetDeviceCount 用于 GPU 可用性探测
 
-namespace rfaa {
+namespace ppml {
 
 namespace {
 // ===== proj_state_add_to_query_row 图版（掩码广播 add）=====
@@ -86,7 +86,7 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
 }
 } // namespace
 
-RFAAConfig::RFAAConfig() {
+PPMLConfig::PPMLConfig() {
     // 默认 SE3 配置
     se3_config.node_dim = D_MSA + D_STATE;  // 288
     se3_config.edge_dim = D_PAIR + 64 + 1;  // 193 (pair + rbf + seqsep)
@@ -101,11 +101,11 @@ RFAAConfig::RFAAConfig() {
 }
 
 // IterBlock 实现
-IterBlock::IterBlock(const RFAAConfig& config, bool update_msa_pair)
+IterBlock::IterBlock(const PPMLConfig& config, bool update_msa_pair)
     : config_(config), update_msa_pair_(update_msa_pair) {
     // 旧值初始化 (保留注释):
-    // 所有 LinearLayer/LayerNorm 值成员已移除, 子模块现由 RFAAModel 创建后通过 set_sub_modules() 注入
-    // pos_enc_ 由 RFAAModel 构造后通过 set_pos_enc() 注入
+    // 所有 LinearLayer/LayerNorm 值成员已移除, 子模块现由 PPMLModel 创建后通过 set_sub_modules() 注入
+    // pos_enc_ 由 PPMLModel 构造后通过 set_pos_enc() 注入
 }
 
 void IterBlock::proj_state_add_to_query_row(TensorF32& msa, const TensorF32& proj_state) {
@@ -1152,13 +1152,13 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
 }
 
 // RefineBlock 构造函数已在 Model.h 中 inline 定义
-/* RefineBlock::RefineBlock(const RFAAConfig& config)
+/* RefineBlock::RefineBlock(const PPMLConfig& config)
     : IterBlock(config, false)  // update_msa_pair = false, 仅更新结构
     // , norm_msa_(D_MSA), norm_pair_(D_PAIR), norm_state_(D_STATE)
     // , embed_x_(NODE_IN_DIM, NODE_OUT_DIM), norm_node_(NODE_OUT_DIM)
     // , embed_e1_(D_PAIR, N_EDGE_FEATS), norm_edge1_(N_EDGE_FEATS)
     // , embed_e2_(EDGE_IN_DIM2, N_EDGE_FEATS), norm_edge2_(N_EDGE_FEATS)
-    // 以上 10 个参数现在由 RFAAModel 创建，通过指针注入
+    // 以上 10 个参数现在由 PPMLModel 创建，通过指针注入
 {
 } */
 
@@ -1560,8 +1560,8 @@ bool cuda_available() {
     return true;
 }
 
-// RFAAModel 实现
-RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
+// PPMLModel 实现
+PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
     int n_iter = N_EXTRA_BLOCKS + N_MAIN_BLOCKS;  // ITER_N_BLOCKS = 12
     int n_refn = N_REFINE_BLOCKS;                  // 4
 
@@ -1977,15 +1977,15 @@ RFAAModel::RFAAModel(const RFAAConfig& config) : config_(config) {
         &tps_pair_ff_);
 }
 
-RFAAModel::~RFAAModel() = default;
+PPMLModel::~PPMLModel() = default;
 
-void RFAAModel::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
+void PPMLModel::set_seq_info(const TensorF32& seq1hot, const TensorI64& idx) {
     seq1hot_.copy_from(seq1hot);
     idx_.copy_from(idx);
     has_seq_info_ = true;
 }
 
-ModelOutput RFAAModel::forward(const ModelInput& input) {
+ModelOutput PPMLModel::forward(const ModelInput& input) {
     ModelOutput output;
     
     int B = input.msa_latent.shape().dims[0];
@@ -2260,7 +2260,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
     return output;
 }
 
-// ===== RFAAModel::forward_graph (图模式前向，新增入口，不改 forward) =====
+// ===== PPMLModel::forward_graph (图模式前向，新增入口，不改 forward) =====
 // 预处理 embedding 与 block 前向均使用 forward_graph 版本。
 // 布局约定（ggml dims[0]=最内维）：
 //   msa        : 图 [D_MSA, L, N, B]     = 值 (B, N, L, D_MSA)
@@ -2272,7 +2272,7 @@ ModelOutput RFAAModel::forward(const ModelInput& input) {
 //   - PositionalEncoding::forward_graph 当前为占位（返回零图节点），pair 初始化不含位置编码；
 //   - SE3 3D track 需"图外值回落"驱动（graph_compute(pair) → run_se3_structural），本入口
 //     暂未驱动 SE3（block 的 forward_graph 在无结构输入时只跑 msa/pair 两条 track）。
-GraphOutput RFAAModel::forward_graph(const ModelInput& input) {
+GraphOutput PPMLModel::forward_graph(const ModelInput& input) {
     GraphOutput go;
 
     const int B = input.msa_latent.shape().dims[0];
@@ -2329,7 +2329,7 @@ GraphOutput RFAAModel::forward_graph(const ModelInput& input) {
 
     // ==== 4. block 前向 (forward_graph) + SE3 3D track（图外值回落驱动）====
     ensure_backend_ready();
-    RFAAContext* ctx = &context();
+    PPMLContext* ctx = &context();
     Backend* backend = cpu_backend_.get();
 
     // SE3 需结构常量：seq1hot（值 (B,L,21)）与链式 coords。
@@ -2443,7 +2443,7 @@ GraphOutput RFAAModel::forward_graph(const ModelInput& input) {
 //The t1d feature has shape (B, T, L, d_t1d) where B is batch size,
 // T is number of templates, L is sequence length, 
 //and d_t1d is the feature dimension that varies by model configuration
-TensorF32 RFAAModel::get_templ_emb(const TensorF32& t1d, const TensorF32& t2d) {
+TensorF32 PPMLModel::get_templ_emb(const TensorF32& t1d, const TensorF32& t2d) {
     int B = t1d.shape().dims[0];
     int T = t1d.shape().dims[1];
     int L = t1d.shape().dims[2];
@@ -2469,14 +2469,14 @@ TensorF32 RFAAModel::get_templ_emb(const TensorF32& t1d, const TensorF32& t2d) {
     return emb_t1d_t2d_->forward(*templ);
 }
 
-void RFAAModel::to(Device device) {
+void PPMLModel::to(Device device) {
     device_ = device;
 
     // 确保后端基础设施已初始化
     ensure_backend_ready();
 }
 
-void RFAAModel::ensure_backend_ready() {
+void PPMLModel::ensure_backend_ready() {
     if (backend_ready_) return;
 
     // 1. 创建 CPU Backend（始终存在）
@@ -2510,30 +2510,30 @@ void RFAAModel::ensure_backend_ready() {
     transfer_params_to_backend();
 }
 
-Device RFAAModel::device() const {
+Device PPMLModel::device() const {
     return device_;
 }
 
-Backend* RFAAModel::active_backend() {
+Backend* PPMLModel::active_backend() {
     ensure_backend_ready();
     // CUDA 若就绪则优先（模型目标设备为 CUDA 且 GPU 可用），否则回退 CPU
     if (device_ == Device::CUDA && cuda_backend_) return cuda_backend_.get();
     return cpu_backend_.get();
 }
 
-void RFAAModel::train() {
+void PPMLModel::train() {
     training_ = true;
 }
 
-void RFAAModel::eval() {
+void PPMLModel::eval() {
     training_ = false;
 }
 
-bool RFAAModel::is_training() const {
+bool PPMLModel::is_training() const {
     return training_;
 }
 
-void RFAAModel::load_weights(const std::string& path) {
+void PPMLModel::load_weights(const std::string& path) {
     std::cout << "Loading weights from: " << path << std::endl;
 
     // 1. 确保后端已就绪
@@ -2554,7 +2554,7 @@ void RFAAModel::load_weights(const std::string& path) {
 // 私有辅助: 收集所有参数 Tensor (weight/bias/gamma/beta), 顺序固定
 // 供 transfer_params_to_backend / params() / 保存共用
 // ============================================================
-void RFAAModel::collect_all_params(std::vector<TensorF32*>& param_tensors) {
+void PPMLModel::collect_all_params(std::vector<TensorF32*>& param_tensors) {
     std::vector<std::string> names;  // 无名字版本: 忽略名字
     collect_params_with_names(param_tensors, names);
 }
@@ -2570,7 +2570,7 @@ void RFAAModel::collect_all_params(std::vector<TensorF32*>& param_tensors) {
 //   - 每个 LayerNorm:   <name>.gamma / <name>.beta
 //   - 每个 Embedding:   <name>.weight
 // ============================================================
-void RFAAModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors,
+void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors,
                                           std::vector<std::string>& param_names) {
     // 辅助 lambda：收集 LinearLayer / LayerNorm / EmbeddingLayer 的参数及名字
     auto collect_linear = [&](LinearLayer* ll, const std::string& name) {
@@ -2792,13 +2792,13 @@ void RFAAModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
     }
 }
 
-std::vector<TensorF32*> RFAAModel::params() {
+std::vector<TensorF32*> PPMLModel::params() {
     std::vector<TensorF32*> out;
     collect_all_params(out);
     return out;
 }
 
-void RFAAModel::transfer_params_to_backend() {
+void PPMLModel::transfer_params_to_backend() {
     if (!scheduler_ || !cpu_backend_) return;
 
     // 幂等保护: 若参数已被分配进 backend buffer (buffer_ != nullptr), 跳过。
@@ -2835,7 +2835,7 @@ void RFAAModel::transfer_params_to_backend() {
     Buffer* param_buf = alloc_buffer(const_cast<BufferType*>(cpu_buft), total_size, BufferUsage::WEIGHTS);
     if (!param_buf) return;
 
-    // 将 buffer 所有权交给 RFAAModel
+    // 将 buffer 所有权交给 PPMLModel
     param_buffers_.emplace_back(param_buf);
 
     TensorAllocator tallocr(param_buf);
@@ -2861,10 +2861,10 @@ void RFAAModel::transfer_params_to_backend() {
     }
 }
 
-void RFAAModel::save_weights(const std::string& path) const {
+void PPMLModel::save_weights(const std::string& path) const {
     std::cout << "Saving weights to: " << path << std::endl;
     // 实现权重保存...
     // 如果有 backend buffer，需要通过 buffer->get_tensor 读取
 }
 
-} // namespace rfaa
+} // namespace ppml
