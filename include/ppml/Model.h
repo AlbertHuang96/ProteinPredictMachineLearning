@@ -445,7 +445,7 @@ public:
     //   - SE3 3D track 需"图外值回落"驱动（graph_compute(pair)→run_se3_structural→graph_compute
     //     offset→apply_coord_update），本入口在 block 循环边界以相同方式驱动；
     //   - 输出头图节点只构建不 graph_compute，由调用方（如 train.cpp）对总 loss 图一次性计算。
-    GraphOutput forward_graph(const ModelInput& input);
+    GraphOutput forward_graph(const ModelInput& input, bool enable_se3 = true);
 
     TensorF32 get_templ_emb(const TensorF32& t1d, const TensorF32& t2d);
     
@@ -490,9 +490,21 @@ private:
     LinearLayer*     bond_emb_           = nullptr; // (8 → D_PAIR)
     LinearLayer*     emb_t1d_            = nullptr; // (110 → 64)
     LinearLayer*     proj_t1d_           = nullptr; // (64 → 64)
-    LinearLayer*     emb_t1d_t2d_        = nullptr; // (224 → 64) get_templ_emb
+    LinearLayer*     emb_t1d_t2d_        = nullptr; // (228 → D_PAIR) get_templ_emb；模板 pair 为 D_PAIR=128 维
     LinearLayer*     temp_stack_t1d_proj_ = nullptr; // (80 → 32) templ_stack
-    LayerNorm*       temp_stack_norm_    = nullptr; // (64)
+    LayerNorm*       temp_stack_norm_    = nullptr; // (D_PAIR=128)
+    // Template state cross-attention 投影 (CrossAttention 外部注入, 无 bias):
+    //   Q=state(D_STATE=32), KV=template_emb(64), H=8 → proj_dim=64
+    LinearLayer*     templ_attn_Wq_      = nullptr; // D_STATE (32) → 64
+    LinearLayer*     templ_attn_Wk_      = nullptr; // 64 → 64
+    LinearLayer*     templ_attn_Wv_      = nullptr; // 64 → 64
+    LinearLayer*     templ_attn_Wo_      = nullptr; // 64 → D_STATE (32)
+    // Template pair→pair cross-attention 投影 (CrossAttention(D_PAIR,D_PAIR,8) 外部注入):
+    //   Q=pair(D_PAIR=128), KV=templ_pair(D_PAIR=128), H=8 → proj_dim=128
+    LinearLayer*     templ_pair_attn_Wq_ = nullptr; // D_PAIR (128) → 128
+    LinearLayer*     templ_pair_attn_Wk_ = nullptr; // D_PAIR (128) → 128
+    LinearLayer*     templ_pair_attn_Wv_ = nullptr; // D_PAIR (128) → 128
+    LinearLayer*     templ_pair_attn_Wo_ = nullptr; // 128 → D_PAIR (128)
 
     // ===== TemplatePairStack 子层 (全局单份, 2 次 forward 复用) =====
     // 直接 LinearLayer/LayerNorm
@@ -617,6 +629,31 @@ private:
     std::vector<LayerNorm*>   msa_ff_norm_;     // D_MSA (256)
     std::vector<LinearLayer*> msa_ff_linear1_;  // D_MSA (256) → D_MSA*4 (1024)
     std::vector<LinearLayer*> msa_ff_linear2_;  // D_MSA*4 (1024) → D_MSA (256)
+
+    // ===== FullBlock(extra_blocks_) 专属 MSA 注意力权重（D_MSA_FULL=64 维）=====
+    // RF2AA 全量 MSA 模块：n_msa_head=8, n_msa_channels=8 → n_head*d_hidden=64=D_MSA_FULL。
+    // FullBlock 处理 msa_full[64,L,N,B]，其 row attention / ff / global col attention 均按 64 维。
+    // 注意：pair 相关（pair_row/col/ff/tri/msa2pair）仍为 D_PAIR=128，不在此列。
+    std::vector<LinearLayer*> full_msa_row_Wq_;     // D_MSA_FULL (64) → 64
+    std::vector<LinearLayer*> full_msa_row_Wk_;
+    std::vector<LinearLayer*> full_msa_row_Wv_;
+    std::vector<LinearLayer*> full_msa_row_to_b_;   // D_PAIR (128) → N_HEAD (8)
+    std::vector<LinearLayer*> full_msa_row_to_g_;   // D_MSA_FULL (64) → 64
+    std::vector<LinearLayer*> full_msa_row_to_out_; // 64 → D_MSA_FULL (64)
+    std::vector<LayerNorm*>   full_msa_ff_norm_;     // D_MSA_FULL (64)
+    std::vector<LinearLayer*> full_msa_ff_linear1_;  // 64 → 256
+    std::vector<LinearLayer*> full_msa_ff_linear2_;  // 256 → 64
+    std::vector<LinearLayer*> full_msa_global_col_Wq_;    // 64 → 64  single-head
+    std::vector<LinearLayer*> full_msa_global_col_Wk_;
+    std::vector<LinearLayer*> full_msa_global_col_Wv_;
+    std::vector<LinearLayer*> full_msa_global_col_to_b_;  // D_PAIR (128) → N_HEAD (8)
+    std::vector<LinearLayer*> full_msa_global_col_to_g_;
+    std::vector<LinearLayer*> full_msa_global_col_to_out_;
+    // FullBlock msa2pair（处理 msa_full[64,...]）— 64 维
+    std::vector<LayerNorm*>   full_msa2pair_norm_;          // 64
+    std::vector<LinearLayer*> full_msa2pair_left_proj_;     // 64→16
+    std::vector<LinearLayer*> full_msa2pair_right_proj_;    // 64→16
+    std::vector<LinearLayer*> full_msa2pair_out_proj_;      // 256→D_PAIR(128)
 
     // --- FeedForward pair_ff_ (1 LN + 2 LL ×12) ---
     std::vector<LayerNorm*>   pair_ff_norm_;     // D_PAIR (128)

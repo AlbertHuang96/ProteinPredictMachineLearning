@@ -33,11 +33,13 @@ set(CORE_SOURCES
     ../src/backend/Backend.cpp
     ../src/backend/CPUBackend.cpp
     ../src/backend/CUDABackend.cpp
+    ../src/backend/Gallocr.cpp
     ../src/backend/CUDAKernels.cpp
     ../src/backend/CPUKernels.cpp
     ../src/backend/ThreadPool.cpp
     ../src/core/GradientClipper.cpp
     ../src/core/AdamW.cpp
+    ../src/core/DynTalloc.cpp
     # GGUF 序列化 (checkpoint 保存/加载)
     ../src/model/GGUF.cpp
     # CUDA kernels

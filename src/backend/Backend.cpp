@@ -404,6 +404,8 @@ bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
 }
 
 // ===== 辅助：根据 backend assignment 预留各后端内存 =====
+// 改用 Gallocr 做延迟分配 + 空间复用：每个后端 buffer 只开峰值大小，
+// 张量沿拓扑序"借/还"复用，替代原来的全量常驻 + bump 分配。
 bool BackendScheduler::reserve_graph_memory() {
     // 释放上次分配的 buffer
     reserved_buffers_.clear();
@@ -425,86 +427,55 @@ bool BackendScheduler::reserve_graph_memory() {
         bufts_[i] = backends_[i]->buffer_type();
     }
 
-    // 3. 为每个后端实际分配 buffer
+    // 3. 配置 Gallocr：注入每个后端的 buft
+    gallocr_.set_n_backends(n_backends_);
+    for (int b = 0; b < n_backends_; b++) {
+        gallocr_.backends()[b].buft = const_cast<BufferType*>(bufts_[b]);
+    }
+
+    // 4. 张量 → 后端 id 映射
+    auto backend_id_of = [&](TensorF32* t) -> int {
+        return tensor_backend_id(t, 0);
+    };
+
+    // 5. Phase1：计算各后端峰值
+    if (!gallocr_.reserve(current_graph_, backend_id_of, n_backends_)) {
+        return false;
+    }
+
+    // 6. Phase2：分配 buffer 并绑定张量 data_/buffer_/buffer_offs_
+    if (!gallocr_.alloc(current_graph_, backend_id_of, n_backends_)) {
+        return false;
+    }
+
+    // 7. 跨后端拷贝节点（build_splits 创建的 dup(src)）单独持久分配，
+    //    数量少、体积小，不参与复用（保持简单正确）。
     for (int b = 0; b < n_backends_; b++) {
         const BufferType* buft = bufts_[b];
         if (!buft) continue;
 
-        size_t backend_size = 0;
-
-        // ---- 3a. 统计原始图节点 ----
-        for (int i = 0; i < current_graph_->n_nodes(); i++) {
-            if (node_backend_id_[i] == b) {
-                TensorF32* t = current_graph_->graph_node(i);
-                if (t->data() == nullptr && t->view_src == nullptr) {
-                    backend_size += GGML_PAD(
-                        buft->get_alloc_size(t),
-                        buft->get_alignment());
-                }
-            }
-        }
-
-        // ---- 3b. 统计 leafs ----
-        for (int i = 0; i < current_graph_->n_leafs(); i++) {
-            if (leaf_backend_id_[i] == b) {
-                TensorF32* t = current_graph_->graph_leaf(i);
-                if (t->data() == nullptr && t->view_src == nullptr) {
-                    backend_size += GGML_PAD(
-                        buft->get_alloc_size(t),
-                        buft->get_alignment());
-                }
-            }
-        }
-
-        // ---- 3c. 统计 copy_tensor_map_ 中的拷贝节点 ----
-        // build_splits 创建的 dup(src) 拷贝节点，需要在此分配 buffer
+        size_t copy_size = 0;
         for (auto& kv : copy_tensor_map_) {
             TensorF32* cpy = kv.second;
             int cpy_backend_id = kv.first.second;  // target_backend_id
-            if (cpy_backend_id == b) {
-                if (cpy->data() == nullptr && cpy->view_src == nullptr) {
-                    backend_size += GGML_PAD(
-                        buft->get_alloc_size(cpy),
-                        buft->get_alignment());
-                }
+            if (cpy_backend_id == b &&
+                cpy->data() == nullptr && cpy->view_src == nullptr) {
+                copy_size += GGML_PAD(buft->get_alloc_size(cpy), buft->get_alignment());
             }
         }
+        if (copy_size == 0) continue;
 
-        if (backend_size > 0) {
-            Buffer* buf = alloc_buffer(const_cast<BufferType*>(buft), backend_size);
-            if (!buf) return false;
+        Buffer* buf = alloc_buffer(const_cast<BufferType*>(buft), copy_size);
+        if (!buf) return false;
+        reserved_buffers_.emplace_back(buf);
 
-            // 持有 buffer 所有权（防止 dangling pointer）
-            reserved_buffers_.emplace_back(buf);
-
-            // ---- 子分配：原始图节点 ----
-            TensorAllocator tallocr(buf);
-            for (int i = 0; i < current_graph_->n_nodes(); i++) {
-                if (node_backend_id_[i] == b) {
-                    TensorF32* t = current_graph_->graph_node(i);
-                    if (t->data() == nullptr && t->view_src == nullptr) {
-                        if (!tallocr.alloc(t)) return false;
-                    }
-                }
-            }
-            for (int i = 0; i < current_graph_->n_leafs(); i++) {
-                if (leaf_backend_id_[i] == b) {
-                    TensorF32* t = current_graph_->graph_leaf(i);
-                    if (t->data() == nullptr && t->view_src == nullptr) {
-                        if (!tallocr.alloc(t)) return false;
-                    }
-                }
-            }
-
-            // ---- 子分配：拷贝节点 ----
-            for (auto& kv : copy_tensor_map_) {
-                TensorF32* cpy = kv.second;
-                int cpy_backend_id = kv.first.second;
-                if (cpy_backend_id == b) {
-                    if (cpy->data() == nullptr && cpy->view_src == nullptr) {
-                        if (!tallocr.alloc(cpy)) return false;
-                    }
-                }
+        TensorAllocator tallocr(buf);
+        for (auto& kv : copy_tensor_map_) {
+            TensorF32* cpy = kv.second;
+            int cpy_backend_id = kv.first.second;
+            if (cpy_backend_id == b &&
+                cpy->data() == nullptr && cpy->view_src == nullptr) {
+                if (!tallocr.alloc(cpy)) return false;
             }
         }
     }

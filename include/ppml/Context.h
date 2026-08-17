@@ -1,5 +1,6 @@
 #pragma once
 #include <cstddef>
+#include <vector>
 
 #include "Tensor.h"
 
@@ -69,8 +70,24 @@ struct PPMLContext {
     static void         free(PPMLContext* ctx);
 
     // 创建张量（核心 API）
+    // no_alloc=false：数据直接分配在 context 缓冲区（data_ 指向 (result+1)）。
+    // no_alloc=true ：只分配 tensor 结构体，数据 data_=nullptr（空壳），
+    //                 由后续 Gallocr/backend buffer 按需分配（节省 context 内存）。
     template<typename T>
     Tensor<T>* new_tensor(int n_dims, const int64_t* ne);
+
+    // 创建参数张量（weight/bias/gamma/beta 等）：no_alloc 时也从宿主暂存区分配
+    // 真实数据（data_ 非空），以便构建期 init_weights/transfer_params 直接读写。
+    template<typename T>
+    Tensor<T>* new_param_tensor(int n_dims, const int64_t* ne);
+
+    // ===== no_alloc 宿主暂存区 =====
+    // no_alloc 时，构建期需直接写入数据的 leaf/常量节点从该暂存区获取宿主内存，
+    // 计算中间节点不占用（data_=nullptr）。暂存块生命周期由 context 管理。
+    // 后续 Gallocr 分配 backend buffer 后可覆盖 data_/buffer_，暂存块在 scratch_free 统一释放。
+    void* scratch_alloc(size_t bytes);
+    void  scratch_free();            // 释放全部暂存块（PPMLContext::free 调用）
+    std::vector<void*> scratch_;     // 已分配的暂存块（owner）
 
     // 计算所需总内存（预分配阶段使用）
     static size_t calc_mem_size(int n_tensors, int total_elements);
@@ -91,11 +108,27 @@ private:
 inline PPMLContext& context() {
     static PPMLContext* g_ctx = nullptr;
     if (!g_ctx) {
-        // 如果未初始化，使用默认参数
-        CtxInitParams default_params = { 1024 * 1024 * 1024, nullptr, false };  // 1GB
+        // 全局 context 启用 no_alloc：中间张量只建空壳，由 Gallocr 延迟分配 + 空间复用，
+        // 避免 eager 全量分配进固定 context 缓冲区（~40GB 溢出）。
+        CtxInitParams default_params = { 1024 * 1024 * 1024, nullptr, true };
         g_ctx = PPMLContext::init(default_params);
     }
     return *g_ctx;
+}
+
+// ===== no_alloc 构建期 leaf 数据绑定 =====
+// 返回 tensor 可写的宿主数据指针：
+//   - no_alloc=false：直接返回 t->data()（new_tensor 已分配在 context 缓冲区）
+//   - no_alloc=true ：若 data() 为空，从 context 暂存区分配并绑定，再返回
+// 构建期需直接写入数据的 leaf/常量节点（constant_*、wrap_input_as_leaf、掩码等）
+// 必须通过此函数获取写指针，否则 no_alloc 时空指针写崩溃。
+template<typename T>
+inline T* bind_leaf_data(PPMLContext& ctx, Tensor<T>* t) {
+    if (t->data()) return t->data();
+    if (t->nbytes() == 0) return nullptr;
+    void* p = ctx.scratch_alloc(t->nbytes());
+    t->bind_data(p);
+    return t->data();
 }
 
 } // namespace ppml

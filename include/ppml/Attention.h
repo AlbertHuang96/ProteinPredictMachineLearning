@@ -184,7 +184,12 @@ private:
 class CrossAttention {
 public:
     CrossAttention(int q_dim, int kv_dim, int n_head);
-    
+    ~CrossAttention();
+
+    // 注入外部持有的投影层参数（提为模型成员，供权重加载/优化收集）。
+    // 与构造函数自建的 Wq/Wk/Wv/Wo 同构（维度一致），调用后 forward/forward_graph 改用注入层。
+    void set_params(LinearLayer* Wq, LinearLayer* Wk, LinearLayer* Wv, LinearLayer* Wo);
+
     // query: (B*L, 1, q_dim), kv: (B*L, T, kv_dim)
     // 输出: (B*L, 1, q_dim)
     TensorF32 forward(const TensorF32& query, const TensorF32& kv);
@@ -201,11 +206,13 @@ private:
     int head_dim_;   // = proj_dim / n_head, where proj_dim = max(q_dim, kv_dim) aligned to n_head
     int proj_dim_;   // 公共投影维度 = n_head * head_dim
 
-    // 投影层: 把 Q 和 KV 投影到相同的 proj_dim
-    std::unique_ptr<LinearLayer> Wq_;   // q_dim → proj_dim
-    std::unique_ptr<LinearLayer> Wk_;   // kv_dim → proj_dim
-    std::unique_ptr<LinearLayer> Wv_;   // kv_dim → proj_dim
-    std::unique_ptr<LinearLayer> Wo_;   // proj_dim → q_dim (输出投影)
+    // 投影层: 把 Q 和 KV 投影到相同的 proj_dim。
+    // 构造时自建 (unique_ptr 语义)，set_params 后切换为外部持有 (裸指针，不拥有)。
+    LinearLayer* Wq_;   // q_dim → proj_dim
+    LinearLayer* Wk_;   // kv_dim → proj_dim
+    LinearLayer* Wv_;   // kv_dim → proj_dim
+    LinearLayer* Wo_;   // proj_dim → q_dim (输出投影)
+    bool owns_params_ = true;   // true=构造函数自建需释放; false=外部注入不拥有
 };
 
 // Triangle Multiplication (Outgoing / Incoming)
@@ -306,7 +313,15 @@ public:
         FeedForward* pair_ff);
     
     TensorF32 forward(const TensorF32& pair, TensorF32& rbf_feature, const TensorF32& state);
-    
+
+    // ===== 图模式前向（训练用）=====
+    // 输入输出均为图节点指针 (ggml 布局 dims[0]=最内维):
+    //   pair: 值 (B*T,L,L,D_PAIR) = 图 [D_PAIR,L,L,B*T]
+    //   rbf_feature: 值 (B*T,L,L,D_RBF) = 图 [D_RBF,L,L,B*T]; 引用，内部 gate 后更新（供多次迭代传递）
+    //   state: 值 (B*T,L,D_STATE) = 图 [D_STATE,L,B*T]
+    // 返回: 图 [D_PAIR,L,L,B*T]
+    TensorF32* forward_graph(TensorF32* pair, TensorF32*& rbf_feature, TensorF32* state);
+
 private:
     // 旧值类型 (保留注释):
     // LinearLayer rbf_proj_(D_RBF, D_PAIR);

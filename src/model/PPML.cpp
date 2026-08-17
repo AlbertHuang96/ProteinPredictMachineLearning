@@ -38,7 +38,7 @@ TensorF32* query_row_add_graph(TensorF32* msa, TensorF32* proj_state) {
     int64_t mask_dims[] = {N};
     TensorF32* n_mask = context().new_tensor<float>(1, mask_dims);
     n_mask->flag = 0;                        // 常量，不可训练
-    float* md = n_mask->data();
+    float* md = bind_leaf_data(context(), n_mask);
     for (int64_t i = 0; i < N; i++) md[i] = (i == 0) ? 1.0f : 0.0f;
     TensorF32* n_mask4 = view(n_mask, Shape{1, 1, N, 1});
 
@@ -60,11 +60,12 @@ TensorF32* wrap_input_as_leaf(const TensorF32& t, const std::vector<int64_t>& di
     int64_t ne[4] = {1, 1, 1, 1};
     for (size_t i = 0; i < dims.size() && i < 4; i++) ne[i] = dims[i];
     TensorF32* leaf = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
+    float* dst = bind_leaf_data(context(), leaf);
     if (t.device() == Device::CUDA) {
         TensorF32 tcpu = t.cpu();
-        std::memcpy(leaf->data(), tcpu.data(), tcpu.numel() * sizeof(float));
+        std::memcpy(dst, tcpu.data(), tcpu.numel() * sizeof(float));
     } else {
-        std::memcpy(leaf->data(), t.data(), t.numel() * sizeof(float));
+        std::memcpy(dst, t.data(), t.numel() * sizeof(float));
     }
     return leaf;
 }
@@ -79,7 +80,16 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
     backend->graph_compute(cgraph);
     if (node->data() != nullptr) {
         size_t bytes = static_cast<size_t>(node->numel()) * sizeof(float);
-        if (dst.numel() == node->numel()) {
+        if (dst.numel() != (size_t)node->numel()) {
+            // 目标值张量为 move-only，无法 operator=；用 placement-new 重建。
+            // 值张量布局 (B,...,C) 最内维 C = 图 dims[0]，故值 shape = 图 dims 逆序。
+            const Shape& g = node->shape();
+            std::vector<int64_t> v;
+            for (int i = (int)g.ndim() - 1; i >= 0; --i) v.push_back(g.dims[i]);
+            dst.~TensorF32();
+            new (&dst) TensorF32(Shape(v), Device::CPU);
+        }
+        if (dst.numel() == (size_t)node->numel()) {
             std::memcpy(dst.data(), node->data(), bytes);
         }
     }
@@ -618,9 +628,12 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
         state2msa_norm_->forward(state));
     msa = query_row_add_graph(msa, proj_state);   // msa[:,0,:,:] += proj_state
 
-    // pair -> pair_biased (msa row attention bias): pair2msa_norm(pair) + rbf
+    // pair -> pair_biased (msa row attention bias): pair2msa_norm(pair) + emb_rbf(rbf)
+    //   RF2AA MSAPairStr2MSA：rbf_feat 先经 emb_rbf (D_RBF=64 → D_PAIR=128) 线性投影到 d_pair，
+    //   再加到 layer-normed pair 上作为 row attention bias。
     TensorF32* pair_biased = add_impl(
-        pair2msa_norm_->forward(pair), rbf, /*inplace=*/false);
+        pair2msa_norm_->forward(pair),
+        pair2pair_rbf_proj_->forward_graph(rbf), /*inplace=*/false);
 
     // MSA Row Attention (with bias)
     msa = msa_row_attn_->forward_graph(msa, pair_biased);
@@ -795,10 +808,10 @@ std::vector<TensorF32*> IterBlock::run_se3_structural(TensorF32*& msa, TensorF32
     // 值版 pair 布局 (B,L,L,D_PAIR)。embed_e_ (D_PAIR→ITER_EDGE_3D_OUT) → norm_edge_3d_。
     // Tensor 为 move-only，避免拷贝。LayerNorm::forward 返回 TensorF32*，
     // LinearLayer::forward 返回 TensorF32（move 到临时值再取址）。
-    TensorF32* pair_normed = norm_pair_3d_->forward(&const_cast<TensorF32&>(pair_value));  // (B,L,L,D_PAIR)
-    TensorF32  edge_emb    = embed_e_->forward(*pair_normed);            // (B,L,L,ITER_EDGE_3D_OUT)
-    TensorF32* edge_out    = norm_edge_3d_->forward(&edge_emb);          // (B,L,L,ITER_EDGE_3D_OUT)
-    se3::GraphData G       = se3::make_graph(coords, *edge_out, residx, 64, 9);
+    TensorF32  pair_normed = norm_pair_3d_->forward_exec(pair_value);   // (B,L,L,D_PAIR) 值版
+    TensorF32  edge_emb    = embed_e_->forward(pair_normed);             // (B,L,L,ITER_EDGE_3D_OUT)
+    TensorF32  edge_out    = norm_edge_3d_->forward_exec(edge_emb);      // (B,L,L,ITER_EDGE_3D_OUT)
+    se3::GraphData G       = se3::make_graph(coords, edge_out, residx, 64, 9);
     SE3Basis basis;
     basis.compute(G.edge_d, 2);
 
@@ -969,8 +982,9 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         int N = msa_full.shape().dims[1];
         int L = msa_full.shape().dims[2];
 
-        auto& msa_normed = *norm_msa_3d_->forward(&msa_full);
-        auto& pair_normed = *norm_pair_3d_->forward(&pair);
+        // 值版 SE3：用 forward_exec（值 LayerNorm），不能用图版 forward
+        auto msa_normed  = norm_msa_3d_->forward_exec(msa_full);
+        auto pair_normed = norm_pair_3d_->forward_exec(pair);
 
         // 序列加权求和 (simplified: equal-weight mean)
         TensorF32 msa_sum({B, L, D_MSA}, msa_normed.device());
@@ -989,30 +1003,20 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         cat_inputs.push_back(&msa_sum);
         cat_inputs.push_back(const_cast<TensorF32*>(&seq1hot));
         auto& node_cat = *concat_ptr(cat_inputs, -1);
-        /* float* cat_data = node_cat.data();
-        for (int b = 0; b < B; ++b)
-            for (int l = 0; l < L; ++l) {
-                for (int d = 0; d < D_MSA; ++d)
-                    cat_data[(b * L + l) * NODE_3D_IN + d] =
-                        sum_data[(b * L + l) * D_MSA + d];
-                for (int d = 0; d < 21; ++d)
-                    cat_data[(b * L + l) * NODE_3D_IN + D_MSA + d] =
-                        seq1hot_.data()[(b * L + l) * 21 + d];
-            } */
 
         auto node_emb = embed_x_->forward(node_cat);
-        auto node_out = norm_node_3d_->forward(&node_emb);
+        auto node_out = norm_node_3d_->forward_exec(node_emb);
         auto edge_emb = embed_e_->forward(pair_normed);
-        auto edge_out = norm_edge_3d_->forward(&edge_emb);
+        auto edge_out = norm_edge_3d_->forward_exec(edge_emb);
 
-        se3::GraphData G = se3::make_graph(coords, *edge_out, residx, 64, 9);
+        se3::GraphData G = se3::make_graph(coords, edge_out, residx, 64, 9);
         TensorF32 l1_feats = compute_l1_features(coords);
 
         //Fiber fiber_in({NODE_3D_OUT, 3}, {0, 1});
         SE3Features node_se3;
         node_se3.features.resize(2);
         // node_out = it was actually msa input
-        node_se3.features[0] = node_out->view({B * L, ITER_NODE_3D_OUT, 1});
+        node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
         node_se3.features[1].copy_from(l1_feats);  // SE3Features::features 是 Tensor 值类型
 
         SE3Basis basis;
@@ -1086,9 +1090,11 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
         state2msa_norm_->forward(state));
     msa_full = query_row_add_graph(msa_full, proj_state);   // msa_full[:,0,:,:] += proj_state
 
-    // pair -> pair_biased (msa row attention bias): pair2msa_norm(pair) + rbf
+    // pair -> pair_biased (msa row attention bias): pair2msa_norm(pair) + emb_rbf(rbf)
+    //   RF2AA MSAPairStr2MSA：rbf_feat 先经 emb_rbf (D_RBF=64 → D_PAIR=128) 线性投影到 d_pair。
     TensorF32* pair_biased = add_impl(
-        pair2msa_norm_->forward(pair), rbf, /*inplace=*/false);
+        pair2msa_norm_->forward(pair),
+        pair2pair_rbf_proj_->forward_graph(rbf), /*inplace=*/false);
 
     // MSA Row Attention (with bias)
     msa_full = msa_row_attn_->forward_graph(msa_full, pair_biased);
@@ -1650,6 +1656,38 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         pair_ff_linear1_.push_back(LinearLayer::create(D_PAIR, D_PAIR * 2));              // 128→256
         pair_ff_linear2_.push_back(LinearLayer::create(D_PAIR * 2, D_PAIR));              // 256→128
     };
+    // ===== FullBlock(extra) 专属 64 维 MSA 注意力（d_msa_full=64, n_msa_head*n_msa_channels=64）=====
+    // RF2AA：FullBlock 处理 msa_full[64,...]，其 row attention/ff/global col attention 均按 64 维。
+    constexpr int FMSA = D_MSA_FULL;                 // 64
+    constexpr int FMSA_HID = N_HEAD * D_MSA_FULL;    // 8*64=512?  实际 n_msa_head*n_msa_channels=64
+    constexpr int FMSA_QOUT = 64;                    // n_msa_head*d_msa_channels = 8*8 = 64
+    auto push_full_msa_row = [&]() {
+        full_msa_row_Wq_.push_back(     LinearLayer::create(FMSA, FMSA_QOUT));  // 64→64
+        full_msa_row_Wk_.push_back(     LinearLayer::create(FMSA, FMSA_QOUT));
+        full_msa_row_Wv_.push_back(     LinearLayer::create(FMSA, FMSA_QOUT));
+        full_msa_row_to_b_.push_back(   LinearLayer::create(D_PAIR, N_HEAD));   // 128→8
+        full_msa_row_to_g_.push_back(   LinearLayer::create(FMSA, FMSA_QOUT));  // 64→64
+        full_msa_row_to_out_.push_back( LinearLayer::create(FMSA_QOUT, FMSA));   // 64→64
+    };
+    auto push_full_msa_ff = [&]() {
+        full_msa_ff_norm_.push_back(   LayerNorm::create(FMSA));                              // 64
+        full_msa_ff_linear1_.push_back(LinearLayer::create(FMSA, FMSA * 4));                  // 64→256
+        full_msa_ff_linear2_.push_back(LinearLayer::create(FMSA * 4, FMSA));                  // 256→64
+    };
+    auto push_full_global_col = [&]() {
+        full_msa_global_col_Wq_.push_back(   LinearLayer::create(FMSA, FMSA_QOUT));  // 64→64 single-head
+        full_msa_global_col_Wk_.push_back(   LinearLayer::create(FMSA, FMSA_QOUT));
+        full_msa_global_col_Wv_.push_back(   LinearLayer::create(FMSA, FMSA_QOUT));
+        full_msa_global_col_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));   // 128→8
+        full_msa_global_col_to_g_.push_back( LinearLayer::create(FMSA, FMSA_QOUT));  // 64→64
+        full_msa_global_col_to_out_.push_back(LinearLayer::create(FMSA_QOUT, FMSA)); // 64→64
+    };
+    auto push_full_msa2pair = [&]() {
+        full_msa2pair_norm_.push_back(      LayerNorm::create(FMSA));                    // 64
+        full_msa2pair_left_proj_.push_back( LinearLayer::create(FMSA, MSA2PAIR_HIDDEN)); // 64→16
+        full_msa2pair_right_proj_.push_back(LinearLayer::create(FMSA, MSA2PAIR_HIDDEN)); // 64→16
+        full_msa2pair_out_proj_.push_back(  LinearLayer::create(MSA2PAIR_HIDDEN * MSA2PAIR_HIDDEN, D_PAIR)); // 256→128
+    };
     auto push_tri = [&](std::vector<LayerNorm*>& ln1, std::vector<LayerNorm*>& ln2,
                          std::vector<LinearLayer*>& l1, std::vector<LinearLayer*>& r1,
                          std::vector<LinearLayer*>& lg, std::vector<LinearLayer*>& rg,
@@ -1687,6 +1725,14 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         msa_global_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));
     }
 
+    // ===== FullBlock(extra) 专属 64 维 MSA 注意力参数（N_EXTRA_BLOCKS 份）=====
+    for (int i = 0; i < N_EXTRA_BLOCKS; ++i) {
+        push_full_msa_row();
+        push_full_msa_ff();
+        push_full_global_col();
+        push_full_msa2pair();
+    }
+
     // ===== PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer) =====
     // 必须先于下方 block 构造循环分配 (1575/1649 处按 idx 访问 pos_enc_emb_res_[idx])
     for (int i = 0; i < N_ITER; ++i) {
@@ -1706,10 +1752,11 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         block->state2msa_norm_       = iter_state2msa_norm_[idx];
         block->state2msa_linear_     = iter_state2msa_linear_[idx];
         block->pair2msa_norm_        = iter_pair2msa_norm_[idx];
-        block->msa2pair_norm_        = iter_msa2pair_norm_[idx];
-        block->msa2pair_left_proj_   = iter_msa2pair_left_proj_[idx];
-        block->msa2pair_right_proj_  = iter_msa2pair_right_proj_[idx];
-        block->msa2pair_out_proj_    = iter_msa2pair_out_proj_[idx];
+        // FullBlock 处理 msa_full[64,...]，msa2pair 用 64 维专属权重
+        block->msa2pair_norm_        = full_msa2pair_norm_[idx];
+        block->msa2pair_left_proj_   = full_msa2pair_left_proj_[idx];
+        block->msa2pair_right_proj_  = full_msa2pair_right_proj_[idx];
+        block->msa2pair_out_proj_    = full_msa2pair_out_proj_[idx];
         block->pair2pair_rbf_proj_   = iter_pair2pair_rbf_proj_[idx];
         block->pair2pair_state_norm_ = iter_pair2pair_state_norm_[idx];
         block->pair2pair_left_proj_  = iter_pair2pair_left_proj_[idx];
@@ -1717,16 +1764,16 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         block->pair2pair_gate_proj_  = iter_pair2pair_gate_proj_[idx];
 
         // 创建并注入子模块 (layernorm 在 IterBlock::forward 外部完成)
+        // 注意：FullBlock 处理 msa_full[64,...]，其 row attention / ff 用 D_MSA_FULL=64 专属权重
         auto msa_row = std::make_unique<MSARowAttention>();
         msa_row->set_params(msa_ac,
-            msa_row_to_b_[idx], msa_row_to_g_[idx], msa_row_to_out_[idx],
-            msa_row_Wq_[idx], msa_row_Wk_[idx], msa_row_Wv_[idx]);
-        auto msa_col = std::make_unique<MSAColAttention>();
-        msa_col->set_params(msa_ac,
-            msa_col_to_b_[idx], msa_col_to_g_[idx], msa_col_to_out_[idx],
-            msa_col_Wq_[idx], msa_col_Wk_[idx], msa_col_Wv_[idx]);
+            full_msa_row_to_b_[idx], full_msa_row_to_g_[idx], full_msa_row_to_out_[idx],
+            full_msa_row_Wq_[idx], full_msa_row_Wk_[idx], full_msa_row_Wv_[idx]);
+        // FullBlock 不用 msa_col（用 global col attention），注入 nullptr 即可
+        std::unique_ptr<MSAColAttention> msa_col;
         auto msa_ff = std::make_unique<FeedForward>();
-        msa_ff->set_params(D_MSA, D_MSA * 4, 0.1f, msa_ff_norm_[idx], msa_ff_linear1_[idx], msa_ff_linear2_[idx]);
+        msa_ff->set_params(D_MSA_FULL, D_MSA_FULL * 4, 0.1f,
+            full_msa_ff_norm_[idx], full_msa_ff_linear1_[idx], full_msa_ff_linear2_[idx]);
         auto pair_row = std::make_unique<PairRowAttention>();
         pair_row->set_params(pair_ac,
             pair_row_to_b_[idx], pair_row_to_g_[idx], pair_row_to_out_[idx],
@@ -1759,11 +1806,11 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         pos_enc->set_params(-32, 32, 8, config.d_pair, pos_enc_emb_res_[idx], pos_enc_emb_atom_[idx]);
         block->set_pos_enc(std::move(pos_enc));
 
-        // GlobalColAttention (FullBlock only)
+        // GlobalColAttention (FullBlock only) — 处理 msa_full[64,...]，用 D_MSA_FULL=64 专属权重
         auto gcol = std::make_unique<MSAGlobalColAttention>();
         gcol->set_params(msa_ac,
-            msa_global_col_to_b_[i], msa_global_col_to_g_[i], msa_global_col_to_out_[i],
-            msa_global_col_Wq_[i], msa_global_col_Wk_[i], msa_global_col_Wv_[i]);
+            full_msa_global_col_to_b_[i], full_msa_global_col_to_g_[i], full_msa_global_col_to_out_[i],
+            full_msa_global_col_Wq_[i], full_msa_global_col_Wk_[i], full_msa_global_col_Wv_[i]);
         block->set_global_col_attn(std::move(gcol));
 
         extra_blocks_.push_back(std::move(block));
@@ -1780,6 +1827,7 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         block->state2msa_norm_       = iter_state2msa_norm_[idx];
         block->state2msa_linear_     = iter_state2msa_linear_[idx];
         block->pair2msa_norm_        = iter_pair2msa_norm_[idx];
+        // main_blocks(IterBlock) 处理 256 维 msa，msa2pair 用 256 维权重
         block->msa2pair_norm_        = iter_msa2pair_norm_[idx];
         block->msa2pair_left_proj_   = iter_msa2pair_left_proj_[idx];
         block->msa2pair_right_proj_  = iter_msa2pair_right_proj_[idx];
@@ -1791,6 +1839,7 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         block->pair2pair_gate_proj_  = iter_pair2pair_gate_proj_[idx];
 
         // 创建并注入子模块 (layernorm 在 IterBlock::forward 外部完成)
+        // main_blocks(IterBlock) 处理 256 维 msa，用 D_MSA=256 权重
         auto msa_row = std::make_unique<MSARowAttention>();
         msa_row->set_params(msa_ac,
             msa_row_to_b_[idx], msa_row_to_g_[idx], msa_row_to_out_[idx],
@@ -1881,9 +1930,20 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
                                     pair_init_pos_enc_emb_res_, pair_init_pos_enc_emb_atom_);
     emb_t1d_              = LinearLayer::create(D_T1D + D_TOR, 64);                  // 110 → 64
     proj_t1d_             = LinearLayer::create(64, 64);                             // 64 → 64
-    emb_t1d_t2d_          = LinearLayer::create(D_T1D * 2 + D_T2D, 64);             // 224 → 64
+    emb_t1d_t2d_          = LinearLayer::create(D_T1D * 2 + D_T2D, D_PAIR);         // 228 → 128（模板 pair=D_PAIR）
     temp_stack_t1d_proj_  = LinearLayer::create(D_T1D, D_STATE);                    // 80 → 32
-    temp_stack_norm_      = LayerNorm::create(64);                                   // 64
+    temp_stack_norm_      = LayerNorm::create(D_PAIR);                               // 128
+    // Template state cross-attention 投影 (CrossAttention 外部注入, 无 bias):
+    //   proj_dim = n_head * head_dim = 8 * ceil(max(32,64)/8)=8 → 64
+    templ_attn_Wq_        = LinearLayer::create(D_STATE, 64, false);                // 32 → 64
+    templ_attn_Wk_        = LinearLayer::create(64, 64, false);                     // 64 → 64
+    templ_attn_Wv_        = LinearLayer::create(64, 64, false);                     // 64 → 64
+    templ_attn_Wo_        = LinearLayer::create(64, D_STATE, false);                // 64 → 32
+    // Template pair→pair cross-attention (CrossAttention(D_PAIR,D_PAIR,8)): proj_dim=128
+    templ_pair_attn_Wq_   = LinearLayer::create(D_PAIR, 128, false);                // 128 → 128
+    templ_pair_attn_Wk_   = LinearLayer::create(D_PAIR, 128, false);                // 128 → 128
+    templ_pair_attn_Wv_   = LinearLayer::create(D_PAIR, 128, false);                // 128 → 128
+    templ_pair_attn_Wo_   = LinearLayer::create(128, D_PAIR, false);                // 128 → 128
 
     // ===== 输出头参数 (全局单份) =====
     // Masked MSA head: LayerNorm(D_MSA) → Linear(D_MSA→D_MSA) → ReLU → Linear(D_MSA→23)
@@ -1913,7 +1973,7 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
     tps_state_norm_ = LayerNorm::create(D_STATE);                                     // 32
     tps_left_proj_  = LinearLayer::create(D_STATE, 16);                               // 32 → 16
     tps_right_proj_ = LinearLayer::create(D_STATE, 16);                               // 32 → 16
-    tps_gate_proj_  = LinearLayer::create(16 * 16, D_PAIR);                           // 256 → 128
+    tps_gate_proj_  = LinearLayer::create(16 * 16, D_RBF);                            // 256 → 64（gate 用于逐元素更新 rbf_feature，须与 D_RBF 同维）
     // TriangleMultiplication out
     tps_tri_out_layernorm_        = LayerNorm::create(D_PAIR);                        // 128
     tps_tri_out_left_proj_        = LinearLayer::create(D_PAIR, 128);
@@ -2272,7 +2332,7 @@ ModelOutput PPMLModel::forward(const ModelInput& input) {
 //   - PositionalEncoding::forward_graph 当前为占位（返回零图节点），pair 初始化不含位置编码；
 //   - SE3 3D track 需"图外值回落"驱动（graph_compute(pair) → run_se3_structural），本入口
 //     暂未驱动 SE3（block 的 forward_graph 在无结构输入时只跑 msa/pair 两条 track）。
-GraphOutput PPMLModel::forward_graph(const ModelInput& input) {
+GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3) {
     GraphOutput go;
 
     const int B = input.msa_latent.shape().dims[0];
@@ -2327,6 +2387,83 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input) {
     }
     TensorF32* rbf = constant_tensor({D_RBF, L, L, B}, rbf_val.data());   // [D_RBF,L,L,B]
 
+    // ==== 3.5 模板特征接入 (t1d/t2d/tor_feat) — 值张量包装成图 leaf，全程图节点 ====
+    // 仅在输入含模板特征时注入。两分支，遵循 4D 图布局 (dims[0]=最内维)。
+    //   state 分支: 用全部 T 模板（T 维作 cross-attn key）
+    //   pair 分支: 用 t=0 单模板（值版 PairTrack::inject_template 为 T=1 语义；图基础设施 4D 上限
+    //              无法在不新增 5D 归约下遍历多模板，故取首模板）。
+    //   TODO(T>1): 完整 pair cross-attn 需把全部 T 模板作 key。当前图 op 缺沿 dims[3] 的归约
+    //              (sum/mean 只支持全归约, sum_rows 只沿 dims[1]) 与 5D permute，故暂用 t=0。
+    //              后续可：① 新增沿任意维的 reduce op；② 或把 templ_pair [64,L,L,T] 经 permute
+    //              重排为 [64,1,1,L*L*T] 作为多模板 kv（T 折叠进 key 长度），query 仍为 B*L*L。
+    //              需同步在值版 PairTrack::inject_template 保持语义一致。
+    // 模板分支仅当 t1d 为合法 4D 模板特征 (B,T,L,80) 时进入。不能只判 numel()>0：
+    // load_from_files 在无模板时可能给 t1d 留 1 元素占位（非空 4D），直接访问 dims[1] 会越界。
+    const bool has_tmpl = (input.t1d.shape().ndim() == 4
+                           && input.t1d.shape().dims[1] > 0
+                           && input.t1d.numel() > 0);
+    if (has_tmpl) {
+        // ---- (a) 输入包装: 值张量 → 图 leaf ----
+        // state 与 pair 分支统一用 t=0 单模板（CrossAttention 单 key 设计）。
+        // 值 (B,L,80)/(B,L,L,68)/(B,L,30) → 图 [80,L,B]/[68,L,L,B]/[30,L,B]
+        TensorF32 t1d_t0 = input.t1d.select(1, 0);                              // 值 (B,L,80)
+        TensorF32 t2d_t0 = input.t2d.select(1, 0);                              // 值 (B,L,L,68)
+        TensorF32* t1d_t0_g = wrap_input_as_leaf(t1d_t0, {D_T1D, L, B});        // [80,L,B]
+        TensorF32* t2d_t0_g = wrap_input_as_leaf(t2d_t0, {D_T2D, L, L, B});     // [68,L,L,B]
+
+        // ---- (b) state 分支: template cross-attention (state 为 Q, 模板为 K/V) ----
+        // 注: CrossAttention::forward_graph 为单 key (T=1) 设计（merge 时 view 掉 T 维），
+        //     故 state 分支也用 t=0 单模板，与 pair 分支一致。多模板 (T>1) 需先扩展
+        //     CrossAttention 支持 T 维（见 README TODO），当前取首模板。
+        // concat(t1d_t0, tor_t0) 沿最内维 → [110,L,B]
+        TensorF32 tor_t0 = input.tor_feat.select(1, 0);                          // 值 (B,L,30)
+        TensorF32* tor_t0_g = wrap_input_as_leaf(tor_t0, {D_TOR, L, B});         // [30,L,B]
+        std::vector<TensorF32*> t1d_parts = {t1d_t0_g, tor_t0_g};
+        TensorF32* t1d_tor = concat_ptr(t1d_parts, 0);                           // [110,L,B]（沿 dims[0] 最内特征维）
+        TensorF32* t1d_emb = emb_t1d_->forward_graph(t1d_tor);                   // [64,L,B]
+        t1d_emb = relu(t1d_emb);
+        t1d_emb = proj_t1d_->forward_graph(t1d_emb);                             // [64,L,B]
+        // kv = 值 (B*L,1,64) = 图 [64,1,1,B*L]（T=1；view 合并 L*B 到 batch）
+        TensorF32* t1d_kv = view(t1d_emb, Shape{64, 1, 1, B * L});
+        // query = state 值 (B,L,32) → 值 (B*L,1,32) = 图 [32,1,1,B*L]
+        TensorF32* state_q = view(state, Shape{D_STATE, 1, 1, B * L});
+        // 用模型成员投影的 CrossAttention（持久化参数，供权重加载/优化）
+        CrossAttention templ_attn(D_STATE, 64, 8);
+        templ_attn.set_params(templ_attn_Wq_, templ_attn_Wk_, templ_attn_Wv_, templ_attn_Wo_);
+        TensorF32* templ_out = templ_attn.forward_graph(state_q, t1d_kv);       // [32,1,1,B*L]
+        TensorF32* templ_add = view(templ_out, Shape{D_STATE, L, B});            // [32,L,B]
+        state = add_impl(state, templ_add, /*inplace=*/false);                   // residual
+
+        // ---- (c) pair 分支: template pair stack (t=0 单模板, 4D) ----
+        // get_templ_emb 图化: t2d + repeat(left t1d) + repeat(right t1d) → [228,L,L,B]
+        TensorF32* t1d_left  = unsqueeze(t1d_t0_g, 1);                          // [80,1,L,B]
+        TensorF32* t1d_right = unsqueeze(t1d_t0_g, 2);                          // [80,L,1,B]
+        int64_t tpl_tgt[4] = {D_T1D, L, L, B};
+        TensorF32* t1d_l_exp = repeat(t1d_left,  context().new_tensor<float>(4, tpl_tgt));  // [80,L,L,B]
+        TensorF32* t1d_r_exp = repeat(t1d_right, context().new_tensor<float>(4, tpl_tgt));  // [80,L,L,B]
+        std::vector<TensorF32*> templ_parts = {t2d_t0_g, t1d_l_exp, t1d_r_exp};
+        TensorF32* templ_pair = concat_ptr(templ_parts, 0);                     // [228,L,L,B]（沿 dims[0] 最内特征维）
+        templ_pair = emb_t1d_t2d_->forward_graph(templ_pair);                   // [D_PAIR=128,L,L,B]
+        // state_proj: temp_stack_t1d_proj(t1d_t0) → [32,L,B]
+        TensorF32* state_proj = temp_stack_t1d_proj_->forward_graph(t1d_t0_g);  // [32,L,B]
+        // TemplatePairStack ×2（rbf 引用，内部 gate 更新；用局部副本指针避免污染主 rbf 常量）
+        TensorF32* rbf_tpl = rbf;                                                // [D_RBF,L,L,B]
+        for (int k = 0; k < 2; ++k)
+            templ_pair = tps_.forward_graph(templ_pair, rbf_tpl, state_proj);    // [D_PAIR=128,L,L,B]
+        templ_pair = temp_stack_norm_->forward(templ_pair);                      // [D_PAIR=128,L,L,B]
+        // 注入到 pair: pair 为 Q, templ_pair 为 K/V 的 cross-attention（模型成员投影）。
+        //   pair 值 (B,L,L,128) → 图 [128,1,1,B*L*L]（query）
+        //   templ_pair 值 (B,L,L,128) → 图 [128,1,1,B*L*L]（kv，T 归并到单模板）
+        TensorF32* pair_q = view(pair, Shape{D_PAIR, 1, 1, B * L * L});          // [128,1,1,B*L*L]
+        TensorF32* tpl_kv = view(templ_pair, Shape{D_PAIR, 1, 1, B * L * L});    // 值 (B*L*L,1,128)
+        CrossAttention templ_pair_attn(D_PAIR, D_PAIR, 8);
+        templ_pair_attn.set_params(templ_pair_attn_Wq_, templ_pair_attn_Wk_,
+                                   templ_pair_attn_Wv_, templ_pair_attn_Wo_);
+        TensorF32* pair_out = templ_pair_attn.forward_graph(pair_q, tpl_kv);    // [128,1,1,B*L*L]
+        TensorF32* pair_add = view(pair_out, Shape{D_PAIR, L, L, B});            // [128,L,L,B]
+        pair = add_impl(pair, pair_add, /*inplace=*/false);                      // 注入模板 pair
+    }
+
     // ==== 4. block 前向 (forward_graph) + SE3 3D track（图外值回落驱动）====
     ensure_backend_ready();
     PPMLContext* ctx = &context();
@@ -2334,20 +2471,27 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input) {
 
     // SE3 需结构常量：seq1hot（值 (B,L,21)）与链式 coords。
     // 有 coords 时驱动 SE3；无 coords 则纯 1D/2D track（与调用方约定一致）。
+    // has_struct: 是否有结构（coords 存在）。rbf 常量仍用 input.coords 计算（在 block 前）。
+    // run_se3: 是否真正驱动 SE3 3D track。enable_se3=false 时跳过（供模板注入验证等，
+    //   规避 SE3 训练驱动未完成的崩溃；rbf 距离特征不受影响）。
     const bool has_struct = (input.coords.numel() > 0);
+    const bool run_se3    = enable_se3 && has_struct;
     TensorF32 seq1hot = has_struct ? one_hot_seq(input.seq_tokens, 21)
                                    : TensorF32();                     // (B,L,21)
-    TensorF32 current_coords;
-    if (has_struct) current_coords.copy_from(input.coords);            // SE3 链式坐标
-    const TensorF32* coords_ptr  = has_struct ? &current_coords : nullptr;
-    const TensorI64* residx_ptr  = has_struct ? &input.residx  : nullptr;
-    const TensorF32* seq1hot_ptr = has_struct ? &seq1hot       : nullptr;
+    // SE3 链式坐标：operator= 被禁用，先按 input.coords 形状构造再 copy_from
+    TensorF32 current_coords = run_se3
+        ? TensorF32(input.coords.shape(), Device::CPU)
+        : TensorF32();
+    if (run_se3) current_coords.copy_from(input.coords);               // SE3 链式坐标
+    const TensorF32* coords_ptr  = run_se3 ? &current_coords : nullptr;
+    const TensorI64* residx_ptr  = run_se3 ? &input.residx  : nullptr;
+    const TensorF32* seq1hot_ptr = run_se3 ? &seq1hot       : nullptr;
 
     // 驱动单个 block 的 SE3（在每个 block 前向之后、下一个 block 之前）：
     //   1) 回落当前 pair 值；2) run_se3_structural 追加可微 SE3 图节点并回写 state；
     //   3) 回落 offset 值 → apply_coord_update → 链式更新 current_coords。
     auto drive_block_se3 = [&](IterBlock* blk, TensorF32*& msa_ref, TensorF32*& pair_ref) {
-        if (!has_struct) return;
+        if (!run_se3) return;
         TensorF32 pair_value;
         { ComputeGraph* cg = ComputeGraph::new_graph(ctx);
           compute_and_read(pair_ref, pair_value, cg, backend); }
@@ -2378,7 +2522,7 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input) {
     // apply_coord_update → 链式更新 current_coords。注意不能复用 drive_block_se3（其调用的
     // run_se3_structural 为 IterBlock 非 virtual 版本，会访问 RefineBlock 未注入的 IterBlock SE3 成员）。
     auto drive_refine_block_se3 = [&](RefineBlock* blk, TensorF32*& msa_ref, TensorF32*& pair_ref) {
-        if (!has_struct) return;
+        if (!run_se3) return;
         TensorF32 pair_value;
         { ComputeGraph* cg = ComputeGraph::new_graph(ctx);
           compute_and_read(pair_ref, pair_value, cg, backend); }
@@ -2435,7 +2579,16 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input) {
     go.phi        = dist_p;
 
     // SE3 更新后的坐标（未驱动 SE3 时即输入；图外量，非可微，供 FAPE/conf 沿用原值版方式）
-    go.coords.copy_from(has_struct ? current_coords : input.coords);
+    // SE3 更新后的坐标（未驱动 SE3 时即输入；图外量，非可微，供 FAPE/conf 沿用原值版方式）
+    // go.coords 默认空（numel=0），copy_from 要求 shape 匹配，故先按源形状重建。
+    {
+        const TensorF32& src = run_se3 ? current_coords : input.coords;
+        if (src.numel() > 0) {
+            go.coords.~TensorF32();
+            new (&go.coords) TensorF32(src.shape(), Device::CPU);
+            go.coords.copy_from(src);
+        }
+    }
 
     return go;
 }
@@ -2613,6 +2766,15 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
     collect_linear(emb_t1d_t2d_, "emb_t1d_t2d");
     collect_linear(temp_stack_t1d_proj_, "temp_stack_t1d_proj");
     collect_layernorm(temp_stack_norm_, "temp_stack_norm");
+    // Template state cross-attention 投影
+    collect_linear(templ_attn_Wq_, "templ.attn.Wq");
+    collect_linear(templ_attn_Wk_, "templ.attn.Wk");
+    collect_linear(templ_attn_Wv_, "templ.attn.Wv");
+    collect_linear(templ_attn_Wo_, "templ.attn.Wo");
+    collect_linear(templ_pair_attn_Wq_, "templ.pair_attn.Wq");
+    collect_linear(templ_pair_attn_Wk_, "templ.pair_attn.Wk");
+    collect_linear(templ_pair_attn_Wv_, "templ.pair_attn.Wv");
+    collect_linear(templ_pair_attn_Wo_, "templ.pair_attn.Wo");
 
     // ===== 输出头参数 =====
     collect_layernorm(msa_head_ln_, "msa_head.ln");
@@ -2680,19 +2842,24 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
 
     for (int i = 0; i < N_ITER; ++i) {
         const std::string& b = iter_block_name[i];
-        collect_linear(msa_row_Wq_[i], b + ".attention.msa_row.Wq");
-        collect_linear(msa_row_Wk_[i], b + ".attention.msa_row.Wk");
-        collect_linear(msa_row_Wv_[i], b + ".attention.msa_row.Wv");
-        collect_linear(msa_row_to_b_[i], b + ".attention.msa_row.to_b");
-        collect_linear(msa_row_to_g_[i], b + ".attention.msa_row.to_g");
-        collect_linear(msa_row_to_out_[i], b + ".attention.msa_row.to_out");
+        // 注意：extra blocks (i<4, FullBlock) 用 D_MSA_FULL=64 专属 MSA 行注意力/ff 权重
+        const bool is_full = (i < N_EXTRA_BLOCKS);
+        collect_linear(is_full ? full_msa_row_Wq_[i]     : msa_row_Wq_[i],     b + ".attention.msa_row.Wq");
+        collect_linear(is_full ? full_msa_row_Wk_[i]     : msa_row_Wk_[i],     b + ".attention.msa_row.Wk");
+        collect_linear(is_full ? full_msa_row_Wv_[i]     : msa_row_Wv_[i],     b + ".attention.msa_row.Wv");
+        collect_linear(is_full ? full_msa_row_to_b_[i]   : msa_row_to_b_[i],   b + ".attention.msa_row.to_b");
+        collect_linear(is_full ? full_msa_row_to_g_[i]   : msa_row_to_g_[i],   b + ".attention.msa_row.to_g");
+        collect_linear(is_full ? full_msa_row_to_out_[i] : msa_row_to_out_[i], b + ".attention.msa_row.to_out");
 
-        collect_linear(msa_col_Wq_[i], b + ".attention.msa_col.Wq");
-        collect_linear(msa_col_Wk_[i], b + ".attention.msa_col.Wk");
-        collect_linear(msa_col_Wv_[i], b + ".attention.msa_col.Wv");
-        collect_linear(msa_col_to_b_[i], b + ".attention.msa_col.to_b");
-        collect_linear(msa_col_to_g_[i], b + ".attention.msa_col.to_g");
-        collect_linear(msa_col_to_out_[i], b + ".attention.msa_col.to_out");
+        // 仅 main blocks (i>=4, IterBlock) 用 msa_col（FullBlock 用 global col attention）
+        if (!is_full) {
+            collect_linear(msa_col_Wq_[i], b + ".attention.msa_col.Wq");
+            collect_linear(msa_col_Wk_[i], b + ".attention.msa_col.Wk");
+            collect_linear(msa_col_Wv_[i], b + ".attention.msa_col.Wv");
+            collect_linear(msa_col_to_b_[i], b + ".attention.msa_col.to_b");
+            collect_linear(msa_col_to_g_[i], b + ".attention.msa_col.to_g");
+            collect_linear(msa_col_to_out_[i], b + ".attention.msa_col.to_out");
+        }
 
         collect_linear(pair_row_Wq_[i], b + ".attention.pair_row.Wq");
         collect_linear(pair_row_Wk_[i], b + ".attention.pair_row.Wk");
@@ -2708,9 +2875,9 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
         collect_linear(pair_col_to_g_[i], b + ".attention.pair_col.to_g");
         collect_linear(pair_col_to_out_[i], b + ".attention.pair_col.to_out");
 
-        collect_layernorm(msa_ff_norm_[i], b + ".msa_ff.norm");
-        collect_linear(msa_ff_linear1_[i], b + ".msa_ff.linear1");
-        collect_linear(msa_ff_linear2_[i], b + ".msa_ff.linear2");
+        collect_layernorm(is_full ? full_msa_ff_norm_[i]     : msa_ff_norm_[i],     b + ".msa_ff.norm");
+        collect_linear(   is_full ? full_msa_ff_linear1_[i]  : msa_ff_linear1_[i],  b + ".msa_ff.linear1");
+        collect_linear(   is_full ? full_msa_ff_linear2_[i]  : msa_ff_linear2_[i],  b + ".msa_ff.linear2");
 
         collect_layernorm(pair_ff_norm_[i], b + ".pair_ff.norm");
         collect_linear(pair_ff_linear1_[i], b + ".pair_ff.linear1");
@@ -2748,10 +2915,10 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
         collect_layernorm(iter_state2msa_norm_[i], b + ".state2msa_norm");
         collect_linear(iter_state2msa_linear_[i], b + ".state2msa_linear");
         collect_layernorm(iter_pair2msa_norm_[i], b + ".pair2msa_norm");
-        collect_layernorm(iter_msa2pair_norm_[i], b + ".msa2pair_norm");
-        collect_linear(iter_msa2pair_left_proj_[i], b + ".msa2pair_left_proj");
-        collect_linear(iter_msa2pair_right_proj_[i], b + ".msa2pair_right_proj");
-        collect_linear(iter_msa2pair_out_proj_[i], b + ".msa2pair_out_proj");
+        collect_layernorm(is_full ? full_msa2pair_norm_[i]      : iter_msa2pair_norm_[i],      b + ".msa2pair_norm");
+        collect_linear(   is_full ? full_msa2pair_left_proj_[i] : iter_msa2pair_left_proj_[i], b + ".msa2pair_left_proj");
+        collect_linear(   is_full ? full_msa2pair_right_proj_[i]: iter_msa2pair_right_proj_[i], b + ".msa2pair_right_proj");
+        collect_linear(   is_full ? full_msa2pair_out_proj_[i]  : iter_msa2pair_out_proj_[i],  b + ".msa2pair_out_proj");
         collect_linear(iter_pair2pair_rbf_proj_[i], b + ".pair2pair_rbf_proj");
         collect_layernorm(iter_pair2pair_state_norm_[i], b + ".pair2pair_state_norm");
         collect_linear(iter_pair2pair_left_proj_[i], b + ".pair2pair_left_proj");
@@ -2759,15 +2926,15 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
         collect_linear(iter_pair2pair_gate_proj_[i], b + ".pair2pair_gate_proj");
     }
 
-    // MSAGlobalColAttention 参数 (FullBlock only, N_GLOB=4)
+    // MSAGlobalColAttention 参数 (FullBlock only, N_GLOB=4) — D_MSA_FULL=64 维
     for (int i = 0; i < N_GLOB; ++i) {
         const std::string& b = iter_block_name[i];  // extra.{0..3}
-        collect_linear(msa_global_col_Wq_[i], b + ".attention.global_col.Wq");
-        collect_linear(msa_global_col_Wk_[i], b + ".attention.global_col.Wk");
-        collect_linear(msa_global_col_Wv_[i], b + ".attention.global_col.Wv");
-        collect_linear(msa_global_col_to_b_[i], b + ".attention.global_col.to_b");
-        collect_linear(msa_global_col_to_g_[i], b + ".attention.global_col.to_g");
-        collect_linear(msa_global_col_to_out_[i], b + ".attention.global_col.to_out");
+        collect_linear(full_msa_global_col_Wq_[i], b + ".attention.global_col.Wq");
+        collect_linear(full_msa_global_col_Wk_[i], b + ".attention.global_col.Wk");
+        collect_linear(full_msa_global_col_Wv_[i], b + ".attention.global_col.Wv");
+        collect_linear(full_msa_global_col_to_b_[i], b + ".attention.global_col.to_b");
+        collect_linear(full_msa_global_col_to_g_[i], b + ".attention.global_col.to_g");
+        collect_linear(full_msa_global_col_to_out_[i], b + ".attention.global_col.to_out");
     }
 
     // PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer, 12 组)

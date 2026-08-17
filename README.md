@@ -141,6 +141,7 @@ make -j$(nproc)
 - Move modules into models
 - Homo-oligomer support
 - residx 目前是理想化连续索引 0..L-1，未用 CSV/PDB 的真实 ResNum；单链连续场景够用，但多链/缺残基(gap)/非标准编号时会丢失真实序列间隔信息（gap 应拉开但当前视为相邻）。CSV 已有 PDB_ResNum 列，尚未用于构建 residx。
+- **模板 pair 注入 T>1（待实现）**：`PPMLModel::forward_graph` 的模板注入中，state 分支已用全部 T 模板作 cross-attn key；但 pair 分支当前**仅用 t=0 单模板**（值版 `PairTrack::inject_template` 亦是 T=1 语义）。原因：图基础设施 4D 上限（`kernel_concat`/`kernel_permute` 只支持 ≤4D），且缺沿 dims[3] 的归约 op（`sum`/`mean` 只做全归约，`sum_rows` 只沿 dims[1]）。完整方案：① 新增沿任意维的 reduce op；或 ② 把 templ_pair `[64,L,L,T]` 经 permute 重排为 `[64,1,1,L*L*T]` 作为多模板 kv（T 折叠进 key 长度），query 仍为 B*L*L。需同步值版语义。
 
 ### Torsion Indices Reference
 - Negative index indicates the previous residue

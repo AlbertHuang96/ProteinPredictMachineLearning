@@ -278,6 +278,9 @@ public:
         src.fill(nullptr);  // 显式清空 src，避免残留脏指针
     }
 
+    // 重新绑定数据指针（no_alloc 空壳 → 构建期暂存区 / 后续 Gallocr backend buffer）
+    void bind_data(void* p) { data_ = static_cast<T*>(p); }
+
     //tensor flag
     int32_t flag;
 

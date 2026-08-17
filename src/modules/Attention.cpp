@@ -157,7 +157,8 @@ TensorF32* MSARowAttention::forward_graph(TensorF32* msa, TensorF32* pair_biased
     int N = static_cast<int>(Q->shape().dims[2]);   // N_seq
     int L = static_cast<int>(Q->shape().dims[1]);   // L (残基)
     int H = config_.n_head;                          // 8
-    int D = D_MSA;                                   // 256
+    // D = 每头隐藏维 = Q 特征维(H*D)/H。main 块 D=D_MSA=256；full 块(msa_full 64维) D=D_MSA_FULL/H=8。
+    int D = (int)Q->shape().dims[0] / H;
 
     // Split heads:
     // 值: (B,N,L,H*D) → view({B*N,L,H,D}) → (B*N,L,H,D) → permute({0,2,3,1}) → (B*N,H,D,L)
@@ -189,7 +190,7 @@ TensorF32* MSARowAttention::forward_graph(TensorF32* msa, TensorF32* pair_biased
     merged = view(merged, Shape{H * D, L, N, B});   // [H*D,L,N,B] = 值 (B,N,L,H*D)
 
     // 门控: gate 与 merged 同为 [H*D,L,N,B]
-    auto* gated = out_prod(gate, merged);
+    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
     // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
     return to_out_->forward_graph(gated);
 }
@@ -281,7 +282,7 @@ TensorF32* MSAColAttention::forward_graph(TensorF32* msa) {
     merged = permute(merged, {0, 2, 1, 3});          // [H*D,L,N,B] = 值 (B,N,L,H*D)
 
     // 门控: gate 与 merged 同为 [H*D,L,N,B]
-    auto* gated = out_prod(gate, merged);
+    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
     // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
     return to_out_->forward_graph(gated);
 }
@@ -369,7 +370,8 @@ TensorF32* MSAGlobalColAttention::forward_graph(TensorF32* msa) {
     int N = static_cast<int>(Q->shape().dims[2]);   // N_seq
     int L = static_cast<int>(Q->shape().dims[1]);   // L (残基)
     int H = config_.n_head;                          // 8
-    int D = D_MSA;                                   // 256
+    // D = 每头隐藏维 = Q 特征维(H*D)/H。main 块 D=256；full 块(msa_full 64维) D=8。
+    int D = (int)Q->shape().dims[0] / H;
 
     // ===== 1. Q mean over N_seq (值 dim1) =====
     // 值: (B,N,L,H*D) → mean(dim=1) → (B,L,H*D)
@@ -416,7 +418,7 @@ TensorF32* MSAGlobalColAttention::forward_graph(TensorF32* msa) {
 
     // ===== 7. 门控 + 输出投影 =====
     // gate 与 merged 同为 [H*D,L,N,B]
-    auto* gated = out_prod(gate, merged);
+    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
     // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
     return to_out_->forward_graph(gated);
 }
@@ -515,7 +517,7 @@ TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     merged = permute(merged, {0, 2, 1, 3});          // [H*D,Lc,Lr,B] = 值 (B,Lr,Lc,H*D)
 
     // 门控: gate 与 merged 同为 [H*D,Lc,Lr,B]
-    auto* gated = out_prod(gate, merged);
+    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
     // 输出投影: H*D → D_PAIR, 返回 [D_PAIR,Lc,Lr,B] = 值 (B,Lr,Lc,D_PAIR)
     return to_out_->forward_graph(gated);
 }
@@ -611,7 +613,7 @@ TensorF32* PairColAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     merged = view(merged, Shape{H * D, Lc, Lr, B}); // [H*D,Lc,Lr,B] = 值 (B,Lr,Lc,H*D)
 
     // 门控: gate 与 merged 同为 [H*D,Lc,Lr,B]
-    auto* gated = out_prod(gate, merged);
+    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
     // 输出投影: H*D → D_PAIR, 返回 [D_PAIR,Lc,Lr,B] = 值 (B,Lr,Lc,D_PAIR)
     return to_out_->forward_graph(gated);
 }
@@ -624,11 +626,31 @@ CrossAttention::CrossAttention(int q_dim, int kv_dim, int n_head)
     head_dim_ = (min_proj + n_head - 1) / n_head;  // ceil(64/8) = 8
     proj_dim_ = n_head * head_dim_;                // 8 * 8 = 64
 
-    // 创建投影层
-    Wq_ = std::unique_ptr<LinearLayer>(LinearLayer::create(q_dim_, proj_dim_, false));
-    Wk_ = std::unique_ptr<LinearLayer>(LinearLayer::create(kv_dim_, proj_dim_, false));
-    Wv_ = std::unique_ptr<LinearLayer>(LinearLayer::create(kv_dim_, proj_dim_, false));
-    Wo_ = std::unique_ptr<LinearLayer>(LinearLayer::create(proj_dim_, q_dim_, false));
+    // 创建投影层 (无 bias, 与 set_params 注入的外部层同构)
+    Wq_ = LinearLayer::create(q_dim_, proj_dim_, false);
+    Wk_ = LinearLayer::create(kv_dim_, proj_dim_, false);
+    Wv_ = LinearLayer::create(kv_dim_, proj_dim_, false);
+    Wo_ = LinearLayer::create(proj_dim_, q_dim_, false);
+}
+
+void CrossAttention::set_params(LinearLayer* Wq, LinearLayer* Wk, LinearLayer* Wv, LinearLayer* Wo) {
+    if (owns_params_) {
+        delete Wq_;
+        delete Wk_;
+        delete Wv_;
+        delete Wo_;
+    }
+    Wq_ = Wq; Wk_ = Wk; Wv_ = Wv; Wo_ = Wo;
+    owns_params_ = false;
+}
+
+CrossAttention::~CrossAttention() {
+    if (owns_params_) {
+        delete Wq_;
+        delete Wk_;
+        delete Wv_;
+        delete Wo_;
+    }
 }
 
 TensorF32 CrossAttention::forward(const TensorF32& query, const TensorF32& kv) {
@@ -913,6 +935,45 @@ TensorF32 TemplatePairStack::forward(const TensorF32& pair, TensorF32& rbf_featu
     TensorF32 result;
     result.copy_from(*pair_final);
     return result;
+}
+
+// ===== TemplatePairStack::forward_graph (图模式) =====
+// 与值版 forward 逻辑一致，输入输出均为图节点指针（ggml 布局 dims[0]=最内维）。
+// rbf_feature 以引用传递并在内部 gate 后更新，供多次迭代（值版 tps_.forward 用引用回写）。
+TensorF32* TemplatePairStack::forward_graph(TensorF32* pair, TensorF32*& rbf_feature, TensorF32* state) {
+    // rbf_proj = rbf_proj_(rbf_feature)  [128,L,L,B*T]（用 gate 前的 rbf_feature）
+    TensorF32* rbf_proj = rbf_proj_->forward_graph(rbf_feature);
+
+    // gate = sigmoid(gate_proj(outer_product(state_normed)))
+    TensorF32* state_normed = state_norm_->forward(state);          // [D_STATE,L,B*T]
+    TensorF32* left  = left_proj_->forward_graph(state_normed);     // [16,L,B*T]
+    TensorF32* right = right_proj_->forward_graph(state_normed);    // [16,L,B*T]
+    TensorF32* gate  = outer_product_graph(left, right);            // [256,L,L,B*T]
+    gate = gate_proj_->forward_graph(gate);                          // [128,L,L,B*T]
+    gate = sigmoid(gate);                                            // [0,1]
+    // 更新 rbf_feature（引用）: rbf_feature = rbf_feature * gate
+    rbf_feature = mul(rbf_feature, gate);
+
+    // 残差链: tri_mul_out → tri_mul_in → row_attn → col_attn → ff
+    TensorF32* pair_tmp = pair;
+    TensorF32* tri_out = tri_mul_out_->forward_graph(pair_tmp, /*bOutgoing=*/true);
+    TensorF32* tri_out_drop = drop_row_.forward_graph(tri_out);
+    pair_tmp = add_impl(pair_tmp, tri_out_drop, /*inplace=*/false);
+
+    TensorF32* tri_in = tri_mul_in_->forward_graph(pair_tmp, /*bOutgoing=*/false);
+    TensorF32* tri_in_drop = drop_row_.forward_graph(tri_in);
+    pair_tmp = add_impl(pair_tmp, tri_in_drop, /*inplace=*/false);
+
+    TensorF32* row_attn = pair_row_attn_->forward_graph(pair_tmp, rbf_proj);
+    TensorF32* row_drop = drop_row_.forward_graph(row_attn);
+    pair_tmp = add_impl(pair_tmp, row_drop, /*inplace=*/false);
+
+    TensorF32* col_attn = pair_col_attn_->forward_graph(pair_tmp, rbf_proj);
+    TensorF32* col_drop = drop_col_.forward_graph(col_attn);
+    pair_tmp = add_impl(pair_tmp, col_drop, /*inplace=*/false);
+
+    TensorF32* pair_ff_out = pair_ff_->forward_graph(pair_tmp);
+    return add_impl(pair_tmp, pair_ff_out, /*inplace=*/false);
 }
 
 } // namespace ppml

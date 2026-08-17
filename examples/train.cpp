@@ -31,11 +31,12 @@ TensorF32* wrap_value_as_leaf(const TensorF32& t, const std::vector<int64_t>& di
     // 数据按扁平顺序拷入. Tensor 是 move-only (禁拷贝), 故:
     //   - CUDA 上: 用 t.cpu() 生成新的 CPU 张量 (可移动) 再取 data
     //   - CPU 上:  直接取 t.data() 拷入
+    float* dst = bind_leaf_data(context(), leaf);
     if (t.device() == Device::CUDA) {
         TensorF32 tcpu = t.cpu();  // 移动构造, 合法
-        std::memcpy(leaf->data(), tcpu.data(), tcpu.numel() * sizeof(float));
+        std::memcpy(dst, tcpu.data(), tcpu.numel() * sizeof(float));
     } else {
-        std::memcpy(leaf->data(), t.data(), t.numel() * sizeof(float));
+        std::memcpy(dst, t.data(), t.numel() * sizeof(float));
     }
     return leaf;
 }
@@ -329,7 +330,9 @@ int main(int argc, char* argv[]) {
         
         // 前向传播（图模式：返回可微图节点，供 loss 组装计算图）
         auto fwd_start = std::chrono::high_resolution_clock::now();
-        auto go = model.forward_graph(input);
+        // enable_se3=false：暂时禁用 SE3 3D track（run_se3_structural 为既有未完成崩溃），
+        // 用于验证小样本 L=51 的内存/训练流程；待 SE3 训练驱动完成后再恢复为默认 true。
+        auto go = model.forward_graph(input, /*enable_se3=*/false);
         auto fwd_end = std::chrono::high_resolution_clock::now();
         auto fwd_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fwd_end - fwd_start).count();
         

@@ -57,7 +57,9 @@ TensorF32 * add1_impl(
     //GGML_ASSERT(ggml_is_padded_1d(a));
 
     assert(b->is_scalar());
-    assert(a->is_contiguous());
+    // 注: 不要求 a 连续。图模式 a 为未 compute 的 op 节点（own_data_=false，
+    //     is_contiguous() 返回 false），但 dup/new_tensor 不访问 a 的 data，
+    //     OP_ADD1 在 graph_compute 时才读 src[0]。值模式 a 天然连续，同样安全。
  
     //struct Tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
     TensorF32 * result;
@@ -987,7 +989,7 @@ TensorF32* fape_loss(
 TensorF32* constant_scalar(float value) {
     int64_t ne[4] = {1, 1, 1, 1};
     TensorF32* t = context().new_tensor<float>(1, ne);
-    t->data()[0] = value;
+    bind_leaf_data(context(), t)[0] = value;
     return t;
 }
 
@@ -998,8 +1000,9 @@ TensorF32* constant_ones(const std::vector<int64_t>& dims) {
         ne[i] = dims[i];
     }
     TensorF32* t = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
+    float* d = bind_leaf_data(context(), t);
     for (int64_t i = 0; i < t->numel(); i++) {
-        t->data()[i] = 1.0f;
+        d[i] = 1.0f;
     }
     return t;
 }
@@ -1013,7 +1016,8 @@ TensorF32* constant_tensor(const std::vector<int64_t>& dims, const float* data) 
         ne[i] = dims[i];
     }
     TensorF32* t = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
-    std::memcpy(t->data(), data, static_cast<size_t>(t->numel()) * sizeof(float));
+    std::memcpy(bind_leaf_data(context(), t), data,
+                static_cast<size_t>(t->numel()) * sizeof(float));
     return t;
 }
 
@@ -1026,7 +1030,7 @@ TensorF32* build_frame_atom_indices(int B, int L) {
     int N_frames = B * L;
     int64_t ne[2] = {N_frames, 3};
     TensorF32* result = context().new_tensor<float>(2, ne);
-    float* data = result->data();
+    float* data = bind_leaf_data(context(), result);
 
     for (int b = 0; b < B; b++) {
         for (int l = 0; l < L; l++) {
@@ -1164,7 +1168,7 @@ static TensorF32* make_scalar(float value) {
     int64_t ne[4] = {1, 1, 1, 1};
     TensorF32* t = context().new_tensor<float>(1, ne);
     // 标量数据直接写入
-    t->data()[0] = value;
+    bind_leaf_data(context(), t)[0] = value;
     return t;
 }
 
@@ -1222,8 +1226,9 @@ TensorF32* one_hot_seq_graph(TensorF32* seq, int num_classes) {
     int64_t eye_dims[] = {num_classes, num_classes};
     TensorF32* eye = context().new_tensor<float>(2, eye_dims);
     eye->flag = 0;  // 常量，不可训练
+    // 先分配 leaf data 再填充（直接 eye->data() 对未 bind 的图节点返回 null）
     const int64_t nn = (int64_t)num_classes * num_classes;
-    float* ed = static_cast<float*>(eye->data());
+    float* ed = bind_leaf_data(context(), eye);
     for (int64_t i = 0; i < nn; i++) ed[i] = 0.0f;
     for (int c = 0; c < num_classes; c++) ed[c * num_classes + c] = 1.0f;
 

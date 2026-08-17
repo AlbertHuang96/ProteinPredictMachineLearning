@@ -20,7 +20,7 @@ namespace ppml {
         // 布局改为 (V, D) = (num_embeddings, embedding_dim)，每行是一个 token 的向量，
         // 以匹配 get_rows(W, idx) 的"按行取"语义（get_rows 沿 dim[0] 取行）
         int64_t dims[] = {num_embeddings, embedding_dim};  // (V, D)
-        layer->weights_ = context().new_tensor<float>(2, dims);
+        layer->weights_ = context().new_param_tensor<float>(2, dims);
         layer->weights_->flag = TENSOR_FLAG_PARAM;
 
         // Xavier init
@@ -96,12 +96,12 @@ namespace ppml {
 
         // ===== 从全局 context 分配权重 =====
         int64_t w_dims[] = {in_features, out_features};  // (in, out)
-        layer->weight_ = context().new_tensor<float>(2, w_dims);
+        layer->weight_ = context().new_param_tensor<float>(2, w_dims);
         layer->weight_->flag = TENSOR_FLAG_PARAM;  // ← 标记为可训练
 
         if (bias) {
             int64_t b_dims[] = {out_features};
-            layer->bias_ = context().new_tensor<float>(1, b_dims);
+            layer->bias_ = context().new_param_tensor<float>(1, b_dims);
             layer->bias_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_NO_WEIGHT_DECAY;  // ← 可训练但不做 weight decay
         }
 
@@ -197,8 +197,8 @@ namespace ppml {
         layer->eps_ = eps;
 
         int64_t dims[] = {normalized_shape};
-        layer->gamma_ = context().new_tensor<float>(1, dims);
-        layer->beta_  = context().new_tensor<float>(1, dims);
+        layer->gamma_ = context().new_param_tensor<float>(1, dims);
+        layer->beta_  = context().new_param_tensor<float>(1, dims);
         layer->gamma_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_NO_WEIGHT_DECAY;
         layer->beta_->flag  = TENSOR_FLAG_PARAM | TENSOR_FLAG_NO_WEIGHT_DECAY;
 
@@ -212,12 +212,15 @@ namespace ppml {
 
     TensorF32* LayerNorm::forward(TensorF32* x) {
         // y = norm(x) * gamma + beta
-        // rms_norm
-        // norm() = OP_NORM we use for layer norm
+        // 图张量 ggml 布局 dims[0]=特征维；norm() 沿 dims[0] 归一化。
+        // gamma/beta 为 [D]，需 view 成 [D,1,1] 再 repeat 到 x 的完整形状，
+        // 然后逐元素 mul/add（不能用 out_prod：那是外积，会产生错误形状）。
         TensorF32* normed = norm(x, eps_);  // or norm() for layernorm
-        //Tensor* scaled = mul_mat(normed, gamma_);
-        TensorF32* scaled = out_prod(normed, gamma_);
-        return add_impl(scaled, beta_, /*inplace=*/false);
+        int D = (int)normed->shape().dims[0];
+        TensorF32* gamma_v = view(gamma_, Shape({D, 1, 1}));
+        TensorF32* beta_v  = view(beta_,  Shape({D, 1, 1}));
+        TensorF32* scaled  = mul(normed, repeat(gamma_v, normed));
+        return add_impl(scaled, repeat(beta_v, scaled), /*inplace=*/false);
     }
     
     TensorF32 LayerNorm::forward_exec(const TensorF32& x) {

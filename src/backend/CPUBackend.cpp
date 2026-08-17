@@ -138,6 +138,28 @@ ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
 
 // ===== graph_compute (Backend 接口) =====
 Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
+    // ---- no_alloc 延迟分配：对 data_==nullptr 的中间节点分配 backend buffer ----
+    // 释放上一图分配的 buffer（上一图消费方已在上次 graph_compute 返回后读取完 data()）。
+    gallocr_.release();
+    bool need_alloc = false;
+    for (int i = 0; i < cgraph->n_nodes(); ++i) {
+        if (cgraph->graph_node(i)->data() == nullptr) { need_alloc = true; break; }
+    }
+    if (!need_alloc) {
+        for (int i = 0; i < cgraph->n_leafs(); ++i) {
+            if (cgraph->graph_leaf(i)->data() == nullptr) { need_alloc = true; break; }
+        }
+    }
+    if (need_alloc) {
+        gallocr_.set_n_backends(1);
+        gallocr_.backends()[0].buft = CPUBufferType::instance();
+        auto backend_id_of = [](TensorF32*) -> int { return 0; };
+        if (!gallocr_.reserve(cgraph, backend_id_of, 1) ||
+            !gallocr_.alloc(cgraph, backend_id_of, 1)) {
+            return Status::ALLOC_FAILED;
+        }
+    }
+
     ComputePlan plan = graph_plan(cgraph);
 
     // 确保工作缓冲区够大

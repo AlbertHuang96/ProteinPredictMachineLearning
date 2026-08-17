@@ -76,7 +76,10 @@ ComputeGraph * ComputeGraph::new_graph_custom(struct PPMLContext * ctx, size_t s
 }
  
 ComputeGraph * ComputeGraph::new_graph(struct PPMLContext * ctx) {
-    return new_graph_custom(ctx, 2048, false);
+    // 大模型全图（msa/pair/SE3 + forward/backward）在 L 较大时节点数可达数万，
+    // 2048 不够会导致 hash set 满、visit_parents_graph 越界崩溃。默认给足容量。
+    // grads=true：训练需 build_backward_expand（否则 this->grads 为 NULL，断言失败）。
+    return new_graph_custom(ctx, 200000, true);
 }
 
 ComputeGraph * ComputeGraph::graph_dup(struct PPMLContext * ctx, struct ComputeGraph * cgraph, bool force_grads) {
@@ -1031,6 +1034,7 @@ size_t ComputeGraph::graph_nbytes(size_t size, bool grads) {
     ComputeGraph::incr_ptr_aligned(&p, sizeof(ComputeGraph), 1);
     ComputeGraph::incr_ptr_aligned(&p, size * sizeof(TensorF32 *), sizeof(TensorF32 *)); // nodes
     ComputeGraph::incr_ptr_aligned(&p, size * sizeof(TensorF32 *), sizeof(TensorF32 *)); // leafs
+    ComputeGraph::incr_ptr_aligned(&p, hash_size_val * sizeof(int32_t), sizeof(int32_t)); // use_counts
     ComputeGraph::incr_ptr_aligned(&p, hash_size_val * sizeof(TensorF32 *), sizeof(TensorF32 *)); // hash keys
     if (grads) {
         ComputeGraph::incr_ptr_aligned(&p, hash_size_val * sizeof(TensorF32 *), sizeof(TensorF32 *)); // grads

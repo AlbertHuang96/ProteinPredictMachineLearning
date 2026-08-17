@@ -121,6 +121,8 @@ PPMLContext* PPMLContext::init(const CtxInitParams& params) {
 // ========== free() ==========
 void PPMLContext::free(PPMLContext* ctx) {
     if (!ctx) return;
+    // 释放 no_alloc 暂存区（leaf/常量宿主内存）
+    ctx->scratch_free();
     if (ctx->mem_buffer_owned && ctx->mem_buffer) {
         ::free(ctx->mem_buffer);
     }
@@ -143,6 +145,10 @@ PPMLObject* PPMLContext::new_object(enum PPMLObjectType type, size_t size) {
     }
 
     size_t size_aligned = (size + PPML_MEM_ALIGN - 1) / PPML_MEM_ALIGN * PPML_MEM_ALIGN;
+
+    // 对齐对象起始偏移，保证后续结构体/图按对齐访问。
+    // （no_alloc 下 tensor 只占小结构体，若不对齐会导致 ComputeGraph 布局断言失败）
+    cur_end = GGML_PAD(cur_end, PPML_MEM_ALIGN);
 
     if (cur_end + size_aligned + PPML_OBJECT_SIZE > mem_size) {
         // 内存不足
@@ -177,7 +183,9 @@ Tensor<T>* PPMLContext::new_tensor(int n_dims, const int64_t* ne) {
     for (int i = 0; i < n_dims; i++) data_size *= ne[i];
 
     // 2. 创建 object
-    size_t obj_alloc_size = data_size;  // tensor 结构体不占额外空间
+    // no_alloc=true：只在 context 缓冲区放置 tensor 结构体（数据由 Gallocr/暂存区另行分配），
+    //                避免把每个中间张量都 eager 分配进 context（造成 ~40GB 溢出）。
+    size_t obj_alloc_size = no_alloc ? 0 : data_size;
     PPMLObject* obj = new_object(PPML_OBJECT_TYPE_TENSOR,
                                   PPML_TENSOR_SIZE + obj_alloc_size);
     if (!obj) return nullptr;
@@ -185,7 +193,7 @@ Tensor<T>* PPMLContext::new_tensor(int n_dims, const int64_t* ne) {
     // 3. tensor 结构体位于 obj->offs 处
     Tensor<T>* result = (Tensor<T>*)((char*)mem_buffer + obj->offs);
 
-    // 4. 数据紧随结构体 (result + 1)
+    // 4. 数据紧随结构体 (result + 1)；no_alloc 时数据为空壳（nullptr）
     void* data_ptr = (obj_alloc_size > 0) ? (void*)(result + 1) : nullptr;
 
     // 5. placement new 初始化 Tensor
@@ -195,8 +203,43 @@ Tensor<T>* PPMLContext::new_tensor(int n_dims, const int64_t* ne) {
     return result;
 }
 
+// ========== new_param_tensor() ==========
+// 参数张量（weight/bias/gamma/beta）在 no_alloc 下也从宿主暂存区分配真实数据，
+// 以便构建期 init_weights / transfer_params_to_backend 直接读写。
+template<typename T>
+Tensor<T>* PPMLContext::new_param_tensor(int n_dims, const int64_t* ne) {
+    Tensor<T>* t = new_tensor<T>(n_dims, ne);
+    if (!t) return nullptr;
+    if (t->data() == nullptr && t->nbytes() > 0) {
+        void* p = scratch_alloc(t->nbytes());
+        if (!p) return nullptr;
+        t->bind_data(p);
+    }
+    return t;
+}
+
+// ========== no_alloc 宿主暂存区 ==========
+// 构建期需直接写入数据的 leaf/常量节点在此分配宿主内存（malloc），
+// 不占用 context 固定缓冲区，避免 1GB 溢出。生命周期由 context 管理，
+// 在 PPMLContext::free 中统一释放。
+void* PPMLContext::scratch_alloc(size_t bytes) {
+    if (bytes == 0) return nullptr;
+    void* p = ::malloc(bytes);
+    if (!p) return nullptr;
+    scratch_.push_back(p);
+    return p;
+}
+
+void PPMLContext::scratch_free() {
+    for (void* p : scratch_) {
+        ::free(p);
+    }
+    scratch_.clear();
+}
+
 // 显式实例化
 template Tensor<float>*  PPMLContext::new_tensor<float>(int, const int64_t*);
 template Tensor<int64_t>* PPMLContext::new_tensor<int64_t>(int, const int64_t*);
+template Tensor<float>*  PPMLContext::new_param_tensor<float>(int, const int64_t*);
 
 } // namespace ppml

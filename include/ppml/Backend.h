@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 #include "ComputeGraph.h"
 #include "Context.h"
+#include "Gallocr.h"
 
 static constexpr int SOFT_MAX_UNROLL = 32;  // SIMD unroll
 
@@ -501,6 +502,9 @@ private:
     // 持有 allocated buffer 的生命周期（避免 dangling pointer）
     std::vector<std::unique_ptr<Buffer>> reserved_buffers_;
 
+    // 延迟分配（no_alloc 空间复用）：替代 reserve_graph_memory 的全量常驻
+    Gallocr gallocr_;
+
     // 分裂结果
     int n_splits_ = 0;
     SplitInfo splits_[MAX_SPLITS];
@@ -629,6 +633,11 @@ private:
     ThreadPool * threadpool_ = nullptr;
     uint8_t    * work_data_  = nullptr;
     size_t       work_size_  = 0;
+
+    // no_alloc 延迟分配：对 data_==nullptr 的中间节点分配 backend buffer 并绑定。
+    // buffer 生命周期由本后端持有，跨 graph_compute 调用存活（消费方后续读 data() 有效），
+    // 在下次 graph_compute 分配新图前释放上一图 buffer。
+    Gallocr gallocr_;
 };
 
 // ==================== CUDABackend ====================
@@ -674,6 +683,9 @@ public:
 
 private:
     int device_id_ = 0;
+
+    // no_alloc 延迟分配（同 CPUBackend：对 data_==nullptr 中间节点分配并绑定）
+    Gallocr gallocr_;
 
     // CUDA dispatch
     static Status dispatch_node(TensorF32 * node, ComputeParams * p);
