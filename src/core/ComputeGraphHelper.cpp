@@ -985,39 +985,52 @@ TensorF32* fape_loss(
 // 9.5 FAPE 帧索引 + 常量图节点构造
 // ============================================================
 
-// constant_scalar(value) — 创建常量标量图节点
+// constant_scalar(value) — 创建常量标量图节点。
+// 数据存于 const_data_（data() 保持 nullptr），由 Gallocr 分配 backend buffer 后填充。
 TensorF32* constant_scalar(float value) {
     int64_t ne[4] = {1, 1, 1, 1};
     TensorF32* t = context().new_tensor<float>(1, ne);
-    bind_leaf_data(context(), t)[0] = value;
+    t->const_data_.assign(static_cast<size_t>(t->numel()), value);
+    t->flag |= TENSOR_FLAG_CONST;
     return t;
 }
 
-// constant_ones(dims) — 创建全 1 常量图节点
+// constant_ones(dims) — 创建全 1 常量图节点。
+// 数据存于 const_data_（data() 保持 nullptr），由 Gallocr 分配 backend buffer 后填充。
 TensorF32* constant_ones(const std::vector<int64_t>& dims) {
     int64_t ne[4] = {1, 1, 1, 1};
     for (size_t i = 0; i < dims.size() && i < 4; i++) {
         ne[i] = dims[i];
     }
     TensorF32* t = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
-    float* d = bind_leaf_data(context(), t);
-    for (int64_t i = 0; i < t->numel(); i++) {
-        d[i] = 1.0f;
-    }
+    t->const_data_.assign(static_cast<size_t>(t->numel()), 1.0f);
+    t->flag |= TENSOR_FLAG_CONST;
     return t;
 }
 
 // constant_tensor(dims, data) — 从已有数据创建常量叶子图节点（逐元素拷贝）。
 // 用于把不参与求导的预计算量（如 SE3 球谐基切片、edge_index 索引、相对坐标等）注入图。
 // data 元素个数须 == dims 的乘积。
+// 数据存于 const_data_（data() 保持 nullptr），由 Gallocr 分配 backend buffer 后填充。
 TensorF32* constant_tensor(const std::vector<int64_t>& dims, const float* data) {
     int64_t ne[4] = {1, 1, 1, 1};
     for (size_t i = 0; i < dims.size() && i < 4; i++) {
         ne[i] = dims[i];
     }
     TensorF32* t = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
-    std::memcpy(bind_leaf_data(context(), t), data,
-                static_cast<size_t>(t->numel()) * sizeof(float));
+    size_t n = static_cast<size_t>(t->numel());
+    t->const_data_.resize(n);
+    if (n > 0) std::memcpy(t->const_data_.data(), data, n * sizeof(float));
+    t->flag |= TENSOR_FLAG_CONST;
+    return t;
+}
+
+// constant_tensor_dynamic(dims, data) — 动态一次性常量（如 dropout 随机掩码）。
+// 语义同 constant_tensor，但 TENSOR_FLAG_CONST 不置位 → Gallocr 填充后清空 const_data_，
+// 避免每个训练迭代的动态掩码在 Context 中累积宿主内存。
+TensorF32* constant_tensor_dynamic(const std::vector<int64_t>& dims, const float* data) {
+    TensorF32* t = constant_tensor(dims, data);
+    t->flag &= ~TENSOR_FLAG_CONST;
     return t;
 }
 

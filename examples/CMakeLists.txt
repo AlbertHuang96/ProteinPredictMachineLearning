@@ -14,6 +14,10 @@ target_link_libraries(ppml_measure PRIVATE ppml_core ppml_python)
 add_executable(ppml_verify_template verify_template.cpp)
 target_link_libraries(ppml_verify_template PRIVATE ppml_core ppml_python)
 
+# const_data_ + TENSOR_FLAG_CONST 机制验证（CPU）
+add_executable(ppml_verify_const_data verify_const_data.cpp)
+target_link_libraries(ppml_verify_const_data PRIVATE ppml_core)
+
 #add_executable(ppml_export_onnx export_onnx.cpp)
 #target_link_libraries(ppml_export_onnx PRIVATE ppml_core)
 

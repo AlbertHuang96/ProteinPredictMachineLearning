@@ -3,6 +3,8 @@
 #include "ppml/Backend.h"   // alloc_buffer, Buffer, BufferType
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstdio>
 #include <limits>
 
 namespace ppml {
@@ -148,14 +150,26 @@ bool Gallocr::reserve(
 
     // 3. 先分配 managed leaves（输入/常量，若需分配）
     for (auto& li : leaves_) {
-        if (li.managed && !allocate_node(&li)) { release(); return false; }
+        if (li.managed && !allocate_node(&li)) {
+            if (getenv("GRAPH_DEBUG_GALLOCR")) {
+                fprintf(stderr, "[gallocr] reserve FAIL at leaf idx=%ld n_bytes=%zu\n",
+                        (long)(&li - &leaves_[0]), li.tensor ? li.tensor->nbytes() : 0);
+            }
+            release(); return false;
+        }
     }
 
     // 4. 遍历 nodes（拓扑序）：分配当前节点，释放已无依赖的 src
     for (auto& ni : nodes_) {
         TensorF32* node = ni.tensor;
         // 先分配本节点
-        if (ni.managed && !allocate_node(&ni)) { release(); return false; }
+        if (ni.managed && !allocate_node(&ni)) {
+            if (getenv("GRAPH_DEBUG_GALLOCR")) {
+                fprintf(stderr, "[gallocr] reserve FAIL at node idx=%ld n_bytes=%zu\n",
+                        (long)(&ni - &nodes_[0]), node ? node->nbytes() : 0);
+            }
+            release(); return false;
+        }
 
         // 释放 src：该节点被消费后，其依赖的 src 引用计数减一
         for (int s = 0; s < GGML_MAX_SRC; s++) {
@@ -171,6 +185,12 @@ bool Gallocr::reserve(
     }
 
     // 5. 保留每个后端的峰值，释放 Phase1 虚拟 talloc（Phase2 会重建真实 buffer）
+    if (getenv("GRAPH_DEBUG_GALLOCR")) {
+        for (auto& ba : backends_) {
+            fprintf(stderr, "[gallocr] reserve done: backend=%d peak=%zu bytes (%.2f GB)\n",
+                    (int)(&ba - &backends_[0]), ba.peak, ba.peak / (1024.0 * 1024.0 * 1024.0));
+        }
+    }
     for (auto& ba : backends_) {
         ba.use = ba.peak > 0;
         delete ba.talloc;
@@ -200,7 +220,13 @@ bool Gallocr::alloc(
         size_t size = ba.peak;
         if (size > 0) {
             Buffer* buf = alloc_buffer(ba.buft, size);
-            if (!buf) { release(); return false; }
+            if (!buf) {
+                if (getenv("GRAPH_DEBUG_GALLOCR")) {
+                    fprintf(stderr, "[gallocr] alloc FAIL: backend=%d peak=%zu bytes (%.2f GB)\n",
+                            (int)(&ba - &backends_[0]), size, size / (1024.0 * 1024.0 * 1024.0));
+                }
+                release(); return false;
+            }
             ba.buffers.push_back(buf);
         }
         ba.talloc = new DynTalloc(size, ba.buft->get_alignment());
@@ -212,14 +238,31 @@ bool Gallocr::alloc(
     // 3. 分配 managed leaves 并绑定
     for (auto& li : leaves_) {
         if (!li.managed) continue;
-        if (!allocate_node(&li)) { release(); return false; }
+        if (!allocate_node(&li)) {
+            if (getenv("GRAPH_DEBUG_GALLOCR")) {
+                fprintf(stderr, "[gallocr] alloc FAIL at leaf idx=%ld n_bytes=%zu peak=%zu\n",
+                        (long)(&li - &leaves_[0]), li.tensor ? li.tensor->nbytes() : 0,
+                        backends_[li.backend_id].peak);
+            }
+            release(); return false;
+        }
         bind_tensor(&li);
     }
 
     // 4. 遍历 nodes，分配并绑定
     for (auto& ni : nodes_) {
         TensorF32* node = ni.tensor;
-        if (ni.managed && !allocate_node(&ni)) { release(); return false; }
+        if (ni.managed && !allocate_node(&ni)) {
+            if (getenv("GRAPH_DEBUG_GALLOCR")) {
+                BackendAlloc& ba = backends_[ni.backend_id];
+                fprintf(stderr, "[gallocr] alloc FAIL at node idx=%ld n_bytes=%zu peak=%zu used=%zu free_blocks=%zu\n",
+                        (long)(&ni - &nodes_[0]), node ? node->nbytes() : 0,
+                        ba.peak,
+                        ba.talloc ? ba.talloc->used_bytes() : 0,
+                        ba.talloc ? ba.talloc->free_blocks().size() : 0);
+            }
+            release(); return false;
+        }
         if (ni.managed) bind_tensor(&ni);
 
         for (int s = 0; s < GGML_MAX_SRC; s++) {
@@ -255,6 +298,18 @@ void Gallocr::bind_tensor(NodeInfo* ni) {
     t->bind_data(static_cast<char*>(base) + off);
     t->buffer_      = b;
     t->buffer_offs_ = off;
+
+    // 常量叶子：分配完成后从 const_data_ 填充数据。
+    //   TENSOR_FLAG_CONST 置位 → 静态可复用（保留 const_data_，图可复用）；
+    //   不置位 → 动态一次性（填充后清空+shrink，避免宿主内存累积）。
+    if (!t->const_data_.empty() && t->data() != nullptr) {
+        std::memcpy(t->data(), t->const_data_.data(),
+                    t->const_data_.size() * sizeof(float));
+        if (!(t->flag & TENSOR_FLAG_CONST)) {
+            t->const_data_.clear();
+            t->const_data_.shrink_to_fit();
+        }
+    }
 }
 
 // ============================================================

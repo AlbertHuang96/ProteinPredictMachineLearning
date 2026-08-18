@@ -3,6 +3,7 @@
 
 #include "ppml/Backend.h"
 #include <cstdlib>
+#include <cstdio>
 
 namespace ppml {
 
@@ -156,7 +157,17 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
         auto backend_id_of = [](TensorF32*) -> int { return 0; };
         if (!gallocr_.reserve(cgraph, backend_id_of, 1) ||
             !gallocr_.alloc(cgraph, backend_id_of, 1)) {
+            if (getenv("GRAPH_DEBUG_GALLOCR")) {
+                fprintf(stderr, "[gallocr] ALLOC_FAILED: n_nodes=%d n_leafs=%d peak=%zu\n",
+                        cgraph->n_nodes(), cgraph->n_leafs(), gallocr_.backend_peak(0));
+            }
             return Status::ALLOC_FAILED;
+        }
+        if (getenv("GRAPH_DEBUG_GALLOCR")) {
+            fprintf(stderr, "[gallocr] ok: n_nodes=%d n_leafs=%d peak=%zu bytes (%.2f GB)\n",
+                    cgraph->n_nodes(), cgraph->n_leafs(),
+                    gallocr_.backend_peak(0),
+                    gallocr_.backend_peak(0) / (1024.0 * 1024.0 * 1024.0));
         }
     }
 

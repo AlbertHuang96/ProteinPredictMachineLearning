@@ -3,6 +3,7 @@
 #include "Core.h"
 #include <cstring>
 #include <array>
+#include <vector>
 #include <cuda_fp16.h>
 
 #define GGML_MAX_OP_PARAMS      64
@@ -21,6 +22,9 @@ enum tensor_flag {
     TENSOR_FLAG_LOSS    = 8,
     TENSOR_FLAG_COMPUTE = 16,
     TENSOR_FLAG_NO_WEIGHT_DECAY = 32,   // 权重衰减豁免（bias / LayerNorm 的 gamma、beta）
+    TENSOR_FLAG_CONST   = 64,           // 常量叶子（data 存于 const_data_，由 Gallocr 分配后填充）
+    // 注：TENSOR_FLAG_CONST 置位 = 静态可复用常量（Gallocr 填充后保留 const_data_，图可复用）；
+    //     不置位 = 动态一次性常量（如 dropout 随机掩码，Gallocr 填充后清空+shrink const_data_）。
 };
 
 enum tensor_type {
@@ -298,6 +302,12 @@ public:
     Buffer*     buffer_      = nullptr;  // 所属的 backend buffer
     Tensor<T>*  view_src     = nullptr;  // view tensor 的源 tensor
     size_t      buffer_offs_ = 0;        // 在 buffer 中的偏移量
+
+    // ==== 常量叶子宿主数据 ====
+    // 供常量叶子（constant_tensor 等）使用：数据存于此处，data() 保持 nullptr，
+    // 使 Gallocr 判定其为 managed 并分配 backend buffer，分配后由 Gallocr 从
+    // const_data_ 填充。TENSOR_FLAG_CONST 置位 → 保留（图可复用）；否则填充后清空释放。
+    std::vector<float> const_data_;
 
     
 private:

@@ -310,6 +310,9 @@ TensorF32* constant_ones(const std::vector<int64_t>& dims);
 TensorF32* constant_scalar(float value);
 // 从已有数据创建常量叶子图节点（逐元素拷贝，不参与求导）
 TensorF32* constant_tensor(const std::vector<int64_t>& dims, const float* data);
+// 动态一次性常量（TENSOR_FLAG_CONST 不置位）：Gallocr 填充后清空 const_data_，
+// 用于 dropout 随机掩码等每迭代重建、不应累积宿主内存的叶子。
+TensorF32* constant_tensor_dynamic(const std::vector<int64_t>& dims, const float* data);
 
 // 10. 位置编码
 TensorF32* rope(TensorF32* a, int n_past, int n_dims = 0);

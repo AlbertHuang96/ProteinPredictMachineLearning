@@ -184,8 +184,10 @@ int main(int argc, char* argv[]) {
     
     PPMLModel model(config);
     
-    // 3. 转移到 GPU
-    model.to(Device::CUDA);
+    // 3. 转移到目标设备。默认 CUDA，但 CUDA 对前向/backward 的众多图 op（repeat/permute/
+    //    concat/outer_product 等）未实现，graph_compute 算不出 loss。为验证数值正确性先
+    //    用 CPU（所有 op 有 kernel）；CUDA op 补齐后再切回。
+    model.to(Device::CPU);
     model.train();
     
     std::cout << "Model created and CPU and CUDA Backend init" << std::endl;
@@ -481,7 +483,11 @@ int main(int argc, char* argv[]) {
 
         // ---- 反向计算 + 梯度裁剪 + AdamW 参数更新 ----
         Backend* backend = model.active_backend();
-        backend->graph_compute(cgraph);                    // 执行前向+反向，写入参数梯度
+        Status compute_st = backend->graph_compute(cgraph); // 执行前向+反向，写入参数梯度
+        if (compute_st != Status::SUCCESS) {
+            std::cout << "[WARN] graph_compute status=" << static_cast<int>(compute_st)
+                      << " (0=SUCCESS 1=ALLOC_FAILED)" << std::endl;
+        }
         float grad_norm = clip_grad_norm(cgraph, 0.1f);    // 全局梯度裁剪 (AF2 推荐 0.1)
 
         if (!optimizer_inited) {

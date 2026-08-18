@@ -31,12 +31,12 @@ static void activate_single_loss(
     }
 }
 
-/// @brief 清空所有参数的梯度缓冲区（grad_accs）
+/// @brief 清空所有参数的梯度缓冲区（grad_accs）。参数是 node 非 leaf，遍历 n_nodes()。
 static void clear_param_grads(ComputeGraph* cgraph) {
-    for (int i = 0; i < cgraph->n_leafs(); i++) {
-        TensorF32* param = cgraph->graph_leaf(i);
-        if (!(param->flag & TENSOR_FLAG_PARAM)) continue;
-        TensorF32* grad = cgraph->graph_get_grad(param);
+    for (int i = 0; i < cgraph->n_nodes(); i++) {
+        TensorF32* node = cgraph->graph_node(i);
+        if (!(node->flag & TENSOR_FLAG_PARAM)) continue;
+        TensorF32* grad = cgraph->graph_get_grad(node);
         if (grad) {
             int64_t n = grad->numel();
             std::fill(grad->data(), grad->data() + n, 0.0f);
@@ -74,15 +74,17 @@ static void scale_param_grads(const std::vector<TensorF32*>& param_list, Compute
     }
 }
 
-/// @brief 收集所有带梯度的参数节点
+/// @brief 收集所有带梯度的参数节点。
+/// 注意: 参数 (TENSOR_FLAG_PARAM) 在 build_forward_impl 中归类为 node 而非 leaf
+///       (ComputeGraph.cpp:137: OP_NONE && !PARAM 才作 leaf)，故必须遍历 n_nodes()。
 static std::vector<TensorF32*> collect_params(ComputeGraph* cgraph) {
     std::vector<TensorF32*> params;
-    for (int i = 0; i < cgraph->n_leafs(); i++) {
-        TensorF32* leaf = cgraph->graph_leaf(i);
-        if (leaf->flag & TENSOR_FLAG_PARAM) {
-            TensorF32* grad = cgraph->graph_get_grad(leaf);
+    for (int i = 0; i < cgraph->n_nodes(); i++) {
+        TensorF32* node = cgraph->graph_node(i);
+        if (node->flag & TENSOR_FLAG_PARAM) {
+            TensorF32* grad = cgraph->graph_get_grad(node);
             if (grad) {
-                params.push_back(leaf);
+                params.push_back(node);
             }
         }
     }

@@ -19,15 +19,17 @@ AdamW::AdamW(float lr, float weight_decay, float beta1, float beta2,
 
 void AdamW::init_from_graph(ComputeGraph* cgraph) {
     states_.clear();
-    for (int i = 0; i < cgraph->n_leafs(); i++) {
-        TensorF32* leaf = cgraph->graph_leaf(i);
-        if (!(leaf->flag & TENSOR_FLAG_PARAM)) continue;          // 非参数，跳过
-        TensorF32* grad = cgraph->graph_get_grad(leaf);
+    // 参数 (TENSOR_FLAG_PARAM) 在 build_forward_impl 中被归类为 node 而非 leaf
+    // (ComputeGraph.cpp:137: OP_NONE && !PARAM 才作 leaf)，故遍历 n_nodes()。
+    for (int i = 0; i < cgraph->n_nodes(); i++) {
+        TensorF32* node = cgraph->graph_node(i);
+        if (!(node->flag & TENSOR_FLAG_PARAM)) continue;          // 非参数，跳过
+        TensorF32* grad = cgraph->graph_get_grad(node);
         if (!grad) continue;                                      // 无梯度（未参与 loss），跳过
         const int64_t n = grad->numel();
         ParamState s;
-        s.param            = leaf;
-        s.no_weight_decay  = (leaf->flag & TENSOR_FLAG_NO_WEIGHT_DECAY) != 0;
+        s.param            = node;
+        s.no_weight_decay  = (node->flag & TENSOR_FLAG_NO_WEIGHT_DECAY) != 0;
         s.m.assign(static_cast<size_t>(n), 0.0f);
         s.v.assign(static_cast<size_t>(n), 0.0f);
         states_.push_back(std::move(s));
@@ -117,10 +119,10 @@ void AdamW::step(ComputeGraph* cgraph) {
 }
 
 void AdamW::zero_grad(ComputeGraph* cgraph) {
-    for (int i = 0; i < cgraph->n_leafs(); i++) {
-        TensorF32* leaf = cgraph->graph_leaf(i);
-        if (!(leaf->flag & TENSOR_FLAG_PARAM)) continue;
-        TensorF32* grad = cgraph->graph_get_grad(leaf);
+    for (int i = 0; i < cgraph->n_nodes(); i++) {
+        TensorF32* node = cgraph->graph_node(i);
+        if (!(node->flag & TENSOR_FLAG_PARAM)) continue;
+        TensorF32* grad = cgraph->graph_get_grad(node);
         if (!grad) continue;
         std::vector<float> z(static_cast<size_t>(grad->numel()), 0.0f);
         write_tensor_values(grad, z);

@@ -1,6 +1,8 @@
 #include "ppml/Dropout.h"
 #include "ppml/ComputeGraph.h"
 #include <algorithm>
+#include <map>
+#include <string>
 
 namespace ppml {
 
@@ -78,17 +80,25 @@ TensorF32 Dropout::forward(const TensorF32& x) {
 }
 
 // ===== Dropout::forward_graph (图模式) =====
-// 用现有图 op 实现: 生成随机掩码常量叶子 (语义同 forward, 已含缩放), 再 mul(x, mask)。
-// mask 是叶子 (不参与求导) → mul 反向只把 grad_out*mask 回传给 x, 与值版 dropout 语义一致。
+// 每次 forward 现场生成随机掩码常量叶子（与 x 同形, 已含缩放 1/(1-p)），再 mul(x, mask)。
+// 掩码用 constant_tensor_dynamic（TENSOR_FLAG_CONST 不置位）：数据存于 const_data_，
+// 由 Gallocr 分配 backend buffer 后填充并立即清空 const_data_，宿主内存不累积。
+// 每次调用新建掩码 leaf → 每次前向都随机化（与值版语义一致）。
 TensorF32* Dropout::forward_graph(TensorF32* x) {
     // If not in training mode, return input directly (no dropout during evaluation)
     if (!training_) {
         return x;
     }
+
+    // 生成掩码（含缩放 1/(1-p)）
     std::vector<float> mask;
     generate_mask(x->shape(), mask);
-    std::vector<int64_t> dims(x->shape().dims.begin(), x->shape().dims.end());
-    TensorF32* mask_node = constant_tensor(dims, mask.data());
+
+    // 动态一次性常量叶子：dims 取 x 的图布局 dims（dims[0]=最内维）
+    std::vector<int64_t> dims;
+    for (int i = 0; i < x->shape().ndim(); i++) dims.push_back(x->shape().dims[i]);
+    TensorF32* mask_node = constant_tensor_dynamic(dims, mask.data());
+
     return mul(x, mask_node);
 }
 
