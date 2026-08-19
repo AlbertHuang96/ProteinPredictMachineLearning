@@ -41,9 +41,74 @@ if(MSVC)
     add_compile_options(/W4)
     # /O2
 else()
-    add_compile_options(-Wall -fPIC)
-    # -O3
+    # 训练性能需要：朴素矩阵乘等在 -O0 下极慢(5-20x)，开 -O2(保留 -g 符号, RelWithDebInfo 风格)。
+    # 若需完整调试可改回 -O0/-g，但训练 forward/backward 会极慢。
+    add_compile_options(-Wall -fPIC -O2)
 endif()
+
+# ============================================================
+# 环境信息打印（构建日志里的 CPU / GPU / 编译器 / 编译类型）
+# ============================================================
+# --- CPU ---
+if(CMAKE_SYSTEM_NAME MATCHES "Linux")
+    find_program(LSCPU_CMD lscpu)
+    if(LSCPU_CMD)
+        execute_process(COMMAND ${LSCPU_CMD} -p OUTPUT_VARIABLE LSCPU_OUT)
+        execute_process(COMMAND ${LSCPU_CMD} --version OUTPUT_VARIABLE LSCPU_VER)
+        if(LSCPU_OUT)
+            list(LENGTH LSCPU_OUT LSCPU_NLINES)
+            string(REGEX MATCH "^[0-9]+" LSCPU_CORES "${LSCPU_NLINES}")
+            if(NOT LSCPU_CORES)
+                set(LSCPU_CORES ${LSCPU_NLINES})
+            endif()
+        endif()
+    endif()
+    # CPU 型号（去掉 MHz 频率项，只留型号名）
+    find_program(GREP_CMD grep)
+    find_program(SED_CMD sed)
+    if(LSCPU_CMD AND GREP_CMD AND SED_CMD)
+        execute_process(
+            COMMAND sh -c "${LSCPU_CMD} | grep -m1 '^Model name:' | sed 's/^Model name:[[:space:]]*//'"
+            OUTPUT_VARIABLE CPU_MODEL
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+    endif()
+elseif(APPLE)
+    execute_process(COMMAND sysctl -n machdep.cpu.brand_string OUTPUT_VARIABLE CPU_MODEL OUTPUT_STRIP_TRAILING_WHITESPACE)
+    execute_process(COMMAND sysctl -n hw.logicalcpu OUTPUT_VARIABLE LSCPU_CORES OUTPUT_STRIP_TRAILING_WHITESPACE)
+endif()
+if(NOT CPU_MODEL)
+    set(CPU_MODEL "unknown")
+endif()
+message(STATUS "[ENV] CPU: ${CPU_MODEL} | logical cores: ${LSCPU_CORES}")
+
+# --- GPU ---
+find_program(NVIDIA_SMI nvidia-smi)
+if(NVIDIA_SMI)
+    execute_process(COMMAND ${NVIDIA_SMI} --query-gpu=name,memory.total --format=csv,noheader OUTPUT_VARIABLE GPU_INFO OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(GPU_INFO)
+        string(REPLACE "\\n" " | " GPU_INFO "${GPU_INFO}")
+        string(REGEX REPLACE "\n" " | " GPU_INFO "${GPU_INFO}")
+        message(STATUS "[ENV] GPU(s): ${GPU_INFO}")
+    else()
+        message(STATUS "[ENV] GPU(s): none detected via nvidia-smi")
+    endif()
+else()
+    message(STATUS "[ENV] GPU(s): nvidia-smi not found (no NVIDIA GPU / no driver)")
+endif()
+
+# --- 编译器 & 编译类型 ---
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    set(_cxx_id "GCC ${CMAKE_CXX_COMPILER_VERSION}")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(_cxx_id "Clang ${CMAKE_CXX_COMPILER_VERSION}")
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "MSVC")
+    set(_cxx_id "MSVC ${CMAKE_CXX_COMPILER_VERSION}")
+else()
+    set(_cxx_id "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+endif()
+message(STATUS "[ENV] C++ compiler: ${_cxx_id}")
+message(STATUS "[ENV] Build type: ${CMAKE_BUILD_TYPE} | CUDA enabled: ${USE_CUDA}")
 
 # GPU 架构自动检测
 # 优先级：

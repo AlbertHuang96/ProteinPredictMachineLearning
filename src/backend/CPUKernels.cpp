@@ -4,12 +4,29 @@
 #include "ppml/FAPE.h"
 #include <cstring>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
 #include <array>
 
 //#include <omp.h>
 
+// ===== 开发用 GPU 加速矩阵乘（方案 B，临时）=====
+// 说明：仅在"矩阵乘"节点上临时调用 CUDA 内核以加速训练（本机 GPU=RTX2050 4GB）。
+//   开关：环境变量 PPML_MUL_MAT_GPU=1 时启用；默认关闭（走 CPU 朴素矩阵乘）。
+//   做法：每次 MUL_MAT 把 A/B 拷到 GPU → mul_mat_cuda 计算 → 结果拷回 host。
+//   注意：此路径有 host↔device 拷贝开销，且每节点独立分配 GPU buffer，仅适合开发期
+//         验证 GPU 加速效果。**正式方案是 BackendScheduler 混合调度**（GPU buffer 复用、
+//         跨后端自动拷贝），本路径应在其就绪后移除。
+// 项目要求 CUDA（CMake find_package(CUDAToolkit REQUIRED)），ppml_core 链接 cudart。
+// 开发用 GPU 矩阵乘开关见上方注释；无 CUDA 环境由运行时 cudaGetDeviceCount 兜底回退 CPU。
+#include <cuda_runtime.h>
 namespace ppml {
+// mul_mat_cuda 实现于 src/cuda/CUDAKernels.cu（host 函数，launch blockTileGEMM kernel）
+extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
+// 读取一次 PPML_MUL_MAT_GPU 开关（开发用，默认关）
+static const bool g_mul_mat_gpu_enabled =
+    (std::getenv("PPML_MUL_MAT_GPU") != nullptr) &&
+    (std::atoi(std::getenv("PPML_MUL_MAT_GPU")) != 0);
 
 // ===== unary op 计算函数前向声明 =====
 static void compute_forward_abs(ComputeParams* p, TensorF32* dst);
@@ -43,6 +60,8 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_MUL:
         case OP_DIV:    kernel_elemwise(node, p);    break;
         case OP_SQR:    kernel_sqr(node, p);         break;
+        case OP_SQRT:   compute_forward_sqrt(p, node); break;  // 独立 sqrt 逐元素(op=10)
+        case OP_LOG:    compute_forward_log(p, node);  break;  // 独立 log 逐元素(op=11)
         case OP_ADD1:   kernel_add1(node, p);        break;
         case OP_SCALE:  kernel_scale(node, p);       break;
         case OP_MUL_MAT:   kernel_mul_mat(node, p);  break;
@@ -140,18 +159,34 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
     float * d = node->data();
     int64_t n = node->numel();
 
+    // 开发诊断（GRAPH_DEBUG_LOSS）：标量 add（total 链累加），打印两输入值与地址，定位 nan 来源
+    if (p->ith == 0 && n == 1 && getenv("GRAPH_DEBUG_LOSS") && node->op == OP_ADD) {
+        fprintf(stderr, "[add] numel=1 a_val=%f a_addr=%p b_val=%f b_addr=%p d_addr=%p\n",
+                a[0], (const void*)a, b[0], (const void*)b, (const void*)d);
+    }
+
+    // 广播支持：当 b 形状是 a 形状去掉若干"前导最内维"的后缀时（如 a=[2,7,N], b=[7,N]），
+    // b 沿 a 的前导维重复。扁平序下 a 前导维在最内，故 b 索引 = i % b_numel。
+    // 同 numel 时 b_numel==n，i%n==i，退化为逐元素，无额外开销。
+    const int64_t bn = node->src[1]->numel();
+    const bool bcast = (bn != n) && (n % bn == 0);
+
     switch (node->op) {
         case OP_ADD:
-            for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] + b[i];
+            if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] + b[i % bn];
+            else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] + b[i];
             break;
         case OP_SUB:
-            for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] - b[i];
+            if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] - b[i % bn];
+            else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] - b[i];
             break;
         case OP_MUL:
-            for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] * b[i];
+            if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] * b[i % bn];
+            else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] * b[i];
             break;
         case OP_DIV:
-            for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] / b[i];
+            if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] / b[i % bn];
+            else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] / b[i];
             break;
     }
 }
@@ -166,15 +201,68 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
     const float * b = node->src[1]->data();
     float * d = node->data();
 
+    // ===== 开发用 GPU 加速矩阵乘（方案 B，临时，见文件顶部注释）=====
+    // 开关 PPML_MUL_MAT_GPU=1。首次调用探测 GPU 是否存在（缓存到 thread-safe static）；
+    // 无 GPU 时直接走 CPU 路径（与原始行为完全等价，不引入额外 barrier）。
+    // 有 GPU 时流程：所有线程 barrier → ith==0 尝试 GPU（结果写 current_chunk）→ 所有线程
+    // barrier → 若成功全部返回（内部 barrier 恰 2 次，与 CPU 路径一致）；cudaMalloc 失败时
+    // 回退 CPU（概率极低，开发用可接受轻微 barrier 次数差异）。
+    if (g_mul_mat_gpu_enabled) {
+        static const bool gpu_avail = []() {
+            int ndev = 0;
+            return (cudaGetDeviceCount(&ndev) == cudaSuccess && ndev > 0);
+        }();
+        if (gpu_avail) {
+            // barrier #1：所有线程到达，准备 GPU 尝试
+            if (p->ith == 0) tp->current_chunk.store(0);
+            tp->barrier_wait();
+
+            if (p->ith == 0) {
+                int gpu_ok = 0;
+                if (M > 0 && N > 0 && K > 0) {
+                    size_t bA = (size_t)M * K * sizeof(float);
+                    size_t bB = (size_t)N * K * sizeof(float);
+                    size_t bC = (size_t)M * N * sizeof(float);
+                    float *dA = nullptr, *dB = nullptr, *dC = nullptr;
+                    if (cudaMalloc(&dA, bA) == cudaSuccess &&
+                        cudaMalloc(&dB, bB) == cudaSuccess &&
+                        cudaMalloc(&dC, bC) == cudaSuccess) {
+                        cudaMemcpy(dA, a, bA, cudaMemcpyHostToDevice);
+                        cudaMemcpy(dB, b, bB, cudaMemcpyHostToDevice);
+                        mul_mat_cuda(dA, dB, dC, M, K, N);
+                        cudaDeviceSynchronize();
+                        cudaMemcpy(d, dC, bC, cudaMemcpyDeviceToHost);
+                        gpu_ok = 1;
+                    }
+                    if (dA) cudaFree(dA);
+                    if (dB) cudaFree(dB);
+                    if (dC) cudaFree(dC);
+                }
+                tp->current_chunk.store(gpu_ok);
+            }
+            // barrier #2：等 ith==0 完成 GPU 尝试
+            tp->barrier_wait();
+            if (tp->current_chunk.load() == 1) {
+                // GPU 成功：所有线程一致返回（内部 barrier 恰 2 次，与 CPU 路径对齐）
+                return;
+            }
+            // GPU 失败(cudaMalloc 失败)：落到下方 CPU 朴素路径
+        }
+    }
+
+    // ===== CPU 朴素矩阵乘（原逻辑；GPU 未启用/无 GPU/GPU 失败时执行）=====
     if (p->ith == 0) tp->current_chunk.store(0);
     tp->barrier_wait();
 
     // a (M * K), b (K * N), d (M * N)
+    // 注意：sum 必须在每个输出列 j 前清零（点积按列独立累加）。
+    //   bug 修复(2026-08-19)：原实现 sum 只在行 i 处重置，导致跨 j 持续累加，
+    //   所有 Linear/mul_mat 输出被污染 → 各 head 输出常数、loss 全 0。
     while (true) {
         int i = tp->current_chunk.fetch_add(1);
         if (i >= M) break;
-        float sum = 0;
         for (int j = 0; j < N; j++) {
+            float sum = 0;
             for (int k = 0; k < K; k++) sum += a[i * K + k] * b[j * K + k];
             d[j + i * N] = sum;
         }
@@ -765,25 +853,15 @@ void CPUBackend::kernel_softmax(TensorF32 * node, ComputeParams * p) {
 
     for (int r = start; r < end; r++) {
         float * sr = src + r * D, * dr = dst + r * D;
+        // 标准两遍 softmax（bug 修复 2026-08-19）：
+        //   原 online 版本漏加 d=0 项（sum 少算 exp(sr[0]-mx)），且 dr[0] 从不写入，
+        //   对常数输入输出 1/(D-1)（如 0.0454=1/22），导致 loss 退化/异常。
         float mx = sr[0];
+        for (int d = 1; d < D; d++) if (sr[d] > mx) mx = sr[d];
         float sum = 0;
-        for (int d = 1; d < D; d++) {
-            float mx_prev = mx;
-            if (sr[d] > mx) {
-                mx = sr[d];
-                sum = sum * expf(mx_prev - mx) + expf(sr[d] - mx);
-                // online softmax
-            }
-            else {
-                sum += expf(sr[d] - mx);
-            }
-        }
-        for (int d = 1; d < D; d++) {
-            dr[d] = expf(sr[d] - mx) / sum;
-        }
-
-        //for (int d = 0; d < D; d++) { dr[d] = expf(sr[d] - mx); sum += dr[d]; }
-        //for (int d = 0; d < D; d++) dr[d] /= sum;
+        for (int d = 0; d < D; d++) sum += expf(sr[d] - mx);
+        float inv = 1.0f / (sum + 1e-9f);
+        for (int d = 0; d < D; d++) dr[d] = expf(sr[d] - mx) * inv;
     }
 }
 
@@ -1022,6 +1100,12 @@ void CPUBackend::kernel_scale(TensorF32 * node, ComputeParams * p) {
     const int64_t per   = (total + p->nth - 1) / p->nth;
     const int64_t start = per * p->ith;
     const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    // 开发诊断（GRAPH_DEBUG_LOSS）：标量 scale（total 链），打印输入值与 buffer 地址，定位 nan 来源
+    if (p->ith == 0 && total == 1 && getenv("GRAPH_DEBUG_LOSS")) {
+        fprintf(stderr, "[scale] numel=1 src0_val=%f src0_addr=%p s=%f dst_addr=%p\n",
+                src[0], (const void*)src, s, (const void*)dst);
+    }
 
     for (int64_t i = start; i < end; i++) dst[i] = src[i] * s;
 }
@@ -1902,14 +1986,14 @@ static void compute_forward_fape(ComputeParams* p, TensorF32* dst) {
             float v1x = pBx - pAx, v1y = pBy - pAy, v1z = pBz - pAz;
             float v2x = pCx - pAx, v2y = pCy - pAy, v2z = pCz - pAz;
 
-            // e1 = normalize(v1)
-            float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z);
+            // e1 = normalize(v1)  —— 退化坐标(v1≈0)时 n1→0，加 eps 避免 0/0=NaN
+            float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z + epsilon);
             float e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
 
-            // e2 = normalize(v2 - (v2·e1)*e1)
+            // e2 = normalize(v2 - (v2·e1)*e1)  —— 三点共线/退化时 u2≈0，加 eps
             float dot = v2x * e1x + v2y * e1y + v2z * e1z;
             float u2x = v2x - dot * e1x, u2y = v2y - dot * e1y, u2z = v2z - dot * e1z;
-            float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z);
+            float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z + epsilon);
             float e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
 
             // e3 = e1 × e2
@@ -1932,12 +2016,12 @@ static void compute_forward_fape(ComputeParams* p, TensorF32* dst) {
             float v1x = tBx - tAx, v1y = tBy - tAy, v1z = tBz - tAz;
             float v2x = tCx - tAx, v2y = tCy - tAy, v2z = tCz - tAz;
 
-            float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z);
+            float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z + epsilon);
             float e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
 
             float dot = v2x * e1x + v2y * e1y + v2z * e1z;
             float u2x = v2x - dot * e1x, u2y = v2y - dot * e1y, u2z = v2z - dot * e1z;
-            float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z);
+            float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z + epsilon);
             float e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
 
             float e3x = e1y * e2z - e1z * e2y;
@@ -2001,6 +2085,11 @@ static void compute_forward_fape(ComputeParams* p, TensorF32* dst) {
 
     // Write scalar output
     dst->data()[0] = loss;
+
+    if (getenv("GRAPH_DEBUG_LOSS")) {
+        fprintf(stderr, "[fape] computed loss=%f denom=%f sum_loss=%f N_atoms=%lld N_frames=%lld\n",
+                loss, denom, sum_loss, (long long)N_atoms, (long long)N_frames);
+    }
 
     tp->barrier_wait();
 }
@@ -2085,16 +2174,16 @@ static void compute_forward_fape_back(ComputeParams* p, TensorF32* dst) {
         float pBx = pred_coords[idx_B * 3 + 0], pBy = pred_coords[idx_B * 3 + 1], pBz = pred_coords[idx_B * 3 + 2];
         float pCx = pred_coords[idx_C * 3 + 0], pCy = pred_coords[idx_C * 3 + 1], pCz = pred_coords[idx_C * 3 + 2];
 
-        // Gram-Schmidt
+        // Gram-Schmidt  —— 退化坐标加 eps 避免 0/0=NaN
         float v1x = pBx - pAx, v1y = pBy - pAy, v1z = pBz - pAz;
         float v2x = pCx - pAx, v2y = pCy - pAy, v2z = pCz - pAz;
 
-        float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z);
+        float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z + epsilon);
         float e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
 
         float dot = v2x * e1x + v2y * e1y + v2z * e1z;
         float u2x = v2x - dot * e1x, u2y = v2y - dot * e1y, u2z = v2z - dot * e1z;
-        float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z);
+        float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z + epsilon);
         float e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
 
         float e3x = e1y * e2z - e1z * e2y;
@@ -2133,12 +2222,12 @@ static void compute_forward_fape_back(ComputeParams* p, TensorF32* dst) {
         float v1x = tBx - tAx, v1y = tBy - tAy, v1z = tBz - tAz;
         float v2x = tCx - tAx, v2y = tCy - tAy, v2z = tCz - tAz;
 
-        float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z);
+        float n1 = sqrtf(v1x * v1x + v1y * v1y + v1z * v1z + epsilon);
         float e1x = v1x / n1, e1y = v1y / n1, e1z = v1z / n1;
 
         float dot = v2x * e1x + v2y * e1y + v2z * e1z;
         float u2x = v2x - dot * e1x, u2y = v2y - dot * e1y, u2z = v2z - dot * e1z;
-        float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z);
+        float n2 = sqrtf(u2x * u2x + u2y * u2y + u2z * u2z + epsilon);
         float e2x = u2x / n2, e2y = u2y / n2, e2z = u2z / n2;
 
         float e3x = e1y * e2z - e1z * e2y;

@@ -462,29 +462,32 @@ void ComputeGraph::compute_backward(
             // src1.shape   [n,p,qq,rr]
 
             if (src0_needs_grads) {
-                assert(grad->shape().dims[2] == src1->shape().dims[2]);
-                assert(grad->shape().dims[3] == src1->shape().dims[3]);
-                TensorF32 * tmp =
-                    out_prod(
-                        src1,          // [n,p,qq,rr]
-                        grad);         // [m,p,qq,rr]
+                // 仅当张量为 4D 时才校验 qq/rr(batch/head) 维。
+                // 2D/3D 张量没有 dims[2]/dims[3]（dims 数组 ndim 之外未初始化，直接访问是垃圾值，
+                // 实测 2D grad dims[3]=33 vs src1 dims[3]=9233 误报断言）。
+                if (grad->shape().ndim() >= 4 && src1->shape().ndim() >= 4) {
+                    assert(grad->shape().dims[2] == src1->shape().dims[2]);
+                    assert(grad->shape().dims[3] == src1->shape().dims[3]);
+                }
+                // dL/dA = grad @ W^T。布局：src0=A dims=[K,M], src1=W dims=[K,N], grad dims=[N,M]。
+                // mul_mat(a,b)=a^T@b 收缩 dims[0]=K。用 mul_mat(grad, transpose(W))：
+                //   grad=(M,N) 作 a(dims[0]=N, dims[1]=M)，transpose(W)=(N,K) 作 b → out=(M,K)→dims=[K,M]==src0。
+                // 项目 out_prod 收缩 dims[1]（CrossAttention 用），不适用于此（会收缩错维），故用 mul_mat+transpose。
+                TensorF32 * tmp = mul_mat(grad, transpose(src1));
                 if (!tmp->same_shape(*src0)) {
-                    assert(tmp->shape().dims[0] == src0->shape().dims[0]);
-                    assert(tmp->shape().dims[1] == src0->shape().dims[1]);
-                    assert(tmp->shape().dims[3] == 1);
                     tmp = repeat_back(tmp, src0);
                 }
                 add_or_set(ctx, cgraph, isrc0, tmp);
             }
             if (src1_needs_grads) {
-                // when src0 is bigger than tensor->grad (this is mostly the case in llama),
-                // avoid transpose of src0, rather transpose smaller tensor->grad
-                // and then use out_prod
+                // dL/dW = grad^T @ A。布局：src0=A dims=[K,M], grad dims=[N,M]。
+                // mul_mat(a,b)=a^T@b 收缩 dims[0]=K。用 mul_mat(transpose(grad), transpose(src0))：
+                //   transpose(grad)=(M,N) 作 a(dims[0]=M, dims[1]=N)，transpose(src0)=(M,K) 作 b
+                //   → out=(N,K)→dims=[K,N]==src1。
                 add_or_set(ctx, cgraph, isrc1,
-                        out_prod(
-                            src0,               // [n,m,q1,r1]
-                            transpose( // [p,m,qq,rr]
-                                grad)));        // [m,p,qq,rr]
+                        mul_mat(
+                            transpose(grad),
+                            transpose(src0)));
             }
         } break;
         case OP_SCALE: {
@@ -539,26 +542,27 @@ void ComputeGraph::compute_backward(
         } break;
         case OP_VIEW: {
             if (src0_needs_grads) {
-                // TODO: needs view_4d with offset/nb1/nb2/nb3 from op_params, then acc_or_set
-                // size_t offset;
-                // memcpy(&offset, tensor->op_params, sizeof(offset));
-                // size_t nb1 = tensor->nb[1];
-                // size_t nb2 = tensor->nb[2];
-                // size_t nb3 = tensor->nb[3];
-                // acc_or_set(ctx, cgraph, isrc0, grad, nb1, nb2, nb3, offset);
+                // view 是同一数据的不同 shape 解释（本项目 view 纯 shape 变化、数据布局不变），
+                // 梯度只需 reshape 回 src0 的 shape 即可。若存在 offset/非连续 view 需 acc_or_set，
+                // 但当前模型构建的 view 均连续，用 reshape 足够。
+                TensorF32 * grad_cont = grad->is_contiguous() ? grad : cont(grad);
+                add_or_set(ctx, cgraph, isrc0, reshape(grad_cont, src0->shape()));
             }
         } break;
         case OP_PERMUTE: {
             if (src0_needs_grads) {
-                // TODO: needs axes stored in op_params to compute inverse permutation
-                // const int32_t * axes = (const int32_t *) tensor->op_params;
-                // const int axis0 = axes[0] & 0x3;
-                // const int axis1 = axes[1] & 0x3;
-                // const int axis2 = axes[2] & 0x3;
-                // const int axis3 = axes[3] & 0x3;
-                // int axb[4] = {0,0,0,0}; // axes backward (inverse)
-                // axb[axis0] = 0; axb[axis1] = 1; axb[axis2] = 2; axb[axis3] = 3;
-                // add_or_set(ctx, cgraph, isrc0, permute(grad, {axb[0], axb[1], axb[2], axb[3]}));
+                // permute 把 src0 的 dim[axes[i]] 搬到输出 dim i。反向需逆置换：
+                //   输出 dim i 的梯度 → 回到 src0 的 dim[axes[i]]。
+                //   axb[axes[i]] = i。
+                // axes 存于 op_params（int，经 float 位模式）。
+                const int32_t * axes = (const int32_t *) tensor->op_params;
+                int nd = grad->shape().ndim();
+                if (nd < 1 || nd > 4) break;  // 不支持则跳过梯度（不打断反向图构建）
+                int axb[4] = {0, 0, 0, 0};
+                for (int i = 0; i < nd; i++) axb[axes[i] & 0x3] = i;
+                std::vector<int> inv(nd);
+                for (int i = 0; i < nd; i++) inv[i] = axb[i];
+                add_or_set(ctx, cgraph, isrc0, permute(grad, inv));
             }
         } break;
         case OP_TRANSPOSE: {

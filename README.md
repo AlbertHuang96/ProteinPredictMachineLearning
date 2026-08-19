@@ -5,6 +5,10 @@ Inspired by RosettaFoldAllAtom
 and   
 llama.cpp and GGML  
 
+dev/training data:
+
+data/training_batch_data/P62891_alignment.a3m data/P62891.fasta  
+
 ## Project Structure
 
 Main goal:  

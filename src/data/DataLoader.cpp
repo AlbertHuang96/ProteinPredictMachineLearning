@@ -1377,10 +1377,13 @@ TensorF32 PPMLDataLoader::parse_csv_true_coords(
             // 找到下一个 "("
             size_t open = all_atoms.find('(', pos);
             if (open == std::string::npos) break;
-            // 原子名 = 从 pos 到 '(' 去空格
+            // 原子名 = pos 到 '(' 之间，去掉前导 '|'/空白、尾随 ':' 后即为原子名（N/CA/C/CB...）
             std::string name = all_atoms.substr(pos, open - pos);
-            // 去除前后空白
-            name.erase(0, name.find_first_not_of(" \t"));
+            size_t s = name.find_first_not_of(" \t|");   // 去前导 '|' 与空白
+            if (s == std::string::npos) { pos = open + 1; continue; }
+            name = name.substr(s);
+            size_t colon = name.find(':');               // 去 ':' 及之后
+            if (colon != std::string::npos) name = name.substr(0, colon);
             name.erase(name.find_last_not_of(" \t") + 1);
             // 找到对应的 ')'
             size_t close = all_atoms.find(')', open);
@@ -1609,8 +1612,13 @@ TensorF32 PPMLDataLoader::parse_csv_true_coords_multi(
             while (pos < all_atoms.size()) {
                 size_t open = all_atoms.find('(', pos);
                 if (open == std::string::npos) break;
+                // 原子名 = pos 到 '(' 之间，去前导 '|'/空白、去 ':' 及之后（N/CA/C/CB...）
                 std::string name = all_atoms.substr(pos, open - pos);
-                name.erase(0, name.find_first_not_of(" \t"));
+                size_t s = name.find_first_not_of(" \t|");
+                if (s == std::string::npos) { pos = open + 1; continue; }
+                name = name.substr(s);
+                size_t colon = name.find(':');
+                if (colon != std::string::npos) name = name.substr(0, colon);
                 name.erase(name.find_last_not_of(" \t") + 1);
                 size_t close = all_atoms.find(')', open);
                 if (close == std::string::npos) break;

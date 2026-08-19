@@ -1964,6 +1964,22 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
     distogram_t_head_ = LinearLayer::create(D_PAIR, 36);  // Θ 36 bins
     distogram_p_head_ = LinearLayer::create(D_PAIR, 18);  // Φ 18 bins
 
+    if (getenv("GRAPH_DEBUG_GALLOCR")) {
+        auto dw = [](LinearLayer* h, const char* tag) {
+            TensorF32* wt = h->weight();
+            const float* w = wt ? wt->data() : nullptr;
+            if (!w) { fprintf(stderr, "[headw] %s weight data=null\n", tag); return; }
+            bool nan=false; float mn=1e30f,mx=-1e30f; long nnan=0;
+            for (int i=0;i<wt->numel();++i){ float v=w[i]; if(v!=v){nan=true;++nnan;} mn=std::min(mn,v); mx=std::max(mx,v);}
+            fprintf(stderr, "[headw] %s w_numel=%d nan=%d nnan=%ld min=%f max=%f w[0]=%f w[1]=%f\n",
+                    tag, (int)wt->numel(), (int)nan, nnan, mn, mx, w[0], w[1]);
+        };
+        dw(distogram_d_head_, "dist");
+        dw(distogram_o_head_, "omega");
+        dw(distogram_t_head_, "theta");
+        dw(distogram_p_head_, "phi");
+    }
+
     // pLDDT head: state → lddt logits (B,L,50)
     plddt_head_       = LinearLayer::create(D_STATE, 50);
 
@@ -2633,8 +2649,15 @@ void PPMLModel::ensure_backend_ready() {
     if (backend_ready_) return;
 
     // 1. 创建 CPU Backend（始终存在）
+    //    线程数：PPML_N_THREADS 环境变量（默认 4）。多线程 barrier/唤醒已重写为
+    //    感翻转屏障 + 图代际唤醒，可安全用于训练（见 ThreadPool.cpp）。
     if (!cpu_backend_) {
-        cpu_backend_ = std::make_unique<CPUBackend>(4);  // 4 线程
+        int n_threads = 4;
+        if (const char* p = getenv("PPML_N_THREADS")) {
+            int v = atoi(p);
+            if (v >= 1) n_threads = v;
+        }
+        cpu_backend_ = std::make_unique<CPUBackend>(n_threads);
     }
 
     // 2. 创建 BackendScheduler 并注册后端

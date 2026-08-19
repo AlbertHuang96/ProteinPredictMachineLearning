@@ -30,6 +30,12 @@ void Gallocr::reset_state(int n_backends) {
     node_map_.clear();
     nodes_.clear();
     leaves_.clear();
+    phase1_offset_.clear();
+    for (auto& ba : backends_) {
+        ba.high_watermark = 0;
+        ba.live.clear();
+    }
+    recording_phase1_ = false;
 }
 
 size_t Gallocr::backend_peak(int b) const {
@@ -56,7 +62,7 @@ void Gallocr::compute_refcounts(
         ni.tensor     = t;
         ni.managed    = (t->data() == nullptr && t->view_src == nullptr);
         ni.backend_id = backend_id_of(t);
-        ni.is_output  = (t->flag & TENSOR_FLAG_OUTPUT) != 0;
+        ni.is_output  = (t->flag & (TENSOR_FLAG_OUTPUT | TENSOR_FLAG_LOSS)) != 0;
         node_map_[t]  = &ni;
     }
     // 登记 leafs
@@ -66,7 +72,7 @@ void Gallocr::compute_refcounts(
         li.tensor     = t;
         li.managed    = (t->data() == nullptr && t->view_src == nullptr);
         li.backend_id = backend_id_of(t);
-        li.is_output  = (t->flag & TENSOR_FLAG_OUTPUT) != 0;
+        li.is_output  = (t->flag & (TENSOR_FLAG_OUTPUT | TENSOR_FLAG_LOSS)) != 0;
         node_map_[t]  = &li;
     }
 
@@ -95,17 +101,33 @@ bool Gallocr::allocate_node(NodeInfo* ni) {
 
     size_t alloc_size = GGML_PAD(ba.buft->get_alloc_size(t), ba.buft->get_alignment());
     size_t offset = 0;
-    if (!ba.talloc->alloc(alloc_size, offset)) {
-        return false;  // 后端 buffer 空间不足（Phase2 峰值计算应已保证足够）
+
+    if (recording_phase1_) {
+        // ---- Phase1：best-fit 模拟分配，记录偏移 + 峰值 ----
+        if (!ba.talloc->alloc(alloc_size, offset)) {
+            return false;  // 后端 buffer 空间不足（Phase1 为虚拟大空间，理论上不应发生）
+        }
+        phase1_offset_[t] = offset;
+        ba.high_watermark = std::max(ba.high_watermark, offset + alloc_size);
+
+        // 峰值 = 最大同时存活字节数（used_bytes 随借/还变化）
+        size_t live = ba.talloc->used_bytes();
+        ba.peak = std::max(ba.peak, live);
+    } else {
+        // ---- Phase2：直接复用 Phase1 记录的偏移（保证两阶段布局一致）----
+        auto it = phase1_offset_.find(t);
+        if (it == phase1_offset_.end()) return false;
+        offset = it->second;
+
+        // 方向3：分配前检查新区间与当前存活区间是否重叠（应恒不重叠，防御性断言）
+        if (getenv("GRAPH_DEBUG_GALLOCR")) check_live_overlap(ba, ni);
+        add_live(ba, offset, alloc_size);
     }
 
-    ni->offset    = offset;
-    ni->buffer    = ba.buffers.empty() ? nullptr : ba.buffers[0];
-    ni->allocated = true;
-
-    // 峰值跟踪：Phase1 时 talloc 是"虚拟大空间"，used_bytes() 即当前存活字节数
-    size_t live = ba.talloc->used_bytes();
-    ba.peak = std::max(ba.peak, live);
+    ni->offset     = offset;
+    ni->alloc_size = alloc_size;
+    ni->buffer     = ba.buffers.empty() ? nullptr : ba.buffers[0];
+    ni->allocated  = true;
     return true;
 }
 
@@ -117,10 +139,13 @@ void Gallocr::free_node(NodeInfo* ni) {
     if (ni->is_output) return;  // OUTPUT 永不复用（本实现保守：也不释放）
 
     BackendAlloc& ba = backends_[ni->backend_id];
-    TensorF32*    t  = ni->tensor;
-    size_t alloc_size = GGML_PAD(ba.buft->get_alloc_size(t), ba.buft->get_alignment());
-    ba.talloc->free_bytes(ni->offset, alloc_size);
-
+    if (recording_phase1_) {
+        // Phase1：把空间还给虚拟 talloc（供后续张量复用）
+        ba.talloc->free_bytes(ni->offset, ni->alloc_size);
+    } else {
+        // Phase2：从存活区间集合移除（方向3）
+        remove_live(ba, ni->offset, ni->alloc_size);
+    }
     ni->allocated = false;
 }
 
@@ -144,6 +169,7 @@ bool Gallocr::reserve(
     compute_refcounts(graph, backend_id_of);
 
     // Phase1 模拟：每个后端用虚拟大空间 DynTalloc（仅追踪偏移/大小，不占用真实内存）
+    recording_phase1_ = true;
     for (auto& ba : backends_) {
         ba.talloc = new DynTalloc(std::numeric_limits<size_t>::max() / 2, ba.buft->get_alignment());
     }
@@ -217,12 +243,17 @@ bool Gallocr::alloc(
         if (!ba.use) continue;
         if (!ba.buft) continue;
 
-        size_t size = ba.peak;
+        // buffer 大小 = Phase1 的 max(offset+alloc_size)（high_watermark ≥ peak），
+        // 直接复用 Phase1 记录的偏移，故不需要为 best-fit 碎片预留 —— 加少量 slack 兜底即可。
+        size_t size = ba.high_watermark;
         if (size > 0) {
+            // slack：12.5% + 1MB 兜底（防御 offset+alloc_size 的尾部边界）
+            size_t slack = GGML_PAD(ba.high_watermark / 8 + (1 << 20), ba.buft->get_alignment());
+            size += slack;
             Buffer* buf = alloc_buffer(ba.buft, size);
             if (!buf) {
                 if (getenv("GRAPH_DEBUG_GALLOCR")) {
-                    fprintf(stderr, "[gallocr] alloc FAIL: backend=%d peak=%zu bytes (%.2f GB)\n",
+                    fprintf(stderr, "[gallocr] alloc FAIL: backend=%d size=%zu bytes (%.2f GB)\n",
                             (int)(&ba - &backends_[0]), size, size / (1024.0 * 1024.0 * 1024.0));
                 }
                 release(); return false;
@@ -233,6 +264,8 @@ bool Gallocr::alloc(
     }
 
     // 2. 重置 refcount（Phase1 已把 n_children 减到 0），重新统计
+    //     Phase2 不再记录偏移（phase1_offset_ 已是 Phase1 的基线）
+    recording_phase1_ = false;
     compute_refcounts(graph, backend_id_of);
 
     // 3. 分配 managed leaves 并绑定
@@ -313,6 +346,42 @@ void Gallocr::bind_tensor(NodeInfo* ni) {
 }
 
 // ============================================================
+// 方向3：Phase2 存活区间跟踪 + overlap 检查
+//   Phase2 复用 Phase1 偏移，布局本身一致；此处为防御性校验，
+//   若未来有任何布局 bug 导致两个同时存活的张量区间重叠，立即暴露。
+// ============================================================
+void Gallocr::add_live(BackendAlloc& ba, size_t off, size_t size) {
+    if (size == 0) return;
+    ba.live.push_back({off, size});
+}
+
+void Gallocr::remove_live(BackendAlloc& ba, size_t off, size_t size) {
+    if (size == 0) return;
+    for (size_t i = 0; i < ba.live.size(); ++i) {
+        if (ba.live[i].off == off && ba.live[i].size == size) {
+            ba.live.erase(ba.live.begin() + i);
+            return;
+        }
+    }
+    // 未找到（如重复 free）—— 幂等，忽略。
+}
+
+void Gallocr::check_live_overlap(BackendAlloc& ba, const NodeInfo* ni) {
+    const size_t off  = phase1_offset_[ni->tensor];
+    const size_t size = GGML_PAD(ba.buft->get_alloc_size(ni->tensor), ba.buft->get_alignment());
+    if (size == 0) return;
+    for (const auto& r : ba.live) {
+        if (off < r.off + r.size && r.off < off + size) {
+            fprintf(stderr,
+                    "[gallocr][LIVE-OVERLAP] tensor=%p n_bytes=%zu [off=%zu,+%zu) overlaps "
+                    "live [off=%zu,+%zu) -- 两阶段布局错位/复用碰撞!\n",
+                    (void*)ni->tensor, ni->tensor ? ni->tensor->nbytes() : 0,
+                    off, size, r.off, r.size);
+        }
+    }
+}
+
+// ============================================================
 // release
 // ============================================================
 void Gallocr::release() {
@@ -322,11 +391,70 @@ void Gallocr::release() {
         delete ba.talloc;
         ba.talloc = nullptr;
         ba.peak = 0;
+        ba.high_watermark = 0;
+        ba.live.clear();
         ba.use = false;
     }
     node_map_.clear();
     nodes_.clear();
     leaves_.clear();
+    phase1_offset_.clear();
+    recording_phase1_ = false;
+}
+
+// ============================================================
+// diagnose_aliasing — 查找与 target 在 Phase2 中 offset 区间重叠的 managed 节点。
+// 用于排查 pred_coords 等被其它节点 buffer 复用覆盖的问题。
+//  - 若 target 为 managed（在 gallocr buffer 中）→ 列出与其 [off, off+size)
+//    区间重叠、且在目标生命周期内可能复用的节点。
+//  - 若 target 非 managed（data() 或 view_src 非空，如 wrap_value_as_leaf 的叶子）→
+//    其数据在独立 scratch/宿主内存，不受 gallocr buffer 复用影响，直接打印该结论。
+// 返回重叠的 managed 节点数（仅对 managed target 有意义）。
+// ============================================================
+int Gallocr::diagnose_aliasing(TensorF32* target) {
+    if (!target) return 0;
+    int n_overlap = 0;
+
+    // 目标在 node_map_ 中（nodes_/leaves_ 里的 NodeInfo）
+    auto tinfo = node_map_.find(target);
+    bool t_managed = false;
+    size_t t_off = 0, t_size = 0;
+    if (tinfo != node_map_.end() && tinfo->second->managed && tinfo->second->allocated) {
+        t_managed = true;
+        t_off  = tinfo->second->offset;
+        t_size = GGML_PAD(tinfo->second->tensor->nbytes(),
+                          backends_[tinfo->second->backend_id].buft->get_alignment());
+    }
+
+    if (!t_managed) {
+        fprintf(stderr,
+                "[gallocr][alias] target=%p n_bytes=%zu is NON-managed "
+                "(data=%p view_src=%p) -> persistent scratch/leaf, "
+                "NOT subject to gallocr buffer reuse.\n",
+                (void*)target, target->nbytes(),
+                (void*)target->data(), (void*)target->view_src);
+        return 0;
+    }
+
+    // 目标 managed：遍历所有 node/leaf，找 offset 区间重叠的。
+    auto overlaps = [&](const NodeInfo& oi) {
+        if (!oi.managed || !oi.allocated || oi.tensor == target) return;
+        size_t o_size = GGML_PAD(oi.tensor->nbytes(),
+                                 backends_[oi.backend_id].buft->get_alignment());
+        size_t o_off = oi.offset;
+        if (o_off < t_off + t_size && t_off < o_off + o_size) {  // 区间相交
+            fprintf(stderr,
+                    "[gallocr][alias] OVERLAP target_off=%zu size=%zu <-> tensor=%p "
+                    "off=%zu size=%zu (op=%d, managed=%d)\n",
+                    t_off, t_size, (void*)oi.tensor, o_off, o_size,
+                    (int)oi.tensor->op, (int)oi.managed);
+            n_overlap++;
+        }
+    };
+    for (auto& li : leaves_) overlaps(li);
+    for (auto& ni : nodes_)  overlaps(ni);
+
+    return n_overlap;
 }
 
 } // namespace ppml

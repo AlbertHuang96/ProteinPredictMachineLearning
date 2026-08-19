@@ -191,8 +191,6 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
     main_state.pool = threadpool_;
     compute_thread(&main_state);
 
-    threadpool_->barrier_wait();
-
     return threadpool_->ec;
 }
 
@@ -226,6 +224,39 @@ void CPUBackend::compute_thread(ThreadState * state) {
 
         if (node_n + 1 < cgraph->n_nodes()) {
             tp->barrier_wait();
+        }
+
+        // ---- 开发诊断：找第一个输出含 NaN 的节点（GRAPH_DEBUG_NAN=1）----
+        if (ith == 0 && getenv("GRAPH_DEBUG_NAN") && node->data() && node->op != OP_NONE) {
+            const int64_t ne_ = node->numel();
+            const float* nd = node->data();
+            for (int64_t q = 0; q < ne_; ++q) {
+                if (nd[q] != nd[q]) {
+                    fprintf(stderr,
+                            "[nan-node] FIRST_NAN node_n=%d op=%d src0op=%d dims=[%lld,%lld,%lld,%lld] "
+                            "numel=%lld idx=%lld src0data=%p\n",
+                            node_n, (int)node->op,
+                            (node->src[0] ? (int)node->src[0]->op : -1),
+                            (long long)(node->shape().ndim()>0?node->shape().dims[0]:-1),
+                            (long long)(node->shape().ndim()>1?node->shape().dims[1]:-1),
+                            (long long)(node->shape().ndim()>2?node->shape().dims[2]:-1),
+                            (long long)(node->shape().ndim()>3?node->shape().dims[3]:-1),
+                            (long long)ne_, (long long)q,
+                            node->src[0] ? (void*)node->src[0]->data() : nullptr);
+                    // 对 MUL/MUL_MAT：dump src0/src1 前 8 个值，判断哪个输入含 NaN
+                    if ((node->op == OP_MUL_MAT || node->op == OP_MUL) && node->src[0] && node->src[1] &&
+                        node->src[0]->data() && node->src[1]->data()) {
+                        fprintf(stderr, "  [nan-node] src0 op=%d head8: ", (int)node->src[0]->op);
+                        const float* s0 = node->src[0]->data();
+                        for (int h = 0; h < 8 && h < node->src[0]->numel(); ++h) fprintf(stderr, "%g,", s0[h]);
+                        fprintf(stderr, "\n  [nan-node] src1 op=%d head8: ", (int)node->src[1]->op);
+                        const float* s1 = node->src[1]->data();
+                        for (int h = 0; h < 8 && h < node->src[1]->numel(); ++h) fprintf(stderr, "%g,", s1[h]);
+                        fprintf(stderr, "\n");
+                    }
+                    break;  // 只报每个节点的首个 NaN
+                }
+            }
         }
     }
 
@@ -278,6 +309,12 @@ int CPUBackend::get_n_tasks(TensorF32 * node, int n_threads) {
 }
 size_t CPUBackend::estimate_work_size(TensorF32 * node, int n_threads, int n_tasks) {
     size_t cur = 0;
+
+    // graph_plan 调用本函数时只传 2 参数，n_tasks 为默认 -1；
+    // 若不修正，RMS_NORM/NORM/FLASH_ATTN/CROSS_ENTROPY 等分支会用 n_tasks=-1
+    // 算出负值(在 size_t 下溢出为超大) → work_size 巨大 → new uint8_t[work_size] 抛 bad_alloc。
+    if (n_tasks < 1) n_tasks = get_n_tasks(node, n_threads);
+    if (n_tasks < 1) n_tasks = 1;
 
     switch (node->op) {
         // ===== 需要反量化的操作 =====

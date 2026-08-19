@@ -39,16 +39,20 @@ public:
         bool       managed    = false;  // true: 参与 DynTalloc 复用；false: 持久（已分配/参数）
         bool       is_output  = false;  // OUTPUT 张量永不复用（本实现暂不依赖）
         size_t     offset     = 0;
+        size_t     alloc_size = 0;   // 对齐后的分配大小（GGML_PAD 后）
         Buffer*    buffer     = nullptr;
         int        backend_id = 0;
     };
 
     // 单后端分配器（一个 backend 对应一个 DynTalloc）
+    struct LiveRange { size_t off; size_t size; };
     struct BackendAlloc {
         BufferType* buft   = nullptr;
-        size_t      peak   = 0;                 // Phase1 计算的峰值（对齐后）
-        DynTalloc*  talloc = nullptr;           // Phase2
+        size_t      peak   = 0;                 // Phase1 计算的峰值（对齐后，= 最大同时存活字节数）
+        size_t      high_watermark = 0;         // Phase1 的 max(offset+alloc_size)（buffer 需 ≥ 此值）
+        DynTalloc*  talloc = nullptr;           // Phase1 用；Phase2 不用于 offset 决策
         std::vector<Buffer*> buffers;           // Phase2 实际分配的 buffer（本类持有所有权）
+        std::vector<LiveRange> live;            // Phase2 当前存活区间（方向3 overlap 检查用）
         bool        use    = false;
     };
 
@@ -77,6 +81,12 @@ public:
     // 释放所有 backend buffer（与 reserve/alloc 配套）
     void release();
 
+    // ============ 诊断（GRAPH_DEBUG_GALLOCR 时输出）============
+    // 打印所有与 target 在 Phase2 中 offset 区间重叠的 managed 节点。
+    // 用于排查 pred_coords 等叶子/输出被其它节点 buffer 复用覆盖的问题。
+    // 返回重叠节点数。
+    int diagnose_aliasing(TensorF32* target);
+
     // 后端峰值（reserve 后有效）
     size_t backend_peak(int b) const;
     size_t n_backends() const { return backends_.size(); }
@@ -95,6 +105,15 @@ private:
     void free_node(NodeInfo* ni);
     // 把分配结果（offset/buffer）写回张量 data_/buffer_/buffer_offs_
     void bind_tensor(NodeInfo* ni);
+    // 方向3：Phase2 分配时检查新区间是否与当前存活区间重叠（应恒不重叠）
+    void check_live_overlap(BackendAlloc& ba, const NodeInfo* ni);
+    void add_live(BackendAlloc& ba, size_t off, size_t size);
+    void remove_live(BackendAlloc& ba, size_t off, size_t size);
+
+    // Phase1（reserve）记录的每个 managed 张量偏移。Phase2 直接复用该偏移，
+    // 使两阶段布局完全一致（消除 best-fit 因 buffer 总大小不同导致的分叉）。
+    std::unordered_map<const TensorF32*, size_t> phase1_offset_;
+    bool recording_phase1_ = false;
 
     std::vector<BackendAlloc> backends_;
     std::unordered_map<const TensorF32*, NodeInfo*> node_map_;

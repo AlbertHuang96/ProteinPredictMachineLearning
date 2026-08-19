@@ -39,6 +39,7 @@ enum class Status {
 
 struct ThreadState {
     int          id;       // 0 ~ n_threads-1
+    int          last_seen = 0;  // worker 已消费的 graph_seq（唤醒判定）
     struct ThreadPool * pool;
     std::thread  os_thread;
 };
@@ -70,13 +71,16 @@ struct alignas(64) ThreadPool {
     std::atomic<bool>       stop  {false};
 
     // ===== 任务 =====
-    std::atomic<int>        n_graph {0};
+    std::atomic<int>        graph_seq {0};      // 图代际：每次 submit +1，worker 据此被唤醒
     ComputeGraph *          cgraph = nullptr;
     ComputePlan  *          cplan  = nullptr;
 
     // ===== 同步 =====
-    alignas(64) std::atomic<int> n_barrier        {0};
-    alignas(64) std::atomic<int> n_barrier_passed {0};
+    // 感翻转屏障（sense-reversing）：n_barrier_passed 初值=n_threads_cur，
+    // 每线程本地 sense 翻转；fetch_sub(1) 到 1 者（最后到达）重置并翻转 n_barrier_sense，
+    // 其余线程自旋等 n_barrier_sense==本地 sense。
+    alignas(64) std::atomic<int> n_barrier_passed {1};
+    alignas(64) std::atomic<int> n_barrier_sense  {0};
     alignas(64) std::atomic<int> current_chunk    {0};
 
     // ===== 控制 =====
@@ -424,6 +428,10 @@ public:
 
     // 优先级（越大越优先被调度）
     virtual int priority() const { return 0; }
+
+    // 延迟分配器访问（诊断 buffer 复用 / aliasing 用）。
+    // 各派生后端持有自己的 gallocr_，故为纯虚，由派生类返回其成员。
+    virtual Gallocr& gallocr() = 0;
 };
 
 class BackendScheduler {
@@ -564,6 +572,9 @@ public:
     // ===== 公开（图规划，可以被外部调用预估算资源）=====
     ComputePlan  graph_plan(ComputeGraph * cgraph) const;
 
+    // 延迟分配器访问（诊断 buffer 复用 / aliasing 用）
+    Gallocr& gallocr() override { return gallocr_; }
+
 private:
     // ===== 图计算线程（静态，无 this 依赖）=====
     static void compute_thread(ThreadState * state);
@@ -680,6 +691,9 @@ public:
     // GPU 优先级高于 CPU
     // set it 0 when we test cpu
     int priority() const override { return 1; }
+
+    // 延迟分配器访问（诊断 buffer 复用 / aliasing 用）
+    Gallocr& gallocr() override { return gallocr_; }
 
 private:
     int device_id_ = 0;

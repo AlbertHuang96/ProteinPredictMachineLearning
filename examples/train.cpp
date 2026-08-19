@@ -226,7 +226,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    PPMLDataLoader loader("", "", 512, 4, 2048);
+    // MSA 深度 N: 原 512 -> 128 (开发用降配, 缓解 Gallocr 峰值内存)。
+    //   注: 此参数决定 MSA 列注意力 softmax [N,N,H,L] 与 FFN 中间件 [d_msa,L,N] 的规模,
+    //       N=512 时 softmax 408MB / unary 204MB, 峰值 ~18GB 超 WSL 15GB;
+    //       N=128 时 softmax ~25MB / unary ~51MB, 峰值可降到 ~5GB 内跑通训练。
+    PPMLDataLoader loader("", "", 128, 4, 2048);
     ModelInput input = loader.load_from_files(a3m_path, sequence, csv_path, template_dir, hhr_path);
     int L = static_cast<int>(sequence.length());
 
@@ -479,7 +483,36 @@ int main(int argc, char* argv[]) {
         PPMLContext* ctx = &context();
         ComputeGraph* cgraph = ComputeGraph::new_graph(ctx);
         cgraph->build_forward_expand(total_node);
-        cgraph->build_backward_expand(ctx, nullptr);
+        // 开发诊断：打印 total 链关键节点（loss 分量及消费它的 scale/add）的 index，验证拓扑顺序
+        if (getenv("GRAPH_DEBUG_LOSS")) {
+            TensorF32* loss_nodes[5] = { loss_fape_node, loss_chi_node, loss_distogram_node, loss_msa_node, loss_conf_node };
+            const char* lnames[5] = { "fape", "chi", "dist", "msa", "conf" };
+            for (int i = 0; i < cgraph->n_nodes(); i++) {
+                TensorF32* nn = cgraph->graph_node(i);
+                // 打印 loss 分量 index 和引用它们的 scale/add 的 index
+                for (int k = 0; k < 5; k++) {
+                    if (nn == loss_nodes[k]) {
+                        std::cout << "  [order] idx=" << i << " is_loss=" << lnames[k] << " op=" << nn->op << std::endl;
+                    }
+                }
+                if (nn->op == 33 || nn->op == 2) {
+                    for (int s = 0; s < 4; s++) {
+                        for (int k = 0; k < 5; k++) {
+                            if (nn->src[s] == loss_nodes[k]) {
+                                std::cout << "  [order] idx=" << i << " consumes_loss=" << lnames[k]
+                                          << " op=" << nn->op << std::endl;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 开发开关：PPML_NO_BACKWARD=1 跳过反向，仅看前向 loss（隔离 forward/backward nan 来源）
+        static const bool no_backward =
+            (std::getenv("PPML_NO_BACKWARD") != nullptr) && (std::atoi(std::getenv("PPML_NO_BACKWARD")) != 0);
+        if (!no_backward) {
+            cgraph->build_backward_expand(ctx, nullptr);
+        }
 
         // ---- 反向计算 + 梯度裁剪 + AdamW 参数更新 ----
         Backend* backend = model.active_backend();
@@ -487,6 +520,74 @@ int main(int argc, char* argv[]) {
         if (compute_st != Status::SUCCESS) {
             std::cout << "[WARN] graph_compute status=" << static_cast<int>(compute_st)
                       << " (0=SUCCESS 1=ALLOC_FAILED)" << std::endl;
+        }
+
+        // ---- 开发诊断：pred_coords 值 + 是否被 gallocr buffer 复用覆盖 ----
+        if (getenv("GRAPH_DEBUG_GALLOCR") && pred_node) {
+            const int64_t pdN = pred_node->numel();
+            const int64_t nprint = (pdN < 9) ? pdN : 9;
+            float* pd = pred_node->data();
+            std::cout << "[gallocr][pred_coords] numel=" << pdN
+                      << " data=" << (void*)pd << std::endl;
+            if (pd) {
+                bool has_nan = false; float mn = 1e30f, mx = -1e30f;
+                for (int64_t q = 0; q < pdN; ++q) {
+                    if (pd[q] != pd[q]) { has_nan = true; break; }
+                    mn = std::min(mn, pd[q]); mx = std::max(mx, pd[q]);
+                }
+                std::cout << "  [gallocr][pred_coords] head=[";
+                for (int64_t q = 0; q < nprint; ++q)
+                    std::cout << pd[q] << (q + 1 < nprint ? "," : "");
+                std::cout << "] min=" << mn << " max=" << mx
+                          << " has_nan=" << has_nan << std::endl;
+            }
+            // 找与 pred_node 分配区间重叠的 gallocr managed 节点（覆盖源）
+            std::cout << "  [gallocr][pred_coords] aliasing pred_node:" << std::endl;
+            backend->gallocr().diagnose_aliasing(pred_node);
+            std::cout << "  [gallocr][pred_coords] aliasing true_node:" << std::endl;
+            backend->gallocr().diagnose_aliasing(true_node);
+        }
+        // ---- 开发诊断：distogram head logits 是否含 nan（数据已算好）----
+        if (getenv("GRAPH_DEBUG_GALLOCR") && go.distogram && go.distogram->numel() > 0) {
+            auto dump4 = [&](TensorF32* t, const char* tag) {
+                if (!t || !t->data()) { std::cout << "[dist_logits] " << tag << " data=null\n"; return; }
+                const float* gd = t->data();
+                float mn=1e30f, mx=-1e30f; bool nan=false; long nnan=0;
+                for (int64_t q=0; q<t->numel(); ++q){ float v=gd[q]; if(v!=v){nan=true;++nnan;} mn=std::min(mn,v); mx=std::max(mx,v);}
+                std::cout << "[dist_logits] " << tag << " numel=" << t->numel() << " min="<<mn<<" max="<<mx
+                          << " nan="<<nan<<" nnan="<<nnan<<" head0="<<gd[0]<<" head1="<<gd[1]<<"\n";
+            };
+            dump4(go.distogram, "dist");
+            dump4(go.omega,     "omega");
+            dump4(go.theta,     "theta");
+            dump4(go.phi,       "phi");
+            // 检查 distogram one-hot 标签本身是否含 NaN（根因验证）
+            auto dumpOH = [&](const TensorF32& t, const char* tag){
+                const float* d=t.data(); bool nan=false; long nn=0;
+                for(int64_t q=0;q<t.numel();++q){ if(d[q]!=d[q]){nan=true;++nn;} }
+                std::cout << "[onehot] " << tag << " numel=" << t.numel() << " nan="<<nan<<" nnan="<<nn<<"\n";
+            };
+            dumpOH(input.D_onehot, "D");
+            dumpOH(input.O_onehot, "O");
+            dumpOH(input.T_onehot, "T");
+            dumpOH(input.P_onehot, "P");
+            if (go.lddt && go.lddt->numel()>0) dump4(go.lddt, "lddt");
+            if (go.pair && go.pair->numel()>0) dump4(go.pair, "pair");
+            if (go.state && go.state->numel()>0) dump4(go.state, "state");
+            // 打印 omega/theta/state 中 nan 的确切下标（首 20 个）
+            {
+                auto nanidx = [&](TensorF32* t, const char* tag){
+                    if(!t||!t->data()) return; const float* d=t->data(); int cnt=0;
+                    std::cout << "[nanidx] " << tag << " ndim=" << t->shape().ndim();
+                    for(int i=0;i<t->shape().ndim();++i) std::cout<<" d"<<i<<"="<<t->shape().dims[i];
+                    std::cout << " nan@";
+                    for(int64_t q=0;q<t->numel()&&cnt<20;++q){ if(d[q]!=d[q]){ std::cout<<q<<","; ++cnt; } }
+                    std::cout<<" cnt="<<cnt<<"\n";
+                };
+                nanidx(go.omega, "omega");
+                nanidx(go.theta, "theta");
+                nanidx(go.state, "state");
+            }
         }
         float grad_norm = clip_grad_norm(cgraph, 0.1f);    // 全局梯度裁剪 (AF2 推荐 0.1)
 
@@ -502,6 +603,187 @@ int main(int argc, char* argv[]) {
         float batch_loss = 0.0f;
         if (total_node->data() != nullptr && total_node->numel() == 1) {
             batch_loss = total_node->data()[0];
+        }
+
+        // 开发诊断：打印各损失分量（定位 loss=0 根因）
+        if (getenv("GRAPH_DEBUG_LOSS")) {
+            auto print_loss = [](const char* name, TensorF32* n) {
+                if (n && n->data() && n->numel() == 1)
+                    std::cout << "  [loss] " << name << " = " << n->data()[0] << std::endl;
+                else if (n && n->data()) {
+                    // 非标量 loss：打印完整 sum 判断是否含 nan
+                    double s = 0; int64_t cn = n->numel();
+                    for (int64_t q = 0; q < cn; q++) s += n->data()[q];
+                    std::cout << "  [loss] " << name << " (numel=" << cn << ") v0=" << n->data()[0]
+                              << " full_sum=" << s << std::endl;
+                }
+                else
+                    std::cout << "  [loss] " << name << " = (null/无值)" << std::endl;
+            };
+            print_loss("fape", loss_fape_node);
+            print_loss("chi", loss_chi_node);
+            print_loss("distogram", loss_distogram_node);
+            print_loss("msa", loss_msa_node);
+            print_loss("conf", loss_conf_node);
+            std::cout << "  [loss] total = " << batch_loss << std::endl;
+            // 手动重算 total（用 loss 分量 data()），对比 graph total，判断 total 诊断 nan 是否 buffer 复用假象
+            {
+                auto v1 = [](TensorF32* n){ return (n && n->data() && n->numel()==1) ? n->data()[0] : 0.0f; };
+                double manual = 0.5*v1(loss_fape_node) + 0.5*v1(loss_chi_node) + 0.3*v1(loss_distogram_node)
+                              + 2.0*v1(loss_msa_node) + 0.01*v1(loss_conf_node);
+                std::cout << "  [loss] manual_total = " << manual << std::endl;
+            }
+            // ---- chi 诊断：值侧重算 torsion/norm，检查 chi_mask 与 gt 是否正常 ----
+            if (getenv("GRAPH_DEBUG_LOSS") && go.alpha && go.alpha->numel() > 0) {
+                const int64_t chN = input.gt_chi.shape().dims[0]*input.gt_chi.shape().dims[1];
+                const float* ap = go.alpha->data();          // (B,L,7,2) row-major, B=1
+                const float* gtp = input.gt_chi.data();       // (B,L,7,2)
+                const float* cmp = input.chi_mask.data();     // (B,L,7)
+                double sum_sqdiff=0, sum_mask=0; bool mask_neg=false; long gt_zero_cnt=0;
+                double npos_chi=0, npos_norm=0;
+                for (int64_t r=0; r<chN; ++r) {
+                    for (int a=0; a<7; ++a) {
+                        float m = cmp[r*7+a];
+                        if (m < 0) mask_neg=true;
+                        if (m > 0) {
+                            double p0=ap[r*14+a*2], p1=ap[r*14+a*2+1];
+                            double g0=gtp[r*14+a*2], g1=gtp[r*14+a*2+1];
+                            double rn=sqrt(p0*p0+p1*p1+1e-8);
+                            double n0=p0/rn, n1=p1/rn;
+                            double sd=(n0-g0)*(n0-g0)+(n1-g1)*(n1-g1);
+                            sum_sqdiff += sd*m; sum_mask += m;
+                            if (g0==0&&g1==0) ++gt_zero_cnt;
+                        }
+                    }
+                }
+                std::cout << "  [chi_diag] mask_neg="<<mask_neg<<" gt_zero="<<gt_zero_cnt
+                          << " sum_mask="<<sum_mask<<" value_side_torsion="
+                          << (sum_mask>0?sum_sqdiff/sum_mask:0.0) << " ap[0..3]="
+                          << ap[0]<<","<<ap[1]<<","<<ap[2]<<","<<ap[3]<<std::endl;
+            }
+            // buffer 地址诊断：若不同 loss 的 data() 指针相同 → Gallocr buffer 复用覆盖
+            std::cout << "  [bufaddr] fape=" << (void*)(loss_fape_node?loss_fape_node->data():nullptr)
+                      << " msa=" << (void*)(loss_msa_node?loss_msa_node->data():nullptr)
+                      << " chi=" << (void*)(loss_chi_node?loss_chi_node->data():nullptr)
+                      << " dist=" << (void*)(loss_distogram_node?loss_distogram_node->data():nullptr)
+                      << " conf=" << (void*)(loss_conf_node?loss_conf_node->data():nullptr) << std::endl;
+            // total 的 src 链（scale+add）回溯，定位 nan
+            if (total_node) {
+                TensorF32* cur = total_node;
+                for (int depth = 0; cur && depth < 8; depth++) {
+                    double s = 0; int64_t cn = cur->numel();
+                    if (cur->data()) for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
+                    std::cout << "  [total-chain] d=" << depth << " op=" << cur->op
+                              << " numel=" << cn << " sum=" << s << " addr=" << (void*)cur->data()
+                              << (cn > 0 && cur->data() ? " v0=" + std::to_string(cur->data()[0]) : "")
+                              << " src1_sum=" << (cur->src[1] && cur->src[1]->data() ?
+                                  std::to_string([&](){double ss=0; for(int64_t q=0;q<cur->src[1]->numel();q++) ss+=cur->src[1]->data()[q]; return ss;}()) : "null")
+                              << " src1_addr=" << (void*)(cur->src[1] ? cur->src[1]->data() : nullptr)
+                              << std::endl;
+                    cur = cur->src[0];
+                }
+            }
+            std::cout << "  [loss] msa_logits=" << (go.msa_logits ? "node" : "null")
+                      << " distogram=" << (go.distogram ? "node" : "null") << std::endl;
+            if (go.msa_logits && go.msa_logits->data()) {
+                int64_t ne = go.msa_logits->numel();
+                std::cout << "  [msa_logits] numel=" << ne << " dims=["
+                          << go.msa_logits->shape().dims[0] << "," << go.msa_logits->shape().dims[1] << ","
+                          << go.msa_logits->shape().dims[2] << "," << go.msa_logits->shape().dims[3] << "]";
+                if (ne > 0) std::cout << " v[0..4]=" << go.msa_logits->data()[0] << ","
+                                      << go.msa_logits->data()[1] << "," << go.msa_logits->data()[2] << ","
+                                      << go.msa_logits->data()[3] << "," << go.msa_logits->data()[4];
+                std::cout << std::endl;
+                // 从 msa_logits 回溯 src 链，定位输出 0 的节点
+                TensorF32* cur = go.msa_logits;
+                for (int depth = 0; cur && depth < 8; depth++) {
+                    double s = 0; int64_t cn = cur->numel();
+                    if (cur->data()) for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
+                    std::cout << "  [chain] d=" << depth << " op=" << cur->op
+                              << " numel=" << cn << " sum=" << s
+                              << (cn > 0 && cur->data() ? " v0=" + std::to_string(cur->data()[0]) : "")
+                              << std::endl;
+                    cur = cur->src[0];
+                }
+            }
+            if (input.bert_mask.numel() > 0) {
+                std::cout << "  [bert_mask] numel=" << input.bert_mask.numel()
+                          << " sum=" << [&](){ double s=0; const float* d=input.bert_mask.data();
+                              for (int64_t i=0;i<input.bert_mask.numel();i++) s+=d[i]; return s; }()
+                          << std::endl;
+            }
+            // 参数统计：PARAM 节点数、有 grad 的 PARAM 数（定位 params=0）
+            int n_param=0, n_param_grad=0, n_all_grad=0;
+            for (int i=0;i<cgraph->n_nodes();i++) {
+                TensorF32* nn = cgraph->graph_node(i);
+                if (nn->flag & TENSOR_FLAG_PARAM) {
+                    n_param++;
+                    if (cgraph->graph_get_grad(nn)) n_param_grad++;
+                }
+                if (cgraph->graph_get_grad(nn)) n_all_grad++;
+            }
+            std::cout << "  [param] total=" << n_param << " with_grad=" << n_param_grad
+                      << " any_node_with_grad=" << n_all_grad << std::endl;
+            // 参数值统计：抽查前几个 PARAM 节点 data() 是否非 0（判断 weight 是否初始化）
+            {
+                int shown = 0;
+                for (int i = 0; i < cgraph->n_nodes() && shown < 3; i++) {
+                    TensorF32* nn = cgraph->graph_node(i);
+                    if (nn->flag & TENSOR_FLAG_PARAM && nn->data()) {
+                        double s = 0; int64_t nn2 = nn->numel();
+                        for (int64_t q = 0; q < nn2; q++) s += nn->data()[q];
+                        std::cout << "  [param-val] numel=" << nn2 << " sum=" << s
+                                  << " v[0..2]=" << (nn2>0?nn->data()[0]:0) << ","
+                                  << (nn2>1?nn->data()[1]:0) << ","
+                                  << (nn2>2?nn->data()[2]:0) << std::endl;
+                        shown++;
+                    }
+                }
+            }
+            // loss 节点结构诊断
+            auto print_loss_node = [&](const char* name, TensorF32* n) {
+                if (!n) { std::cout << "  [lossnode] " << name << " = null" << std::endl; return; }
+                std::cout << "  [lossnode] " << name << " op=" << n->op << " numel=" << n->numel()
+                          << " ndim=" << n->shape().ndim()
+                          << " dims=[" << n->shape().dims[0] << "," << n->shape().dims[1] << ","
+                          << n->shape().dims[2] << "," << n->shape().dims[3] << "]"
+                          << " src0_op=" << (n->src[0] ? n->src[0]->op : -1)
+                          << " src1_op=" << (n->src[1] ? n->src[1]->op : -1)
+                          << std::endl;
+            };
+            print_loss_node("fape", loss_fape_node);
+            print_loss_node("msa", loss_msa_node);
+            print_loss_node("distogram", loss_distogram_node);
+            // msa loss (div) 的 src 链回溯
+            if (loss_msa_node) {
+                TensorF32* cur = loss_msa_node;
+                for (int depth = 0; cur && depth < 6; depth++) {
+                    double s = 0; int64_t cn = cur->numel();
+                    if (cur->data()) for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
+                    std::cout << "  [msa-loss-chain] d=" << depth << " op=" << cur->op
+                              << " numel=" << cn << " sum=" << s
+                              << (cn > 0 && cur->data() ? " v0=" + std::to_string(cur->data()[0]) : "")
+                              << std::endl;
+                    cur = cur->src[0];
+                }
+            }
+            // 输入诊断：msa_latent / true_msa / true_coords 是否有效
+            auto print_vals = [](const char* name, const TensorF32& t) {
+                const float* d = t.data();
+                double s = 0; int64_t nn = t.numel();
+                for (int64_t i = 0; i < nn; i++) s += d[i];
+                std::cout << "  [input] " << name << " numel=" << nn << " sum=" << s;
+                if (nn > 0) std::cout << " v[0..3]=" << d[0] << "," << d[1] << "," << d[2] << "," << d[3];
+                std::cout << std::endl;
+            };
+            print_vals("msa_latent", input.msa_latent);
+            print_vals("true_msa", input.true_msa);
+            print_vals("bert_mask", input.bert_mask);
+            print_vals("coords", input.coords);
+            print_vals("true_coords", input.true_coords);
+            print_vals("D_onehot", input.D_onehot);
+            print_vals("pair_mask", input.pair_mask);
+            print_vals("ca_mask", input.ca_mask);
         }
 
         epoch_loss += batch_loss;
