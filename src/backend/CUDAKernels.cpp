@@ -64,6 +64,8 @@ extern void per_edge_matmul_back_gathered_cuda(
 // ============================================================
 
 Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
+    // CUDA 后端无线程池（单流异步 kernel），错误统一经局部 Status 上报。
+    Status st = Status::SUCCESS;
     switch (node->op) {
         case OP_NONE:   break;
 
@@ -90,7 +92,7 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             break;
 
         case OP_CONCAT:
-            kernel_concat_cuda(node, p);
+            kernel_concat_cuda(node, &st);
             break;
 
         case OP_EDGE_GATHER_ROWS:
@@ -137,10 +139,10 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
 
         // ===== 无实现的 op：统一返回 NOT_SUPPORTED =====
         default:
-            p->threadpool->ec = Status::NOT_SUPPORTED;
+            st = Status::NOT_SUPPORTED;
             break;
     }
-    return p->threadpool->ec;
+    return st;
 }
 
 // ============================================================
@@ -243,20 +245,20 @@ void CUDABackend::kernel_dup_cuda(TensorF32 * node) {
     (void)node;
 }
 
-void CUDABackend::kernel_scale_cuda(TensorF32 * node, ComputeParams * p) {
-    p->threadpool->ec = Status::NOT_SUPPORTED;
+void CUDABackend::kernel_scale_cuda(TensorF32 * node, Status* st) {
+    (void)node; if (st) *st = Status::NOT_SUPPORTED;
 }
 
-void CUDABackend::kernel_add1_cuda(TensorF32 * node, ComputeParams * p) {
-    p->threadpool->ec = Status::NOT_SUPPORTED;
+void CUDABackend::kernel_add1_cuda(TensorF32 * node, Status* st) {
+    (void)node; if (st) *st = Status::NOT_SUPPORTED;
 }
 
-void CUDABackend::kernel_sum_cuda(TensorF32 * node, ComputeParams * p) {
-    p->threadpool->ec = Status::NOT_SUPPORTED;
+void CUDABackend::kernel_sum_cuda(TensorF32 * node, Status* st) {
+    (void)node; if (st) *st = Status::NOT_SUPPORTED;
 }
 
-void CUDABackend::kernel_mean_cuda(TensorF32 * node, ComputeParams * p) {
-    p->threadpool->ec = Status::NOT_SUPPORTED;
+void CUDABackend::kernel_mean_cuda(TensorF32 * node, Status* st) {
+    (void)node; if (st) *st = Status::NOT_SUPPORTED;
 }
 
 void CUDABackend::kernel_relu_cuda(TensorF32 * node) { (void)node; }
@@ -349,10 +351,9 @@ void CUDABackend::kernel_per_edge_matmul_back_gathered_cuda(TensorF32 * node, Co
     per_edge_matmul_back_gathered_cuda(grad->data(), kernel->data(), node->data(), M, K, E);
 }
 
-void CUDABackend::kernel_concat_cuda(TensorF32 * node, ComputeParams * p) {
-    (void)p;
+void CUDABackend::kernel_concat_cuda(TensorF32 * node, Status* st) {
     const int dim = node->op_params[0];
-    if (dim < 0 || dim >= 4) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+    if (dim < 0 || dim >= 4) { if (st) *st = Status::NOT_SUPPORTED; return; }
 
     // src 为固定大小数组(GGML_MAX_SRC)，仅统计非空输入，空位跳过
     int n_src = 0;
@@ -360,7 +361,7 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, ComputeParams * p) {
     for (int s = 0; s < GGML_MAX_SRC; s++) {
         if (node->src[s]) srcs_tmp[n_src++] = node->src[s];
     }
-    if (n_src < 2) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+    if (n_src < 2) { if (st) *st = Status::NOT_SUPPORTED; return; }
 
     // ============================================================
     // concat 不支持广播语义：强制要求所有 src 的非拼接维与 dst 一致
@@ -375,7 +376,7 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, ComputeParams * p) {
             const int      sd    = srcs_tmp[s]->shape().ndim();
             const int64_t  src_d = (d < sd) ? srcs_tmp[s]->shape().dims[d] : 1;
             if (src_d != dst_d) {
-                p->threadpool->ec = Status::NOT_SUPPORTED;
+                if (st) *st = Status::NOT_SUPPORTED;
                 return;
             }
         }

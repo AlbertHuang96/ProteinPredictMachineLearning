@@ -11,6 +11,49 @@ namespace ppml {
 // 内部辅助函数
 // ============================================================
 
+// ---- 张量读写工具：兼容 backend buffer / 裸 CPU / CUDA 裸张量 ----
+// 当全图在 CUDA 上时，参数/梯度 buffer_ 指向 device 内存，grad->data() 是 device 指针，
+// 不能直接当 host 读写；统一经 buffer_->get_tensor（D2H 同步拷贝）/ set_tensor（H2D）访问。
+namespace {
+std::vector<float> read_tensor_values(const TensorF32* t) {
+    std::vector<float> buf(static_cast<size_t>(t->numel()));
+    const size_t bytes = static_cast<size_t>(t->numel()) * sizeof(float);
+    if (t->buffer_) {
+        // 从 backend buffer 读取（CPU buffer 直接 memcpy；CUDA buffer 内部自动 D2H 同步）
+        t->buffer_->get_tensor(t, buf.data(), t->buffer_offs_, bytes);
+    } else if (t->device() == Device::CPU) {
+        std::memcpy(buf.data(), t->data(), bytes);
+    } else {
+        // CUDA 且无 buffer：拷贝一份 CPU 张量读取
+        TensorF32 tcpu = t->cpu();
+        std::memcpy(buf.data(), tcpu.data(), bytes);
+    }
+    return buf;
+}
+
+void write_tensor_values(TensorF32* t, const std::vector<float>& vals) {
+    const size_t bytes = static_cast<size_t>(t->numel()) * sizeof(float);
+    if (t->buffer_) {
+        t->buffer_->set_tensor(t, vals.data(), t->buffer_offs_, bytes);
+    } else {
+        std::memcpy(t->data(), vals.data(), bytes);
+    }
+}
+
+void fill_tensor_values(TensorF32* t, float val) {
+    const int64_t n = t->numel();
+    if (t->buffer_) {
+        std::vector<float> v(static_cast<size_t>(n), val);
+        t->buffer_->set_tensor(t, v.data(), t->buffer_offs_, static_cast<size_t>(n) * sizeof(float));
+    } else if (t->device() == Device::CPU) {
+        std::fill(t->data(), t->data() + n, val);
+    } else {
+        std::vector<float> v(static_cast<size_t>(n), val);
+        write_tensor_values(t, v);
+    }
+}
+} // namespace
+
 /// @brief 激活单个 loss 节点：将其 upstream grad 设为 1.0，其他 loss 设为 0.0
 static void activate_single_loss(
     ComputeGraph* cgraph,
@@ -22,12 +65,8 @@ static void activate_single_loss(
         TensorF32* grad = cgraph->graph_get_grad(loss_node);
         if (!grad) continue;
         float val = (loss_node == active_loss) ? 1.0f : 0.0f;
-        int64_t n = grad->numel();
-        // 对 GPU tensor 也需写入；此处假设 graph_compute 已在正确设备上下文
-        float* gdata = grad->data();
-        for (int64_t j = 0; j < n; j++) {
-            gdata[j] = val;
-        }
+        // buffer 感知：CUDA 上写 device 内存（D2H 经 set_tensor）
+        fill_tensor_values(grad, val);
     }
 }
 
@@ -38,8 +77,7 @@ static void clear_param_grads(ComputeGraph* cgraph) {
         if (!(node->flag & TENSOR_FLAG_PARAM)) continue;
         TensorF32* grad = cgraph->graph_get_grad(node);
         if (grad) {
-            int64_t n = grad->numel();
-            std::fill(grad->data(), grad->data() + n, 0.0f);
+            fill_tensor_values(grad, 0.0f);
         }
     }
 }
@@ -52,10 +90,11 @@ static float compute_total_grad_norm(const std::vector<TensorF32*>& param_list, 
     for (auto* param : param_list) {
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
-        float* g = grad->data();
-        int64_t n = grad->numel();
+        std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
+        const int64_t n = grad->numel();
         for (int64_t j = 0; j < n; j++) {
-            norm_sq += static_cast<double>(g[j]) * static_cast<double>(g[j]);
+            norm_sq += static_cast<double>(g[static_cast<size_t>(j)]) *
+                       static_cast<double>(g[static_cast<size_t>(j)]);
         }
     }
     return static_cast<float>(std::sqrt(norm_sq));
@@ -66,11 +105,12 @@ static void scale_param_grads(const std::vector<TensorF32*>& param_list, Compute
     for (auto* param : param_list) {
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
-        float* g = grad->data();
-        int64_t n = grad->numel();
+        std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
+        const int64_t n = grad->numel();
         for (int64_t j = 0; j < n; j++) {
-            g[j] *= scale;
+            g[static_cast<size_t>(j)] *= scale;
         }
+        write_tensor_values(grad, g);  // H2D 写回
     }
 }
 
@@ -172,10 +212,10 @@ float accumulate_per_loss_gradients(
         for (size_t a = 0; a < accumulators.size(); a++) {
             TensorF32* grad = cgraph->graph_get_grad(accumulators[a].param);
             if (!grad) continue;
-            float* gdata = grad->data();
+            std::vector<float> gdata = read_tensor_values(grad);  // D2H（若 device）
             int64_t n = grad->numel();
             for (int64_t j = 0; j < n; j++) {
-                accumulators[a].accum[static_cast<size_t>(j)] += gdata[j];
+                accumulators[a].accum[static_cast<size_t>(j)] += gdata[static_cast<size_t>(j)];
             }
         }
 
@@ -192,9 +232,7 @@ float accumulate_per_loss_gradients(
     for (size_t a = 0; a < accumulators.size(); a++) {
         TensorF32* grad = cgraph->graph_get_grad(accumulators[a].param);
         if (!grad) continue;
-        int64_t n = grad->numel();
-        std::memcpy(grad->data(), accumulators[a].accum.data(),
-                    static_cast<size_t>(n) * sizeof(float));
+        write_tensor_values(grad, accumulators[a].accum);  // H2D（若 device）
     }
 
     // ---- Step 3: 全局裁剪 ----

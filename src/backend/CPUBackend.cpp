@@ -140,40 +140,43 @@ ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
 // ===== graph_compute (Backend 接口) =====
 Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
     // ---- no_alloc 延迟分配：对 data_==nullptr 的中间节点分配 backend buffer ----
-    // 释放上一图分配的 buffer（上一图消费方已在上次 graph_compute 返回后读取完 data()）。
-    gallocr_.release();
-    bool need_alloc = false;
-    for (int i = 0; i < cgraph->n_nodes(); ++i) {
-        if (cgraph->graph_node(i)->data() == nullptr) { need_alloc = true; break; }
-    }
-    if (!need_alloc) {
-        for (int i = 0; i < cgraph->n_leafs(); ++i) {
-            if (cgraph->graph_leaf(i)->data() == nullptr) { need_alloc = true; break; }
+    // 混训时 scheduler 已通过 reserve_graph_memory 预分配了全部张量，置 skip_alloc_=true，
+    // 这里跳过本端自己的 gallocr，避免两套 gallocr 反复 re-bind 张量导致跨 split 读到错位 buffer。
+    if (!skip_alloc_) {
+        // 释放上一图分配的 buffer（上一图消费方已在上次 graph_compute 返回后读取完 data()）。
+        gallocr_.release();
+        bool need_alloc = false;
+        for (int i = 0; i < cgraph->n_nodes(); ++i) {
+            if (cgraph->graph_node(i)->data() == nullptr) { need_alloc = true; break; }
         }
-    }
-    if (need_alloc) {
-        gallocr_.set_n_backends(1);
-        gallocr_.backends()[0].buft = CPUBufferType::instance();
-        auto backend_id_of = [](TensorF32*) -> int { return 0; };
-        if (!gallocr_.reserve(cgraph, backend_id_of, 1) ||
-            !gallocr_.alloc(cgraph, backend_id_of, 1)) {
-            if (getenv("GRAPH_DEBUG_GALLOCR")) {
-                fprintf(stderr, "[gallocr] ALLOC_FAILED: n_nodes=%d n_leafs=%d peak=%zu\n",
-                        cgraph->n_nodes(), cgraph->n_leafs(), gallocr_.backend_peak(0));
+        if (!need_alloc) {
+            for (int i = 0; i < cgraph->n_leafs(); ++i) {
+                if (cgraph->graph_leaf(i)->data() == nullptr) { need_alloc = true; break; }
             }
-            return Status::ALLOC_FAILED;
         }
-        if (getenv("GRAPH_DEBUG_GALLOCR")) {
-            fprintf(stderr, "[gallocr] ok: n_nodes=%d n_leafs=%d peak=%zu bytes (%.2f GB)\n",
-                    cgraph->n_nodes(), cgraph->n_leafs(),
-                    gallocr_.backend_peak(0),
-                    gallocr_.backend_peak(0) / (1024.0 * 1024.0 * 1024.0));
+        if (need_alloc) {
+            gallocr_.set_n_backends(1);
+            gallocr_.backends()[0].buft = CPUBufferType::instance();
+            auto backend_id_of = [](TensorF32*) -> int { return 0; };
+            if (!gallocr_.reserve(cgraph, backend_id_of, 1) ||
+                !gallocr_.alloc(cgraph, backend_id_of, 1)) {
+                if (getenv("GRAPH_DEBUG_GALLOCR")) {
+                    fprintf(stderr, "[gallocr] ALLOC_FAILED: n_nodes=%d n_leafs=%d peak=%zu\n",
+                            cgraph->n_nodes(), cgraph->n_leafs(), gallocr_.backend_peak(0));
+                }
+                return Status::ALLOC_FAILED;
+            }
+            if (getenv("GRAPH_DEBUG_GALLOCR")) {
+                fprintf(stderr, "[gallocr] ok: n_nodes=%d n_leafs=%d peak=%zu bytes (%.2f GB)\n",
+                        cgraph->n_nodes(), cgraph->n_leafs(),
+                        gallocr_.backend_peak(0),
+                        gallocr_.backend_peak(0) / (1024.0 * 1024.0 * 1024.0));
+            }
         }
     }
 
     ComputePlan plan = graph_plan(cgraph);
 
-    // 确保工作缓冲区够大
     if (work_size_ < plan.work_size) {
         delete[] work_data_;
         work_data_ = new uint8_t[plan.work_size];

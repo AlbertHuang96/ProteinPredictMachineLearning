@@ -3,10 +3,11 @@
 #include "ppml/PositionalEncoding.h"
 #include "ppml/MathUtils.h"
 #include <iostream>
+#include <algorithm>        // std::max
 
 #include "ppml/Dropout.h"
 #include "ppml/Context.h"
-#include <cuda_runtime.h>   // cudaGetDeviceCount 用于 GPU 可用性探测
+#include <cuda_runtime.h>   // cudaGetDeviceCount / cudaMemGetInfo 用于 GPU/显存探测
 
 namespace ppml {
 
@@ -73,6 +74,7 @@ TensorF32* wrap_input_as_leaf(const TensorF32& t, const std::vector<int64_t>& di
 // ===== 图节点回落为值张量（build + compute + 读 data）=====
 // 图节点 dims [C, L, N, B]（dims[0]=最内维）扁平数据 == 值张量 (B,N,L,C) 扁平数据，
 // 存储兼容，直接 memcpy 到目标值张量。
+// CUDA 后端：kernel 异步，node->data() 是 device 指针，须先 synchronize 再经 buffer D2H 读回。
 void compute_and_read(TensorF32* node, TensorF32& dst,
                       ComputeGraph* cgraph, Backend* backend) {
     if (!node) return;
@@ -90,7 +92,14 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
             new (&dst) TensorF32(Shape(v), Device::CPU);
         }
         if (dst.numel() == (size_t)node->numel()) {
-            std::memcpy(dst.data(), node->data(), bytes);
+            const bool on_device = (node->buffer_ != nullptr && !node->buffer_->is_host());
+            if (on_device) {
+                // CUDA：先同步等待异步 kernel 完成，再经 buffer 做 D2H 拷贝到 host。
+                backend->synchronize();
+                node->buffer_->get_tensor(node, dst.data(), node->buffer_offs_, bytes);
+            } else {
+                std::memcpy(dst.data(), node->data(), bytes);
+            }
         }
     }
 }
@@ -1566,6 +1575,30 @@ bool cuda_available() {
     return true;
 }
 
+// ===== GPU 显存可用性探测 =====
+// 返回当前 CUDA 设备剩余可用显存字节数；失败返回 0。
+// 用于 ensure_backend_ready：CUDA 训练图显存需求很大，若剩余显存不足则提前回退 CPU，
+// 避免 graph_compute 中途 ALLOC_FAILED。
+size_t cuda_free_memory_bytes() {
+    if (!cuda_available()) return 0;
+    size_t free_b = 0, total_b = 0;
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) return 0;
+    return free_b;
+}
+
+// 估算模型/图运行所需显存下限（字节）。粗略：参数 + 前向/反向峰值图工作区。
+// 训练图峰值目前按"小样本 L=51"经验约 18-19.5GB（CPU gallocr 测得）；这里给出一个
+// 可由环境变量覆盖的阈值，作为是否启用 CUDA 的判据。
+size_t cuda_min_required_bytes() {
+    if (const char* p = getenv("PPML_CUDA_MIN_FREE_MB")) {
+        size_t mb = (size_t)std::max(0, atoi(p));
+        if (mb > 0) return mb * 1024ULL * 1024ULL;
+    }
+    // 默认要求至少 4GB 空闲显存才启用 CUDA（RTX 2050 4GB 可跑小样本）。
+    return 4ULL * 1024ULL * 1024ULL * 1024ULL;
+}
+
 // PPMLModel 实现
 PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
     int n_iter = N_EXTRA_BLOCKS + N_MAIN_BLOCKS;  // ITER_N_BLOCKS = 12
@@ -2664,17 +2697,26 @@ void PPMLModel::ensure_backend_ready() {
     if (!scheduler_) {
         scheduler_ = std::make_unique<BackendScheduler>();
         scheduler_->add_backend(cpu_backend_.get());
-        // 3. 若模型目标设备为 CUDA, 先探测 GPU 可用性; 无 GPU 则警告并回退 CPU
+        // 3. 若模型目标设备为 CUDA, 先探测 GPU 可用性 + 空闲显存; 不足则警告并回退 CPU
         if (device_ == Device::CUDA) {
             if (!cuda_available()) {
                 std::cerr << "[WARN] CUDA device not available; "
                           << "falling back to CPU backend." << std::endl;
                 device_ = Device::CPU;   // 回退: 模型按 CPU 运行
-            } else if (!cuda_backend_) {
-                // scheduler 按 priority 排序, CUDA 优先调度到 GPU;
-                // 不支持的 op 自动跨后端拷贝回 CPU
-                cuda_backend_ = std::make_unique<CUDABackend>(0);  // device 0
-                scheduler_->add_backend(cuda_backend_.get());
+            } else {
+                const size_t free_b = cuda_free_memory_bytes();
+                const size_t need_b = cuda_min_required_bytes();
+                if (free_b > 0 && free_b < need_b) {
+                    std::cerr << "[WARN] CUDA device free VRAM " << (free_b >> 20)
+                              << " MB < required " << (need_b >> 20)
+                              << " MB; falling back to CPU backend." << std::endl;
+                    device_ = Device::CPU;
+                } else if (!cuda_backend_) {
+                    // scheduler 按 priority 排序, CUDA 优先调度到 GPU;
+                    // 不支持的 op 自动跨后端拷贝回 CPU
+                    cuda_backend_ = std::make_unique<CUDABackend>(0);  // device 0
+                    scheduler_->add_backend(cuda_backend_.get());
+                }
             }
         }
     }
@@ -2695,6 +2737,11 @@ Backend* PPMLModel::active_backend() {
     // CUDA 若就绪则优先（模型目标设备为 CUDA 且 GPU 可用），否则回退 CPU
     if (device_ == Device::CUDA && cuda_backend_) return cuda_backend_.get();
     return cpu_backend_.get();
+}
+
+BackendScheduler* PPMLModel::scheduler() {
+    ensure_backend_ready();
+    return scheduler_.get();
 }
 
 void PPMLModel::train() {
@@ -2749,30 +2796,32 @@ void PPMLModel::collect_all_params(std::vector<TensorF32*>& param_tensors) {
 void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors,
                                           std::vector<std::string>& param_names) {
     // 辅助 lambda：收集 LinearLayer / LayerNorm / EmbeddingLayer 的参数及名字
+    // 注：param_tensors 与 param_names 必须严格一一对应（save_checkpoint 校验数量一致）。
+    // 之前用 `if(!param_names.empty())` 守卫名字，导致从空向量开始时名字永远不 push → 数量不匹配 bug。
     auto collect_linear = [&](LinearLayer* ll, const std::string& name) {
         if (ll && ll->weight()) {
             param_tensors.push_back(ll->weight());
-            if (!param_names.empty()) param_names.push_back(name + ".weight");
+            param_names.push_back(name + ".weight");
         }
         if (ll && ll->bias()) {
             param_tensors.push_back(ll->bias());
-            if (!param_names.empty()) param_names.push_back(name + ".bias");
+            param_names.push_back(name + ".bias");
         }
     };
     auto collect_layernorm = [&](LayerNorm* ln, const std::string& name) {
         if (ln && ln->gamma()) {
             param_tensors.push_back(ln->gamma());
-            if (!param_names.empty()) param_names.push_back(name + ".gamma");
+            param_names.push_back(name + ".gamma");
         }
         if (ln && ln->beta()) {
             param_tensors.push_back(ln->beta());
-            if (!param_names.empty()) param_names.push_back(name + ".beta");
+            param_names.push_back(name + ".beta");
         }
     };
     auto collect_embedding = [&](EmbeddingLayer* emb, const std::string& name) {
         if (emb && emb->weight()) {
             param_tensors.push_back(emb->weight());
-            if (!param_names.empty()) param_names.push_back(name + ".weight");
+            param_names.push_back(name + ".weight");
         }
     };
 

@@ -27,6 +27,11 @@ struct ThreadPool;
 template<typename T> class Tensor;
 using TensorF32 = Tensor<float>;
 
+// 判断 data 指针是否指向 device（GPU）内存。
+// 有 buffer_ 时看 is_host()；无 buffer_（裸 device 指针，应为非法状态）时
+// 用 4 字节 D2H 探测兜底。定义在 Backend.cpp，供 Backend/CPUKernels 共用。
+bool is_device_pointer(const TensorF32* src, const float* data);
+
 // ==================== 状态码 ====================
 enum class Status {
     SUCCESS = 0,
@@ -429,9 +434,19 @@ public:
     // 优先级（越大越优先被调度）
     virtual int priority() const { return 0; }
 
+    // ===== 预分配跳过开关 =====
+    // 由 BackendScheduler 在混训时设置：scheduler 已通过 reserve_graph_memory 预分配了
+    // 所有张量，后端 graph_compute 不应再跑自己的 gallocr（否则两套 gallocr 反复 re-bind
+    // 张量的 data_/buffer_，导致跨 split 引用读到已释放/错位的 buffer → 段错误）。
+    bool skip_alloc() const { return skip_alloc_; }
+    void set_skip_alloc(bool v) { skip_alloc_ = v; }
+
     // 延迟分配器访问（诊断 buffer 复用 / aliasing 用）。
     // 各派生后端持有自己的 gallocr_，故为纯虚，由派生类返回其成员。
     virtual Gallocr& gallocr() = 0;
+
+protected:
+    bool skip_alloc_ = false;
 };
 
 class BackendScheduler {
@@ -458,6 +473,10 @@ public:
     // 执行所有 split（含跨后端拷贝）
     Status graph_compute();
 
+    // 显存预算查询（测试/诊断用）
+    size_t gpu_vram_budget() const { return gpu_vram_budget_; }
+    size_t gpu_reserved_bytes() const { return gpu_reserved_bytes_; }
+
 private:
     // ===== 三趟扫描 =====
     void pass_assign_leafs(ComputeGraph * graph);        // 第一趟：叶子节点分配
@@ -472,6 +491,11 @@ private:
     void set_backend_if_supported(TensorF32* node, int backend_id);
     int  count_supported_inputs(TensorF32* node, int backend_id) const;
     bool tensor_buffer_compatible(const TensorF32* src, int backend_id) const;
+
+    // 显存预算：把一部分节点放 GPU（受支持且不 OOM），其余回落 CPU。
+    // gpu_assign_if_affordable 返回 true 表示已分配到 GPU（或无需限制）；
+    // 否则因显存预算不足拒绝 GPU 分配。
+    bool gpu_assign_if_affordable(TensorF32* node, int gpu_backend_id);
 
     // alloc_splits invoke this function to allocate the memory
     bool reserve_graph_memory();
@@ -512,6 +536,14 @@ private:
 
     // 延迟分配（no_alloc 空间复用）：替代 reserve_graph_memory 的全量常驻
     Gallocr gallocr_;
+
+    // ===== 显存预算（把部分节点放 GPU，防止 OOM）=====
+    size_t gpu_vram_budget_ = 0;     // 预算字节数；0 = 不限制
+    size_t gpu_reserved_bytes_ = 0;  // 已累计分配给 GPU 的估算字节数
+
+    // CPU split 兜底：device 输入 D2H 暂存（Step 1b），split 后恢复。
+    std::vector<std::pair<TensorF32*, float*>> host_stage_;   // <tensor, 原 device 指针>
+    std::vector<std::vector<float>>            host_scratch_; // 暂存 host 缓冲
 
     // 分裂结果
     int n_splits_ = 0;
@@ -581,6 +613,7 @@ private:
 
     // ===== op 分发 =====
     static Status  dispatch_node(TensorF32 * node, ComputeParams * p);
+    static Status  dispatch_body(TensorF32 * node, ComputeParams * p);  // 实际 kernel 分发（无 buffer 感知）
 
     static int get_n_tasks(TensorF32 * node, int n_threads);
     static size_t estimate_work_size(TensorF32 * node, int n_threads, int n_tasks = -1);
@@ -717,11 +750,12 @@ private:
     static void kernel_norm_cuda     (TensorF32 * node, ComputeParams * p);
     static void kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p);
     static void kernel_dup_cuda      (TensorF32 * node);
-    static void kernel_scale_cuda    (TensorF32 * node, ComputeParams * p);
-    static void kernel_add1_cuda     (TensorF32 * node, ComputeParams * p);
-    static void kernel_sum_cuda      (TensorF32 * node, ComputeParams * p);
-    static void kernel_mean_cuda     (TensorF32 * node, ComputeParams * p);
-    static void kernel_concat_cuda   (TensorF32 * node, ComputeParams * p);
+    // 错误上报：CUDA 后端无线程池，统一经 Status* 输出，避免空指针解引用。
+    static void kernel_scale_cuda    (TensorF32 * node, Status* st);
+    static void kernel_add1_cuda     (TensorF32 * node, Status* st);
+    static void kernel_sum_cuda      (TensorF32 * node, Status* st);
+    static void kernel_mean_cuda     (TensorF32 * node, Status* st);
+    static void kernel_concat_cuda   (TensorF32 * node, Status* st);
 
     // SE3 消息传递三件套（方案 B）+ per_edge_matmul 反向核
     static void kernel_edge_gather_rows_cuda (TensorF32 * node, ComputeParams * p);

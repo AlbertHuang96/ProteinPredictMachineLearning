@@ -15,8 +15,55 @@
 #include <filesystem>
 #include <sstream>
 #include <iomanip>
+#include <unistd.h>        // sysconf 用于页大小/物理页数 (内存)
+#include <sys/sysinfo.h>   // sysinfo 用于总/可用内存
+#include <cuda_runtime.h>  // cudaGetDeviceProperties 用于 GPU 信息
 
 using namespace ppml;
+
+// ============================================================================
+// 打印 CPU / 内存 / GPU 信息（训练开始前的环境概览）
+// ============================================================================
+void print_system_info() {
+    // ---- CPU ----
+    std::cout << "==== System Info ====" << std::endl;
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    std::cout << "  CPU   : " << ncpu << " logical cores" << std::endl;
+
+    // ---- 内存 (Linux sysinfo) ----
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+        const double gb = 1024.0 * 1024.0 * 1024.0;
+        std::cout << "  RAM   : total " << std::fixed << std::setprecision(1)
+                  << (si.totalram * si.mem_unit / gb) << " GB, "
+                  << "available " << (si.freeram * si.mem_unit / gb) << " GB"
+                  << std::endl;
+    }
+
+    // ---- GPU (CUDA) ----
+    int dev_count = 0;
+    if (cudaGetDeviceCount(&dev_count) == cudaSuccess && dev_count > 0) {
+        for (int d = 0; d < dev_count; ++d) {
+            cudaDeviceProp prop;
+            if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+                std::cout << "  GPU[" << d << "] : " << prop.name
+                          << ", compute " << prop.major << "." << prop.minor
+                          << ", VRAM " << std::fixed << std::setprecision(2)
+                          << (prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0)) << " GB"
+                          << std::endl;
+            }
+        }
+    } else {
+        std::cout << "  GPU   : (no CUDA device)" << std::endl;
+    }
+
+    // ---- 训练模式开关 ----
+    const bool full = (std::getenv("FULL_TRAIN") != nullptr) &&
+                      (std::strcmp(std::getenv("FULL_TRAIN"), "true") == 0);
+    std::cout << "  Mode  : " << (full ? "FULL_TRAIN" : "dev (FULL_TRAIN unset)")
+              << std::endl;
+    std::cout << "===========================" << std::endl;
+}
 
 // ============================================================================
 // 工具: 将值张量 (GraphOutput.coords / ModelInput.true_coords / 各 gt onehot) 包装为图节点 leaf。
@@ -172,7 +219,18 @@ int main(int argc, char* argv[]) {
         std::cerr << "Failed to initialize Python" << std::endl;
         return 1;
     }
-    
+
+    // 调试/开发开关：FULL_TRAIN=true 时切换为完整训练配置
+    //   - MSA 深度 N 由 128 改回 512
+    //   - 开启 checkpoint 权重保存 (ckpt_interval)
+    //   - 开启 SE3 训练（forward_graph enable_se3=true，更新坐标）
+    const bool full_train =
+        (std::getenv("FULL_TRAIN") != nullptr) &&
+        (std::strcmp(std::getenv("FULL_TRAIN"), "true") == 0);
+
+    // 训练开始前打印 CPU / 内存 / GPU 环境概览
+    print_system_info();
+
     // 2. 创建模型
     PPMLConfig config;
     config.d_msa = 256;
@@ -187,7 +245,10 @@ int main(int argc, char* argv[]) {
     // 3. 转移到目标设备。默认 CUDA，但 CUDA 对前向/backward 的众多图 op（repeat/permute/
     //    concat/outer_product 等）未实现，graph_compute 算不出 loss。为验证数值正确性先
     //    用 CPU（所有 op 有 kernel）；CUDA op 补齐后再切回。
-    model.to(Device::CPU);
+    // 默认 CPU 训练；设 PPML_USE_CUDA=1 且显存充足时才尝试 CUDA（scheduler 分配 op）。
+    const bool use_cuda =
+        (std::getenv("PPML_USE_CUDA") != nullptr) && (std::atoi(std::getenv("PPML_USE_CUDA")) != 0);
+    model.to(use_cuda ? Device::CUDA : Device::CPU);
     model.train();
     
     std::cout << "Model created and CPU and CUDA Backend init" << std::endl;
@@ -230,7 +291,11 @@ int main(int argc, char* argv[]) {
     //   注: 此参数决定 MSA 列注意力 softmax [N,N,H,L] 与 FFN 中间件 [d_msa,L,N] 的规模,
     //       N=512 时 softmax 408MB / unary 204MB, 峰值 ~18GB 超 WSL 15GB;
     //       N=128 时 softmax ~25MB / unary ~51MB, 峰值可降到 ~5GB 内跑通训练。
-    PPMLDataLoader loader("", "", 128, 4, 2048);
+    //   FULL_TRAIN=true 时改回 N=512。
+    const int msa_max_seqs = full_train ? 512 : 128;
+    PPMLDataLoader loader("", "", msa_max_seqs, 4, 2048);
+    std::cout << "[config] MSA depth N=" << msa_max_seqs
+              << " (FULL_TRAIN=" << (full_train ? "true" : "false") << ")" << std::endl;
     ModelInput input = loader.load_from_files(a3m_path, sequence, csv_path, template_dir, hhr_path);
     int L = static_cast<int>(sequence.length());
 
@@ -309,13 +374,17 @@ int main(int argc, char* argv[]) {
     //input.true_coords= input.true_coords.to(Device::CUDA);
     
     // 5. 训练循环
-    const int num_epochs = 10;
+    // 默认 10 epoch；可用 PPML_NUM_EPOCHS 覆盖（如快速验证 grad_norm 用 3~5）。
+    int num_epochs = 10;
+    if (const char* pe = std::getenv("PPML_NUM_EPOCHS")) {
+        int v = std::atoi(pe);
+        if (v >= 1) num_epochs = v;
+    }
 
     // ---- Checkpoint 配置 ----
     // 每隔 checkpoint_interval 个 epoch 保存一次权重 (GGUF)。
-    // TODO(增强): 增加命令行参数 --ckpt-interval N 覆盖此默认值,
-    //             例: 解析 argc/argv 后 ckpt_interval = atoi(argv[k])。
-    int ckpt_interval = 2;                     // 默认每 2 个 epoch 保存一次
+    // FULL_TRAIN=true 开启 checkpoint 保存（每 2 epoch）；否则 dev 模式默认不保存。
+    int ckpt_interval = full_train ? 2 : 0;    // 0 = 禁用 checkpoint
     const std::string ckpt_dir = "checkpoints"; // checkpoint 输出目录
 
     // ---- AdamW 优化器配置 (decoupled weight decay) ----
@@ -336,9 +405,9 @@ int main(int argc, char* argv[]) {
         
         // 前向传播（图模式：返回可微图节点，供 loss 组装计算图）
         auto fwd_start = std::chrono::high_resolution_clock::now();
-        // enable_se3=false：暂时禁用 SE3 3D track（run_se3_structural 为既有未完成崩溃），
-        // 用于验证小样本 L=51 的内存/训练流程；待 SE3 训练驱动完成后再恢复为默认 true。
-        auto go = model.forward_graph(input, /*enable_se3=*/false);
+        // enable_se3：FULL_TRAIN=true 时开启 SE3 3D track（训练更新坐标）；
+        // dev 模式关闭（run_se3_structural 曾为未完成崩溃，用于小样本流程验证）。
+        auto go = model.forward_graph(input, /*enable_se3=*/full_train);
         auto fwd_end = std::chrono::high_resolution_clock::now();
         auto fwd_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fwd_end - fwd_start).count();
         
@@ -512,11 +581,49 @@ int main(int argc, char* argv[]) {
             (std::getenv("PPML_NO_BACKWARD") != nullptr) && (std::atoi(std::getenv("PPML_NO_BACKWARD")) != 0);
         if (!no_backward) {
             cgraph->build_backward_expand(ctx, nullptr);
+
+            // 关键：为 loss 节点梯度种子 = 1.0（dL/dL=1）。
+            // build_backward_expand 只创建 loss 的梯度累加器（初值 0），不置 1；
+            // 若不置 1，反向从 loss 处梯度恒 0 → 所有参数梯度恒 0（grad_norm=0）。
+            if (total_node) {
+                // loss 梯度累加器是 ctx->new_tensor（no_alloc 下 data==nullptr）。
+                // 分配 host 存储并置种子 1.0（loss 为标量 numel==1，直接 p[0]=1）。
+                TensorF32* loss_grad = cgraph->graph_get_grad(total_node);
+                if (loss_grad && loss_grad->data() == nullptr && loss_grad->numel() == 1) {
+                    float* p = bind_leaf_data(*ctx, loss_grad);
+                    p[0] = 1.0f;
+                }
+            }
         }
 
         // ---- 反向计算 + 梯度裁剪 + AdamW 参数更新 ----
+        // CUDA 激活时用 scheduler 分配算子（受支持 op 跑 GPU、不支持的跨后端回落 CPU）；
+        // 否则走单后端（CPU 或 CUDA）graph_compute。
         Backend* backend = model.active_backend();
-        Status compute_st = backend->graph_compute(cgraph); // 执行前向+反向，写入参数梯度
+        Status compute_st = Status::SUCCESS;
+        BackendScheduler* sched = model.scheduler();
+        // 仅在显式 PPML_CUDA_SCHED=1 时用 scheduler 分配算子（实验性）。
+        // 注意：scheduler 会把参数/梯度放 device，clip_grad_norm/AdamW 当前仍读 host
+        //      grad->data()，故全 CUDA 图训练须先补齐 device→host 梯度读回（见说明）。
+        static const bool sched_flag =
+            (std::getenv("PPML_CUDA_SCHED") != nullptr) && (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0);
+        const bool use_sched = (model.device() == Device::CUDA && sched && sched_flag);
+        if (use_sched) {
+            sched->split_graph(cgraph);
+            if (sched->alloc_splits()) {
+                compute_st = sched->graph_compute();   // 跨后端拷贝 + 各 split 执行
+            } else {
+                compute_st = Status::ALLOC_FAILED;
+            }
+            if (compute_st == Status::ALLOC_FAILED) {
+                // 显存不足/分配失败 → 回退到单后端 CPU 全图计算（保证训练不中断）
+                std::cerr << "[WARN] CUDA scheduler alloc failed; "
+                          << "falling back to CPU single-backend compute." << std::endl;
+                compute_st = backend->graph_compute(cgraph);
+            }
+        } else {
+            compute_st = backend->graph_compute(cgraph); // 执行前向+反向，写入参数梯度
+        }
         if (compute_st != Status::SUCCESS) {
             std::cout << "[WARN] graph_compute status=" << static_cast<int>(compute_st)
                       << " (0=SUCCESS 1=ALLOC_FAILED)" << std::endl;
@@ -589,6 +696,24 @@ int main(int argc, char* argv[]) {
                 nanidx(go.state, "state");
             }
         }
+        // 诊断：统计图节点数与参数梯度幅值（确认 backward 是否产生非零梯度）
+        if (getenv("PPML_DEBUG_GRAD")) {
+            double gsum = 0, gmx = 0; int gcnt = 0; double gnan = 0;
+            for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
+                TensorF32* nd = cgraph->graph_node(gi);
+                if (!(nd->flag & TENSOR_FLAG_PARAM)) continue;
+                TensorF32* gr = cgraph->graph_get_grad(nd);
+                if (!gr) continue;
+                ++gcnt;
+                std::vector<float> gv = read_tensor_cpu(gr);
+                for (float v : gv) { if (v != v) { gnan += 1.0; continue; } gsum += (double)(v*v); gmx = std::max(gmx, (double)std::fabs(v)); }
+            }
+            std::cout << "[grad] n_nodes=" << cgraph->n_nodes()
+                      << " params_with_grad=" << gcnt
+                      << " sum_sq=" << gsum
+                      << " max_abs=" << gmx
+                      << " nan_cnt=" << gnan << std::endl;
+        }
         float grad_norm = clip_grad_norm(cgraph, 0.1f);    // 全局梯度裁剪 (AF2 推荐 0.1)
 
         if (!optimizer_inited) {
@@ -600,9 +725,11 @@ int main(int argc, char* argv[]) {
         optimizer.step(cgraph);                            // 更新权重 (decoupled weight decay)
 
         // 读取 total loss 数值 (graph_compute 后才有值)
+        // 用 read_tensor_cpu 走 buffer_->get_tensor，CUDA 上也会同步 D2H，保证读到 host 标量。
         float batch_loss = 0.0f;
-        if (total_node->data() != nullptr && total_node->numel() == 1) {
-            batch_loss = total_node->data()[0];
+        if (total_node->numel() == 1 && (total_node->data() != nullptr || total_node->buffer_)) {
+            std::vector<float> tv = read_tensor_cpu(total_node);
+            if (!tv.empty()) batch_loss = tv[0];
         }
 
         // 开发诊断：打印各损失分量（定位 loss=0 根因）
@@ -802,8 +929,11 @@ int main(int argc, char* argv[]) {
 
         // ============================================================
         // Checkpoint 保存: 每隔 ckpt_interval 个 epoch, 以及最后一个 epoch
+        // (ckpt_interval=0 时禁用保存, 避免除零)
         // ============================================================
-        bool is_ckpt_epoch = (epoch + 1) % ckpt_interval == 0 || (epoch + 1) == num_epochs;
+        const bool is_ckpt_epoch =
+            (ckpt_interval > 0) &&
+            (((epoch + 1) % ckpt_interval == 0) || (epoch + 1) == num_epochs);
         if (is_ckpt_epoch) {
             // 确保输出目录存在
             std::error_code ec;

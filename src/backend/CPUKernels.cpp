@@ -23,10 +23,12 @@
 namespace ppml {
 // mul_mat_cuda 实现于 src/cuda/CUDAKernels.cu（host 函数，launch blockTileGEMM kernel）
 extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
-// 读取一次 PPML_MUL_MAT_GPU 开关（开发用，默认关）
-static const bool g_mul_mat_gpu_enabled =
-    (std::getenv("PPML_MUL_MAT_GPU") != nullptr) &&
-    (std::atoi(std::getenv("PPML_MUL_MAT_GPU")) != 0);
+// ===== 禁用内部 GPU 自跑路径 =====
+// mul_mat 应完全由 BackendScheduler 分配：要 GPU 时 scheduler 会 dispatch 到 CUDABackend
+// (kernel_mul_mat_cuda)，无需 CPU kernel 内部再 cudaMalloc 自跑一次。内部旁路(PPML_MUL_MAT_GPU)
+// 假设 a/b 是 host 指针，混训时可能读到 device 指针 → 段错误，且 barrier 与 scheduler 冲突。
+// 故强制关闭（保留代码作参考）。
+static const bool g_mul_mat_gpu_enabled = false;
 
 // ===== unary op 计算函数前向声明 =====
 static void compute_forward_abs(ComputeParams* p, TensorF32* dst);
@@ -51,7 +53,47 @@ static void compute_forward_fape(ComputeParams* p, TensorF32* dst);
 static void compute_forward_fape_back(ComputeParams* p, TensorF32* dst);
 
 // ===== dispatch =====
-Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
+
+// 运行时开关：PPML_CPU_BUFFER_AWARE=1 时，CPU kernel 容忍 device(即 GPU)输入。
+// 大型机（显存充足、混训 CPU+GPU）开启；本机默认关 → 纯 CPU 行为完全不变。
+// 实现：在 dispatch 层把 device buffer 的 src 经 get_tensor(D2H) 暂存到 host，
+//       临时 bind_data 到 host scratch，跑完 kernel 后恢复原 device 指针。
+//       不依赖 scheduler 的跨后端拷贝（避免拷贝缺口），直接让 CPU kernel 读 host。
+static bool g_cpu_buffer_aware_init = false;
+static bool g_cpu_buffer_aware = false;
+static bool cpu_buffer_aware_enabled() {
+    if (!g_cpu_buffer_aware_init) {
+        g_cpu_buffer_aware_init = true;
+        const char* e = getenv("PPML_CPU_BUFFER_AWARE");
+        g_cpu_buffer_aware = (e != nullptr) && (atoi(e) != 0);
+    }
+    return g_cpu_buffer_aware;
+}
+
+// 判断 data 指针是否指向 device 内存。
+// 复用 Backend.cpp 中的共享实现（ppml::is_device_pointer）。
+// 有 buffer_ 时看 is_host()；无 buffer_（如裸 device 指针）时用 4 字节 D2H 探测兜底。
+
+// 暂存一个 device 内存 src 到 host scratch，返回需恢复的原 device 指针（nullptr 表示无需恢复）
+// 仅在 buffer-aware 模式调用。src->data() 是 device 指针（无论有无 buffer_）都暂存。
+static float* stage_device_src(TensorF32* src, std::vector<float>& scratch) {
+    float* data = src->data();
+    if (!is_device_pointer(src, data)) return nullptr;   // host，无需暂存
+    const int64_t n = src->numel();
+    scratch.resize(static_cast<size_t>(n));
+    if (src->buffer_) {
+        src->buffer_->get_tensor(src, scratch.data(), src->buffer_offs_,
+                                 static_cast<size_t>(n) * sizeof(float));  // D2H
+    } else {
+        cudaMemcpy(scratch.data(), data, static_cast<size_t>(n) * sizeof(float),
+                   cudaMemcpyDeviceToHost);   // 无 buffer 裸 device 指针 D2H
+    }
+    src->bind_data(scratch.data());   // 临时让 kernel 读 host
+    return data;
+}
+
+// 实际 dispatch 主体：执行节点 kernel（不感知 buffer 来源）。
+Status CPUBackend::dispatch_body(TensorF32* node, ComputeParams* p) {
     switch (node->op) {
         case OP_NONE:   break;
         case OP_DUP:    kernel_dup(node);            break;
@@ -152,6 +194,39 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
     return p->threadpool->ec;
 }
 
+// ===== 统一入口：运行时开关 PPML_CPU_BUFFER_AWARE=1 时容忍 device 输入 =====
+Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
+    if (!cpu_buffer_aware_enabled()) {
+        return dispatch_body(node, p);   // 默认：纯 CPU，行为不变
+    }
+
+    // ---- buffer-aware：暂存 device 输入为 host，跑 kernel，恢复 ----
+    // node 是 CPU 后端节点，node->data() 为 host；仅 src 可能是 device buffer。
+    // 多线程：thread0 完成 D2H 暂存后 barrier，所有线程跑 kernel，再 barrier 恢复。
+    float* orig_data[GGML_MAX_SRC];
+    for (int s = 0; s < GGML_MAX_SRC; s++) orig_data[s] = nullptr;
+    std::vector<std::vector<float>> scratch(GGML_MAX_SRC);
+
+    if (p->ith == 0) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            TensorF32* src = node->src[s];
+            if (!src) continue;
+            orig_data[s] = stage_device_src(src, scratch[s]);
+        }
+    }
+    if (p->nth > 1) p->threadpool->barrier_wait();   // 等 thread0 暂存完成
+
+    Status st = dispatch_body(node, p);              // 执行 kernel（读暂存后的 host src）
+
+    if (p->nth > 1) p->threadpool->barrier_wait();   // 等所有线程 kernel 完成
+    if (p->ith == 0) {
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (orig_data[s]) node->src[s]->bind_data(orig_data[s]);  // 恢复原 device 指针
+        }
+    }
+    return st;
+}
+
 // ===== elemwise =====
 void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
     const float * a = node->src[0]->data();
@@ -200,6 +275,7 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
     const float * a = node->src[0]->data();
     const float * b = node->src[1]->data();
     float * d = node->data();
+
 
     // ===== 开发用 GPU 加速矩阵乘（方案 B，临时，见文件顶部注释）=====
     // 开关 PPML_MUL_MAT_GPU=1。首次调用探测 GPU 是否存在（缓存到 thread-safe static）；
@@ -1021,9 +1097,24 @@ void CPUBackend::kernel_cpy(TensorF32 * node, ComputeParams * p) {
         p->threadpool->barrier_wait();
         return;
     }
-    const float * src = node->src[0]->data();
-    float       * dst = node->data();
-    std::memcpy(dst, src, node->numel() * sizeof(float));
+    // 缓冲感知拷贝：CPU/CUDA 混训时，src 或 dst 可能在 device buffer。
+    // 裸 memcpy 会把 device 指针当 host 读 → 段错误。统一经 buffer get_tensor/set_tensor。
+    TensorF32 * src_t = node->src[0];
+    const size_t bytes = static_cast<size_t>(node->numel()) * sizeof(float);
+    const bool src_dev = src_t->buffer_ && !src_t->buffer_->is_host();
+    const bool dst_dev = node->buffer_ && !node->buffer_->is_host();
+
+    if (src_dev && dst_dev) {
+        std::vector<float> tmp(static_cast<size_t>(node->numel()));
+        src_t->buffer_->get_tensor(src_t, tmp.data(), src_t->buffer_offs_, bytes);   // D2H
+        node->buffer_->set_tensor(node, tmp.data(), node->buffer_offs_, bytes);      // H2D
+    } else if (src_dev) {
+        src_t->buffer_->get_tensor(src_t, node->data(), src_t->buffer_offs_, bytes); // D2H
+    } else if (dst_dev) {
+        node->buffer_->set_tensor(node, src_t->data(), node->buffer_offs_, bytes);   // H2D
+    } else {
+        std::memcpy(node->data(), src_t->data(), bytes);
+    }
     p->threadpool->barrier_wait();
 }
 

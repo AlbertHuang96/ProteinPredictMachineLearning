@@ -158,6 +158,24 @@ bool Gallocr::reserve(
     const std::function<int(TensorF32*)>& backend_id_of,
     int n_backends) {
 
+    // 复位上一轮（或上一图）绑定的张量指针元数据，使 compute_refcounts 的
+    // managed 判定（依赖 data()==nullptr）重新成立。否则若上一轮 alloc 已把
+    // tensor->data_/buffer_ 绑到 buffer、而本轮 reserve 不先复位，则
+    // compute_refcounts 会误判 managed=false → 不重分配 → 悬垂指针崩溃。
+    // 用【图本身】作为权威来源（而非 nodes_/leaves_ 快照）：遍历所有 graph 张量，
+    // 凡 buffer_ 非空（曾被 gallocr 绑定）即复位。这样即便 free_node 把节点
+    // allocated 置 false、或 nodes_ 快照与张量实际 buffer_ 不一致，也能可靠复位。
+    // 叶子（buffer_==nullptr，数据在 context scratch）不受影响。
+    auto reset_tensor = [](TensorF32* t) {
+        if (t && t->buffer_ != nullptr) {
+            t->bind_data(nullptr);
+            t->buffer_      = nullptr;
+            t->buffer_offs_ = 0;
+        }
+    };
+    for (int i = 0; i < graph->n_nodes(); ++i) reset_tensor(graph->graph_node(i));
+    for (int i = 0; i < graph->n_leafs(); ++i) reset_tensor(graph->graph_leaf(i));
+
     reset_state(n_backends);
     if (n_backends == 0) return false;
 
@@ -335,9 +353,16 @@ void Gallocr::bind_tensor(NodeInfo* ni) {
     // 常量叶子：分配完成后从 const_data_ 填充数据。
     //   TENSOR_FLAG_CONST 置位 → 静态可复用（保留 const_data_，图可复用）；
     //   不置位 → 动态一次性（填充后清空+shrink，避免宿主内存累积）。
+    //   注意：若 buffer 是 device（CUDA），必须用 set_tensor（H2D），
+    //   否则 std::memcpy 会把 device 指针当 host 源 → UB/崩溃。
     if (!t->const_data_.empty() && t->data() != nullptr) {
-        std::memcpy(t->data(), t->const_data_.data(),
-                    t->const_data_.size() * sizeof(float));
+        if (b && !b->is_host()) {
+            b->set_tensor(t, t->const_data_.data(), off,
+                          t->const_data_.size() * sizeof(float));  // H2D
+        } else {
+            std::memcpy(t->data(), t->const_data_.data(),
+                        t->const_data_.size() * sizeof(float));
+        }
         if (!(t->flag & TENSOR_FLAG_CONST)) {
             t->const_data_.clear();
             t->const_data_.shrink_to_fit();
@@ -385,6 +410,25 @@ void Gallocr::check_live_overlap(BackendAlloc& ba, const NodeInfo* ni) {
 // release
 // ============================================================
 void Gallocr::release() {
+    // 复位所有曾绑定（buffer_!=nullptr）张量的指针元数据，否则这些张量仍指向
+    // 即将被 cudaFree/delete 的 buffer，下一图 compute_refcounts 会因
+    // data()!=nullptr 误判 managed=false 而不重分配 → 悬垂 device 指针崩溃。
+    // 用 ni.buffer!=nullptr 判定（而非 ni.allocated）：free_node 在 Phase2 会把已
+    // 释放节点 allocated 置 false，但 data_/buffer_ 仍指向即将删除的 buffer，
+    // 若按 allocated 判定会漏掉 → 悬垂指针。
+    auto reset_bound = [&](std::vector<NodeInfo>& infos) {
+        for (auto& ni : infos) {
+            if (ni.buffer != nullptr) {
+                ni.tensor->bind_data(nullptr);
+                ni.tensor->buffer_      = nullptr;
+                ni.tensor->buffer_offs_ = 0;
+                ni.allocated = false;
+            }
+        }
+    };
+    reset_bound(nodes_);
+    reset_bound(leaves_);
+
     for (auto& ba : backends_) {
         for (Buffer* b : ba.buffers) delete b;
         ba.buffers.clear();
