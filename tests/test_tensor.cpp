@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include "rfaa/Tensor.h"
+#include "ppml/Tensor.h"
 
-using namespace rfaa;
+using namespace ppml;
 
 TEST(TensorTest, BasicConstruction) {
     TensorF32 t({2, 3, 4}, Device::CPU);

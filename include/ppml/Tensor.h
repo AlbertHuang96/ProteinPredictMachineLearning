@@ -177,6 +177,12 @@ enum tensor_op {
     // per_edge_matmul 反向（梯度 wrt kernel 与 gathered）
     OP_PER_EDGE_MATMUL_BACK_KERNEL,     // grad(E,M)⊗gathered(E,K) → dkernel(E,M,K)
     OP_PER_EDGE_MATMUL_BACK_GATHERED,   // kernel(E,M,K)ᵀ@grad(E,M) → dgathered(E,K)
+    // concat 反向：把 grad 沿拼接维切回各 src（concat 的梯度回传）
+    OP_CONCAT_BACK,
+    // 全局最大归约：max_all(x) → 标量。用于 softmax 数值稳定（max 减稳，避免 exp 溢出）
+    OP_MAX_ALL,
+    // relu 反向：relu_back(grad, x) → grad * (x>0)（解决 RadialFunc 里 relu 无反向断链）
+    OP_RELU_BACK,
     OP_COUNT,
 };
 
@@ -280,6 +286,14 @@ public:
         device_ = Device::CPU;
         own_data_ = false;  // Context 管理生命周期
         src.fill(nullptr);  // 显式清空 src，避免残留脏指针
+        // ⚠️ 必须显式初始化 op/flag：Tensor() 默认构造不初始化这两个成员，
+        //    而 new_tensor 用 placement new 且 context 缓冲区可能是复用/非全零，
+        //    导致 op 读到垃圾值（如 32653）→ dispatch_body 无 case → NOT_SUPPORTED。
+        //    （本会话 SE3 测试 `node#92 op=32653` 即此根因：RadialFunc 的 BN 参数
+        //     经 new TensorF32 后 op 未初始化。）
+        op        = OP_NONE;
+        flag      = 0;
+        for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = 0;
     }
 
     // 重新绑定数据指针（no_alloc 空壳 → 构建期暂存区 / 后续 Gallocr backend buffer）

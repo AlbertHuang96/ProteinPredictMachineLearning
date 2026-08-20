@@ -874,9 +874,13 @@ void SE3Basis::compute(const TensorF32& edge_d, int J_max) {
 
         // ---- 计算所有 J 的 Y_J(theta, phi) ----
         // 对标 Python: Y = precompute_sh(r_ij, 2*max_degree)
+        // SphericalHarmonics::get(J, theta, phi) 返回真实实球谐 [Y_J^{-J}..Y_J^J]
+        // （索引 m+J）。此前此处用了全零占位导致所有 basis=0、SE3 卷积核恒 0，
+        // 等变/不变性几何基础失效；现接上真实球谐计算。
+        // 注：sh.get() 内部每调用一次就 clear() 一次缓存，故对每条边、每个 J 各调一次，
+        // 与 Python 逐边 precompute_sh 语义一致（每边独立的 θ/φ）。
         for (int J = 0; J <= max_Y_degree; ++J) {
-            // TODO: RealSphericalHarmonics 尚未实现，暂时用占位
-            std::vector<double> Y(2 * J + 1, 0.0);  // sh.get(J, theta_sh, phi_sh)
+            std::vector<double> Y = sh.get(J, theta_sh, phi_sh);
             float* y_data = edge_Y[J].data();
             int d_J = 2 * J + 1;
             for (int m = 0; m < d_J; ++m) {
@@ -983,10 +987,18 @@ RadialFunc::RadialFunc(int num_freq, int in_dim, int out_dim, int edge_dim)
     linear3_ = LinearLayer::create(mid_dim_, num_freq_ * in_dim_ * out_dim_, /*bias=*/true);
 
     // BN 参数: gamma 初始化为 1, beta 初始化为 0
+    // ⚠️ 用 new_param_tensor（context 管理）+ TENSOR_FLAG_PARAM：图模式下这些参数
+    //    会进计算图，需有正确的 op=OP_NONE（免 dispatch 报 NOT_SUPPORTED）且标记
+    //    PARAM（否则 build_backward_expand 不给它们梯度累加器 → graph_get_grad=nullptr，
+    //    方案1 反向测试拿不到 BN 梯度）。
     bn1_gamma_ = new TensorF32(Shape({mid_dim_}), Device::CPU);
     bn1_beta_  = new TensorF32(Shape({mid_dim_}), Device::CPU);
     bn2_gamma_ = new TensorF32(Shape({mid_dim_}), Device::CPU);
     bn2_beta_  = new TensorF32(Shape({mid_dim_}), Device::CPU);
+    bn1_gamma_->flag = TENSOR_FLAG_PARAM;
+    bn1_beta_->flag  = TENSOR_FLAG_PARAM;
+    bn2_gamma_->flag = TENSOR_FLAG_PARAM;
+    bn2_beta_->flag  = TENSOR_FLAG_PARAM;
 
     for (int i = 0; i < mid_dim_; ++i) {
         bn1_gamma_->data()[i] = 1.0f;
@@ -1104,11 +1116,15 @@ TensorF32* RadialFunc::forward_graph(TensorF32* x) {
     h = linear2_->forward_graph(h);                     // (E, 32)
     h = add_impl(mul(h, repeat(bn2_gamma_, h)), repeat(bn2_beta_, h), /*inplace=*/false);
     h = relu(h);
-    // ---- Layer 3: Linear → reshape (E, num_freq*in*out) → (E, out, in, num_freq) ----
+    // ---- Layer 3: Linear → reshape (E, num_freq*in*out) → R dims=[num_freq, in, out, E] ----
     TensorF32* y = linear3_->forward_graph(h);          // (E, num_freq*in*out)
     const int64_t E = y->shape().dims[1];
-    // view: 展平 i0 = ((o*in+ci)*num_freq + j) → dims=[num_freq, in, out, E]
-    return view(y, Shape({E, out_dim_, in_dim_, num_freq_}));
+    // ⚠️ view 形状必须按 ggml 约定 dims[0]=最内维：R 期望 [num_freq, in, out, E]
+    //    （dims[0]=num_freq 最内，与 PairwiseConv 的 permute{2,0,1,3} 和
+    //    view(R_co, Shape({E,in,nf})) 布局对齐）。原代码 Shape({E,out,in,nf}) 让
+    //    dims[0]=E 最内，导致 PairwiseConv 读 R 错位 → kernel 值巨大 → exp 溢出 NaN
+    //    （本会话 SE3 测试 `node_n=508 op=8 div` 溢出即此根因）。
+    return view(y, Shape({num_freq_, in_dim_, out_dim_, E}));
 }
 
 // ============================================================================
@@ -1328,7 +1344,10 @@ TensorF32* PairwiseConv::forward_graph(TensorF32* feat, const TensorF32& basis) 
         // R_co = R[:,co,:,:] → (E,in,nf) dims=[nf,in,E]
         TensorF32* co_leaf = constant_scalar(static_cast<float>(co));
         TensorF32* R_co_flat = get_rows(R_2d, co_leaf);          // (1, E*in*nf)
-        TensorF32* R_co = view(R_co_flat, Shape({E, in, nf}));   // dims=[nf,in,E]
+        // ⚠️ 修正：按 ggml dims[0]=最内维，行内数据布局是 [nf,in,E]（nf 最内、E 在 dims[2]），
+        //    per_edge_matmul 读 kernel->dims[2] 作为 E。原 Shape({E,in,nf}) 让 dims[0]=E、
+        //    dims[2]=nf，per_edge_matmul 会把 nf 当 E → 索引错乱 → kernel 值巨大 → exp 溢出 NaN。
+        TensorF32* R_co = view(R_co_flat, Shape({nf, in, E}));   // dims=[nf,in,E]
 
         for (int64_t mo = 0; mo < dout; mo++) {
             std::vector<TensorF32*> row_blocks;   // 每个 dims=[in, E]，按 mi 拼 → [in*din, E]
@@ -2054,11 +2073,18 @@ std::vector<TensorF32*> GMABSE3::forward_graph(
     TensorF32* e = mul_mat(dot, H);                                    // [n_heads, E]  e[h,e]
     e = scale(e, 1.0f / std::sqrt(static_cast<float>(K_total)));
 
-    // ===== Step 4: edge_softmax（无 max 减稳）=====
-    TensorF32* exp_e    = exp(e);                                       // [n_heads, E]
-    TensorF32* s_node   = scatter_add(exp_e, edge_tgt_idx, N);          // [n_heads, N]
-    TensorF32* s_edge   = edge_gather_rows(s_node, edge_tgt_idx);       // [n_heads, E]
-    TensorF32* a        = div(exp_e, s_edge);                           // [n_heads, E]
+    // ===== Step 4: edge_softmax（max 减稳，避免 exp 溢出）=====
+    // 原实现 exp(e) 无减稳：e 较大时 exp 溢出 inf → div(inf,inf)=NaN（本会话 node_n=508 根因）。
+    // 用全局 max 减稳：a[e]=exp(e[e]-e_max)/Σ_{tgt}exp(e[e']-e_max)，数学等价（每项除 exp(e_max)）。
+    TensorF32* e_max  = max_all(e);                                      // 标量
+    TensorF32* e_neg  = scale(repeat(e_max, e), -1.0f);                  // 广播 -e_max 到 [n_heads,E]
+    TensorF32* e_sub  = add_impl(e, e_neg, false);                       // e - e_max ≤ 0
+    TensorF32* exp_e  = exp(e_sub);                                      // exp(e-e_max) ∈ (0,1]，不溢出
+    TensorF32* s_node = scatter_add(exp_e, edge_tgt_idx, N);             // [n_heads, N]
+    TensorF32* s_edge = edge_gather_rows(s_node, edge_tgt_idx);          // [n_heads, E]
+    // 除零保护：s_edge 为 0 的目标节点（无入边）→ 分母加 eps，避免 div(exp,0)=inf → NaN
+    TensorF32* s_eps  = add1_impl(s_edge, constant_scalar(1e-6f), false);
+    TensorF32* a      = div(exp_e, s_eps);                               // [n_heads, E] softmax
 
     // ===== Step 5: 每度注意力加权聚合 =====
     std::vector<TensorF32*> out(f_value_.size(), nullptr);

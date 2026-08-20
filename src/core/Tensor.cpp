@@ -44,12 +44,24 @@ static void cuda_copy(void* dst, const void* src, size_t size, cudaMemcpyKind ki
 template<typename T>
 Tensor<T>::Tensor(const Shape& shape, Device device) 
     : shape_(shape), device_(device), own_data_(true) {
+    // ⚠️ 必须初始化 op/flag/src：Tensor() 默认构造不初始化这些成员，
+    //    若用普通构造（如 RadialFunc 的 BN 参数 new TensorF32(Shape,Device)）
+    //    再进图，op 读到垃圾（32653）→ dispatch_body 无 case → NOT_SUPPORTED。
+    op = OP_NONE;
+    flag = 0;
+    src.fill(nullptr);
+    for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = 0;
     allocate();
 }
 
 template<typename T>
 Tensor<T>::Tensor(const Shape& shape, T* data, Device device, bool own)
-    : shape_(shape), data_(data), device_(device), own_data_(own) {}
+    : shape_(shape), data_(data), device_(device), own_data_(own) {
+    op = OP_NONE;
+    flag = 0;
+    src.fill(nullptr);
+    for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = 0;
+}
 
 template<typename T>
 Tensor<T>::~Tensor() {
@@ -196,15 +208,26 @@ Tensor<T> Tensor<T>::select(int dim, int64_t index) const {
         if (i != dim) new_shape.dims.push_back(shape_.dims[i]);
     }
     
-    // 计算偏移
-    int64_t stride = 1;
-    for (int i = dim + 1; i < shape_.ndim(); ++i) {
-        stride *= shape_.dims[i];
+    // 正确切片（ggml 布局 dims[0] 最内维）：取 dim 维的 index，深拷贝到独立内存。
+    // ⚠️ 旧实现 `Tensor(new_shape, data_+offset, false)` 是错误 view：offset 与 view 形状不匹配，
+    //    导致切片数据读到错误区域（巨大值/垃圾），模板分支 emb_t1d_ 由此产生 1.78e6 溢出（[kern] op=30）。
+    //    改为按外层步进深拷贝，得到正确的、独立拥有的切片。
+    int64_t outer = 1;   // dim 之前维度乘积
+    int64_t inner = 1;   // dim 及之后维度乘积
+    for (int i = 0; i < dim; ++i)       outer *= shape_.dims[i];
+    for (int i = dim; i < shape_.ndim(); ++i) inner *= shape_.dims[i];
+    const int64_t dim_size   = shape_.dims[dim];
+    const int64_t slice_step = dim_size > 0 ? inner / dim_size : 1;   // 每个 dim 切片（dim 之后）元素数
+
+    Tensor<T> result(new_shape, device_);   // own_data_=true
+    T* dst = result.data();
+    const T* src_base = data_;
+    for (int64_t o = 0; o < outer; ++o) {
+        const T* src = src_base + o * inner + index * slice_step;
+        std::memcpy(dst, src, slice_step * sizeof(T));
+        dst += slice_step;
     }
-    // ?
-    int64_t offset = index * stride;
-    
-    return Tensor<T>(new_shape, data_ + offset, device_, false);
+    return result;
 }
 
 template<typename T>
@@ -229,8 +252,14 @@ Tensor<T> Tensor<T>::unsqueeze(int dim) const {
         new_shape.dims.push_back(shape_.dims[i]);
     }
     
-    // 返回视图（不拥有数据）
-    return Tensor<T>(new_shape, data_, device_, false);
+    // 返回深拷贝（own_data_=true）：
+    // ⚠️ 旧实现返回 view（own_data_=false）会触发 use-after-free：
+    //    `input.X = input.X.unsqueeze(0)` 自引用 move 时，move 赋值 deallocate() 释放原 data，
+    //    而 view 仍指向该已释放内存 → 悬垂（ASAN: heap-use-after-free，DataLoader.cpp:2300/2302/2310）。
+    //    故改为深拷贝，使 move 赋值接管的是独立内存，无共享、无悬垂。
+    Tensor<T> result(new_shape, device_);   // own_data_=true, allocate()
+    std::memcpy(result.data(), data_, numel() * sizeof(T));
+    return result;
 }
 
 

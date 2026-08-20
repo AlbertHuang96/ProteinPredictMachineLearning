@@ -76,6 +76,7 @@ bool CPUBackend::supports_op(TensorF32* node) const {
         case OP_SCATTER_ADD:
         case OP_PER_EDGE_MATMUL_BACK_KERNEL:
         case OP_PER_EDGE_MATMUL_BACK_GATHERED:
+        case OP_CONCAT_BACK:
         case OP_OUTER_PROD_MEAN:
         case OP_OUTER_PROD_MEAN_BACK:
         case OP_OUTER_PROD:
@@ -234,7 +235,7 @@ void CPUBackend::compute_thread(ThreadState * state) {
             const int64_t ne_ = node->numel();
             const float* nd = node->data();
             for (int64_t q = 0; q < ne_; ++q) {
-                if (nd[q] != nd[q]) {
+                if (!std::isfinite(nd[q])) {   // NaN 或 Inf 都报
                     fprintf(stderr,
                             "[nan-node] FIRST_NAN node_n=%d op=%d src0op=%d dims=[%lld,%lld,%lld,%lld] "
                             "numel=%lld idx=%lld src0data=%p\n",
@@ -246,8 +247,9 @@ void CPUBackend::compute_thread(ThreadState * state) {
                             (long long)(node->shape().ndim()>3?node->shape().dims[3]:-1),
                             (long long)ne_, (long long)q,
                             node->src[0] ? (void*)node->src[0]->data() : nullptr);
-                    // 对 MUL/MUL_MAT：dump src0/src1 前 8 个值，判断哪个输入含 NaN
-                    if ((node->op == OP_MUL_MAT || node->op == OP_MUL) && node->src[0] && node->src[1] &&
+                    // 对 MUL/MUL_MAT/DIV：dump src0/src1 前 8 个值，判断哪个输入含 NaN/巨大
+                    if ((node->op == OP_MUL_MAT || node->op == OP_MUL || node->op == OP_DIV) &&
+                        node->src[0] && node->src[1] &&
                         node->src[0]->data() && node->src[1]->data()) {
                         fprintf(stderr, "  [nan-node] src0 op=%d head8: ", (int)node->src[0]->op);
                         const float* s0 = node->src[0]->data();

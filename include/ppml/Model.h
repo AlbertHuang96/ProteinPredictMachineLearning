@@ -130,6 +130,9 @@ struct GraphOutput {
 class IterBlock {
 public:
     IterBlock(const PPMLConfig& config, bool update_msa_pair = true);
+    // 多态基类必须有 virtual 析构：RefineBlock 经 make_unique 分配（更大），被存进 unique_ptr<IterBlock>
+    // 删除时若走非 virtual 析构会 new-delete-type-mismatch（ASAN）。加 virtual 使 delete 按最派生类型正确回收。
+    virtual ~IterBlock() = default;
     
     // 由 PPMLModel 注入子模块 (non-owning pointers 已在之前注入, 这里是 unique_ptr 所有权转移)
     void set_sub_modules(
@@ -537,6 +540,7 @@ private:
     LayerNorm*       tps_tri_in_output_layernorm_ = nullptr;
     LinearLayer*     tps_tri_in_out_proj_         = nullptr;
     // PairRowAttention (6 LL)
+    LayerNorm*       tps_pair_norm_       = nullptr; // D_PAIR (128) LayerNorm(pair)，投影前归一化
     LinearLayer*     tps_pair_row_to_b_   = nullptr;
     LinearLayer*     tps_pair_row_to_g_   = nullptr;
     LinearLayer*     tps_pair_row_to_out_ = nullptr;
@@ -615,6 +619,7 @@ private:
     std::vector<LinearLayer*> msa_global_col_to_out_;
 
     // --- PairRowAttention (6 LL ×12) ---
+    std::vector<LayerNorm*>   pair_attn_norm_;  // D_PAIR (128) LayerNorm(pair)，投影前归一化（row/col 共享）
     std::vector<LinearLayer*> pair_row_Wq_;     // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
     std::vector<LinearLayer*> pair_row_Wk_;     
     std::vector<LinearLayer*> pair_row_Wv_;     

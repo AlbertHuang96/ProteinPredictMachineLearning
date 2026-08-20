@@ -10,16 +10,23 @@ if(NOT GTest_FOUND)
     FetchContent_MakeAvailable(googletest)
 endif()
 
-add_executable(rfaa_tests
+add_executable(ppml_tests
     test_tensor.cpp
     test_attention.cpp
     test_model.cpp
+    test_outer_product_mean.cpp
+    test_dyntalloc.cpp
+    test_gallocr.cpp
+    test_cuda.cpp
+    test_se3_equivariance.cpp
+    test_se3_graph_backward.cpp
+    test_se3_forward_graph.cpp
 )
 
-target_link_libraries(rfaa_tests PRIVATE
-    rfaa_core
+target_link_libraries(ppml_tests PRIVATE
+    ppml_core
     GTest::gtest_main
 )
 
 include(GoogleTest)
-gtest_discover_tests(rfaa_tests)
+gtest_discover_tests(ppml_tests)

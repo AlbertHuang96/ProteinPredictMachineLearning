@@ -55,14 +55,54 @@ void Gallocr::compute_refcounts(
     nodes_.resize(graph->n_nodes());
     leaves_.resize(graph->n_leafs());
 
+    // ===== 恢复参数 data()：参数(TENSOR_FLAG_PARAM)必须始终有有效数据 =====
+    // 之前 Gallocr::release 曾把参数 bind_data(nullptr) 清空（旧 bug，已修复跳过 PARAM），
+    // 但已清空过的参数 data() 仍为 null。若其 buffer_(param_buf) 非空，从这里恢复
+    // data() = buffer_->data() + buffer_offs_，使参数重新指向 param_buf（非空）。
+    // 这样参数不被 Gallocr 判定 managed → 不分配可复用中间 buffer → 不被覆盖污染。
+    auto restore_param_data = [](TensorF32* t) {
+        if (!(t->flag & TENSOR_FLAG_PARAM)) return;
+        if (t->data() != nullptr) return;
+        if (t->buffer_ != nullptr) {
+            t->bind_data(static_cast<float*>(t->buffer_->data()) + t->buffer_offs_);
+        }
+    };
+    for (int i = 0; i < graph->n_nodes(); i++) restore_param_data(graph->graph_node(i));
+    for (int i = 0; i < graph->n_leafs(); i++) restore_param_data(graph->graph_leaf(i));
+
     // 登记 nodes
     for (int i = 0; i < graph->n_nodes(); i++) {
         TensorF32* t = graph->graph_node(i);
         NodeInfo& ni = nodes_[i];
         ni.tensor     = t;
+        // 参数(TENSOR_FLAG_PARAM)需要 buffer，但该 buffer 必须存活到训练结束（不可被复用覆盖）。
+        // 这里仍按 data()/view_src 判定 managed（参数 data() 通常非空则不分配）；
+        // 若参数 data() 为 null 会被判定 managed 并分配——这是允许的（参数需要 buffer），
+        // 但后续需保证其 buffer 不被复用（见 is_output / 存活标记）。
         ni.managed    = (t->data() == nullptr && t->view_src == nullptr);
         ni.backend_id = backend_id_of(t);
         ni.is_output  = (t->flag & (TENSOR_FLAG_OUTPUT | TENSOR_FLAG_LOSS)) != 0;
+        // 诊断：恢复后仍 data()==nullptr（参数从未有独立数据）→ 真问题，需查参数创建/transfer。
+        if ((t->flag & TENSOR_FLAG_PARAM) && ni.managed) {
+            fprintf(stderr, "[gallocr] WARN param node data()==nullptr buffer_=%p nbytes=%zu view_src=%p const_data=%zu op=%d dims=[%lld,%lld,%lld,%lld]",
+                    (const void*)t->buffer_, t->nbytes(), (const void*)t->view_src,
+                    t->const_data_.size(), (int)t->op,
+                    (long long)(t->shape().ndim()>0?t->shape().dims[0]:-1),
+                    (long long)(t->shape().ndim()>1?t->shape().dims[1]:-1),
+                    (long long)(t->shape().ndim()>2?t->shape().dims[2]:-1),
+                    (long long)(t->shape().ndim()>3?t->shape().dims[3]:-1));
+            // 追溯：该参数被哪个节点引用（定位它是哪层的权重）
+            for (int j = 0; j < graph->n_nodes(); j++) {
+                TensorF32* tj = graph->graph_node(j);
+                for (int s = 0; s < GGML_MAX_SRC; s++) {
+                    if (tj->src[s] == t) {
+                        fprintf(stderr, " used_by(op=%d,src%d)", (int)tj->op, s);
+                        break;
+                    }
+                }
+            }
+            fprintf(stderr, "\n");
+        }
         node_map_[t]  = &ni;
     }
     // 登记 leafs
@@ -73,6 +113,11 @@ void Gallocr::compute_refcounts(
         li.managed    = (t->data() == nullptr && t->view_src == nullptr);
         li.backend_id = backend_id_of(t);
         li.is_output  = (t->flag & (TENSOR_FLAG_OUTPUT | TENSOR_FLAG_LOSS)) != 0;
+        // 诊断：恢复后仍 data()==nullptr → 真问题
+        if ((t->flag & TENSOR_FLAG_PARAM) && li.managed) {
+            fprintf(stderr, "[gallocr] WARN param leaf data()==nullptr buffer_=%p nbytes=%zu (param has NO data!)\n",
+                    (const void*)t->buffer_, t->nbytes());
+        }
         node_map_[t]  = &li;
     }
 
@@ -167,6 +212,12 @@ bool Gallocr::reserve(
     // allocated 置 false、或 nodes_ 快照与张量实际 buffer_ 不一致，也能可靠复位。
     // 叶子（buffer_==nullptr，数据在 context scratch）不受影响。
     auto reset_tensor = [](TensorF32* t) {
+        // 跳过参数(TENSOR_FLAG_PARAM)：参数数据必须跨 graph_compute 存活到训练结束。
+        // 若参数经 transfer_params_to_backend 迁到独立 param_buf（buffer_ 非空），这里 reset
+        // 会 bind_data(nullptr) 清空参数 data_ 并清 buffer_，导致参数数据永久丢失 → 后续
+        // kernel 读参数 data()==nullptr 段错误或 Gallocr 重新分配可复用 buffer 被覆盖 → NaN。
+        // 参数 buffer 归 param_buffers_ 管理，绝不能被 Gallocr 当作可复用中间 buffer reset。
+        if (t && (t->flag & TENSOR_FLAG_PARAM)) return;
         if (t && t->buffer_ != nullptr) {
             t->bind_data(nullptr);
             t->buffer_      = nullptr;
@@ -418,6 +469,11 @@ void Gallocr::release() {
     // 若按 allocated 判定会漏掉 → 悬垂指针。
     auto reset_bound = [&](std::vector<NodeInfo>& infos) {
         for (auto& ni : infos) {
+            // 跳过参数(TENSOR_FLAG_PARAM)：参数数据必须跨 graph_compute 存活到训练结束，
+            // 不能被复位成 nullptr（否则 embedding/get_rows/linear 读参数 data()==nullptr 段错误）。
+            // 参数若由 transfer_params_to_backend 迁到独立 param_buf，其 buffer_ 非空且不应被
+            // Gallocr 当作可复用中间 buffer 清空；此处只清 Gallocr 自己分配的 managed 中间节点。
+            if (ni.tensor->flag & TENSOR_FLAG_PARAM) continue;
             if (ni.buffer != nullptr) {
                 ni.tensor->bind_data(nullptr);
                 ni.tensor->buffer_      = nullptr;

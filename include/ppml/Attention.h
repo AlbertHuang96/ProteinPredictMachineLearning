@@ -126,11 +126,12 @@ public:
 class PairRowAttention {
 public:
     PairRowAttention() = default;
-    void set_params(const AttnConfig& config,
+    void set_params(const AttnConfig& config, LayerNorm* norm,
                     LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                     LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv);
     
-    // pair/str_bias 应为已过 layernorm 的输入
+    // AF2 PairAxialAttention: 投影前对 pair 做 LayerNorm（norm_），Q/K/V 用归一化 pair，gate 用原始 pair。
+    // str_bias 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
 
     // ===== 图模式前向（训练用）=====
@@ -142,6 +143,7 @@ public:
 
 private:
     std::unique_ptr<SelfAttention> self_attn_;
+    LayerNorm* norm_  = nullptr; // D_PAIR (128) LayerNorm(pair)，投影前归一化
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
     LinearLayer* to_g_  = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
     LinearLayer* to_out_ = nullptr; // N_HEAD*D_PAIR_HIDDEN (256) → D_PAIR (128)
@@ -155,11 +157,12 @@ private:
 class PairColAttention {
 public:
     PairColAttention() = default;
-    void set_params(const AttnConfig& config,
+    void set_params(const AttnConfig& config, LayerNorm* norm,
                     LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                     LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv);
     
-    // pair/str_bias 应为已过 layernorm 的输入
+    // AF2 PairAxialAttention: 投影前对 pair 做 LayerNorm（norm_），Q/K/V 用归一化 pair，gate 用原始 pair。
+    // str_bias 应为已过 layernorm 的输入
     TensorF32 forward(const TensorF32& pair, const TensorF32& str_bias);
 
     // ===== 图模式前向（训练用）=====
@@ -171,6 +174,7 @@ public:
 
 private:
     std::unique_ptr<SelfAttention> self_attn_;
+    LayerNorm* norm_  = nullptr; // D_PAIR (128) LayerNorm(pair)，投影前归一化
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
     LinearLayer* to_g_  = nullptr; // D_PAIR (128) → N_HEAD*D_PAIR_HIDDEN (256)
     LinearLayer* to_out_ = nullptr; // N_HEAD*D_PAIR_HIDDEN (256) → D_PAIR (128)

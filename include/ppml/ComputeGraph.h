@@ -175,6 +175,7 @@ TensorF32* softmax_backward(TensorF32* grad, TensorF32* output);
 TensorF32* silu   (TensorF32* a);
 TensorF32* gelu   (TensorF32* a);
 TensorF32* relu   (TensorF32* a);
+TensorF32* relu_back(TensorF32* grad, TensorF32* x);
 TensorF32* exp    (TensorF32* a);
 TensorF32* leaky_relu(TensorF32* a, float alpha = 0.01f);
 TensorF32* sigmoid(TensorF32* a);
@@ -186,6 +187,7 @@ TensorF32* norm   (TensorF32* a, float eps = 1e-5f);
 // 5. 规约
 TensorF32* sum     (TensorF32* a);
 TensorF32* mean    (TensorF32* a);
+TensorF32* max_all (TensorF32* a);
 TensorF32* sum_rows(TensorF32* a);
 
 // 6. 形状
@@ -195,6 +197,7 @@ TensorF32* permute  (TensorF32* a, const std::vector<int>& dims);
 TensorF32* unsqueeze(TensorF32* a, int dim);
 TensorF32* concat     (const std::vector<TensorF32>& tensors, int dim);
 TensorF32* concat_ptr (const std::vector<TensorF32*>& tensors, int dim);
+TensorF32* concat_back(TensorF32* grad, TensorF32* src, int dim, int64_t offset);
 TensorF32* repeat   (TensorF32* a, TensorF32* b);
 TensorF32* repeat_back(TensorF32* a, TensorF32* b);
 TensorF32* cont     (TensorF32* a);

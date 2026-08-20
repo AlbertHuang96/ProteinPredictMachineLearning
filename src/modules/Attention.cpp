@@ -424,11 +424,12 @@ TensorF32* MSAGlobalColAttention::forward_graph(TensorF32* msa) {
 }
 
 // ===== PairRowAttention =====
-void PairRowAttention::set_params(const AttnConfig& config,
+void PairRowAttention::set_params(const AttnConfig& config, LayerNorm* norm,
                                   LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                                   LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv) {
     config_ = config;
     self_attn_ = std::make_unique<SelfAttention>(config);
+    norm_   = norm;
     to_b_   = to_b;   to_g_   = to_g;   to_out_ = to_out;
     Wq_     = Wq;     Wk_     = Wk;     Wv_     = Wv;
 }
@@ -436,7 +437,10 @@ void PairRowAttention::set_params(const AttnConfig& config,
 TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_bias) {
     // Row attention: 沿最后一个 L 维 (行) 做 attention
     // 输入 pair: (B, L_row, L_col, 128)
-    auto Q = Wq_->forward(pair);  // (B, L_row, L_col, 256)
+    // AF2 PairAxialAttention: Q/K/V 用归一化 pair，gate(to_g) 用原始 pair。
+    // Tensor 为 move-only（禁止拷贝），LayerNorm::forward 接受非 const 指针，用 const_cast（只读输入）。
+    auto& pair_normed = *norm_->forward(const_cast<TensorF32*>(&pair));
+    auto Q = Wq_->forward(pair_normed);  // (B, L_row, L_col, 256)
     int B   = static_cast<int>(Q.shape().dims[0]);
     int Lr  = static_cast<int>(Q.shape().dims[1]);  // L_row
     int Lc  = static_cast<int>(Q.shape().dims[2]);  // L_col
@@ -447,11 +451,11 @@ TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_
     Q = Q.view(Shape({B * Lc, Lr, H, D}));
     Q = Q.permute({0, 2, 3, 1});  // (B*Lc, 8, 32, Lr)
 
-    auto K = Wk_->forward(pair);
+    auto K = Wk_->forward(pair_normed);
     K = K.view(Shape({B * Lc, Lr, H, D}));
     K = K.permute({0, 2, 3, 1});
 
-    auto V = Wv_->forward(pair);
+    auto V = Wv_->forward(pair_normed);
     V = V.view(Shape({B * Lc, Lr, H, D}));
     V = V.permute({0, 2, 3, 1});
 
@@ -476,8 +480,10 @@ TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_
 TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias) {
     // 输入: pair 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
     //       str_bias 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
-    // Wq_->forward_graph(pair) → 值 (B,Lr,Lc,H*D) = 图 [H*D, Lc, Lr, B]
-    auto* Q = Wq_->forward_graph(pair);
+    // AF2 PairAxialAttention: Q/K/V 用归一化 pair，gate(to_g) 用原始 pair。
+    // Wq_->forward_graph(pair_normed) → 值 (B,Lr,Lc,H*D) = 图 [H*D, Lc, Lr, B]
+    auto* pair_normed = norm_->forward(pair);
+    auto* Q = Wq_->forward_graph(pair_normed);
     int B  = static_cast<int>(Q->shape().dims[3]);   // B (最外层)
     int Lr = static_cast<int>(Q->shape().dims[2]);   // L_row
     int Lc = static_cast<int>(Q->shape().dims[1]);   // L_col
@@ -489,10 +495,10 @@ TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     // 图: [H*D,Lc,Lr,B] → view([D,H,Lr,B*Lc]) → permute({2,0,1,3}) → [Lr,D,H,B*Lc] (self_attn 契约)
     Q = view(Q, Shape{D, H, Lr, B * Lc});
     Q = permute(Q, {2, 0, 1, 3});
-    auto* K = Wk_->forward_graph(pair);
+    auto* K = Wk_->forward_graph(pair_normed);
     K = view(K, Shape{D, H, Lr, B * Lc});
     K = permute(K, {2, 0, 1, 3});
-    auto* V = Wv_->forward_graph(pair);
+    auto* V = Wv_->forward_graph(pair_normed);
     V = view(V, Shape{D, H, Lr, B * Lc});
     V = permute(V, {2, 0, 1, 3});
 
@@ -501,7 +507,7 @@ TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     // 前置不变量：pair 为方阵（Lr==Lc==L），实际网络里 str_bias 来自 rbf_proj (B,L,L,D_PAIR)。
     auto* bias = to_b_->forward_graph(str_bias);
     bias = prepare_pair_bias(bias, /*Lq=*/Lr, /*Lk=*/Lr, /*B=*/B, /*fold=*/Lc);
-    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]
+    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]（gate 用原始 pair）
     auto* gv   = to_g_->forward_graph(pair);
     auto* gate = sigmoid(gv);
 
@@ -523,11 +529,12 @@ TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
 }
 
 // ===== PairColAttention =====
-void PairColAttention::set_params(const AttnConfig& config,
+void PairColAttention::set_params(const AttnConfig& config, LayerNorm* norm,
                                   LinearLayer* to_b,  LinearLayer* to_g,  LinearLayer* to_out,
                                   LinearLayer* Wq,    LinearLayer* Wk,    LinearLayer* Wv) {
     config_ = config;
     self_attn_ = std::make_unique<SelfAttention>(config);
+    norm_   = norm;
     to_b_   = to_b;   to_g_   = to_g;   to_out_ = to_out;
     Wq_     = Wq;     Wk_     = Wk;     Wv_     = Wv;
 }
@@ -535,7 +542,10 @@ void PairColAttention::set_params(const AttnConfig& config,
 TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_bias) {
     // Col attention: 沿倒数第二个 L 维 (列) 做 attention
     // 输入 pair: (B, L_row, L_col, 128)
-    auto Q = Wq_->forward(pair);  // (B, L_row, L_col, 256)
+    // AF2 PairAxialAttention: Q/K/V 用归一化 pair，gate(to_g) 用原始 pair。
+    // Tensor 为 move-only（禁止拷贝），LayerNorm::forward 接受非 const 指针，用 const_cast（只读输入）。
+    auto& pair_normed = *norm_->forward(const_cast<TensorF32*>(&pair));
+    auto Q = Wq_->forward(pair_normed);  // (B, L_row, L_col, 256)
     int B   = static_cast<int>(Q.shape().dims[0]);
     int Lr  = static_cast<int>(Q.shape().dims[1]);  // L_row
     int Lc  = static_cast<int>(Q.shape().dims[2]);  // L_col
@@ -546,11 +556,11 @@ TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_
     Q = Q.view(Shape({B * Lr, Lc, H, D}));
     Q = Q.permute({0, 2, 3, 1});  // (B*Lr, 8, 32, Lc)
 
-    auto K = Wk_->forward(pair);
+    auto K = Wk_->forward(pair_normed);
     K = K.view(Shape({B * Lr, Lc, H, D}));
     K = K.permute({0, 2, 3, 1});
 
-    auto V = Wv_->forward(pair);
+    auto V = Wv_->forward(pair_normed);
     V = V.view(Shape({B * Lr, Lc, H, D}));
     V = V.permute({0, 2, 3, 1});
 
@@ -574,8 +584,10 @@ TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_
 TensorF32* PairColAttention::forward_graph(TensorF32* pair, TensorF32* str_bias) {
     // 输入: pair 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
     //       str_bias 值 (B,Lr,Lc,D_PAIR) = 图 [D_PAIR, Lc, Lr, B]
-    // Wq_->forward_graph(pair) → 值 (B,Lr,Lc,H*D) = 图 [H*D, Lc, Lr, B]
-    auto* Q = Wq_->forward_graph(pair);
+    // AF2 PairAxialAttention: Q/K/V 用归一化 pair，gate(to_g) 用原始 pair。
+    // Wq_->forward_graph(pair_normed) → 值 (B,Lr,Lc,H*D) = 图 [H*D, Lc, Lr, B]
+    auto* pair_normed = norm_->forward(pair);
+    auto* Q = Wq_->forward_graph(pair_normed);
     int B  = static_cast<int>(Q->shape().dims[3]);   // B (最外层)
     int Lr = static_cast<int>(Q->shape().dims[2]);   // L_row
     int Lc = static_cast<int>(Q->shape().dims[1]);   // L_col
@@ -587,10 +599,10 @@ TensorF32* PairColAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     // 图: [H*D,Lc,Lr,B] → view([D,H,Lc,B*Lr]) → permute({2,0,1,3}) → [Lc,D,H,B*Lr] (self_attn 契约)
     Q = view(Q, Shape{D, H, Lc, B * Lr});
     Q = permute(Q, {2, 0, 1, 3});
-    auto* K = Wk_->forward_graph(pair);
+    auto* K = Wk_->forward_graph(pair_normed);
     K = view(K, Shape{D, H, Lc, B * Lr});
     K = permute(K, {2, 0, 1, 3});
-    auto* V = Wv_->forward_graph(pair);
+    auto* V = Wv_->forward_graph(pair_normed);
     V = view(V, Shape{D, H, Lc, B * Lr});
     V = permute(V, {2, 0, 1, 3});
 
@@ -599,7 +611,7 @@ TensorF32* PairColAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     // 前置不变量：pair 为方阵（Lr==Lc==L），实际网络里 str_bias 来自 rbf_proj (B,L,L,D_PAIR)。
     auto* bias = to_b_->forward_graph(str_bias);
     bias = prepare_pair_bias(bias, /*Lq=*/Lc, /*Lk=*/Lc, /*B=*/B, /*fold=*/Lr);
-    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]
+    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]（gate 用原始 pair）
     auto* gv   = to_g_->forward_graph(pair);
     auto* gate = sigmoid(gv);
 

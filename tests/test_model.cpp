@@ -1,10 +1,10 @@
 #include <gtest/gtest.h>
-#include "rfaa/Model.h"
+#include "ppml/Model.h"
 
-using namespace rfaa;
+using namespace ppml;
 
-TEST(ModelTest, RFAAConfigDefault) {
-    RFAAConfig config;
+TEST(ModelTest, PPMLConfigDefault) {
+    PPMLConfig config;
     EXPECT_EQ(config.d_msa, 256);
     EXPECT_EQ(config.d_pair, 128);
     EXPECT_EQ(config.d_state, 32);
@@ -14,23 +14,23 @@ TEST(ModelTest, RFAAConfigDefault) {
 }
 
 TEST(ModelTest, ModelCreation) {
-    RFAAConfig config;
+    PPMLConfig config;
     config.n_extra_blocks = 1;
     config.n_main_blocks = 1;
     config.n_refine_blocks = 1;
     
-    RFAAModel model(config);
+    PPMLModel model(config);
     EXPECT_EQ(model.device(), Device::CPU);
     EXPECT_FALSE(model.is_training());
 }
 
 TEST(ModelTest, ModelForward) {
-    RFAAConfig config;
+    PPMLConfig config;
     config.n_extra_blocks = 1;
     config.n_main_blocks = 1;
     config.n_refine_blocks = 1;
     
-    RFAAModel model(config);
+    PPMLModel model(config);
     model.eval();
     
     int B = 1, N = 16, L = 32, T = 2;
@@ -39,6 +39,15 @@ TEST(ModelTest, ModelForward) {
     input.seq_tokens = zeros<float>({B, L}, Device::CPU);
     input.t1d = zeros<float>({B, T, L, D_T1D}, Device::CPU);
     input.coords = zeros<float>({B, L, 3, 3}, Device::CPU);
+    // 补全 forward 用到的字段（避免空 Tensor 解引用崩溃，PPML.cpp:2122 residx）
+    input.residx = zeros<int64_t>({B, L}, Device::CPU);
+    for (int l = 0; l < L; ++l) input.residx.data()[l] = l;
+    input.tor_feat = zeros<float>({B, T, L, D_TOR}, Device::CPU);
+    input.t2d = zeros<float>({B, T, L, L, D_T2D}, Device::CPU);
+    input.bond_feats = zeros<float>({B, L, L, 5}, Device::CPU);
+    input.dist_matrix = zeros<float>({B, L, L}, Device::CPU);
+    input.same_chain = zeros<float>({B, L, L}, Device::CPU);
+    input.template_mask = zeros<float>({B, T, L}, Device::CPU);
     
     auto output = model.forward(input);
     
@@ -49,8 +58,8 @@ TEST(ModelTest, ModelForward) {
 }
 
 TEST(ModelTest, ModelTrainEval) {
-    RFAAConfig config;
-    RFAAModel model(config);
+    PPMLConfig config;
+    PPMLModel model(config);
     
     model.train();
     EXPECT_TRUE(model.is_training());
@@ -60,8 +69,8 @@ TEST(ModelTest, ModelTrainEval) {
 }
 
 TEST(ModelTest, DeviceTransfer) {
-    RFAAConfig config;
-    RFAAModel model(config);
+    PPMLConfig config;
+    PPMLModel model(config);
     
     model.to(Device::CUDA);
     EXPECT_EQ(model.device(), Device::CUDA);

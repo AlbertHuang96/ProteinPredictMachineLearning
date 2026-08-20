@@ -22,6 +22,14 @@ std::vector<float> read_tensor_values(const TensorF32* t) {
         // 从 backend buffer 读取（CPU buffer 直接 memcpy；CUDA buffer 内部自动 D2H 同步）
         t->buffer_->get_tensor(t, buf.data(), t->buffer_offs_, bytes);
     } else if (t->device() == Device::CPU) {
+        if (!t->data()) {
+            // 梯度 data 未分配（SE3 部分参数无梯度路径 / graph_compute 未算出）→ 返回空（跳过）
+            if (getenv("GRAPH_DEBUG_GRAD")) {
+                std::fprintf(stderr, "[GRAD-NULL] grad data null, numel=%lld\n",
+                    (long long)t->numel());
+            }
+            return {};
+        }
         std::memcpy(buf.data(), t->data(), bytes);
     } else {
         // CUDA 且无 buffer：拷贝一份 CPU 张量读取

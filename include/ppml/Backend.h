@@ -645,10 +645,13 @@ private:
     static void kernel_sum     (TensorF32 * node, ComputeParams * p);
     static void kernel_sum_rows(TensorF32 * node, ComputeParams * p);
     static void kernel_mean    (TensorF32 * node, ComputeParams * p);
+    static void kernel_max_all (TensorF32 * node, ComputeParams * p);
+    static void kernel_relu_back(TensorF32 * node, ComputeParams * p);
     static void kernel_repeat  (TensorF32 * node, ComputeParams * p);
     static void kernel_repeat_back(TensorF32 * node, ComputeParams * p);
     static void kernel_sqr     (TensorF32 * node, ComputeParams * p);
     static void kernel_concat  (TensorF32 * node, ComputeParams * p);
+    static void kernel_concat_back(TensorF32 * node, ComputeParams * p);
 
     // ===== shape op（方案 B：Tensor 无 nb，均需实际拷贝）=====
     // kernel_cpy:    整块 memcpy src→dst（reshape/view/cont，元素顺序不变）

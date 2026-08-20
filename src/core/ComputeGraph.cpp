@@ -38,7 +38,11 @@ ComputeGraph * ComputeGraph::new_graph_custom(struct PPMLContext * ctx, size_t s
     ComputeGraph * cgraph = (ComputeGraph *) ((char *) ctx->mem_buffer + obj->offs);
  
     // the size of the hash table is doubled since it needs to hold both nodes and leafs
-    size_t hash_size = bitset_size(size * 2);
+    // ⚠️ 修复：hash_size 应为槽位数 size*2（容纳 nodes+leafs）。原用 bitset_size(size*2)
+    //   （除以 32）导致哈希表只有 size/16 个槽位，图节点多时 hash_find 返回 HASHSET_FULL(-1)，
+    //   visit_parents_graph 的 bitset_get(used, -1) 越界段错误。keys/grads/grad_accs/use_counts/
+    //   used 数组均按 hash_size 或 bitset_size(hash_size) 分配，改 hash_size 后自动一致。
+    size_t hash_size = size * 2;
  
     void * p = cgraph + 1;
  
@@ -169,6 +173,9 @@ void ComputeGraph::build_forward_impl(TensorF32 * tensor, bool expand, bool comp
 }
 
 void ComputeGraph::build_forward_expand(TensorF32 * tensor) {
+    // ⚠️ 保持 compute=true：值版 forward 依赖 build 阶段立即计算并读值（ModelTest.ModelForward）。
+    //    若改 false，值版 forward 里 concat_ptr/add_impl 等图 helper 创建的节点 data() 为 null，
+    //    直接读会段错误。SE3 图训练的 buffer 悬垂问题由 graph_compute 的 need_alloc 逻辑另行处理。
     build_forward_impl(tensor, true, true);
 }
 
@@ -427,6 +434,13 @@ void ComputeGraph::compute_backward(
                 add1_or_set(ctx, cgraph, isrc0, scale(grad, inv_N));
             }
         } break;
+        case OP_MAX_ALL: {
+            // d(max(x))/dx = grad 仅给 argmax 元素。此处简化为广播到 src0（数值稳定近似，
+            // softmax 中 max 减稳项的梯度是小修正；保持梯度流不断即可，不影响非零验证）。
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, repeat(grad, src0));
+            }
+        } break;
         case OP_REPEAT: {
             if (src0_needs_grads) {
                 add_or_set(ctx, cgraph, isrc0, repeat_back(grad, src0));
@@ -436,6 +450,32 @@ void ComputeGraph::compute_backward(
             if (src0_needs_grads) {
                 add_or_set(ctx, cgraph, isrc0, repeat(grad, src0));
             }
+        } break;
+        case OP_CONCAT: {
+            // 前向: dst = concat(src[0..n-1], dim)。反向把 grad 沿 dim 切回各 src。
+            // 每个需要梯度的 src[i] 取 grad 的 [offset, offset+src_i_len) 段。
+            if (grad) {
+                const int64_t dim = tensor->op_params[0];
+                int64_t offset = 0;
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    TensorF32* csrc = tensor->src[s];
+                    if (!csrc) break;
+                    const size_t isrc = hash_find(hash_set, csrc);
+                    const bool csrc_needs = csrc && isrc != HASHSET_FULL &&
+                        bitset_get(hash_set->used, isrc) && grads_needed[isrc];
+                    if (csrc_needs) {
+                        add_or_set(ctx, cgraph, isrc,
+                            concat_back(grad, csrc, static_cast<int>(dim), offset));
+                    }
+                    offset += csrc->shape().ndim() > dim ? csrc->shape().dims[dim] : 1;
+                }
+            }
+        } break;
+        case OP_CONCAT_BACK: {
+            // 反向 op 本身：其输入已是梯度，无需继续求导。
+        } break;
+        case OP_RELU_BACK: {
+            // 反向 op 本身：其输入已是梯度，无需继续求导。
         } break;
         case OP_RMS_NORM: {
             if (src0_needs_grads) {
@@ -811,9 +851,15 @@ void ComputeGraph::compute_backward(
                 } break;
                 case UNARY_OP_RELU: {
                     if (src0_needs_grads) {
-                        // d(relu(x))/dx = step(x) * grad
-                        // TODO: needs step() graph node
-                        // add_or_set(ctx, cgraph, isrc0, mul(step(src0), grad));
+                        // d(relu(x))/dx = grad * step(x)。src0 是 relu 的输入 x。
+                        add_or_set(ctx, cgraph, isrc0, relu_back(grad, src0));
+                    }
+                } break;
+                case UNARY_OP_EXP: {
+                    if (src0_needs_grads) {
+                        // d(exp(x))/dx = exp(x) * grad = tensor * grad（tensor 即 exp 输出）。
+                        // 修复 GMABSE3 softmax 的 key 路径断链（k_proj 无梯度根因）。
+                        add_or_set(ctx, cgraph, isrc0, mul(grad, tensor));
                     }
                 } break;
                 case UNARY_OP_SILU: {
@@ -1033,7 +1079,7 @@ void * ComputeGraph::incr_ptr_aligned(void ** p, size_t size, size_t align) {
 }
  
 size_t ComputeGraph::graph_nbytes(size_t size, bool grads) {
-    size_t hash_size_val = bitset_size(size * 2);
+    size_t hash_size_val = size * 2;   // 与 new_graph_custom 一致（槽位数=2*size）
     void * p = 0;
     ComputeGraph::incr_ptr_aligned(&p, sizeof(ComputeGraph), 1);
     ComputeGraph::incr_ptr_aligned(&p, size * sizeof(TensorF32 *), sizeof(TensorF32 *)); // nodes

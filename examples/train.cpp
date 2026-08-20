@@ -11,6 +11,8 @@
 #include <iostream>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
+#include <algorithm>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -227,18 +229,27 @@ int main(int argc, char* argv[]) {
     const bool full_train =
         (std::getenv("FULL_TRAIN") != nullptr) &&
         (std::strcmp(std::getenv("FULL_TRAIN"), "true") == 0);
+    // 调试开关：PPML_DEV_SE3=1 时在 dev 模式（FULL_TRAIN 未设）也开 SE3（enable_se3=true），
+    // 但保持小配置（MSA 深度 N=128，非 FULL_TRAIN 的 512），避免全图 OOM，用于验证 SE3 训练链路。
+    const bool dev_se3 =
+        (std::getenv("PPML_DEV_SE3") != nullptr) &&
+        (std::strcmp(std::getenv("PPML_DEV_SE3"), "1") == 0);
 
     // 训练开始前打印 CPU / 内存 / GPU 环境概览
     print_system_info();
 
     // 2. 创建模型
+    //    block 数固定为开发模式正常值：extra=4, main=8, refine=4。
     PPMLConfig config;
     config.d_msa = 256;
     config.d_pair = 128;
     config.d_state = 32;
-    config.n_extra_blocks = 4;
-    config.n_main_blocks = 8;
+    config.n_extra_blocks  = 4;
+    config.n_main_blocks   = 8;
     config.n_refine_blocks = 4;
+    std::cout << "[config] blocks: extra=" << config.n_extra_blocks
+              << " main=" << config.n_main_blocks
+              << " refine=" << config.n_refine_blocks << std::endl;
     
     PPMLModel model(config);
     
@@ -287,12 +298,12 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // MSA 深度 N: 原 512 -> 128 (开发用降配, 缓解 Gallocr 峰值内存)。
+    // MSA 深度 N: 开发模式固定为 128 (缓解 Gallocr 峰值内存)。
     //   注: 此参数决定 MSA 列注意力 softmax [N,N,H,L] 与 FFN 中间件 [d_msa,L,N] 的规模,
     //       N=512 时 softmax 408MB / unary 204MB, 峰值 ~18GB 超 WSL 15GB;
     //       N=128 时 softmax ~25MB / unary ~51MB, 峰值可降到 ~5GB 内跑通训练。
     //   FULL_TRAIN=true 时改回 N=512。
-    const int msa_max_seqs = full_train ? 512 : 128;
+    const int msa_max_seqs = (full_train ? 512 : 128);
     PPMLDataLoader loader("", "", msa_max_seqs, 4, 2048);
     std::cout << "[config] MSA depth N=" << msa_max_seqs
               << " (FULL_TRAIN=" << (full_train ? "true" : "false") << ")" << std::endl;
@@ -400,14 +411,51 @@ int main(int argc, char* argv[]) {
     for (int epoch = 0; epoch < num_epochs; ++epoch) {
         // ===== 计时代码: epoch 级 + 前向/损失阶段子计时 =====
         auto epoch_start = std::chrono::high_resolution_clock::now();
+
+        // 参数膨胀诊断（PPML_DEBUG_PARAM_DIST=1）：每个 epoch 前打印所有参数 max_abs 分布，
+        // 用于区分"训练中权重/gamma 膨胀（梯度爆炸）" vs "前向 kernel 写坏参数"。
+        //   - 若 max_abs 随 epoch 增长到 >>Xavier 尺度（64 维应 ~0.18，32 维 ~0.25）→ 训练不稳定；
+        //   - 若第 1 epoch 前就已巨大 → 初始化/加载/构造 bug 或前向写坏。
+        if (getenv("PPML_DEBUG_PARAM_DIST")) {
+            std::vector<TensorF32*> pvec;
+            std::vector<std::string> pnames;
+            model.collect_params_with_names(pvec, pnames);
+            int cnt = 0;
+            double gmax = 0; int gidx = -1; double gsum = 0;
+            int n_null = 0;   // data()==nullptr 的参数数（若>0 → 参数创建后没数据，transfer 也跳过）
+            for (size_t i = 0; i < pvec.size(); i++) {
+                TensorF32* t = pvec[i];
+                if (!t->data()) { n_null++; continue; }
+                float mx = 0;
+                for (int64_t q = 0; q < t->numel(); q++) {
+                    float v = t->data()[q];
+                    if (v != v) { mx = mx; continue; }
+                    float a = (v < 0) ? -v : v;
+                    if (a > mx) mx = a;
+                }
+                if (mx > 1e6f) cnt++;
+                gsum += (double)mx;
+                if (mx > gmax) { gmax = mx; gidx = (int)i; }
+            }
+            fprintf(stderr, "[param-dist] epoch=%d n_params=%zu n_null=%d n_overflow(>1e6)=%d gmax=%.6g@[%d] gsum=%.6g",
+                    epoch, pvec.size(), n_null, cnt, gmax, gidx, gsum);
+            // 打印 gmax 对应参数的地址与是否被 gallocr 绑定（对比 GRAPH_DEBUG_KERNEL 里 src1 ptr，
+            // 判断 kernel 读的"权重"是不是这个真实参数：若 param 正常(±1)而 kernel src1 读巨大/非负，
+            // 且二者 ptr 不同 → kernel 读的是被复用的 buffer 而非参数）。
+            if (gidx >= 0 && gidx < (int)pvec.size()) {
+                TensorF32* gtp = pvec[gidx];
+                fprintf(stderr, " ptr=%p buf=%d", (const void*)gtp->data(), (gtp->buffer_ ? 1 : 0));
+            }
+            fprintf(stderr, "\n");
+        }
         
         float epoch_loss = 0.0f;
         
         // 前向传播（图模式：返回可微图节点，供 loss 组装计算图）
         auto fwd_start = std::chrono::high_resolution_clock::now();
-        // enable_se3：FULL_TRAIN=true 时开启 SE3 3D track（训练更新坐标）；
-        // dev 模式关闭（run_se3_structural 曾为未完成崩溃，用于小样本流程验证）。
-        auto go = model.forward_graph(input, /*enable_se3=*/full_train);
+        // enable_se3：FULL_TRAIN=true 或 PPML_DEV_SE3=1 时开启 SE3 3D track（训练更新坐标）；
+        // dev 默认关闭（run_se3_structural 曾为未完成崩溃，用于小样本流程验证）。
+        auto go = model.forward_graph(input, /*enable_se3=*/(full_train || dev_se3));
         auto fwd_end = std::chrono::high_resolution_clock::now();
         auto fwd_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fwd_end - fwd_start).count();
         
@@ -597,6 +645,21 @@ int main(int argc, char* argv[]) {
         }
 
         // ---- 反向计算 + 梯度裁剪 + AdamW 参数更新 ----
+        // 诊断：graph_compute 前检查参数是否已含 NaN（区分"初始化 NaN"vs"graph_compute 后 buffer 覆盖假象"）
+        if (getenv("PPML_PRE_COMPUTE_PARAM")) {
+            std::cout << "[pre-param] checking params BEFORE graph_compute:" << std::endl;
+            for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
+                TensorF32* nd = cgraph->graph_node(gi);
+                if (!nd || !(nd->flag & TENSOR_FLAG_PARAM)) continue;
+                const float* d = nd->data();
+                if (!d) { std::cout << "  [pre-param] node=" << gi << " numel=" << nd->numel() << " data=NULL\n"; continue; }
+                bool nan = false; float mn=1e30f, mx=-1e30f;
+                for (int64_t q=0; q<nd->numel(); ++q){ float v=d[q]; if(v!=v){nan=true;break;} mn=std::min(mn,v); mx=std::max(mx,v);}
+                std::cout << "  [pre-param] node=" << gi << " op=" << nd->op
+                          << " numel=" << nd->numel() << " has_nan=" << nan
+                          << " min=" << mn << " max=" << mx << std::endl;
+            }
+        }
         // CUDA 激活时用 scheduler 分配算子（受支持 op 跑 GPU、不支持的跨后端回落 CPU）；
         // 否则走单后端（CPU 或 CUDA）graph_compute。
         Backend* backend = model.active_backend();
@@ -699,6 +762,9 @@ int main(int argc, char* argv[]) {
         // 诊断：统计图节点数与参数梯度幅值（确认 backward 是否产生非零梯度）
         if (getenv("PPML_DEBUG_GRAD")) {
             double gsum = 0, gmx = 0; int gcnt = 0; double gnan = 0;
+            // 逐参数梯度统计：定位爆炸源（哪个参数贡献了 max_abs / 大部分 L2）
+            struct PStat { double l2=0; double maxabs=0; int64_t numel=0; int idx=0; };
+            std::vector<PStat> pstats;
             for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
                 TensorF32* nd = cgraph->graph_node(gi);
                 if (!(nd->flag & TENSOR_FLAG_PARAM)) continue;
@@ -706,15 +772,78 @@ int main(int argc, char* argv[]) {
                 if (!gr) continue;
                 ++gcnt;
                 std::vector<float> gv = read_tensor_cpu(gr);
-                for (float v : gv) { if (v != v) { gnan += 1.0; continue; } gsum += (double)(v*v); gmx = std::max(gmx, (double)std::fabs(v)); }
+                PStat ps; ps.numel = gr->numel(); ps.idx = gi;
+                for (float v : gv) {
+                    if (v != v) { gnan += 1.0; continue; }
+                    ps.l2 += (double)(v*v);
+                    ps.maxabs = std::max(ps.maxabs, (double)std::fabs(v));
+                }
+                pstats.push_back(ps);
             }
+            for (const auto& ps : pstats) { gsum += ps.l2; gmx = std::max(gmx, ps.maxabs); }
             std::cout << "[grad] n_nodes=" << cgraph->n_nodes()
                       << " params_with_grad=" << gcnt
                       << " sum_sq=" << gsum
                       << " max_abs=" << gmx
                       << " nan_cnt=" << gnan << std::endl;
+            // 按 L2 贡献排序，打印 top-N 参数（每参数 L2、max_abs、numel、图节点 idx）
+            std::vector<const PStat*> ord;
+            for (const auto& ps : pstats) ord.push_back(&ps);
+            std::sort(ord.begin(), ord.end(),
+                [](const PStat* a, const PStat* b){ return a->l2 > b->l2; });
+            int nprint = (int)ord.size() < 12 ? (int)ord.size() : 12;
+            for (int q = 0; q < nprint; q++) {
+                std::cout << "  [grad-param] rank=" << q
+                          << " node_idx=" << ord[q]->idx
+                          << " numel=" << ord[q]->numel
+                          << " l2=" << ord[q]->l2
+                          << " max_abs=" << ord[q]->maxabs << std::endl;
+            }
         }
-        float grad_norm = clip_grad_norm(cgraph, 0.1f);    // 全局梯度裁剪 (AF2 推荐 0.1)
+        // 定位纯 forward 里第一个产生 NaN/巨大值(>1e6) 的图节点（hash 修复后完整图执行，用于定位 NaN op 源）
+        if (getenv("PPML_DEBUG_NANOP")) {
+            int64_t hit_cnt = 0;
+            for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
+                TensorF32* nd = cgraph->graph_node(gi);
+                if (!nd) continue;
+                TensorF32* ndv = nd->data() ? nd : nullptr;
+                if (!ndv) continue;
+                const int64_t nelt = nd->numel();
+                if (nelt <= 0) continue;
+                std::vector<float> vals = read_tensor_cpu(nd);
+                bool bad = false; float firstbad = 0; int64_t firstidx = -1;
+                for (int64_t v = 0; v < (int64_t)vals.size(); ++v) {
+                    float x = vals[v];
+                    if (x != x || std::fabs(x) > 1e6f) { bad = true; firstbad = x; firstidx = v; break; }
+                }
+                if (bad) {
+                    std::cout << "[nanop] node_idx=" << gi << " op=" << nd->op
+                              << " numel=" << nelt << " ndim=" << nd->shape().ndim()
+                              << " bad=" << firstbad << " @flat=" << firstidx
+                              << " src0_op=" << (nd->src[0] ? (int)nd->src[0]->op : -1)
+                              << " src1_op=" << (nd->src[1] ? (int)nd->src[1]->op : -1);
+                    if (nd->shape().ndim() >= 1 && nd->shape().ndim() <= 4) {
+                        std::cout << " dims=[";
+                        for (int d = 0; d < nd->shape().ndim(); ++d)
+                            std::cout << (d ? "," : "") << nd->shape().dims[d];
+                        std::cout << "]";
+                    }
+                    std::cout << std::endl;
+                    if (++hit_cnt >= 20) break;
+                }
+            }
+            std::cout << "[nanop] total_bad_nodes_shown=" << hit_cnt << std::endl;
+        }
+        // 全局梯度裁剪阈值：默认 0.1（AF2 惯例），可用环境变量 PPML_CLIP_NORM 覆盖。
+        float grad_norm = 0.0f;
+        {
+            float clip_norm = 0.1f;
+            if (const char* cn = getenv("PPML_CLIP_NORM")) {
+                float v = static_cast<float>(std::atof(cn));
+                if (v > 0.0f) clip_norm = v;
+            }
+            grad_norm = clip_grad_norm(cgraph, clip_norm);
+        }
 
         if (!optimizer_inited) {
             optimizer.init_from_graph(cgraph);             // 首次收集参数并分配 m/v
@@ -898,8 +1027,10 @@ int main(int argc, char* argv[]) {
             auto print_vals = [](const char* name, const TensorF32& t) {
                 const float* d = t.data();
                 double s = 0; int64_t nn = t.numel();
-                for (int64_t i = 0; i < nn; i++) s += d[i];
-                std::cout << "  [input] " << name << " numel=" << nn << " sum=" << s;
+                float mn = 1e30f, mx = -1e30f; int64_t nnan = 0;
+                for (int64_t i = 0; i < nn; i++) { float v = d[i]; if (v != v) { nnan++; continue; } s += v; if (v<mn) mn=v; if (v>mx) mx=v; }
+                std::cout << "  [input] " << name << " numel=" << nn << " sum=" << s
+                          << " min=" << (nn?mn:0) << " max=" << (nn?mx:0) << " nnan=" << nnan;
                 if (nn > 0) std::cout << " v[0..3]=" << d[0] << "," << d[1] << "," << d[2] << "," << d[3];
                 std::cout << std::endl;
             };

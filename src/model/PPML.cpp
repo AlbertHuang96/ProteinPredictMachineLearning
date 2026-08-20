@@ -62,11 +62,27 @@ TensorF32* wrap_input_as_leaf(const TensorF32& t, const std::vector<int64_t>& di
     for (size_t i = 0; i < dims.size() && i < 4; i++) ne[i] = dims[i];
     TensorF32* leaf = context().new_tensor<float>(static_cast<int>(dims.size()), ne);
     float* dst = bind_leaf_data(context(), leaf);
+    const float* srcp = (t.device() == Device::CUDA) ? nullptr : t.data();
     if (t.device() == Device::CUDA) {
         TensorF32 tcpu = t.cpu();
+        srcp = tcpu.data();
         std::memcpy(dst, tcpu.data(), tcpu.numel() * sizeof(float));
     } else {
         std::memcpy(dst, t.data(), t.numel() * sizeof(float));
+    }
+    // GRAPH_DEBUG_KERNEL=1：检查输入 leaf 值域，定位哪个输入含巨大值/NaN（程序此前无输入有效检查）
+    if (getenv("GRAPH_DEBUG_KERNEL")) {
+        const int64_t nelt = t.numel();
+        if (srcp && nelt > 0) {
+            bool nan = false; float mn = srcp[0], mx = srcp[0]; int64_t nnan = 0;
+            int64_t scan = nelt < 4096 ? nelt : 4096;
+            for (int64_t i = 0; i < scan; i++) { float v = srcp[i]; if (v != v) { nan = true; nnan++; } else { if (v<mn) mn=v; if (v>mx) mx=v; } }
+            if (nelt >= 4096) { int64_t c = 0; for (int64_t i=0;i<nelt;i++) if (srcp[i]!=srcp[i]) c++; if (c){nan=true;nnan=c;} }
+            if (nan || mx > 1e6f || mn < -1e6f) {
+                fprintf(stderr, "[inleaf] numel=%lld min=%.6g max=%.6g nan=%d nnan=%lld\n",
+                        (long long)nelt, (double)mn, (double)mx, nan?1:0, (long long)nnan);
+            }
+        }
     }
     return leaf;
 }
@@ -736,12 +752,22 @@ std::vector<TensorF32*> IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pa
     // ---- node 度0：msa 沿 Nseq 维均值 → cat(seq1hot) → embed_x_ → norm_node_3d_ ----
     // msa 图节点 [D_MSA, L, Nseq, B]：permute 把 Nseq 移到最内 dims[0] 后 sum_rows 归约
     const int64_t Nseq = msa->shape().dims[2];
-    TensorF32* msa_p = permute(msa, std::vector<int>{2, 0, 1, 3});    // [Nseq, D_MSA, L, B]
-    TensorF32* msa_s = sum_rows(msa_p);                              // [1, D_MSA, L, B]
+    const int64_t msa_feat = msa->shape().dims[0];  // 实际特征维（IterBlock=256, FullBlock=64）
+    TensorF32* msa_p = permute(msa, std::vector<int>{2, 0, 1, 3});    // [Nseq, msa_feat, L, B]
+    TensorF32* msa_s = sum_rows(msa_p);                              // [1, msa_feat, L, B]
     TensorF32* msa_m = scale(msa_s, 1.0f / static_cast<float>(Nseq)); // 均值
-    TensorF32* msa_v = view(msa_m, Shape({D_MSA, L, B}));            // [D_MSA, L, B]
+    TensorF32* msa_v = view(msa_m, Shape({msa_feat, L, B}));         // [msa_feat, L, B]
+    // FullBlock 的 msa_full 特征维为 D_MSA_FULL=64，而 embed_x_ 为 D_MSA+21=277 维（值版
+    // FullBlock::forward 的 SE3 也用 D_MSA=256 累加 msa_sum）。故 64 维 msa 须 pad 到 D_MSA=256，
+    // 使 node_cat=[256+21=277, L, B] 与 embed_x_ 输入匹配。IterBlock(256) 无需 pad。
+    if (msa_feat < D_MSA) {
+        const int64_t pad_len = D_MSA - msa_feat;   // 256-64=192
+        std::vector<float> pad_zero(static_cast<size_t>(pad_len) * L * B, 0.0f);
+        TensorF32* pad = constant_tensor({pad_len, L, B}, pad_zero.data());
+        msa_v = concat_ptr({msa_v, pad}, 0);        // [D_MSA, L, B]
+    }
     TensorF32* s1h   = constant_tensor({21, L, B}, seq1hot.data());  // [21, L, B]
-    TensorF32* node_cat = concat_ptr({msa_v, s1h}, 0);               // [D_MSA+21, L, B]
+    TensorF32* node_cat = concat_ptr({msa_v, s1h}, 0);               // [D_MSA+21=277, L, B]
     TensorF32* node_emb = embed_x_->forward_graph(node_cat);         // [32, L, B]
     TensorF32* node_nrm = norm_node_3d_->forward(node_emb);          // [32, L, B]
     TensorF32* node0 = view(node_nrm, Shape({ITER_NODE_3D_OUT, N})); // [32, B*L]（n=b*L+l）
@@ -817,6 +843,15 @@ std::vector<TensorF32*> IterBlock::run_se3_structural(TensorF32*& msa, TensorF32
     // 值版 pair 布局 (B,L,L,D_PAIR)。embed_e_ (D_PAIR→ITER_EDGE_3D_OUT) → norm_edge_3d_。
     // Tensor 为 move-only，避免拷贝。LayerNorm::forward 返回 TensorF32*，
     // LinearLayer::forward 返回 TensorF32（move 到临时值再取址）。
+    // 防护：回落 pair 值失败（pair_ref graph_compute 未算出 → pair_value 空）时，跳过 SE3，
+    // 返回空 vector（等价无有效边图），避免 embed_e_ 处理空张量段错误。
+    if (pair_value.numel() <= 0 || !pair_value.data()) {
+        if (getenv("GRAPH_DEBUG_COORD")) {
+            std::fprintf(stderr, "[SE3-SKIP] run_se3_structural: pair_value empty (numel=%lld data=%p), skip SE3\n",
+                (long long)pair_value.numel(), (void*)pair_value.data());
+        }
+        return {};
+    }
     TensorF32  pair_normed = norm_pair_3d_->forward_exec(pair_value);   // (B,L,L,D_PAIR) 值版
     TensorF32  edge_emb    = embed_e_->forward(pair_normed);             // (B,L,L,ITER_EDGE_3D_OUT)
     TensorF32  edge_out    = norm_edge_3d_->forward_exec(edge_emb);      // (B,L,L,ITER_EDGE_3D_OUT)
@@ -836,11 +871,40 @@ std::vector<TensorF32*> IterBlock::run_se3_structural(TensorF32*& msa, TensorF32
 void IterBlock::apply_coord_update(const TensorF32& offset_value, const TensorF32& coords) {
     const int B = coords.shape().dims[0];
     const int L = coords.shape().dims[1];
+    if (getenv("GRAPH_DEBUG_COORD")) {
+        std::fprintf(stderr, "[COORD] this=%p coords={%lld,%lld,%lld,%lld} numel=%lld offset={%lld,%lld,%lld,%lld} numel=%lld xyz_new_={%lld,%lld,%lld,%lld} numel=%lld\n",
+            (void*)this,
+            (long long)(coords.shape().dims.size()>0?coords.shape().dims[0]:-1),
+            (long long)(coords.shape().dims.size()>1?coords.shape().dims[1]:-1),
+            (long long)(coords.shape().dims.size()>2?coords.shape().dims[2]:-1),
+            (long long)(coords.shape().dims.size()>3?coords.shape().dims[3]:-1),
+            (long long)coords.numel(),
+            (long long)(offset_value.shape().dims.size()>0?offset_value.shape().dims[0]:-1),
+            (long long)(offset_value.shape().dims.size()>1?offset_value.shape().dims[1]:-1),
+            (long long)(offset_value.shape().dims.size()>2?offset_value.shape().dims[2]:-1),
+            (long long)(offset_value.shape().dims.size()>3?offset_value.shape().dims[3]:-1),
+            (long long)offset_value.numel(),
+            (long long)(xyz_new_.shape().dims.size()>0?xyz_new_.shape().dims[0]:-1),
+            (long long)(xyz_new_.shape().dims.size()>1?xyz_new_.shape().dims[1]:-1),
+            (long long)(xyz_new_.shape().dims.size()>2?xyz_new_.shape().dims[2]:-1),
+            (long long)(xyz_new_.shape().dims.size()>3?xyz_new_.shape().dims[3]:-1),
+            (long long)xyz_new_.numel());
+    }
     const float* xyz_data = coords.data();
     const float* off_data = offset_value.data();
 
     TensorF32 xyz_new({B, L, 3, 3}, coords.device());
     float* xyz_out = xyz_new.data();
+    if (getenv("GRAPH_DEBUG_COORD")) {
+        std::fprintf(stderr, "[COORD-PTR] coords.data=%p off.data=%p xyz_out=%p B=%d L=%d req=%d\n",
+            (void*)xyz_data, (void*)off_data, (void*)xyz_out, B, L, (int)(B*L*9));
+    }
+    // 防护：offset/coords data 无效（graph_compute 未算 offset 值）时不能做坐标更新
+    if (!xyz_data || !off_data || !xyz_out) {
+        std::fprintf(stderr, "[COORD-WARN] null data (xyz=%p off=%p out=%p), skip coord update\n",
+            (void*)xyz_data, (void*)off_data, (void*)xyz_out);
+        return;
+    }
     for (int b = 0; b < B; ++b) {
         for (int l = 0; l < L; ++l) {
             const int base = (b * L + l) * 9;
@@ -863,6 +927,12 @@ void IterBlock::apply_coord_update(const TensorF32& offset_value, const TensorF3
             xyz_out[base + 7] = ca_y_new + off_data[base + 7];
             xyz_out[base + 8] = ca_z_new + off_data[base + 8];
         }
+    }
+    // xyz_new_ 是成员，首次调用时为空（numel=0）；copy_from 要求 numel 严格相等，
+    // 故 numel 不等时用 placement-new 重建（Tensor 为 move-only，不能 operator=）。
+    if (xyz_new_.numel() != xyz_new.numel()) {
+        xyz_new_.~TensorF32();
+        new (&xyz_new_) TensorF32(xyz_new.shape(), xyz_new.device());
     }
     xyz_new_.copy_from(xyz_new);
 }
@@ -1537,6 +1607,15 @@ std::vector<TensorF32*> RefineBlock::run_se3_structural_refine(TensorF32*& msa, 
                                                                const TensorI64& residx,
                                                                const TensorF32& seq1hot) {
     // ---- Phase A: pair 值 → 两阶段边嵌入 → make_graph → basis ----
+    // 防护：回落 pair 值失败（pair_ref graph_compute 未算出 → pair_value 空）时，跳过 SE3，
+    // 返回空 vector（等价无有效边图），避免 norm_pair_ 处理空张量段错误。
+    if (pair_value.numel() <= 0 || !pair_value.data()) {
+        if (getenv("GRAPH_DEBUG_COORD")) {
+            std::fprintf(stderr, "[SE3-SKIP] run_se3_structural_refine: pair_value empty (numel=%lld data=%p), skip SE3\n",
+                (long long)pair_value.numel(), (void*)pair_value.data());
+        }
+        return {};
+    }
     // 阶段1: norm_pair_(pair) → embed_e1_ → norm_edge1_ → (B,L,L,32)
     TensorF32* pair_normed = norm_pair_->forward(&const_cast<TensorF32&>(pair_value));  // (B,L,L,D_PAIR)
     TensorF32  e1_emb      = embed_e1_->forward(*pair_normed);                          // (B,L,L,32)
@@ -1664,6 +1743,7 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         msa_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));
     };
     auto push_pair_row = [&]() {
+        pair_attn_norm_.push_back(LayerNorm::create(D_PAIR));                             // 128 (AF2 PairAxialAttention 投影前 norm)
         pair_row_Wq_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));  // 128→256
         pair_row_Wk_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
         pair_row_Wv_.push_back(   LinearLayer::create(D_PAIR, N_HEAD * D_PAIR_HIDDEN));
@@ -1808,11 +1888,11 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         msa_ff->set_params(D_MSA_FULL, D_MSA_FULL * 4, 0.1f,
             full_msa_ff_norm_[idx], full_msa_ff_linear1_[idx], full_msa_ff_linear2_[idx]);
         auto pair_row = std::make_unique<PairRowAttention>();
-        pair_row->set_params(pair_ac,
+        pair_row->set_params(pair_ac, pair_attn_norm_[idx],
             pair_row_to_b_[idx], pair_row_to_g_[idx], pair_row_to_out_[idx],
             pair_row_Wq_[idx], pair_row_Wk_[idx], pair_row_Wv_[idx]);
         auto pair_col = std::make_unique<PairColAttention>();
-        pair_col->set_params(pair_ac,
+        pair_col->set_params(pair_ac, pair_attn_norm_[idx],
             pair_col_to_b_[idx], pair_col_to_g_[idx], pair_col_to_out_[idx],
             pair_col_Wq_[idx], pair_col_Wk_[idx], pair_col_Wv_[idx]);
         auto pair_ff = std::make_unique<FeedForward>();
@@ -1884,11 +1964,11 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         auto msa_ff = std::make_unique<FeedForward>();
         msa_ff->set_params(D_MSA, D_MSA * 4, 0.1f, msa_ff_norm_[idx], msa_ff_linear1_[idx], msa_ff_linear2_[idx]);
         auto pair_row = std::make_unique<PairRowAttention>();
-        pair_row->set_params(pair_ac,
+        pair_row->set_params(pair_ac, pair_attn_norm_[idx],
             pair_row_to_b_[idx], pair_row_to_g_[idx], pair_row_to_out_[idx],
             pair_row_Wq_[idx], pair_row_Wk_[idx], pair_row_Wv_[idx]);
         auto pair_col = std::make_unique<PairColAttention>();
-        pair_col->set_params(pair_ac,
+        pair_col->set_params(pair_ac, pair_attn_norm_[idx],
             pair_col_to_b_[idx], pair_col_to_g_[idx], pair_col_to_out_[idx],
             pair_col_Wq_[idx], pair_col_Wk_[idx], pair_col_Wv_[idx]);
         auto pair_ff = std::make_unique<FeedForward>();
@@ -2051,14 +2131,15 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         tps_tri_in_right_proj_,       tps_tri_in_left_gate_,
         tps_tri_in_right_gate_,       tps_tri_in_gate_,
         tps_tri_in_output_layernorm_, tps_tri_in_out_proj_);
-    // PairRowAttention
+    // PairRowAttention (AF2 PairAxialAttention: 投影前 LayerNorm(pair))
+    tps_pair_norm_       = LayerNorm::create(D_PAIR);                                // 128
     tps_pair_row_to_b_   = LinearLayer::create(D_PAIR, 8);                           // 128 → 8
     tps_pair_row_to_g_   = LinearLayer::create(D_PAIR, 256);                         // 128 → 256
     tps_pair_row_to_out_ = LinearLayer::create(256, D_PAIR);                         // 256 → 128
     tps_pair_row_Wq_     = LinearLayer::create(D_PAIR, 256);                         // 128 → 256
     tps_pair_row_Wk_     = LinearLayer::create(D_PAIR, 256);
     tps_pair_row_Wv_     = LinearLayer::create(D_PAIR, 256);
-    tps_pair_row_attn_.set_params(AttnConfig(D_PAIR, 8),
+    tps_pair_row_attn_.set_params(AttnConfig(D_PAIR, 8), tps_pair_norm_,
         tps_pair_row_to_b_, tps_pair_row_to_g_, tps_pair_row_to_out_,
         tps_pair_row_Wq_,   tps_pair_row_Wk_,   tps_pair_row_Wv_);
     // PairColAttention
@@ -2068,7 +2149,7 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
     tps_pair_col_Wq_     = LinearLayer::create(D_PAIR, 256);                         // 128 → 256
     tps_pair_col_Wk_     = LinearLayer::create(D_PAIR, 256);
     tps_pair_col_Wv_     = LinearLayer::create(D_PAIR, 256);
-    tps_pair_col_attn_.set_params(AttnConfig(D_PAIR, 8),
+    tps_pair_col_attn_.set_params(AttnConfig(D_PAIR, 8), tps_pair_norm_,
         tps_pair_col_to_b_, tps_pair_col_to_g_, tps_pair_col_to_out_,
         tps_pair_col_Wq_,   tps_pair_col_Wk_,   tps_pair_col_Wv_);
     // FeedForward
@@ -2121,7 +2202,15 @@ ModelOutput PPMLModel::forward(const ModelInput& input) {
         for (int64_t i = 0; i < input.residx.numel(); ++i)
             residx_f32.data()[i] = static_cast<float>(input.residx.data()[i]);
         auto pos_out = pair_init_pos_enc_->forward(pair_repr, residx_f32, input.bond_feats, input.dist_matrix, input.same_chain);
-        pair_track_->representation().copy_from(*add_impl(&pair_repr, &pos_out, /*inplace=*/false));
+        //  值版 forward 用值加法，不能用图 helper add_impl（返回 OP_ADD 图节点 data()=nullptr，
+        //    copy_from 读 null 崩，PPML.cpp:2124 SIGSEGV）。pair_repr/pos_out 都是值张量。
+        //    Tensor 是 move-only，不能 `TensorF32 pair_init = pair_repr`（拷贝构造已删除），
+        //    须先构造空张量再 copy_from 拷贝数据。
+        TensorF32 pair_init(pair_repr.shape(), pair_repr.device());
+        pair_init.copy_from(pair_repr);
+        for (int64_t i = 0; i < pair_init.numel(); ++i)
+            pair_init.data()[i] += pos_out.data()[i];
+        pair_track_->representation().copy_from(pair_init);
     }
 
     // msa full embed?
@@ -2448,7 +2537,8 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3) {
     //              需同步在值版 PairTrack::inject_template 保持语义一致。
     // 模板分支仅当 t1d 为合法 4D 模板特征 (B,T,L,80) 时进入。不能只判 numel()>0：
     // load_from_files 在无模板时可能给 t1d 留 1 元素占位（非空 4D），直接访问 dims[1] 会越界。
-    const bool has_tmpl = (input.t1d.shape().ndim() == 4
+    const bool has_tmpl = (getenv("PPML_DISABLE_TEMPLATE") == nullptr
+                           && input.t1d.shape().ndim() == 4
                            && input.t1d.shape().dims[1] > 0
                            && input.t1d.numel() > 0);
     if (has_tmpl) {
@@ -2551,7 +2641,38 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3) {
             { ComputeGraph* cg = ComputeGraph::new_graph(ctx);
               compute_and_read(se3_out[1], offset_val, cg, backend); }
             blk->apply_coord_update(offset_val, current_coords);
-            current_coords.copy_from(blk->updated_coords());   // 链式坐标供下一 block
+            if (getenv("GRAPH_DEBUG_COORD")) {
+                const TensorF32& uc = blk->updated_coords();
+                std::fprintf(stderr, "[DRIVE] cur={%lld,%lld,%lld,%lld} numel=%lld upd={%lld,%lld,%lld,%lld} numel=%lld se3_out=%zu\n",
+                    (long long)(current_coords.shape().dims.size()>0?current_coords.shape().dims[0]:-1),
+                    (long long)(current_coords.shape().dims.size()>1?current_coords.shape().dims[1]:-1),
+                    (long long)(current_coords.shape().dims.size()>2?current_coords.shape().dims[2]:-1),
+                    (long long)(current_coords.shape().dims.size()>3?current_coords.shape().dims[3]:-1),
+                    (long long)current_coords.numel(),
+                    (long long)(uc.shape().dims.size()>0?uc.shape().dims[0]:-1),
+                    (long long)(uc.shape().dims.size()>1?uc.shape().dims[1]:-1),
+                    (long long)(uc.shape().dims.size()>2?uc.shape().dims[2]:-1),
+                    (long long)(uc.shape().dims.size()>3?uc.shape().dims[3]:-1),
+                    (long long)uc.numel(), se3_out.size());
+            }
+            const TensorF32& ucc = blk->updated_coords();
+            if (getenv("GRAPH_DEBUG_COORD")) {
+                std::fprintf(stderr, "[DRIVE-PTR] cur.data=%p cur.numel=%lld upd.data=%p upd.numel=%lld\n",
+                    (void*)current_coords.data(), (long long)current_coords.numel(),
+                    (void*)ucc.data(), (long long)ucc.numel());
+            }
+            // 链式坐标更新：仅当 SE3 产出了有效 offset（xyz_new_ numel>1）才更新 current_coords；
+            // 若 offset 空（graph_compute 未算出 se3_out[1]，apply_coord_update 跳过），保持原坐标，
+            // 避免重建空 current_coords 后 copy_from 悬垂崩（DRIVE-WARN 触发场景）。
+            if (ucc.numel() > 1) {
+                if (ucc.numel() != current_coords.numel()) {
+                    std::fprintf(stderr, "[DRIVE-WARN] blk=%p upd numel=%lld != cur numel=%lld, rebuild cur\n",
+                        (void*)blk, (long long)ucc.numel(), (long long)current_coords.numel());
+                    current_coords.~TensorF32();
+                    new (&current_coords) TensorF32(ucc.shape(), ucc.device());
+                }
+                current_coords.copy_from(ucc);   // 链式坐标供下一 block
+            }
         }
     };
 
@@ -2582,7 +2703,38 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3) {
             { ComputeGraph* cg = ComputeGraph::new_graph(ctx);
               compute_and_read(se3_out[1], offset_val, cg, backend); }
             blk->apply_coord_update(offset_val, current_coords);
-            current_coords.copy_from(blk->updated_coords());   // 链式坐标供下一 block
+            if (getenv("GRAPH_DEBUG_COORD")) {
+                const TensorF32& uc = blk->updated_coords();
+                std::fprintf(stderr, "[DRIVE] cur={%lld,%lld,%lld,%lld} numel=%lld upd={%lld,%lld,%lld,%lld} numel=%lld se3_out=%zu\n",
+                    (long long)(current_coords.shape().dims.size()>0?current_coords.shape().dims[0]:-1),
+                    (long long)(current_coords.shape().dims.size()>1?current_coords.shape().dims[1]:-1),
+                    (long long)(current_coords.shape().dims.size()>2?current_coords.shape().dims[2]:-1),
+                    (long long)(current_coords.shape().dims.size()>3?current_coords.shape().dims[3]:-1),
+                    (long long)current_coords.numel(),
+                    (long long)(uc.shape().dims.size()>0?uc.shape().dims[0]:-1),
+                    (long long)(uc.shape().dims.size()>1?uc.shape().dims[1]:-1),
+                    (long long)(uc.shape().dims.size()>2?uc.shape().dims[2]:-1),
+                    (long long)(uc.shape().dims.size()>3?uc.shape().dims[3]:-1),
+                    (long long)uc.numel(), se3_out.size());
+            }
+            const TensorF32& ucc = blk->updated_coords();
+            if (getenv("GRAPH_DEBUG_COORD")) {
+                std::fprintf(stderr, "[DRIVE-PTR] cur.data=%p cur.numel=%lld upd.data=%p upd.numel=%lld\n",
+                    (void*)current_coords.data(), (long long)current_coords.numel(),
+                    (void*)ucc.data(), (long long)ucc.numel());
+            }
+            // 链式坐标更新：仅当 SE3 产出了有效 offset（xyz_new_ numel>1）才更新 current_coords；
+            // 若 offset 空（graph_compute 未算出 se3_out[1]，apply_coord_update 跳过），保持原坐标，
+            // 避免重建空 current_coords 后 copy_from 悬垂崩（DRIVE-WARN 触发场景）。
+            if (ucc.numel() > 1) {
+                if (ucc.numel() != current_coords.numel()) {
+                    std::fprintf(stderr, "[DRIVE-WARN] blk=%p upd numel=%lld != cur numel=%lld, rebuild cur\n",
+                        (void*)blk, (long long)ucc.numel(), (long long)current_coords.numel());
+                    current_coords.~TensorF32();
+                    new (&current_coords) TensorF32(ucc.shape(), ucc.device());
+                }
+                current_coords.copy_from(ucc);   // 链式坐标供下一 block
+            }
         }
     };
     for (auto& block : refine_blocks_) {
@@ -2886,6 +3038,7 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
     collect_layernorm(tps_tri_in_output_layernorm_, "tps.tri_mul_in.output_layernorm");
     collect_linear(tps_tri_in_out_proj_, "tps.tri_mul_in.out_proj");
     // pair_row_attn
+    collect_layernorm(tps_pair_norm_, "tps.attention.pair_norm");
     collect_linear(tps_pair_row_to_b_, "tps.attention.pair_row.to_b");
     collect_linear(tps_pair_row_to_g_, "tps.attention.pair_row.to_g");
     collect_linear(tps_pair_row_to_out_, "tps.attention.pair_row.to_out");
@@ -2933,6 +3086,7 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
             collect_linear(msa_col_to_out_[i], b + ".attention.msa_col.to_out");
         }
 
+        collect_layernorm(pair_attn_norm_[i], b + ".attention.pair_norm");
         collect_linear(pair_row_Wq_[i], b + ".attention.pair_row.Wq");
         collect_linear(pair_row_Wk_[i], b + ".attention.pair_row.Wk");
         collect_linear(pair_row_Wv_[i], b + ".attention.pair_row.Wv");

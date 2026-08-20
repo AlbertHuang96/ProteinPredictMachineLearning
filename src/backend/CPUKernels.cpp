@@ -4,6 +4,7 @@
 #include "ppml/FAPE.h"
 #include <cstring>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <vector>
 #include <array>
@@ -117,9 +118,12 @@ Status CPUBackend::dispatch_body(TensorF32* node, ComputeParams* p) {
         case OP_SUM:    kernel_sum(node, p);         break;
         case OP_SUM_ROWS: kernel_sum_rows(node, p);  break;
         case OP_MEAN:   kernel_mean(node, p);        break;
+        case OP_MAX_ALL: kernel_max_all(node, p);    break;
+        case OP_RELU_BACK: kernel_relu_back(node, p); break;
         case OP_REPEAT:      kernel_repeat(node, p);      break;
         case OP_REPEAT_BACK: kernel_repeat_back(node, p); break;
-        case OP_CONCAT: kernel_concat(node, p);      break;
+        case OP_CONCAT:      kernel_concat(node, p);      break;
+        case OP_CONCAT_BACK: kernel_concat_back(node, p); break;
         // 方案 B shape op：reshape/view/cont/cpy 整块拷贝；permute/transpose 重排
         case OP_RESHAPE:
         case OP_VIEW:
@@ -191,6 +195,73 @@ Status CPUBackend::dispatch_body(TensorF32* node, ComputeParams* p) {
             p->threadpool->ec = Status::NOT_SUPPORTED;
             break;
     }
+    // GRAPH_DEBUG_KERNEL=1：逐个 op 检查输出值域，定位第一个产生 NaN/巨大值(>1e6) 的 kernel
+    if (p->ith == 0 && p->threadpool->ec == Status::SUCCESS && node->op != OP_NONE && node->data()) {
+        static const char* kdbg = getenv("GRAPH_DEBUG_KERNEL");
+        if (kdbg) {
+            const int64_t nelt = node->numel();
+            if (nelt > 0) {
+                const float* dd = node->data();
+                float mn = dd[0], mx = dd[0]; bool nan = false; int64_t nnan = 0;
+                // 只扫描前若干元素 + 全扫找 nan（避免大张量全扫太慢，但需找 nan 必须全扫）
+                int64_t scan = nelt < 4096 ? nelt : 4096;
+                for (int64_t i = 0; i < scan; i++) { float v = dd[i]; if (v != v) { nan = true; nnan++; } else { if (v<mn) mn=v; if (v>mx) mx=v; } }
+                // 大张量额外全扫 nan
+                if (nelt >= 4096) {
+                    int64_t nnan2 = 0;
+                    for (int64_t i = 0; i < nelt; i++) if (dd[i] != dd[i]) nnan2++;
+                    if (nnan2) { nan = true; nnan = nnan2; }
+                }
+                static int kern_cnt = 0;   // 只打印前 15 条，避免刷屏看不到第一条
+                // GRAPH_DEBUG_KERNEL_DETAIL=1 时阈值降到 1e3，暴露 msa_emb_ 等较小但异常的中间量（定位 msa 特征巨大起点）
+                const float kern_thresh = getenv("GRAPH_DEBUG_KERNEL_DETAIL") ? 1e3f : 1e6f;
+                if (nan || mx > kern_thresh || (mn < -kern_thresh)) {
+                    if (kern_cnt >= 15) { /* 超过 15 条不再打印，但记录已发现异常 */ return p->threadpool->ec; }
+                    kern_cnt++;
+                    fprintf(stderr, "[kern#%d] op=%d numel=%lld min=%.6g max=%.6g nan=%d nnan=%lld src0_op=%d src1_op=%d ndim=%d",
+                            kern_cnt, (int)node->op, (long long)nelt, (double)mn, (double)mx,
+                            (nan?1:0), (long long)nnan,
+                            (node->src[0] ? (int)node->src[0]->op : -1),
+                            (node->src[1] ? (int)node->src[1]->op : -1),
+                            (int)node->shape().ndim());
+                    if (node->shape().ndim() >= 1 && node->shape().ndim() <= 4) {
+                        fprintf(stderr, " dims=[");
+                        for (int d = 0; d < node->shape().ndim(); ++d)
+                            fprintf(stderr, "%s%lld", (d ? "," : ""), (long long)node->shape().dims[d]);
+                        fprintf(stderr, "]");
+                    }
+                    // 打印 src0/src1 值域（若存在且有 data），定位输入是否巨大
+                    for (int si = 0; si < 2; si++) {
+                        const TensorF32* sp = node->src[si];
+                        if (!sp || !sp->data()) continue;
+                        const int64_t sn = sp->numel();
+                        if (sn <= 0) continue;
+                        float smn = sp->data()[0], smx = sp->data()[0]; bool snan = false;
+                        int64_t sscan = sn < 4096 ? sn : 4096;
+                        for (int64_t q = 0; q < sscan; q++) { float v = sp->data()[q]; if (v != v) { snan = true; break; } if (v < smn) smn = v; if (v > smx) smx = v; }
+                        fprintf(stderr, " src%d[op=%d", si, (int)sp->op);
+                        if (sp->shape().ndim() >= 1 && sp->shape().ndim() <= 4) {
+                            fprintf(stderr, " d=[");
+                            for (int dd = 0; dd < sp->shape().ndim(); ++dd) fprintf(stderr, "%s%lld", (dd?",":""), (long long)sp->shape().dims[dd]);
+                            fprintf(stderr, "]");
+                        }
+                        // 定位：打印 src 是否为参数(PARAM)、是否被 gallocr 绑定(buffer_)、及数据指针，
+                        // 用于判断 kernel 读的 src 是不是真实参数（若被 buffer 绑定/覆盖则读到污染值）。
+                        fprintf(stderr, " flag=0x%x buf=%d ptr=%p", (unsigned)sp->flag,
+                                (sp->buffer_ ? 1 : 0), (const void*)sp->data());
+                        fprintf(stderr, " min=%.6g max=%.6g nan=%d]", (double)smn, (double)smx, snan ? 1 : 0);
+                    }
+                    // 追溯 src0 的来源（src0->src[0]->op），定位巨大输入来自哪个 op
+                    if (node->src[0] && node->src[0]->src[0]) {
+                        const TensorF32* g0 = node->src[0]->src[0];
+                        fprintf(stderr, " src0_src0_op=%d", (int)g0->op);
+                        if (g0->src[0]) fprintf(stderr, "(src=%d)", (int)g0->src[0]->op);
+                    }
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    }
     return p->threadpool->ec;
 }
 
@@ -250,6 +321,25 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
         case OP_ADD:
             if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] + b[i % bn];
             else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] + b[i];
+            if (getenv("GRAPH_DEBUG_ELEM_NAN") && node->numel() <= 4096) {
+                int cnt = 0;
+                // 统计 a/b 中 NaN 数（判断 node#8 dispatch 时 src 是否已含 NaN）
+                int na = 0, nb = 0;
+                for (int64_t i = 0; i < n; ++i) {
+                    if (std::isnan(a[i])) na++;
+                    if (std::isnan(bcast?b[i%bn]:b[i])) nb++;
+                }
+                for (int64_t i = 0; i < n; ++i) if (std::isnan(d[i])) {
+                    if (cnt < 3) fprintf(stderr, "[elem-add] nan@%lld a=%f b=%f src0op=%d src1op=%d\n",
+                        (long long)i, a[i], bcast?b[i%bn]:b[i],
+                        (node->src[0]?(int)node->src[0]->op:-1),
+                        (node->src[1]?(int)node->src[1]->op:-1));
+                    cnt++;
+                }
+                if (cnt > 0) fprintf(stderr, "[elem-add] node_n? op=%d total_nan=%d/%lld a_nan=%d b_nan=%d self=%p src0=%p src1=%p\n",
+                    (int)node->op, cnt, (long long)n, na, nb,
+                    (const void*)d, (const void*)a, (const void*)b);
+            }
             break;
         case OP_SUB:
             if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] - b[i % bn];
@@ -275,6 +365,22 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
     const float * a = node->src[0]->data();
     const float * b = node->src[1]->data();
     float * d = node->data();
+    if (getenv("GRAPH_DEBUG_MULMAT") && (int64_t)M * N * K > 200000000LL && p->ith == 0) {
+        std::fprintf(stderr, "[MULMAT-BIG] M=%d N=%d K=%d ops=%lld a={%lld,%lld,%lld,%lld} b={%lld,%lld,%lld,%lld} d={%lld,%lld,%lld,%lld}\n",
+            M, N, K, (long long)((int64_t)M * N * K),
+            (long long)(node->src[0]->shape().dims.size()>0?node->src[0]->shape().dims[0]:-1),
+            (long long)(node->src[0]->shape().dims.size()>1?node->src[0]->shape().dims[1]:-1),
+            (long long)(node->src[0]->shape().dims.size()>2?node->src[0]->shape().dims[2]:-1),
+            (long long)(node->src[0]->shape().dims.size()>3?node->src[0]->shape().dims[3]:-1),
+            (long long)(node->src[1]->shape().dims.size()>0?node->src[1]->shape().dims[0]:-1),
+            (long long)(node->src[1]->shape().dims.size()>1?node->src[1]->shape().dims[1]:-1),
+            (long long)(node->src[1]->shape().dims.size()>2?node->src[1]->shape().dims[2]:-1),
+            (long long)(node->src[1]->shape().dims.size()>3?node->src[1]->shape().dims[3]:-1),
+            (long long)(node->shape().dims.size()>0?node->shape().dims[0]:-1),
+            (long long)(node->shape().dims.size()>1?node->shape().dims[1]:-1),
+            (long long)(node->shape().dims.size()>2?node->shape().dims[2]:-1),
+            (long long)(node->shape().dims.size()>3?node->shape().dims[3]:-1));
+    }
 
 
     // ===== 开发用 GPU 加速矩阵乘（方案 B，临时，见文件顶部注释）=====
@@ -327,6 +433,17 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
     }
 
     // ===== CPU 朴素矩阵乘（原逻辑；GPU 未启用/无 GPU/GPU 失败时执行）=====
+    // GRAPH_DEBUG_KERNEL=1：检查 mul_mat 输入 a/b 值域（定位 emb_t1d_ 巨大是输入问题还是 kernel 问题）
+    if (getenv("GRAPH_DEBUG_KERNEL") && p->ith == 0) {
+        bool abad = false; float amn = 0, amx = 0; int64_t anan = 0;
+        const int64_t anelt = (int64_t)M * K;
+        if (anelt > 0 && a) { amn = a[0]; amx = a[0]; for (int64_t q = 0; q < anelt; q++) { float v = a[q]; if (v != v) { anan++; abad = true; } else { if (v < amn) amn = v; if (v > amx) amx = v; } } if (amx > 1e6f || amn < -1e6f) abad = true; }
+        if (abad) fprintf(stderr, "[mulmat-in-a] M=%d K=%d numel=%lld min=%.6g max=%.6g nan=%lld\n", M, K, (long long)anelt, (double)amn, (double)amx, (long long)anan);
+        bool bbad = false; float bmn = 0, bmx = 0; int64_t bnan = 0;
+        const int64_t bnelt = (int64_t)N * K;
+        if (bnelt > 0 && b) { bmn = b[0]; bmx = b[0]; for (int64_t q = 0; q < bnelt; q++) { float v = b[q]; if (v != v) { bnan++; bbad = true; } else { if (v < bmn) bmn = v; if (v > bmx) bmx = v; } } if (bmx > 1e6f || bmn < -1e6f) bbad = true; }
+        if (bbad) fprintf(stderr, "[mulmat-in-b] N=%d K=%d numel=%lld min=%.6g max=%.6g nan=%lld\n", N, K, (long long)bnelt, (double)bmn, (double)bmx, (long long)bnan);
+    }
     if (p->ith == 0) tp->current_chunk.store(0);
     tp->barrier_wait();
 
@@ -1285,6 +1402,42 @@ void CPUBackend::kernel_mean(TensorF32 * node, ComputeParams * p) {
     p->threadpool->barrier_wait();
 }
 
+// ===== max_all (全局最大值，标量) =====
+// 用于 softmax 数值稳定：e' = e - max_all(e)，避免 exp 溢出。
+void CPUBackend::kernel_max_all(TensorF32 * node, ComputeParams * p) {
+    if (p->ith != 0) {
+        p->threadpool->barrier_wait();
+        return;
+    }
+    const float * src = node->src[0]->data();
+    const int64_t n   = node->src[0]->numel();
+    float m = -INFINITY;
+    for (int64_t i = 0; i < n; i++) {
+        float v = src[i];
+        if (!std::isnan(v) && v > m) m = v;
+    }
+    node->data()[0] = (n > 0) ? m : 0.0f;
+    p->threadpool->barrier_wait();
+}
+
+// ===== relu 反向：d(relu(x))/dx = grad * step(x) = grad * (x > 0) =====
+void CPUBackend::kernel_relu_back(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * grad = node->src[0];
+    const TensorF32 * x    = node->src[1];
+    TensorF32       * dst  = node;
+    if (!grad || !x || !grad->data() || !x->data() || !dst->data()) return;
+    const int64_t n = dst->numel();
+    const int64_t per = (n + p->nth - 1) / p->nth;
+    const int64_t i_lo = per * p->ith;
+    const int64_t i_hi = (i_lo + per < n) ? (i_lo + per) : n;
+    const float * g = grad->data();
+    const float * xd = x->data();
+    float * d = dst->data();
+    for (int64_t i = i_lo; i < i_hi; ++i) {
+        d[i] = (xd[i] > 0.0f) ? g[i] : 0.0f;
+    }
+}
+
 // ===== repeat (广播) =====
 // 语义: 将 src0 广播到 node(=src1) 的形状。src0 的尾部维与 dst 尾部维对齐，
 //       src0 维度数少于 dst 时，缺失的前导维按 1 处理（即广播）。
@@ -1296,6 +1449,22 @@ void CPUBackend::kernel_repeat(TensorF32 * node, ComputeParams * p) {
 
     const int nd_src = src0->shape().ndim();
     const int nd_dst = dst->shape().ndim();
+    if (getenv("GRAPH_DEBUG_REPEAT")) {
+        const int64_t t = (int64_t)dst->shape().numel();
+        if (t > 10000000) {   // 只打印超大 repeat（numel>1000万）
+            std::fprintf(stderr, "[REPEAT-BIG] dst={%lld,%lld,%lld,%lld} numel=%lld src={%lld,%lld,%lld,%lld} numel=%lld\n",
+                (long long)(nd_dst>0?dst->shape().dims[0]:-1),
+                (long long)(nd_dst>1?dst->shape().dims[1]:-1),
+                (long long)(nd_dst>2?dst->shape().dims[2]:-1),
+                (long long)(nd_dst>3?dst->shape().dims[3]:-1),
+                (long long)t,
+                (long long)(nd_src>0?src0->shape().dims[0]:-1),
+                (long long)(nd_src>1?src0->shape().dims[1]:-1),
+                (long long)(nd_src>2?src0->shape().dims[2]:-1),
+                (long long)(nd_src>3?src0->shape().dims[3]:-1),
+                (long long)src0->shape().numel());
+        }
+    }
 
     const int64_t ne0[4] = {
         src0->shape().dims[0],
@@ -1420,7 +1589,17 @@ void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
     for (int s = 0; s < GGML_MAX_SRC; s++) {
         if (node->src[s]) srcs[n_src++] = node->src[s];
     }
-    if (n_src < 2) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+    // 单源 concat 是 identity（GMABSE3 对单度 fiber 的 concat_ptr(k_nodes,0) 会只有 1 个源，
+    //    若直接 NOT_SUPPORTED 会报错）。n_src==1 时 dst 与 src 同形状，直接拷贝。
+    //    （本会话 SE3 测试 `node#269 op=22 单源` 即此根因）
+    if (n_src < 1) { p->threadpool->ec = Status::NOT_SUPPORTED; return; }
+    if (n_src == 1) {
+        const TensorF32* src0 = srcs[0];
+        if (src0 && src0->data() && node->data()) {
+            std::memcpy(node->data(), src0->data(), node->nbytes());
+        }
+        return;
+    }
 
     // 各 src 在 dim 维的长度与累积起点
     std::vector<int64_t> len(n_src), start(n_src, 0);
@@ -1471,6 +1650,36 @@ void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
         if (a0 >= s0 || a1 >= s1 || a2 >= s2 || a3 >= s3) continue;
 
         d[idx] = src->data()[((a3 * s2 + a2) * s1 + a1) * s0 + a0];
+    }
+}
+
+// ===== concat 反向：从 concat 输出梯度中切出某 src 的梯度段 =====
+// 语义: concat_back(grad, src, dim, offset)
+//   src[0]=grad：concat 输出梯度（形状在 dim 上 = 各 src 之和）
+//   src[1]=src：参考（目标形状 = 该 src 的形状）
+//   op_params[0]=dim, op_params[1]=offset（该 src 在 dim 上的起始偏移）
+// dst(node)：形状与 src 相同，取 grad 的 [offset, offset+dim_len) 段。
+// 原理：ggml 行主序 dims[0] 最内，dim 维 stride = prod(dims[0..dim-1])，
+//       dst 线性索引 k 在 grad 中 = k + offset*stride（仅 dim 维索引平移）。
+void CPUBackend::kernel_concat_back(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * grad   = node->src[0];
+    const TensorF32 * src    = node->src[1];
+    TensorF32       * dst    = node;
+    if (!grad || !src || !grad->data() || !dst->data()) return;
+    const int64_t dim    = node->op_params[0];
+    const int64_t offset = node->op_params[1];
+
+    int64_t stride = 1;
+    for (int64_t d = 0; d < dim && d < grad->shape().ndim(); ++d) stride *= grad->shape().dims[d];
+
+    const int64_t total = dst->numel();
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t i_lo  = per * p->ith;
+    const int64_t i_hi  = (i_lo + per < total) ? (i_lo + per) : total;
+    const float * g = grad->data();
+    float * d = dst->data();
+    for (int64_t k = i_lo; k < i_hi; ++k) {
+        d[k] = g[k + offset * stride];
     }
 }
 

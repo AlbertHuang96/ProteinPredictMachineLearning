@@ -255,6 +255,15 @@ TensorF32* relu(TensorF32* a) {
     return result;
 }
 
+// relu_back(grad, x) — d(relu(x))/dx = grad * step(x)。src[0]=grad, src[1]=x。
+TensorF32* relu_back(TensorF32* grad, TensorF32* x) {
+    TensorF32* result = context().new_tensor<float>(x->shape().ndim(), x->shape().dims.data());
+    result->op     = OP_RELU_BACK;
+    result->src[0] = grad;
+    result->src[1] = x;
+    return result;
+}
+
 // exp(a) — 自然指数 e^a
 TensorF32* exp(TensorF32* a) {
     TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
@@ -326,6 +335,15 @@ TensorF32* mean(TensorF32* a) {
     return result;
 }
 
+// max_all(a) — 全局最大值（标量）。用于 softmax 数值稳定（max 减稳避免 exp 溢出）。
+TensorF32* max_all(TensorF32* a) {
+    int64_t ne[1] = {1};
+    TensorF32* result = context().new_tensor<float>(1, ne);
+    result->op     = OP_MAX_ALL;
+    result->src[0] = a;
+    return result;
+}
+
 // sum_rows(a) — 沿最后一行求和 (a: M×N → M×1)
 TensorF32* sum_rows(TensorF32* a) {
     int nd = a->shape().ndim();
@@ -344,6 +362,20 @@ TensorF32* sum_rows(TensorF32* a) {
 
 // view(a, new_shape) — 零拷贝视图（不拥有数据）
 TensorF32* view(TensorF32* a, const Shape& new_shape) {
+    if (getenv("GRAPH_DEBUG_VIEW") && new_shape.numel() != a->numel()) {
+        std::fprintf(stderr,
+            "[VIEW-FAIL] new_shape={%lld,%lld,%lld,%lld} numel=%lld  a->shape={%lld,%lld,%lld,%lld} ndim=%d numel=%lld op=%d\n",
+            (long long)(new_shape.dims.size()>0?new_shape.dims[0]:-1),
+            (long long)(new_shape.dims.size()>1?new_shape.dims[1]:-1),
+            (long long)(new_shape.dims.size()>2?new_shape.dims[2]:-1),
+            (long long)(new_shape.dims.size()>3?new_shape.dims[3]:-1),
+            (long long)new_shape.numel(),
+            (long long)(a->shape().dims.size()>0?a->shape().dims[0]:-1),
+            (long long)(a->shape().dims.size()>1?a->shape().dims[1]:-1),
+            (long long)(a->shape().dims.size()>2?a->shape().dims[2]:-1),
+            (long long)(a->shape().dims.size()>3?a->shape().dims[3]:-1),
+            (int)a->shape().ndim(), (long long)a->numel(), (int)a->op);
+    }
     assert(new_shape.numel() == a->numel());
     // view 不分配新数据，指针复用
     int64_t ne[4] = {1, 1, 1, 1};
@@ -473,6 +505,19 @@ TensorF32* concat_ptr(const std::vector<TensorF32*>& tensors, int dim) {
     for (size_t i = 0; i < tensors.size() && i < GGML_MAX_SRC; i++) {
         result->src[i] = tensors[i];
     }
+    return result;
+}
+
+// concat 反向：grad 是 concat 输出梯度，src 是其中一个输入，取 grad 中
+//   [offset, offset+src_dim_len) 沿 dim 的段作为该 src 的梯度。
+//   src[0]=grad, src[1]=src(参考形状), op_params[0]=dim, op_params[1]=offset。
+TensorF32* concat_back(TensorF32* grad, TensorF32* src, int dim, int64_t offset) {
+    TensorF32* result = context().new_tensor<float>(src->shape().ndim(), src->shape().dims.data());
+    result->op = OP_CONCAT_BACK;
+    result->src[0] = grad;
+    result->src[1] = src;
+    result->op_params[0] = dim;
+    result->op_params[1] = static_cast<int>(offset);
     return result;
 }
 
@@ -712,9 +757,15 @@ static TensorF32* make_scalar(float value);
 
 // log_softmax_stable(a) — 数值稳定的 log_softmax，用于 CE 损失。
 // 直接 log(softmax(a)) 在 softmax 下溢到精确 0 时得 -inf，随后 onehot*lsm=0*(-inf)=NaN。
-// 加 eps 使 softmax 恒 >0 → log 恒有限（下溢 bin 得 log(eps)=-18 而非 -inf，乘 onehot=0 → 0）。
+// 用 log(softmax(a)+eps) 防 log(0)=-inf（下溢 bin 得 log(eps)，乘 onehot=0 → 0）。
+// eps 取 1e-4：既防止 log(0)=-inf，又避免 eps 过小（1e-8）时下溢 bin 的 log(eps)=-18 把 CE 抬到异常
+//   巨大（distogram=71 的部分原因）、且反向 1/(softmax+eps) 在 softmax 极小处放大梯度。
+//   1e-4 时下溢 bin 得 log(1e-4)=-9.2，梯度 1/eps 最大 1e4，远温和于 1e-8 的 1e8。
+// 注意：真正严格的 logsumexp(x)=x-log(sum(exp(x-m))) 需要"沿类别维 max"，图中仅有全局 max_all，
+//   用全局 max 重写会引入 max_all 的 backward 广播（repeat(grad,src) 到全图），改变 buffer 布局
+//   并可能触发 Gallocr 覆盖假 NaN，故暂不采用（2026-08-21 实测全图 NaN，已回退本版）。
 TensorF32* log_softmax_stable(TensorF32* a) {
-    const float eps = 1e-8f;
+    const float eps = 1e-4f;
     return log(add1_impl(softmax(a), make_scalar(eps), false));  // softmax + eps，防 log(0)=-inf
 }
 
@@ -735,8 +786,9 @@ TensorF32* torsion_angle_loss(TensorF32* pred, TensorF32* gt, TensorF32* chi_mas
     float eps = 1e-8f;
 
     // Step 1: normalize pred to unit circle: pred_n = pred / sqrt(sum(pred², dim=-1))
+    // ⚠️ r 必须加 eps：pred 某通道为 0 时 sqrt(0)=0，div(pred,0)=inf → chi=inf（训练 loss 卡死根因）
     auto sq_sum = sum_rows(sqr(pred));       // [N, 7]
-    auto r      = sqrt(sq_sum);              // [N, 7]
+    auto r      = sqrt(add1_impl(sq_sum, make_scalar(eps), false)); // [N, 7] 加 eps 防除零
     auto pred_n = div(pred, r);              // [N, 7, 2] broadcast
 
     // Step 2: squared difference in (sin,cos) space
