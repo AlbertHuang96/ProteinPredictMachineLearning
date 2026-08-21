@@ -295,9 +295,13 @@ TensorF32* rms_norm(TensorF32* a, float eps) {
     return result;
 }
 
-// norm(a, eps) — Layer Normalization 沿最后一维
+// norm(a, eps) — Layer Normalization。
+// 本项目图布局 dims[0]=最内维（特征维），kernel_norm 沿 dims[0] 归一化（CPUKernels.cpp:1081），
+// 故这里也必须用 dims[0] 作为特征维 D（mean/rstd 缓存 rows 个数），与 kernel 一致。
+// 原用 dims.back()（对 4D pair [D,L,L,B] 得 B=1 → rows=numel），导致 norm_back 输出
+// [rows,D]=[332928,1] 与输入 4D 不匹配 → 后续 mul 广播巨大 shape → OOM。
 TensorF32* norm(TensorF32* a, float eps) {
-    int D = a->shape().dims.back();
+    int D = a->shape().dims[0];
     int rows = a->numel() / D;
 
     TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
@@ -384,8 +388,10 @@ TensorF32* view(TensorF32* a, const Shape& new_shape) {
     }
     TensorF32* result = context().new_tensor<float>(
         static_cast<int>(new_shape.dims.size()), ne);
-    // view shares data with source (TODO: set via public API when available)
-    //result->set_view_src(a);
+    // view 零拷贝共享源数据：置 view_src 让 gallocr 不为其分配独立 buffer（避免 buffer 复用释放后
+    // data() 悬垂），并让 dispatch 时从 src0 解析 data()。此前 view_src 未设导致 gallocr 把 view 当
+    // managed 分配独立 buffer，跨 compute_and_read 复用/释放后 kernel_cpy 写悬垂地址 → SIGSEGV。
+    result->view_src = a;
     result->op     = OP_VIEW;
     result->src[0] = a;
     return result;

@@ -488,6 +488,9 @@ private:
 
     // helper
     bool is_view_op(int op) const;
+    // host 生产者判定：OP_NONE 参数/常量节点（数据在 host，dispatch 跳过且不建 cpy），
+    // 不能放 GPU，否则消费者裸读 host 指针崩溃。
+    bool node_is_host_producer(TensorF32* node) const;
     void set_backend_if_supported(TensorF32* node, int backend_id);
     int  count_supported_inputs(TensorF32* node, int backend_id) const;
     bool tensor_buffer_compatible(const TensorF32* src, int backend_id) const;
@@ -526,6 +529,10 @@ private:
     std::vector<int> prev_node_backend_id_;
     std::vector<int> leaf_backend_id_;
     std::vector<int> prev_leaf_backend_id_;
+
+    // GRAPH_DEBUG_SCHED=1 诊断：每 backend 分配的 op 计数（检测 GPU 是否被调用）
+    int* sched_backend_cnt_ = nullptr;
+    long* sched_backend_op_last_ = nullptr;
     
     std::vector<const BufferType*> bufts_;
 

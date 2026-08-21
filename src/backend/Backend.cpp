@@ -45,7 +45,34 @@ bool BackendScheduler::is_view_op(int op) const {
     return op == OP_VIEW || op == OP_RESHAPE || op == OP_PERMUTE || op == OP_TRANSPOSE;
 }
 
+// host producer 判定：数据实际在 host 的节点（参数 param / 常量 / 已绑定 host data / 共享 host 的
+// view），绝不能分配到 GPU 后端：
+//   - CUDABackend::supports_op 对 OP_NONE 返回 true，会被 pass_fill_unassigned 贪心放到 GPU；
+//   - 但 CUDA dispatch 对 OP_NONE 直接 skip（不 dispatch、不做 H2D），其 data() 保持 host；
+//   - 非 OP_NONE 但有 host data（如 view 共享的 host 源、已绑定 host 数据的节点）被分到 GPU 时，
+//     build_splits 因与消费者同属 GPU 后端不建 cpy → GPU kernel 裸读 host 指针 → [CUDA-ERR]。
+// 强制回落 CPU 后，GPU 消费者会经 build_splits 建 cpy（H2D），数值正确。
+// 沿 view_src 链解析到底层：若底层是 OP_NONE 参数/常量，或持有 host data（buffer 为 null/host），
+// 判定为 host 生产者。已显式挂 device buffer（非 host）的节点数据已在 device，不算。
+bool BackendScheduler::node_is_host_producer(TensorF32* node) const {
+    if (!node) return false;
+    // 沿 view_src 链找底层数据载体（view 共享源数据，data 在源头）
+    const TensorF32* base = node;
+    int guard = 0;
+    while (base->view_src && guard++ < 64) base = base->view_src;
+    if (base->op == OP_NONE) return true;  // 参数/常量
+    if (base->data() != nullptr) {
+        if (base->buffer_ && !base->buffer_->is_host()) return false;  // device data
+        return true;  // host data
+    }
+    return false;
+}
+
 void BackendScheduler::set_backend_if_supported(TensorF32* node, int backend_id) {
+    // host 生产者（OP_NONE 参数/常量）不得放 GPU：数据在 host，dispatch 跳过它，
+    // 也不会建 cpy（与消费者同后端），GPU kernel 会读 host 指针。
+    if (node_is_host_producer(node)) return;
+
     Backend * backend = backends_[backend_id];
     if (!backend->supports_op(node)) return;
 
@@ -434,6 +461,17 @@ bool is_device_pointer(const TensorF32* src, const float* data) {
 bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
     if (src == dst) return true;
 
+    // view 零拷贝共享源数据：src 本身 data() 为 null（数据在 view_src 链底层）。
+    // 跨后端拷贝时必须从底层数据载体读，否则 set_tensor 从 null 拷贝 → 崩溃/垃圾。
+    const TensorF32* real_src = src;
+    {
+        const TensorF32* cur = src;
+        int guard = 0;
+        while (cur && cur->view_src && guard++ < 64) cur = cur->view_src;
+        real_src = cur;  // 底层数据载体
+    }
+    src = real_src;
+
     size_t nbytes = src->nbytes();
 
     // ===== Case 1: src 在 host buffer 上（或没有 buffer）=====
@@ -700,6 +738,13 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
             // 不再按"输入兼容数"贪心——host 叶子在 CPU 时会把节点拽回 CPU，
             // 违背"尽量放 GPU"的意图；跨后端拷贝由 build_splits 处理。
             int best_backend = n_backends_ - 1;  // 默认 CPU
+            // host 生产者（OP_NONE 参数/常量）：数据在 host，dispatch 跳过它也不会建 cpy，
+            // 若放 GPU 消费者会裸读 host 指针 → [CUDA-ERR] HOST/INVALID → 崩溃。强制回落 CPU，
+            // 由 build_splits 为 GPU 消费者建 H2D cpy。
+            if (node_is_host_producer(node)) {
+                backend_map_[node] = best_backend;  // CPU
+                continue;
+            }
             for (int b = 0; b < n_backends_; b++) {
                 if (backends_[b]->supports_op(node)) {
                     best_backend = b;  // backends_ 已按 priority 降序 → 第一个即最高
@@ -711,11 +756,79 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                 !gpu_assign_if_affordable(node, best_backend)) {
                 best_backend = n_backends_ - 1;  // CPU
             }
+
+            // ===== 混合训练正确性护栏（避免段错误）=====
+            // 仅广播 op 强制回落 CPU：CUDA elemwise kernel 用扁平 idx<n 索引，
+            // 不支持广播（src numel != dst numel 越界）。host 源不再整节点禁用 GPU，
+            // 改由 build_splits 插入 H2D 拷贝 + graph_compute 兜底处理。
+            if (backends_[best_backend]->priority() > 0) {
+                // (1) 广播检测：任意 op 只要存在 src numel != dst numel，
+                //     CUDA kernel 假设扁平等长索引 -> 越界读/写 -> 段错误。强制 CPU。
+                bool broadcast = false;
+                {
+                    long long dn = (long long)node->numel();
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        TensorF32* s = node->src[j];
+                        if (s && (long long)s->numel() != dn) { broadcast = true; break; }
+                    }
+                }
+                // (2) 广播检测：只有"真·逐元素"op 在 src numel != dst numel 时才构成
+                //     广播（CUDA elemwise kernel 用扁平 idx<n 索引，会越界）。
+                //     mul_mat / out_prod / norm / softmax / concat 等 op 的 src numel
+                //     天然 ≠ dst numel（收缩/归约），属正常语义，不是广播。
+                static const int kElemwiseBroadcastOps[] = {
+                    OP_ADD, OP_ADD1, OP_ADD_ID, OP_SUB, OP_MUL, OP_DIV,
+                    OP_SCALE, OP_SUM, OP_MEAN, OP_SQR, OP_SQRT, OP_LOG,
+                    OP_SIN, OP_COS, OP_LEAKY_RELU, OP_UNARY, OP_CLAMP,
+                    OP_FILL, OP_ARANGE, OP_GLU, OP_TRI_MUL, OP_OUTER_PROD_MEAN,
+                    OP_OUTER_PROD,
+                    -1
+                };
+                bool is_elemwise = false;
+                for (int k = 0; kElemwiseBroadcastOps[k] >= 0; k++) {
+                    if (node->op == (tensor_op)kElemwiseBroadcastOps[k]) { is_elemwise = true; break; }
+                }
+                bool real_broadcast = broadcast && is_elemwise;
+                // (3) host 数据传递：
+                //     历史护栏曾把"任一 src 沿视图链是 host"的节点整节点强制 CPU，
+                //     导致叶子全 host 时所有节点都被拽回 CPU → GPU 0 算子。
+                //     正确做法：host 源由 build_splits 插入 H2D 拷贝解决，不在此禁用 GPU。
+                //     仅当 GPU 后端对该 op 显式不支持（supports_op 已过滤）时才回落 CPU。
+                if (real_broadcast) {
+                    if (getenv("GRAPH_DEBUG_SCHED")) {
+                        fprintf(stderr,
+                                "[sched] force CPU: op=%d (broadcast=1) — "
+                                "CUDA elemwise kernel has no broadcast support (idx<n index)\n",
+                                (int)node->op);
+                    }
+                    best_backend = n_backends_ - 1;  // CPU
+                }
+            }
             backend_map_[node] = best_backend;
+            // 诊断（GRAPH_DEBUG_SCHED=1）：统计每 backend 分配的 op 数，检测 GPU 是否被分配到 op
+            if (getenv("GRAPH_DEBUG_SCHED") && best_backend < 4) {
+                if (sched_backend_cnt_ == nullptr) sched_backend_cnt_ = new int[4]();
+                if (sched_backend_op_last_ == nullptr) sched_backend_op_last_ = new long[4]();
+                sched_backend_cnt_[best_backend]++;
+                sched_backend_op_last_[best_backend] = (int)node->op;
+            }
         }
         // else:
         // 已分配：可以考虑升级到更高优先级的后端
         // 简化：跳过升级逻辑
+    }
+
+    // 诊断（GRAPH_DEBUG_SCHED=1）：打印每 backend 分配的 op 数（检测 GPU 是否被调用）
+    if (getenv("GRAPH_DEBUG_SCHED") && sched_backend_cnt_ != nullptr) {
+        int n_cpu = sched_backend_cnt_[0];
+        long gpu_total = 0;
+        for (int b = 1; b < n_backends_; b++) gpu_total += sched_backend_cnt_[b];
+        fprintf(stderr, "[sched] split_graph: total_op_cpu=%d total_op_gpu=%lld (gpu_backends=%d)\n",
+                n_cpu, (long long)gpu_total, n_backends_ - 1);
+        for (int b = 1; b < n_backends_; b++) {
+            fprintf(stderr, "[sched]   backend=%d op_count=%d last_op=%lld\n",
+                    b, sched_backend_cnt_[b], sched_backend_op_last_[b]);
+        }
     }
 }
 
@@ -893,9 +1006,10 @@ Status BackendScheduler::graph_compute() {
                     if (src->buffer_) is_device = !src->buffer_->is_host();
                     else is_device = is_device_pointer(src, static_cast<const float*>(src->data()));
                     if (!is_device) continue;  // 非 device
-                    // 已是被拷到 host 的 cpy（上面已处理）则跳过
-                    if (src->op == OP_DUP && src->src[0] && src->src[0]->buffer_ &&
-                        !src->src[0]->buffer_->is_host()) continue;
+                    // 已是被拷到 host 的 cpy（上面已处理）则跳过：仅当 cpy 自身 data 已是 host。
+                    // 注意：不能看 src->src[0]->is_host()（旧逻辑误把"cpy 源仍是 device"当跳过条件，
+                    // 反而漏掉未完成拷贝的 device src → CPU kernel 段错误）。改为：cpy 自身已是 host 才跳。
+                    if (src->op == OP_DUP && src->src[0] && !is_device_pointer(src, src->data())) continue;
                     // D2H 暂存（device 张量必有 buffer_，但无 buffer_ 时用裸 cudaMemcpy 兜底）
                     const int64_t n = src->numel();
                     host_stage_.emplace_back(src, src->data());

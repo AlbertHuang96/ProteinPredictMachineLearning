@@ -784,12 +784,17 @@ void ComputeGraph::compute_backward(
             // backward:
             //   dL_dx = rstd/D * (D * dL_dy - sum(dL_dy) - y * sum(dL_dy * y))
             if (src0_needs_grads) {
-                int D    = src0->shape().dims.back();
+                // 本项目图布局 dims[0]=最内维（特征维），kernel_norm 沿 dims[0] 归一化。
+                // 原用 dims.back()（对 4D pair [D,L,L,B] 得 B=1 → rows=numel → dx [rows,1]=[332928,1]），
+                // 导致 norm_back 梯度 shape 与输入 4D 不匹配 → 后续 mul 广播巨大 → OOM。
+                int D    = src0->shape().dims[0];
                 int rows = src0->numel() / D;
 
-                // 构造 OP_NORM_BACK 节点
-                int64_t dx_dims[] = {rows, D};  // 2D shape
-                TensorF32 * dx = context().new_tensor<float>(2, dx_dims);
+                // 构造 OP_NORM_BACK 节点：dx 必须保持 src0（x）的 shape（梯度与输入同 shape）
+                int64_t dx_dims[GGML_MAX_DIMS];
+                for (int dd = 0; dd < src0->shape().ndim(); ++dd)
+                    dx_dims[dd] = src0->shape().dims[dd];
+                TensorF32 * dx = context().new_tensor<float>(src0->shape().ndim(), dx_dims);
                 dx->op     = OP_NORM_BACK;
                 dx->src[0] = grad;              // dL_dy
                 dx->src[1] = tensor->src[0];    // x (原始输入)

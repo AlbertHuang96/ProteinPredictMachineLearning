@@ -217,8 +217,15 @@ namespace ppml {
         // 然后逐元素 mul/add（不能用 out_prod：那是外积，会产生错误形状）。
         TensorF32* normed = norm(x, eps_);  // or norm() for layernorm
         int D = (int)normed->shape().dims[0];
-        TensorF32* gamma_v = view(gamma_, Shape({D, 1, 1}));
-        TensorF32* beta_v  = view(beta_,  Shape({D, 1, 1}));
+        int nd = normed->shape().ndim();
+        // gamma/beta [D] → view 成与 normed 同 ndim 的 [D,1,...,1]（尾部对齐 repeat 才正确）。
+        // 原固定 [D,1,1]（3D）对 4D 输入（如 pair [D,L,L,B]）跨 ndim 尾部对齐会把 D 对齐到 L，
+        // 导致 repeat 语义错乱（甚至巨大 shape）。
+        TensorF32* gamma_v;
+        TensorF32* beta_v;
+        if (nd == 2)      { gamma_v = view(gamma_, Shape({D, 1}));       beta_v = view(beta_, Shape({D, 1})); }
+        else if (nd == 3) { gamma_v = view(gamma_, Shape({D, 1, 1}));    beta_v = view(beta_, Shape({D, 1, 1})); }
+        else              { gamma_v = view(gamma_, Shape({D, 1, 1, 1})); beta_v = view(beta_, Shape({D, 1, 1, 1})); }
         TensorF32* scaled  = mul(normed, repeat(gamma_v, normed));
         return add_impl(scaled, repeat(beta_v, scaled), /*inplace=*/false);
     }

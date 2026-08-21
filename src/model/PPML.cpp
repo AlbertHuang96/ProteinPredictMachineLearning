@@ -94,7 +94,17 @@ TensorF32* wrap_input_as_leaf(const TensorF32& t, const std::vector<int64_t>& di
 void compute_and_read(TensorF32* node, TensorF32& dst,
                       ComputeGraph* cgraph, Backend* backend) {
     if (!node) return;
+    // 崩溃定位（GRAPH_DEBUG_DISPATCH=1）：打印每次值回落的调用点（build 前 / graph_compute 前），
+    // 区分崩溃在"图构建"还是"kernel 执行"。numel=1 的是 loss 累加等小量。
+    if (getenv("GRAPH_DEBUG_DISPATCH")) {
+        fprintf(stderr, "[CAR] op=%d numel=%lld -> build_forward_expand\n",
+                (int)node->op, (long long)node->numel());
+    }
     cgraph->build_forward_expand(node);
+    if (getenv("GRAPH_DEBUG_DISPATCH")) {
+        fprintf(stderr, "[CAR] op=%d numel=%lld -> graph_compute (n_nodes=%d)\n",
+                (int)node->op, (long long)node->numel(), (int)cgraph->n_nodes());
+    }
     backend->graph_compute(cgraph);
     if (node->data() != nullptr) {
         size_t bytes = static_cast<size_t>(node->numel()) * sizeof(float);
@@ -1649,6 +1659,16 @@ bool cuda_available() {
     int device_count = 0;
     cudaError_t err = cudaGetDeviceCount(&device_count);
     if (err != cudaSuccess || device_count <= 0) {
+        // 打印实际失败原因，便于排查 "CUDA 调用问题"（最常见：CUDA 11/12 运行时冲突、
+        // libcudart 被 LD_LIBRARY_PATH 指向错误版本、或驱动不可见）。
+        fprintf(stderr,
+                "[CUDA-AVAIL] cudaGetDeviceCount failed: %s (device_count=%d)\n",
+                cudaGetErrorString(err), device_count);
+        fprintf(stderr,
+                "[CUDA-AVAIL] 提示: 本项目链接 CUDA 11 (libcudart.so.11.0)。若 LD_LIBRARY_PATH 指向了\n"
+                "  含其他版本 libcudart 的目录（如 anaconda 的 libcudart），可能加载到不兼容的运行时\n"
+                "  或导致设备探测失败。建议: export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu\n"
+                "  （系统 11.0 所在目录），并确认 nvidia-smi 能看到 GPU、/dev/nvidia* 可访问。\n");
         return false;
     }
     return true;
@@ -1680,8 +1700,13 @@ size_t cuda_min_required_bytes() {
 
 // PPMLModel 实现
 PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
-    int n_iter = N_EXTRA_BLOCKS + N_MAIN_BLOCKS;  // ITER_N_BLOCKS = 12
-    int n_refn = N_REFINE_BLOCKS;                  // 4
+    // block 数用 config（支持 PPML_N_EXTRA/PPML_N_MAIN/PPML_N_REFINE 环境变量覆盖），
+    // 不用硬编码宏 N_EXTRA_BLOCKS/N_MAIN_BLOCKS/N_REFINE_BLOCKS（否则 config 显示与实际建块数不一致）。
+    const int n_extra  = config.n_extra_blocks;
+    const int n_main   = config.n_main_blocks;
+    const int n_refine = config.n_refine_blocks;
+    int n_iter = n_extra + n_main;  // ITER_N_BLOCKS = 12
+    int n_refn = n_refine;          // 4
 
     // ===== IterBlock 3D SE 参数 (每组 6 个, 共 12 组) =====
     for (int i = 0; i < n_iter; ++i) {
@@ -1814,8 +1839,8 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         op.push_back( LinearLayer::create(T, D_PAIR));
     };
 
-    // 12 份 IterBlock 参数
-    for (int i = 0; i < N_ITER; ++i) {
+    // n_iter 份 IterBlock 参数
+    for (int i = 0; i < n_iter; ++i) {
         push_msa_row(); push_msa_col(); push_pair_row(); push_pair_col();
         push_msa_ff(); push_pair_ff();
         push_tri(tri_out_layernorm_, tri_out_output_layernorm_,
@@ -1828,8 +1853,8 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
                  tri_in_gate_, tri_in_out_proj_);
     }
 
-    // 4 份 GlobalColAttention 参数
-    for (int i = 0; i < N_GLOB; ++i) {
+    // n_extra 份 GlobalColAttention 参数
+    for (int i = 0; i < n_extra; ++i) {
         msa_global_col_Wq_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
         msa_global_col_Wk_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
         msa_global_col_Wv_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
@@ -1838,8 +1863,8 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         msa_global_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));
     }
 
-    // ===== FullBlock(extra) 专属 64 维 MSA 注意力参数（N_EXTRA_BLOCKS 份）=====
-    for (int i = 0; i < N_EXTRA_BLOCKS; ++i) {
+    // ===== FullBlock(extra) 专属 64 维 MSA 注意力参数（n_extra 份）=====
+    for (int i = 0; i < n_extra; ++i) {
         push_full_msa_row();
         push_full_msa_ff();
         push_full_global_col();
@@ -1848,14 +1873,14 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
 
     // ===== PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer) =====
     // 必须先于下方 block 构造循环分配 (1575/1649 处按 idx 访问 pos_enc_emb_res_[idx])
-    for (int i = 0; i < N_ITER; ++i) {
+    for (int i = 0; i < n_iter; ++i) {
         pos_enc_emb_res_.push_back(EmbeddingLayer::create(65, D_PAIR));     // (65, 128)  residue dist
         pos_enc_emb_atom_.push_back(EmbeddingLayer::create(17, D_PAIR));    // (17, 128)  atom bond dist
     }
 
     // ===== 创建迭代块 + 注入指针 =====
-    // extra_blocks (4) — FullBlock with update_msa_pair=true
-    for (int i = 0; i < N_EXTRA_BLOCKS; ++i) {
+    // extra_blocks (n_extra) — FullBlock with update_msa_pair=true
+    for (int i = 0; i < n_extra; ++i) {
         int idx = i;
         auto block = std::make_unique<FullBlock>(config, true);
         // 注入 3D SE + forward 内部参数
@@ -1929,9 +1954,9 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
         extra_blocks_.push_back(std::move(block));
     }
 
-    // main_blocks (8) — IterBlock with update_msa_pair=true
-    for (int i = 0; i < N_MAIN_BLOCKS; ++i) {
-        int idx = N_EXTRA_BLOCKS + i;
+    // main_blocks (n_main) — IterBlock with update_msa_pair=true
+    for (int i = 0; i < n_main; ++i) {
+        int idx = n_extra + i;
         auto block = std::make_unique<IterBlock>(config, true);
         // 注入 3D SE + forward 内部参数
         block->norm_msa_3d_  = iter_norm_msa_3d_[idx]; block->norm_pair_3d_ = iter_norm_pair_3d_[idx];
@@ -2072,6 +2097,7 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
     chi_head_linear2_ = LinearLayer::create(D_STATE, 7 * 2);    // 32 → 14
 
     // Distogram head: 从 pair 特征投影 4 组 logits (D/Ω/Θ/Φ)
+    distogram_pair_ln_ = LayerNorm::create(D_PAIR);       // 128 LayerNorm(pair)，投影前归一化
     distogram_d_head_ = LinearLayer::create(D_PAIR, 60);  // 距离 60 bins
     distogram_o_head_ = LinearLayer::create(D_PAIR, 36);  // Ω 36 bins
     distogram_t_head_ = LinearLayer::create(D_PAIR, 36);  // Θ 36 bins
@@ -2421,13 +2447,15 @@ ModelOutput PPMLModel::forward(const ModelInput& input) {
     // ===== Distogram head: pair (B,L,L,D_PAIR) → 4 组 logits =====
     //   distogram (B,L,L,60), omega (B,L,L,36), theta (B,L,L,36), phi (B,L,L,18)
     if (pair.numel() > 0) {
+        // distogram 头投影前对 pair 做 LayerNorm（防 logits 巨大→softmax 退化→loss 卡死）
+        auto& pair_normed = *distogram_pair_ln_->forward(const_cast<TensorF32*>(&pair));
         int dg_B = pair.shape().dims[0];
         int dg_L = pair.shape().dims[1];
         int64_t dg_rows = (int64_t)dg_B * dg_L * dg_L;
 
         // pair (B,L,L,D_PAIR) → 展平 (B*L*L, D_PAIR) 送入各 head
         TensorF32 pair_flat(Shape({dg_rows, D_PAIR}), pair.device());
-        pair_flat.copy_from(pair);
+        pair_flat.copy_from(pair_normed);
 
         auto project_logits = [&](LinearLayer* head, int bins) {
             auto logits2 = head->forward(pair_flat);              // (B*L*L, bins)
@@ -2758,11 +2786,12 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3) {
     TensorF32* ch_relu = relu(ch1);
     TensorF32* alpha   = chi_head_linear2_->forward_graph(ch_relu);   // [14,L,B]
 
-    // Distogram heads: pair → 4 组 logits
-    TensorF32* dist_d = distogram_d_head_->forward_graph(pair);
-    TensorF32* dist_o = distogram_o_head_->forward_graph(pair);
-    TensorF32* dist_t = distogram_t_head_->forward_graph(pair);
-    TensorF32* dist_p = distogram_p_head_->forward_graph(pair);
+    // Distogram heads: pair → LayerNorm → 4 组 logits（防 logits 巨大→softmax 退化→loss 卡死）
+    TensorF32* pair_normed = distogram_pair_ln_->forward(pair);
+    TensorF32* dist_d = distogram_d_head_->forward_graph(pair_normed);
+    TensorF32* dist_o = distogram_o_head_->forward_graph(pair_normed);
+    TensorF32* dist_t = distogram_t_head_->forward_graph(pair_normed);
+    TensorF32* dist_p = distogram_p_head_->forward_graph(pair_normed);
 
     // pLDDT head: state → [50,L,B] = (B,L,50)
     TensorF32* lddt   = plddt_head_->forward_graph(state);
@@ -2834,8 +2863,9 @@ void PPMLModel::ensure_backend_ready() {
     if (backend_ready_) return;
 
     // 1. 创建 CPU Backend（始终存在）
-    //    线程数：PPML_N_THREADS 环境变量（默认 4）。多线程 barrier/唤醒已重写为
-    //    感翻转屏障 + 图代际唤醒，可安全用于训练（见 ThreadPool.cpp）。
+    //    线程数：PPML_N_THREADS 环境变量（默认 4）。多线程 barrier 已修：graph_plan 保证
+    //    plan.n_threads 恒等于实际参与线程数（n_threads_），barrier 计数一致，多线程安全。
+    //    GPU op 走 CUDA（dispatch 单线程）仍加速。
     if (!cpu_backend_) {
         int n_threads = 4;
         if (const char* p = getenv("PPML_N_THREADS")) {
@@ -2852,20 +2882,59 @@ void PPMLModel::ensure_backend_ready() {
         // 3. 若模型目标设备为 CUDA, 先探测 GPU 可用性 + 空闲显存; 不足则警告并回退 CPU
         if (device_ == Device::CUDA) {
             if (!cuda_available()) {
+                const bool user_requested =
+                    (getenv("PPML_USE_CUDA") != nullptr);
                 std::cerr << "[WARN] CUDA device not available; "
                           << "falling back to CPU backend." << std::endl;
+                if (user_requested) {
+                    std::cerr
+                        << "[CUDA-ERR] 你已显式设置 PPML_USE_CUDA=1，但 GPU 探测失败，"
+                           "训练将完全在 CPU 上运行（你加在 CUDABackend 中的日志不会打印）。\n"
+                        << "[CUDA-ERR] 常见原因与排查:\n"
+                        << "  1) LD_LIBRARY_PATH 指向了其他版本的 libcudart（如 anaconda 的 11 变体），"
+                           "覆盖了系统 /usr/lib/x86_64-linux-gnu 的 libcudart.so.11.0 -> "
+                           "运行前 export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu。\n"
+                        << "  2) nvidia-smi / 驱动不可见 -> 确认驱动已加载、nvidia-smi 能列出 GPU。\n"
+                        << "  3) 无 GPU 或权限不足 -> 确认设备节点 /dev/nvidia* 可访问。\n"
+                        << "[CUDA-ERR] 见上方 [CUDA-AVAIL] 输出的 cudaGetDeviceCount 具体错误。\n";
+                }
                 device_ = Device::CPU;   // 回退: 模型按 CPU 运行
             } else {
                 const size_t free_b = cuda_free_memory_bytes();
                 const size_t need_b = cuda_min_required_bytes();
-                if (free_b > 0 && free_b < need_b) {
-                    std::cerr << "[WARN] CUDA device free VRAM " << (free_b >> 20)
-                              << " MB < required " << (need_b >> 20)
-                              << " MB; falling back to CPU backend." << std::endl;
-                    device_ = Device::CPU;
-                } else if (!cuda_backend_) {
+
+                // 是否启用 scheduler（混合训练：按节点分配，GPU 放得下的放 GPU，放不下的回落 CPU）。
+                // 该标志与 train.cpp 中 use_sched 的判定保持一致。
+                const bool use_sched_flag =
+                    (getenv("PPML_CUDA_SCHED") != nullptr) &&
+                    (std::atoi(getenv("PPML_CUDA_SCHED")) != 0);
+
+                if (!use_sched_flag) {
+                    // 单后端全 GPU 模式：确实需要整块显存，不足则整体回退 CPU。
+                    if (free_b > 0 && free_b < need_b) {
+                        std::cerr << "[WARN] CUDA device free VRAM " << (free_b >> 20)
+                                  << " MB < required " << (need_b >> 20)
+                                  << " MB (single-backend full-GPU mode); "
+                                     "falling back to CPU backend." << std::endl;
+                        device_ = Device::CPU;
+                        }
+                } else {
+                    // 混合训练（scheduler）：不整体回退。显存不足由 scheduler 的
+                    // gpu_vram_budget_（=空闲显存*4/5）逐节点预算控制，放不下的节点
+                    // 自动回落 CPU。仅当空闲显存近乎为 0（驱动/设备异常）才整体回退。
+                    if (free_b < (256ULL << 20)) {
+                        std::cerr << "[WARN] CUDA free VRAM only " << (free_b >> 20)
+                                  << " MB (<256MB); falling back to CPU backend." << std::endl;
+                        device_ = Device::CPU;
+                        }
+                    std::cerr << "[INFO] Mixed CUDA training (scheduler): free VRAM "
+                              << (free_b >> 20) << " MB, nodes that fit are placed on GPU, "
+                                 "the rest spill to CPU. No full fallback." << std::endl;
+                }
+
+                if (device_ == Device::CUDA && !cuda_backend_) {
                     // scheduler 按 priority 排序, CUDA 优先调度到 GPU;
-                    // 不支持的 op 自动跨后端拷贝回 CPU
+                    // 不支持的 op / 预算不足的节点自动跨后端拷贝或回落 CPU
                     cuda_backend_ = std::make_unique<CUDABackend>(0);  // device 0
                     scheduler_->add_backend(cuda_backend_.get());
                 }
@@ -3007,6 +3076,7 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
     collect_layernorm(chi_head_ln_, "chi_head.ln");
     collect_linear(chi_head_linear1_, "chi_head.linear1");
     collect_linear(chi_head_linear2_, "chi_head.linear2");
+    collect_layernorm(distogram_pair_ln_, "distogram_head.pair_ln");
     collect_linear(distogram_d_head_, "distogram_head.dist");
     collect_linear(distogram_o_head_, "distogram_head.omega");
     collect_linear(distogram_t_head_, "distogram_head.theta");
@@ -3057,18 +3127,18 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
     collect_linear(tps_pair_ff_linear1_, "tps.pair_ff.linear1");
     collect_linear(tps_pair_ff_linear2_, "tps.pair_ff.linear2");
 
-    // attention 参数 (12 blocks × 6 LinearLayer × 6 组)
-    // extra = FullBlock (索引 0..3), main = IterBlock (索引 4..11)
-    const std::string iter_block_name[12] = {
-        "extra.0", "extra.1", "extra.2", "extra.3",
-        "main.0",  "main.1",  "main.2",  "main.3",
-        "main.4",  "main.5",  "main.6",  "main.7",
-    };
+    // attention 参数 (n_iter blocks × 6 LinearLayer × 6 组)
+    // extra = FullBlock (索引 0..n_extra-1), main = IterBlock (索引 n_extra..)
+    // block 数用 config（支持环境变量覆盖），名字动态生成。
+    const int c_n_extra  = config_.n_extra_blocks;
+    const int c_n_main   = config_.n_main_blocks;
+    const int c_n_iter   = c_n_extra + c_n_main;
 
-    for (int i = 0; i < N_ITER; ++i) {
-        const std::string& b = iter_block_name[i];
-        // 注意：extra blocks (i<4, FullBlock) 用 D_MSA_FULL=64 专属 MSA 行注意力/ff 权重
-        const bool is_full = (i < N_EXTRA_BLOCKS);
+    for (int i = 0; i < c_n_iter; ++i) {
+        const std::string b = (i < c_n_extra ? "extra." + std::to_string(i)
+                                             : "main." + std::to_string(i - c_n_extra));
+        // 注意：extra blocks (FullBlock) 用 D_MSA_FULL=64 专属 MSA 行注意力/ff 权重
+        const bool is_full = (i < c_n_extra);
         collect_linear(is_full ? full_msa_row_Wq_[i]     : msa_row_Wq_[i],     b + ".attention.msa_row.Wq");
         collect_linear(is_full ? full_msa_row_Wk_[i]     : msa_row_Wk_[i],     b + ".attention.msa_row.Wk");
         collect_linear(is_full ? full_msa_row_Wv_[i]     : msa_row_Wv_[i],     b + ".attention.msa_row.Wv");
@@ -3152,9 +3222,9 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
         collect_linear(iter_pair2pair_gate_proj_[i], b + ".pair2pair_gate_proj");
     }
 
-    // MSAGlobalColAttention 参数 (FullBlock only, N_GLOB=4) — D_MSA_FULL=64 维
-    for (int i = 0; i < N_GLOB; ++i) {
-        const std::string& b = iter_block_name[i];  // extra.{0..3}
+    // MSAGlobalColAttention 参数 (FullBlock only, n_extra) — D_MSA_FULL=64 维
+    for (int i = 0; i < c_n_extra; ++i) {
+        const std::string b = "extra." + std::to_string(i);
         collect_linear(full_msa_global_col_Wq_[i], b + ".attention.global_col.Wq");
         collect_linear(full_msa_global_col_Wk_[i], b + ".attention.global_col.Wk");
         collect_linear(full_msa_global_col_Wv_[i], b + ".attention.global_col.Wv");
@@ -3163,14 +3233,15 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
         collect_linear(full_msa_global_col_to_out_[i], b + ".attention.global_col.to_out");
     }
 
-    // PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer, 12 组)
-    for (int i = 0; i < N_ITER; ++i) {
-        const std::string& b = iter_block_name[i];
+    // PositionalEncoding 参数 (每 block 2 个 EmbeddingLayer, n_iter 组)
+    for (int i = 0; i < c_n_iter; ++i) {
+        const std::string b = (i < c_n_extra ? "extra." + std::to_string(i)
+                                             : "main." + std::to_string(i - c_n_extra));
         collect_embedding(pos_enc_emb_res_[i], b + ".pos_enc_emb_res");
         collect_embedding(pos_enc_emb_atom_[i], b + ".pos_enc_emb_atom");
     }
 
-    // RefineBlock 参数 (N_REFINE_BLOCKS=4)
+    // RefineBlock 参数 (n_refine_blocks)
     for (int i = 0; i < (int)refine_norm_msa_.size(); ++i) {
         const std::string b = "refine." + std::to_string(i);
         collect_layernorm(refine_norm_msa_[i], b + ".norm_msa");

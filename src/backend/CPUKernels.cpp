@@ -265,10 +265,47 @@ Status CPUBackend::dispatch_body(TensorF32* node, ComputeParams* p) {
     return p->threadpool->ec;
 }
 
-// ===== 统一入口：运行时开关 PPML_CPU_BUFFER_AWARE=1 时容忍 device 输入 =====
+// ===== 统一入口：CPU 节点遇到 device(即 GPU) 输入时自动暂存为 host =====
+// 不再依赖 PPML_CPU_BUFFER_AWARE 开关：只要检测到本 node 有 device 输入就走
+// buffer-aware 暂存路径；否则走原纯 CPU 路径（行为完全不变，无额外开销）。
+// 这是混合训练(CPU+GPU)的兜底——scheduler 跨后端拷贝缺口导致 CPU kernel 直接
+// 读到 GPU device 指针 → SIGSEGV，此处保证任何 device 输入都先 D2H 暂存。
+static bool node_has_device_input(TensorF32* node) {
+    for (int s = 0; s < GGML_MAX_SRC; s++) {
+        TensorF32* src = node->src[s];
+        if (!src) continue;
+        // 确定性判定：只看 buffer_（device tensor 必有 buffer_ 且非 host）。避免用 is_device_pointer
+        // 的 cudaMemcpy 探测——多线程并发探测结果可能不一致，导致同一 node 部分线程走 buffer-aware、
+        // 部分走纯 CPU → dispatch 路径/barrier 计数不匹配 → 崩溃（PPML_N_THREADS=1 不崩、多线程崩）。
+        if (src->buffer_ && !src->buffer_->is_host()) return true;
+    }
+    return false;
+}
+
 Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
-    if (!cpu_buffer_aware_enabled()) {
-        return dispatch_body(node, p);   // 默认：纯 CPU，行为不变
+    // 崩溃定位（GRAPH_DEBUG_DISPATCH=1，线程 0）：打印每个待调度节点的序号/op/src 指针，
+    // 在进入任何 kernel 前。崩溃前最后一行 = 即将执行的故障节点（无论哪种 kernel）。
+    // 线程 0 与 worker 带 barrier 逐节点同步，故线程 0 会先打印再进入 kernel。
+    if (getenv("GRAPH_DEBUG_DISPATCH") && p->ith == 0) {
+        fprintf(stderr,
+                "[DISP] node=%p op=%d | src0{op=%d data=%p buf=%p} src1{op=%d data=%p buf=%p}"
+                " dst{op=%d data=%p buf=%p}\n",
+                (void*)node, (int)node->op,
+                (node->src[0] ? (int)node->src[0]->op : -1),
+                (node->src[0] ? (void*)node->src[0]->data() : nullptr),
+                (node->src[0] ? (void*)node->src[0]->buffer_ : nullptr),
+                (node->src[1] ? (int)node->src[1]->op : -1),
+                (node->src[1] ? (void*)node->src[1]->data() : nullptr),
+                (node->src[1] ? (void*)node->src[1]->buffer_ : nullptr),
+                (int)node->op, (void*)node->data(), (void*)node->buffer_);
+    }
+
+    // 默认纯 CPU 路径：本 node 无 device 输入时直接执行，行为与旧版完全一致。
+    // 有 device 输入（混合训练跨后端缺口）时走 buffer-aware 暂存，避免段错误。
+    // 注：view src 的 data() 解析已移到 CPUBackend::graph_compute 提交前（单线程），避免多线程
+    // 写共享 src->data()/buffer_ 的竞态（崩溃位置漂移）。
+    if (!cpu_buffer_aware_enabled() && !node_has_device_input(node)) {
+        return dispatch_body(node, p);
     }
 
     // ---- buffer-aware：暂存 device 输入为 host，跑 kernel，恢复 ----
@@ -300,6 +337,29 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
 
 // ===== elemwise =====
 void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
+    // 混训崩溃定位：elemwise 裸读 src/dst。若 src[0]/src[1] 为 null，或指针指向 device/悬垂，
+    // 这里解引用即 SIGSEGV。必须先把 src 判空再解引用，否则诊断自身先在 src[0]->data() 崩掉。
+    // 所有线程带 barrier 逐 node 同步 → 线程 0 也处理崩溃节点，在解引用前打印 → 最后一个
+    // [ELEM-PTR] 行就是故障节点。GRAPH_DEBUG_ELEM=1 时线程 0 对每个 elemwise 节点打印。
+    if (getenv("GRAPH_DEBUG_ELEM") && p->ith == 0) {
+        TensorF32* s0 = node->src[0];
+        TensorF32* s1 = node->src[1];
+        fprintf(stderr,
+                "[ELEM-PTR] op=%d n=%lld src0=%s src1=%s | src0{op=%d buf=%p host=%d data=%p flag=%d}"
+                " src1{op=%d buf=%p host=%d data=%p flag=%d} dst{op=%d buf=%p host=%d data=%p flag=%d}\n",
+                (int)node->op, (long long)node->numel(),
+                s0 ? "ok" : "NULL", s1 ? "ok" : "NULL",
+                s0 ? (int)s0->op : -1, s0 ? (void*)s0->buffer_ : nullptr,
+                (s0 && s0->buffer_ ? (int)s0->buffer_->is_host() : -1),
+                s0 ? (void*)s0->data() : nullptr, s0 ? (int)s0->flag : -1,
+                s1 ? (int)s1->op : -1, s1 ? (void*)s1->buffer_ : nullptr,
+                (s1 && s1->buffer_ ? (int)s1->buffer_->is_host() : -1),
+                s1 ? (void*)s1->data() : nullptr, s1 ? (int)s1->flag : -1,
+                (int)node->op, (void*)(node->buffer_),
+                (node->buffer_ ? (int)node->buffer_->is_host() : -1),
+                (void*)node->data(), (int)node->flag);
+    }
+
     const float * a = node->src[0]->data();
     const float * b = node->src[1]->data();
     float * d = node->data();
@@ -365,6 +425,30 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
     const float * a = node->src[0]->data();
     const float * b = node->src[1]->data();
     float * d = node->data();
+    // 混训崩溃定位：mul_mat 裸读 src/dst 指针，若参数被搬到 device/悬垂/null，这里解引用即 SIGSEGV。
+    // 打印 src 的 data()/buffer_/is_host/flag，区分"参数被 device 化"vs"buffer 复用悬垂"vs"null"。
+    if (!a || !b || !d) {
+        if (p->ith == 0) {
+            fprintf(stderr,
+                    "[MULMAT-NULL] M=%d N=%d K=%d a=%p b=%p d=%p | src0{op=%d buf=%p host=%d data=%p flag=%d}"
+                    " src1{op=%d buf=%p host=%d data=%p flag=%d} dst{op=%d buf=%p host=%d data=%p flag=%d}\n",
+                    M, N, K, (const void*)a, (const void*)b, (const void*)d,
+                    (int)node->src[0]->op, (void*)(node->src[0]->buffer_),
+                    (node->src[0]->buffer_ ? (int)node->src[0]->buffer_->is_host() : -1),
+                    (void*)node->src[0]->data(), (int)node->src[0]->flag,
+                    (int)node->src[1]->op, (void*)(node->src[1]->buffer_),
+                    (node->src[1]->buffer_ ? (int)node->src[1]->buffer_->is_host() : -1),
+                    (void*)node->src[1]->data(), (int)node->src[1]->flag,
+                    (int)node->op, (void*)(node->buffer_),
+                    (node->buffer_ ? (int)node->buffer_->is_host() : -1),
+                    (void*)node->data(), (int)node->flag);
+            fprintf(stderr, "[MULMAT-NULL] aborting mul_mat node to avoid SIGSEGV\n");
+        }
+        // ⚠️ 所有线程必须一致 return：kernel 内部有 barrier（GPU/CPU 路径各 2 次），若只线程 0
+        // return 而 worker 继续走 barrier → barrier 次数不匹配 → 线程失步 → 后续 kernel_elemwise 崩。
+        // 所有线程都 return → 每线程跳过的 barrier 次数一致 → 同步不破坏。
+        return;
+    }
     if (getenv("GRAPH_DEBUG_MULMAT") && (int64_t)M * N * K > 200000000LL && p->ith == 0) {
         std::fprintf(stderr, "[MULMAT-BIG] M=%d N=%d K=%d ops=%lld a={%lld,%lld,%lld,%lld} b={%lld,%lld,%lld,%lld} d={%lld,%lld,%lld,%lld}\n",
             M, N, K, (long long)((int64_t)M * N * K),
@@ -1211,6 +1295,18 @@ void CPUBackend::kernel_dup(TensorF32 * node) {
 // 方案 B 下 Tensor 无 nb[]，这些 shape op 不能像 ggml 那样共享 data 指针。
 void CPUBackend::kernel_cpy(TensorF32 * node, ComputeParams * p) {
     if (p->ith != 0) {
+        p->threadpool->barrier_wait();
+        return;
+    }
+    // 零拷贝 view：view 共享源数据（view_src 已置），不拷贝、不写独立 buffer。
+    // 直接把 node 的 data()/buffer_/buffer_offs_ 解析为 src0 的（源已计算时 data 有效）。
+    if (node->op == OP_VIEW) {
+        TensorF32* src_t = node->src[0];
+        if (src_t && src_t->data()) {
+            node->bind_data(src_t->data());
+            node->buffer_      = src_t->buffer_;
+            node->buffer_offs_ = src_t->buffer_offs_;
+        }
         p->threadpool->barrier_wait();
         return;
     }

@@ -240,6 +240,7 @@ int main(int argc, char* argv[]) {
 
     // 2. 创建模型
     //    block 数固定为开发模式正常值：extra=4, main=8, refine=4。
+    //    可用 PPML_N_EXTRA/PPML_N_MAIN/PPML_N_REFINE 环境变量覆盖（降低 block 数可大幅降低 backward 全图峰值内存，避免 OOM）。
     PPMLConfig config;
     config.d_msa = 256;
     config.d_pair = 128;
@@ -247,6 +248,9 @@ int main(int argc, char* argv[]) {
     config.n_extra_blocks  = 4;
     config.n_main_blocks   = 8;
     config.n_refine_blocks = 4;
+    if (const char* pe = std::getenv("PPML_N_EXTRA"))  { int v=std::atoi(pe); if(v>0) config.n_extra_blocks=v; }
+    if (const char* pm = std::getenv("PPML_N_MAIN"))   { int v=std::atoi(pm); if(v>0) config.n_main_blocks=v; }
+    if (const char* pr = std::getenv("PPML_N_REFINE")) { int v=std::atoi(pr); if(v>0) config.n_refine_blocks=v; }
     std::cout << "[config] blocks: extra=" << config.n_extra_blocks
               << " main=" << config.n_main_blocks
               << " refine=" << config.n_refine_blocks << std::endl;
@@ -303,7 +307,12 @@ int main(int argc, char* argv[]) {
     //       N=512 时 softmax 408MB / unary 204MB, 峰值 ~18GB 超 WSL 15GB;
     //       N=128 时 softmax ~25MB / unary ~51MB, 峰值可降到 ~5GB 内跑通训练。
     //   FULL_TRAIN=true 时改回 N=512。
-    const int msa_max_seqs = (full_train ? 512 : 128);
+    //   可用 PPML_MSA_DEPTH 环境变量覆盖（含 dev 模式），用于降低峰值内存（如带 backward 时 OOM，N 128→64）。
+    int msa_max_seqs = (full_train ? 512 : 128);
+    if (const char* pmd = std::getenv("PPML_MSA_DEPTH")) {
+        int v = std::atoi(pmd);
+        if (v > 0) msa_max_seqs = v;
+    }
     PPMLDataLoader loader("", "", msa_max_seqs, 4, 2048);
     std::cout << "[config] MSA depth N=" << msa_max_seqs
               << " (FULL_TRAIN=" << (full_train ? "true" : "false") << ")" << std::endl;
@@ -678,9 +687,12 @@ int main(int argc, char* argv[]) {
             } else {
                 compute_st = Status::ALLOC_FAILED;
             }
-            if (compute_st == Status::ALLOC_FAILED) {
-                // 显存不足/分配失败 → 回退到单后端 CPU 全图计算（保证训练不中断）
-                std::cerr << "[WARN] CUDA scheduler alloc failed; "
+            if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED) {
+                // 显存不足/分配失败/节点含 host 指针（GPU kernel 无法执行）→
+                // 回退到单后端 CPU 全图计算（保证训练不中断）。CPU kernel 对 device 输入
+                // 有 stage_device_src 兜底（D2H 暂存），不会裸读 device 指针。
+                std::cerr << "[WARN] CUDA scheduler compute failed (status="
+                          << static_cast<int>(compute_st) << "); "
                           << "falling back to CPU single-backend compute." << std::endl;
                 compute_st = backend->graph_compute(cgraph);
             }
@@ -691,6 +703,21 @@ int main(int argc, char* argv[]) {
             std::cout << "[WARN] graph_compute status=" << static_cast<int>(compute_st)
                       << " (0=SUCCESS 1=ALLOC_FAILED)" << std::endl;
         }
+
+        // ---- 读取 total loss ----
+        // total_node 在混合调度 gallocr 下 buffer 可能被别名/覆盖（读出 1.00/0.00 而非真实 ~30），
+        // 故不用 total_node->data()，改为用 5 个 loss 分量（分量在 GRAPH_DEBUG_LOSS 里读对过，
+        // 加权和=真实 total）经 read_tensor_cpu 可靠读取加权求和。每个分量标量 numel==1。
+        auto read_scalar = [&](TensorF32* n) -> float {
+            if (!n || n->numel() != 1) return 0.0f;
+            std::vector<float> tv = read_tensor_cpu(n);
+            return tv.empty() ? 0.0f : tv[0];
+        };
+        float batch_loss = 0.5f * read_scalar(loss_fape_node)
+                         + 0.5f * read_scalar(loss_chi_node)
+                         + 0.3f * read_scalar(loss_distogram_node)
+                         + 2.0f * read_scalar(loss_msa_node)
+                         + 0.01f * read_scalar(loss_conf_node);
 
         // ---- 开发诊断：pred_coords 值 + 是否被 gallocr buffer 复用覆盖 ----
         if (getenv("GRAPH_DEBUG_GALLOCR") && pred_node) {
@@ -853,15 +880,8 @@ int main(int argc, char* argv[]) {
         }
         optimizer.step(cgraph);                            // 更新权重 (decoupled weight decay)
 
-        // 读取 total loss 数值 (graph_compute 后才有值)
-        // 用 read_tensor_cpu 走 buffer_->get_tensor，CUDA 上也会同步 D2H，保证读到 host 标量。
-        float batch_loss = 0.0f;
-        if (total_node->numel() == 1 && (total_node->data() != nullptr || total_node->buffer_)) {
-            std::vector<float> tv = read_tensor_cpu(total_node);
-            if (!tv.empty()) batch_loss = tv[0];
-        }
-
         // 开发诊断：打印各损失分量（定位 loss=0 根因）
+        // batch_loss 已在 graph_compute 后读取（见上），此处只打印分量。
         if (getenv("GRAPH_DEBUG_LOSS")) {
             auto print_loss = [](const char* name, TensorF32* n) {
                 if (n && n->data() && n->numel() == 1)

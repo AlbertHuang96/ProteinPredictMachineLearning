@@ -581,6 +581,7 @@ private:
 
     // Distogram head: 从 pair 特征投影 4 组 logits (D/Ω/Θ/Φ)
     // 输出 distogram (B,L,L,60), omega (B,L,L,36), theta (B,L,L,36), phi (B,L,L,18)
+    LayerNorm*   distogram_pair_ln_ = nullptr;  // D_PAIR (128) LayerNorm(pair)，投影前归一化（防 logits 巨大→softmax 退化）
     LinearLayer* distogram_d_head_ = nullptr;  // D_PAIR → 60 (距离 bins)
     LinearLayer* distogram_o_head_ = nullptr;  // D_PAIR → 36 (Ω bins)
     LinearLayer* distogram_t_head_ = nullptr;  // D_PAIR → 36 (Θ bins)

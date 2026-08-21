@@ -122,14 +122,31 @@ void Gallocr::compute_refcounts(
     }
 
     // 统计 refcount：遍历 nodes，对每个 src 若为 managed 则 +1
+    // view 特例：view 共享底层数据，view 本身非 managed（无独立 buffer）。
+    //  - view 节点的 src（底层）不计数：view 不"消费/释放"底层，是共享。
+    //  - 消费者引用 view 时：同时给 view 与其底层计数，保证底层在 view 的消费者间存活。
     for (int i = 0; i < graph->n_nodes(); i++) {
         TensorF32* node = graph->graph_node(i);
+        if (node->view_src) continue;  // view 节点：不把底层当作被消费计数
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             TensorF32* src = node->src[s];
             if (!src) continue;
             auto it = node_map_.find(src);
-            if (it == node_map_.end() || !it->second->managed) continue;
-            it->second->n_children++;
+            if (it == node_map_.end()) continue;
+            NodeInfo* sni = it->second;
+            if (src->view_src) {
+                // src 是 view：消费者依赖 view 及 view 的底层数据
+                sni->n_children++;  // view 本身（非 managed，仅跟踪释放时序）
+                TensorF32* under = src->src[0];
+                if (under) {
+                    auto uit = node_map_.find(under);
+                    if (uit != node_map_.end() && uit->second->managed) {
+                        uit->second->n_children++;  // 底层在 view 的消费者间存活
+                    }
+                }
+            } else if (sni->managed) {
+                sni->n_children++;
+            }
         }
     }
 }
@@ -255,8 +272,15 @@ bool Gallocr::reserve(
     }
 
     // 4. 遍历 nodes（拓扑序）：分配当前节点，释放已无依赖的 src
+    //    诊断：跟踪 nbytes 最大的张量（定位异常超大 buffer，如 backward 节点 shape bug）
+    long max_node_idx = -1; size_t max_node_bytes = 0; int max_node_op = -1;
     for (auto& ni : nodes_) {
         TensorF32* node = ni.tensor;
+        if (node && node->nbytes() > max_node_bytes) {
+            max_node_bytes = node->nbytes();
+            max_node_idx   = &ni - &nodes_[0];
+            max_node_op    = (int)node->op;
+        }
         // 先分配本节点
         if (ni.managed && !allocate_node(&ni)) {
             if (getenv("GRAPH_DEBUG_GALLOCR")) {
@@ -267,13 +291,27 @@ bool Gallocr::reserve(
         }
 
         // 释放 src：该节点被消费后，其依赖的 src 引用计数减一
+        if (node->view_src) continue;  // view 节点不分配也不释放底层（共享，随消费者释放）
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             TensorF32* src = node->src[s];
             if (!src) continue;
             auto it = node_map_.find(src);
-            if (it == node_map_.end() || !it->second->managed) continue;
+            if (it == node_map_.end()) continue;
             NodeInfo* sni = it->second;
-            if (--sni->n_children <= 0) {
+            if (src->view_src) {
+                // src 是 view：view 被消费，view 引用减一；到底层也减一（底层随 view 消费者释放）
+                if (--sni->n_children <= 0) {
+                    free_node(sni);  // view 非 managed，free_node 应跳过实际释放
+                    TensorF32* under = src->src[0];
+                    if (under) {
+                        auto uit = node_map_.find(under);
+                        if (uit != node_map_.end() && uit->second->managed &&
+                            --uit->second->n_children <= 0) {
+                            free_node(uit->second);
+                        }
+                    }
+                }
+            } else if (sni->managed && --sni->n_children <= 0) {
                 free_node(sni);
             }
         }
@@ -285,6 +323,32 @@ bool Gallocr::reserve(
             fprintf(stderr, "[gallocr] reserve done: backend=%d peak=%zu bytes (%.2f GB)\n",
                     (int)(&ba - &backends_[0]), ba.peak, ba.peak / (1024.0 * 1024.0 * 1024.0));
         }
+        // 诊断：打印 nbytes 最大的张量（定位异常超大 buffer 的来源 op）
+        fprintf(stderr, "[gallocr] max tensor: node_idx=%ld n_bytes=%zu (%.2f GB) op=%d dims=[",
+                max_node_idx, max_node_bytes, max_node_bytes / (1024.0 * 1024.0 * 1024.0), max_node_op);
+        if (max_node_idx >= 0 && max_node_idx < (long)nodes_.size()) {
+            TensorF32* mt = nodes_[max_node_idx].tensor;
+            if (mt) {
+                for (int d = 0; d < mt->shape().ndim(); ++d)
+                    fprintf(stderr, "%s%lld", (d?",":""), (long long)mt->shape().dims[d]);
+                fprintf(stderr, "]");
+                auto pr = [](TensorF32* t) {
+                    if (!t) { fprintf(stderr, "null"); return; }
+                    fprintf(stderr, "[op=%d d=", (int)t->op);
+                    for (int d = 0; d < t->shape().ndim(); ++d)
+                        fprintf(stderr, "%s%lld", (d?",":""), (long long)t->shape().dims[d]);
+                    fprintf(stderr, "]");
+                };
+                fprintf(stderr, " src0="); pr(mt->src[0]);
+                fprintf(stderr, " src1="); pr(mt->src[1]);
+                // 若 src0 是 ADD（op=2），打印其输入，定位 [332928,1] 的来源
+                if (mt->src[0] && mt->src[0]->op == OP_ADD) {
+                    fprintf(stderr, " src0_src0="); pr(mt->src[0]->src[0]);
+                    fprintf(stderr, " src0_src1="); pr(mt->src[0]->src[1]);
+                }
+            }
+        }
+        fprintf(stderr, "\n");
     }
     for (auto& ba : backends_) {
         ba.use = ba.peak > 0;
@@ -367,13 +431,27 @@ bool Gallocr::alloc(
         }
         if (ni.managed) bind_tensor(&ni);
 
+        // 释放 src：该节点被消费后，其依赖的 src 引用计数减一（view 特例同 reserve）
+        if (node->view_src) continue;  // view 节点不分配也不释放底层（共享，随消费者释放）
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             TensorF32* src = node->src[s];
             if (!src) continue;
             auto it = node_map_.find(src);
-            if (it == node_map_.end() || !it->second->managed) continue;
+            if (it == node_map_.end()) continue;
             NodeInfo* sni = it->second;
-            if (--sni->n_children <= 0) {
+            if (src->view_src) {
+                if (--sni->n_children <= 0) {
+                    free_node(sni);  // view 非 managed，free_node 应跳过实际释放
+                    TensorF32* under = src->src[0];
+                    if (under) {
+                        auto uit = node_map_.find(under);
+                        if (uit != node_map_.end() && uit->second->managed &&
+                            --uit->second->n_children <= 0) {
+                            free_node(uit->second);
+                        }
+                    }
+                }
+            } else if (sni->managed && --sni->n_children <= 0) {
                 free_node(sni);
             }
         }

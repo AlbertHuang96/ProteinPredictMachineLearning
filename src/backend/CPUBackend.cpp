@@ -118,6 +118,12 @@ bool CPUBackend::supports_op(TensorF32* node) const {
 // ===== graph_plan (公有，可外部调用预估算) =====
 ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
     ComputePlan plan;
+    // ⚠️ n_threads 必须恒等于 n_threads_（实际参与线程数 = 主线程 + 全部 worker）。
+    // 线程池 submit 设 n_threads_cur = plan.n_threads，barrier 期待该数量的线程参与；
+    // 但 worker_loop 会在【全部】n_threads_-1 个 worker 上跑 compute_thread，主线程也参与，
+    // 共 n_threads_ 个线程调 barrier。若 plan.n_threads < n_threads_（例如 max_tasks 较小），
+    // barrier 期待 n_threads 个线程但实际有 n_threads_ 个线程调用 → 计数错 → 线程失步 →
+    // 后续 kernel_elemwise 读被改 buffer 崩（单线程不崩、多线程崩）。故必须恒为 n_threads_。
     plan.n_threads  = n_threads_;
     plan.threadpool = threadpool_;
     plan.work_size  = 0;
@@ -131,7 +137,6 @@ ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
         size_t cur = estimate_work_size(node, n_threads_);
         plan.work_size = std::max(plan.work_size, cur);
     }
-    plan.n_threads = std::min(max_tasks, n_threads_);
     if (plan.work_size > 0)
         plan.work_size += CACHE_LINE_SIZE * n_threads_;
 
@@ -176,7 +181,31 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
         }
     }
 
+    // ---- 提交前单线程解析所有 view src ----
+    // view（view_src 共享源数据）作为别的 op 的 src 时 data() 为 null（kernel_cpy 只在 view 自身
+    // 被 dispatch 时解析）。若在 dispatch_node 里多线程解析，会写共享 src->data()/buffer_ 造成竞态
+    // （崩溃位置漂移）。这里由主线程在提交线程池前一次性解析，消除竞态。
+    for (int i = 0; i < cgraph->n_nodes(); ++i) {
+        TensorF32* node = cgraph->graph_node(i);
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            TensorF32* src = node->src[s];
+            if (!src || !src->view_src) continue;
+            TensorF32* base = src;
+            int guard = 0;
+            while (base->view_src && guard++ < 64) base = base->view_src;
+            if (base->data()) {
+                src->bind_data(base->data());
+                src->buffer_      = base->buffer_;
+                src->buffer_offs_ = base->buffer_offs_;
+            }
+        }
+    }
+
     ComputePlan plan = graph_plan(cgraph);
+
+    // ⚠️ 不再强制 skip_alloc_ 时 plan.n_threads=1：那会破坏"n_threads 必须等于实际参与线程数
+    // n_threads_"的不变量（见 graph_plan）。graph_plan 现在恒返回 n_threads_（全部线程参与），
+    // 多线程 barrier 计数一致，正确。
 
     if (work_size_ < plan.work_size) {
         delete[] work_data_;
