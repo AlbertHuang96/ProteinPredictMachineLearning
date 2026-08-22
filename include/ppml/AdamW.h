@@ -47,6 +47,7 @@ private:
     struct ParamState {
         TensorF32*         param;
         bool               no_weight_decay;
+        float              se3_lr_scale = 1.0f;  // SE3 参数分层 lr 缩放（TENSOR_FLAG_SE3 时 0.1）
         std::vector<float> m;   // 一阶矩
         std::vector<float> v;   // 二阶矩
     };

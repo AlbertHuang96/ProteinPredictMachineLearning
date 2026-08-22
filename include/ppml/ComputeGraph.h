@@ -79,6 +79,11 @@ public:
     TensorF32 ** graph_nodes();
     TensorF32 * graph_get_grad(const TensorF32 * node);
 
+    // backward 梯度节点访问（gallocr liveness 修复用）：
+    // grads[i] 存前向节点 i 的梯度（可能为 null）；数组大小为 visited_hash_set.size。
+    TensorF32 ** graph_grads() { return grads; }
+    int          graph_grad_slots() { return static_cast<int>(visited_hash_set.size); }
+
     void build_forward_expand(TensorF32 * tensor);
     void build_backward_expand(
         struct PPMLContext *  ctx,

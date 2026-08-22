@@ -44,11 +44,13 @@ static void cuda_copy(void* dst, const void* src, size_t size, cudaMemcpyKind ki
 template<typename T>
 Tensor<T>::Tensor(const Shape& shape, Device device) 
     : shape_(shape), device_(device), own_data_(true) {
-    // ⚠️ 必须初始化 op/flag/src：Tensor() 默认构造不初始化这些成员，
+    //  必须初始化 op/flag/src：Tensor() 默认构造不初始化这些成员，
     //    若用普通构造（如 RadialFunc 的 BN 参数 new TensorF32(Shape,Device)）
     //    再进图，op 读到垃圾（32653）→ dispatch_body 无 case → NOT_SUPPORTED。
     op = OP_NONE;
     flag = 0;
+    type = TENSOR_TYPE_F32;   //  必须初始化：值构造（如 RadialFunc BN 参数）也进图作 src，
+                              //    type 垃圾值 → build_backward_expand 断言失败。
     src.fill(nullptr);
     for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = 0;
     allocate();
@@ -59,6 +61,7 @@ Tensor<T>::Tensor(const Shape& shape, T* data, Device device, bool own)
     : shape_(shape), data_(data), device_(device), own_data_(own) {
     op = OP_NONE;
     flag = 0;
+    type = TENSOR_TYPE_F32;
     src.fill(nullptr);
     for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = 0;
 }
@@ -74,6 +77,11 @@ Tensor<T>::Tensor(Tensor&& other) noexcept
       data_(other.data_),
       device_(other.device_),
       own_data_(other.own_data_) {
+    op       = other.op;
+    flag     = other.flag;
+    type     = other.type;
+    src      = other.src;
+    for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = other.op_params[i];
     other.data_ = nullptr;
     other.own_data_ = false;
 }
@@ -86,6 +94,11 @@ Tensor<T>& Tensor<T>::operator=(Tensor&& other) noexcept {
         data_ = other.data_;
         device_ = other.device_;
         own_data_ = other.own_data_;
+        op       = other.op;
+        flag     = other.flag;
+        type     = other.type;
+        src      = other.src;
+        for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = other.op_params[i];
         other.data_ = nullptr;
         other.own_data_ = false;
     }
@@ -156,6 +169,12 @@ void Tensor<T>::zero_() {
 template<typename T>
 void Tensor<T>::copy_from(const Tensor& other) {
     if (shape_.numel() != other.shape_.numel()) {
+        // [COPY-FAIL] 诊断：打印新旧 shape 与 numel，定位值版 forward 的 copy 错配
+        fprintf(stderr, "[COPY-FAIL] dst numel=%lld src numel=%lld | dst=(", (long long)shape_.numel(), (long long)other.shape_.numel());
+        for (int i = 0; i < shape_.ndim(); ++i) fprintf(stderr, "%lld%s", (long long)shape_.dims[i], i + 1 < shape_.ndim() ? "," : "");
+        fprintf(stderr, ") src=(");
+        for (int i = 0; i < other.shape_.ndim(); ++i) fprintf(stderr, "%lld%s", (long long)other.shape_.dims[i], i + 1 < other.shape_.ndim() ? "," : "");
+        fprintf(stderr, ")\n");
         throw PPMLError("Tensor shape mismatch in copy");
     }
     
@@ -176,6 +195,12 @@ void Tensor<T>::copy_from(const Tensor& other) {
 template<typename T>
 Tensor<T> Tensor<T>::view(const Shape& new_shape) const {
     if (new_shape.numel() != shape_.numel()) {
+        // [VIEW-FAIL] 诊断：打印新旧 shape 与 numel，定位值版 forward 的 view 错配
+        fprintf(stderr, "[VIEW-FAIL] old numel=%lld new numel=%lld | old=(", (long long)shape_.numel(), (long long)new_shape.numel());
+        for (int i = 0; i < shape_.ndim(); ++i) fprintf(stderr, "%lld%s", (long long)shape_.dims[i], i + 1 < shape_.ndim() ? "," : "");
+        fprintf(stderr, ") new=(");
+        for (int i = 0; i < new_shape.ndim(); ++i) fprintf(stderr, "%lld%s", (long long)new_shape.dims[i], i + 1 < new_shape.ndim() ? "," : "");
+        fprintf(stderr, ")\n");
         throw PPMLError("View shape size mismatch");
     }
     return Tensor<T>(new_shape, data_, device_, false);  // 不拥有数据
@@ -253,7 +278,7 @@ Tensor<T> Tensor<T>::unsqueeze(int dim) const {
     }
     
     // 返回深拷贝（own_data_=true）：
-    // ⚠️ 旧实现返回 view（own_data_=false）会触发 use-after-free：
+    //  旧实现返回 view（own_data_=false）会触发 use-after-free：
     //    `input.X = input.X.unsqueeze(0)` 自引用 move 时，move 赋值 deallocate() 释放原 data，
     //    而 view 仍指向该已释放内存 → 悬垂（ASAN: heap-use-after-free，DataLoader.cpp:2300/2302/2310）。
     //    故改为深拷贝，使 move 赋值接管的是独立内存，无共享、无悬垂。
@@ -307,73 +332,42 @@ Tensor<T> Tensor<T>::permute(const std::vector<int>& dims) const {
     }
     
     // 遍历新张量的每个元素，计算在旧张量中的位置
+    //  旧 4D 特化分支索引映射错误（old_idx[j] = new_idx[dims[j]] 反了，正确为
+    //    old_idx[dims[j]] = new_idx[j]），对 {0,3,1,2} 等 permutation 越界读。
+    //    统一用通用正确实现（最多支持6维）。
     const T* src = data_;
     T* dst = result.data();
     int64_t total = new_shape.numel();
     
-    // 使用递归或迭代方式填充数据
-    // 这里使用简单的N维循环（最多支持6维）
-    if (shape_.ndim() == 4) {
-        // 常见情况：4D张量 (B, H, L, L) -> (B, L, H, L)
-        int64_t B = new_shape.dims[0];
-        int64_t D1 = new_shape.dims[1];
-        int64_t D2 = new_shape.dims[2];
-        int64_t D3 = new_shape.dims[3];
-        
-        // 新索引 (nb, n1, n2, n3) -> 旧索引 (ob, o1, o2, o3)
-        // 其中 old_dim = dims[new_dim]
-        for (int64_t nb = 0; nb < B; ++nb) {
-            for (int64_t n1 = 0; n1 < D1; ++n1) {
-                for (int64_t n2 = 0; n2 < D2; ++n2) {
-                    for (int64_t n3 = 0; n3 < D3; ++n3) {
-                        // 计算新索引的线性位置
-                        int64_t new_linear = nb * new_stride[0] + n1 * new_stride[1] + 
-                                            n2 * new_stride[2] + n3 * new_stride[3];
-                        
-                        // 计算对应的旧索引
-                        int64_t ob = (dims[0] == 0) ? nb : (dims[0] == 1) ? n1 : (dims[0] == 2) ? n2 : n3;
-                        int64_t o1 = (dims[1] == 0) ? nb : (dims[1] == 1) ? n1 : (dims[1] == 2) ? n2 : n3;
-                        int64_t o2 = (dims[2] == 0) ? nb : (dims[2] == 1) ? n1 : (dims[2] == 2) ? n2 : n3;
-                        int64_t o3 = (dims[3] == 0) ? nb : (dims[3] == 1) ? n1 : (dims[3] == 2) ? n2 : n3;
-                        
-                        int64_t old_linear = ob * old_stride[0] + o1 * old_stride[1] + 
-                                            o2 * old_stride[2] + o3 * old_stride[3];
-                        
-                        dst[new_linear] = src[old_linear];
-                    }
-                }
-            }
+    // 通用情况：使用迭代方式遍历所有组合
+    std::vector<int64_t> new_indices(shape_.ndim(), 0);
+    std::vector<int64_t> old_indices(shape_.ndim(), 0);
+    
+    // 使用迭代方式遍历所有组合
+    int64_t* new_idx = new_indices.data();
+    int64_t* old_idx = old_indices.data();
+    
+    for (int64_t linear = 0; linear < total; ++linear) {
+        // 计算新索引（行优先线性分解：从最低维用 % dims[d]）
+        //  不能用 tmp / new_stride[d] 从低位分解（错误，会得到超界索引）。
+        int64_t tmp = linear;
+        for (int d = shape_.ndim() - 1; d >= 0; --d) {
+            new_idx[d] = tmp % new_shape.dims[d];
+            tmp /= new_shape.dims[d];
         }
-    } else {
-        // 通用情况：使用递归或栈来遍历
-        std::vector<int64_t> new_indices(shape_.ndim(), 0);
-        std::vector<int64_t> old_indices(shape_.ndim(), 0);
         
-        // 使用迭代方式遍历所有组合
-        int64_t* new_idx = new_indices.data();
-        int64_t* old_idx = old_indices.data();
-        
-        for (int64_t linear = 0; linear < total; ++linear) {
-            // 计算新索引
-            int64_t tmp = linear;
-            for (int d = shape_.ndim() - 1; d >= 0; --d) {
-                new_idx[d] = tmp / new_stride[d];
-                tmp %= new_stride[d];
-            }
-            
-            // 计算旧索引
-            for (int d = 0; d < shape_.ndim(); ++d) {
-                old_idx[dims[d]] = new_idx[d];
-            }
-            
-            // 计算旧线性索引
-            int64_t old_linear = 0;
-            for (int d = 0; d < shape_.ndim(); ++d) {
-                old_linear += old_idx[d] * old_stride[d];
-            }
-            
-            dst[linear] = src[old_linear];
+        // 计算旧索引
+        for (int d = 0; d < shape_.ndim(); ++d) {
+            old_idx[dims[d]] = new_idx[d];
         }
+        
+        // 计算旧线性索引
+        int64_t old_linear = 0;
+        for (int d = 0; d < shape_.ndim(); ++d) {
+            old_linear += old_idx[d] * old_stride[d];
+        }
+        
+        dst[linear] = src[old_linear];
     }
     
     return result;

@@ -151,15 +151,12 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
     if (!skip_alloc_) {
         // 释放上一图分配的 buffer（上一图消费方已在上次 graph_compute 返回后读取完 data()）。
         gallocr_.release();
-        bool need_alloc = false;
-        for (int i = 0; i < cgraph->n_nodes(); ++i) {
-            if (cgraph->graph_node(i)->data() == nullptr) { need_alloc = true; break; }
-        }
-        if (!need_alloc) {
-            for (int i = 0; i < cgraph->n_leafs(); ++i) {
-                if (cgraph->graph_leaf(i)->data() == nullptr) { need_alloc = true; break; }
-            }
-        }
+        // ⚠️ need_alloc 必须恒 true：release() 已释放全部 buffer 并复位快照内节点 data()，
+        //    但跨图共享节点（SE3 的 compute_and_read 独立 cg 与主图共享 backend gallocr_）
+        //    的 data() 可能仍非空且指向已释放 buffer —— 若依赖 data()==nullptr 判定跳过
+        //    重新分配，主图 compute 就会读悬垂指针 → SIGSEGV（[ELEM-PTR] 显示 data 非空仍崩）。
+        //    skip_alloc_=true（scheduler 预分配）时整个分支跳过，不受影响。
+        bool need_alloc = true;
         if (need_alloc) {
             gallocr_.set_n_backends(1);
             gallocr_.backends()[0].buft = CPUBufferType::instance();
@@ -198,6 +195,30 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
                 src->buffer_      = base->buffer_;
                 src->buffer_offs_ = base->buffer_offs_;
             }
+        }
+    }
+
+    // ---- GRAPH_DEBUG_ALLOC=1：提交前扫描未分配的中间节点（data==nullptr），
+    // 定位 [ELEM-NULL]/NaN 源（哪些节点被 gallocr 漏分配，dispatch 时读 null/悬垂）。----
+    if (getenv("GRAPH_DEBUG_ALLOC")) {
+        for (int i = 0; i < cgraph->n_nodes(); ++i) {
+            TensorF32* nd = cgraph->graph_node(i);
+            if (!nd) continue;
+            if (nd->data() != nullptr) continue;
+            const bool viewish = (nd->op == OP_VIEW || nd->op == OP_RESHAPE ||
+                                  nd->op == OP_PERMUTE || nd->op == OP_TRANSPOSE);
+            if (viewish || nd->view_src) continue;
+            fprintf(stderr,
+                    "[NOALLOC] node=%d op=%d numel=%lld ndim=%d flag=0x%x buf=%p view_src=%p"
+                    " src0={op=%d numel=%lld data=%p} src1={op=%d numel=%lld data=%p}\n",
+                    i, (int)nd->op, (long long)nd->numel(), (int)nd->shape().ndim(),
+                    (unsigned)nd->flag, (void*)nd->buffer_, (void*)nd->view_src,
+                    (nd->src[0] ? (int)nd->src[0]->op : -1),
+                    (nd->src[0] ? (long long)nd->src[0]->numel() : -1),
+                    (nd->src[0] ? (void*)nd->src[0]->data() : nullptr),
+                    (nd->src[1] ? (int)nd->src[1]->op : -1),
+                    (nd->src[1] ? (long long)nd->src[1]->numel() : -1),
+                    (nd->src[1] ? (void*)nd->src[1]->data() : nullptr));
         }
     }
 

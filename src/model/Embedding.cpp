@@ -88,7 +88,7 @@ namespace ppml {
 
 
     // 工厂函数：从 context 分配权重
-    LinearLayer* LinearLayer::create(int in_features, int out_features, bool bias) {
+    LinearLayer* LinearLayer::create(int in_features, int out_features, bool bias, bool se3) {
         LinearLayer* layer = new LinearLayer();
         layer->in_features_  = in_features;
         layer->out_features_ = out_features;
@@ -98,11 +98,13 @@ namespace ppml {
         int64_t w_dims[] = {in_features, out_features};  // (in, out)
         layer->weight_ = context().new_param_tensor<float>(2, w_dims);
         layer->weight_->flag = TENSOR_FLAG_PARAM;  // ← 标记为可训练
+        if (se3) layer->weight_->flag |= TENSOR_FLAG_SE3;  // SE3 分层 lr
 
         if (bias) {
             int64_t b_dims[] = {out_features};
             layer->bias_ = context().new_param_tensor<float>(1, b_dims);
             layer->bias_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_NO_WEIGHT_DECAY;  // ← 可训练但不做 weight decay
+            if (se3) layer->bias_->flag |= TENSOR_FLAG_SE3;
         }
 
         // ===== Xavier 初始化 =====
@@ -149,7 +151,12 @@ namespace ppml {
         // output: (..., out_features)
         
         int batch = x.shape().numel() / in_features_;
-        TensorF32 output(Shape({batch, out_features_}), x.device());
+        // ⚠️ 直接按 (..., out_features) 分配并返回**拥有数据**的张量。
+        // 旧实现先分配 (batch,out) 再 return output.view(out_shape)（own_data_=false），
+        // 局部 output 析构释放数据 → 返回悬垂指针（use-after-free，值版 forward 崩溃根因）。
+        auto out_shape = x.shape();
+        out_shape.dims.back() = out_features_;
+        TensorF32 output(out_shape, x.device());
         
         // 简化的矩阵乘法 (实际应使用 cuBLAS)
         for (int b = 0; b < batch; ++b) {
@@ -159,15 +166,12 @@ namespace ppml {
                 for (int i = 0; i < in_features_; ++i) {
                     sum += x.data()[b * in_features_ + i] * weight_->data()[o * in_features_ + i];
                 }
-                // dim of output: (batch, out_features)
+                // dim of output: (..., out_features)，行优先扁平索引与 (batch,out) 一致
                 output.data()[b * out_features_ + o] = sum;
             }
         }
         
-        // 恢复原始形状 (最后维变为 out_features)
-        auto out_shape = x.shape();
-        out_shape.dims.back() = out_features_;
-        return output.view(out_shape);
+        return output;
     }
 
     // weight() / bias() 已在 Embedding.h 中 inline 定义
@@ -282,15 +286,27 @@ namespace ppml {
     //ChemData().NBTYPES represents the number of categorical bond types the model recognizes, 
     //and its value is 8
     TensorF32 BondEmbedding::forward(const TensorF32& bond_feats) {
-        // bond_feats: (B, L, L, d_init)
+        // bond_feats: (B, L, L)（每对残基一个 bond 类型整数）或 (B, L, L, d_init)
         // output: (B, L, L, d_pair)
         int B = bond_feats.shape().dims[0];
         int L = bond_feats.shape().dims[1];
+        const int64_t n = bond_feats.numel();   // 总位置数（B*L*L 或 B*L*L*d_init）
+        const int64_t rows = n / static_cast<int64_t>(L * L);  // 位置数（每行一个 bond 类型）
         
-        TensorF32 output;
-        TensorF32 bond_onehot = one_hot_seq(bond_feats, NBYTES); // (B, L, L, NBYTES)
-        // 旧: output = emb_.forward(one_hot);
-        output = emb_->forward(bond_onehot); // (B, L, L, d_pair)
+        // ⚠️ 值版修复（2026-08-22）：bond_feats 实际是 3D (B,L,L)，不能直接喂 one_hot_seq（期望 2D）。
+        // 扁平化所有位置为 1D，对每个位置做 one-hot (NBYTES)，再 reshape 回 (B,L,L,NBYTES)。
+        TensorF32 flat(Shape({rows * L * L}), bond_feats.device());  // 位置扁平
+        flat.copy_from(bond_feats);   // 前 n 元素即各位置值（若 4D 输入取前 B*L*L 个）
+        TensorF32 bond_onehot(Shape({B, L, L, NBYTES}), bond_feats.device());
+        bond_onehot.zero_();
+        const float* fd = flat.data();
+        float* od = bond_onehot.data();
+        for (int64_t r = 0; r < rows * L * L; ++r) {
+            int idx = static_cast<int>(fd[r]);
+            if (idx < 0 || idx >= NBYTES) idx = 0;  // 防御：越界 bond 类型置 0
+            od[r * NBYTES + idx] = 1.0f;
+        }
+        TensorF32 output = emb_->forward(bond_onehot); // (B, L, L, d_pair)
         
         return output;
     }

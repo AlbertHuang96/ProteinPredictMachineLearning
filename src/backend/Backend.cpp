@@ -745,7 +745,22 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                 backend_map_[node] = best_backend;  // CPU
                 continue;
             }
+            if (getenv("GRAPH_DEBUG_SCHED")) {
+                fprintf(stderr,
+                    "[sched] pass_fill node=%p op=%d n_bk=%d best0=%d bk0=%p v0=%p bk1=%p v1=%p\n",
+                    (void*)node, (int)node->op, n_backends_, best_backend,
+                    (void*)(n_backends_>0?backends_[0]:nullptr),
+                    (n_backends_>0 && backends_[0])?*(void**)backends_[0]:nullptr,
+                    (void*)(n_backends_>1?backends_[1]:nullptr),
+                    (n_backends_>1 && backends_[1])?*(void**)backends_[1]:nullptr);
+            }
             for (int b = 0; b < n_backends_; b++) {
+                if (getenv("GRAPH_DEBUG_SCHED")) {
+                    fprintf(stderr, "[sched]   try b=%d node=%p bk=%p v=%p\n",
+                            b, (void*)node,
+                            (void*)backends_[b],
+                            backends_[b] ? *(void**)backends_[b] : nullptr);
+                }
                 if (backends_[b]->supports_op(node)) {
                     best_backend = b;  // backends_ 已按 priority 降序 → 第一个即最高
                     break;

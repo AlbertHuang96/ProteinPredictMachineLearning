@@ -25,6 +25,8 @@ enum tensor_flag {
     TENSOR_FLAG_CONST   = 64,           // 常量叶子（data 存于 const_data_，由 Gallocr 分配后填充）
     // 注：TENSOR_FLAG_CONST 置位 = 静态可复用常量（Gallocr 填充后保留 const_data_，图可复用）；
     //     不置位 = 动态一次性常量（如 dropout 随机掩码，Gallocr 填充后清空+shrink const_data_）。
+    TENSOR_FLAG_SE3     = 128,          // SE3 等变模块参数：梯度尺度与主图不匹配（offset 直接连坐标，
+    //     FAPE 梯度经 coords→offset→SE3 权重放大），AdamW 对其用分层小 lr（se3_lr_scale，默认 0.1）。
 };
 
 enum tensor_type {
@@ -293,6 +295,8 @@ public:
         //     经 new TensorF32 后 op 未初始化。）
         op        = OP_NONE;
         flag      = 0;
+        type      = TENSOR_TYPE_F32;   // ⚠️ 必须显式初始化：placement new + context 缓冲区复用可能非全零，
+                                       //    否则 type 读到垃圾值（非 F32/F16）→ build_backward_expand 断言失败。
         for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = 0;
     }
 

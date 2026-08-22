@@ -114,6 +114,12 @@ struct GraphOutput {
     TensorF32* msa         = nullptr; // [D_MSA, L, N, B]   最终 block msa 图节点
     TensorF32* pair        = nullptr; // [D_PAIR, L, L, B]  最终 block pair 图节点
     TensorF32* state       = nullptr; // [D_STATE, L, B]    SE3 后 state 图节点
+    // 落地值成员：forward_graph 在 head 之前把 msa/pair/state 图节点一次性落到这些持久值，
+    // 供 go.msa/go.pair/go.state 指针引用。否则 head 的值版 forward 触发 compute 会经 gallocr
+    // 复用释放原图节点 buffer，使 go.* 读到 0/NaN，且图节点 src 悬垂。（见 4.5 段）
+    TensorF32 msa_v;
+    TensorF32 pair_v;
+    TensorF32 state_v;
     TensorF32* msa_logits  = nullptr; // [23, L, N, B]      masked-msa head 图节点
     TensorF32* alpha       = nullptr; // [14, L, B]         chi head 图节点
     TensorF32* lddt        = nullptr; // [50, L, B]         plddt head 图节点
@@ -124,6 +130,10 @@ struct GraphOutput {
 
     // SE3 更新后的骨架坐标（值，图外量；未驱动 SE3 时即输入坐标）
     TensorF32 coords;                  // (B, L, 3, 3)
+    // 【FAPE 梯度回传】SE3 更新后的坐标图节点 [9, B*L]（9=3原子×3坐标, 原子最内）。
+    // 坐标链: wrap(input.coords) → add(mul_mat(T, offset)) 逐 block，FAPE 用此可微节点，
+    // 梯度经 coords→offset→SE3 回传。值 coords 仍供 conf/lddt 计算（compute_lddt_ca 需 host 值）。
+    TensorF32* coords_graph = nullptr; // [9, B*L] 图节点
 };
 
 // 迭代块 (IterBlock)
@@ -214,7 +224,6 @@ public:
     //   表示无有效边图（跳过 SE3）。
     std::vector<TensorF32*> run_se3_structural(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
                                                TensorF32*& state,
-                                               const TensorF32& pair_value,
                                                const TensorF32& coords,
                                                const TensorI64& residx,
                                                const TensorF32& seq1hot);
@@ -370,7 +379,6 @@ public:
     //       图节点（训练入口 graph_compute 后 apply_coord_update 更新坐标）。
     std::vector<TensorF32*> run_se3_structural_refine(TensorF32*& msa, TensorF32*& pair, TensorF32* rbf,
                                                       TensorF32*& state,
-                                                      const TensorF32& pair_value,
                                                       const TensorF32& coords,
                                                       const TensorI64& residx,
                                                       const TensorF32& seq1hot);
@@ -422,8 +430,10 @@ private:
     //bool      has_seq_info_ = false;
 
     // ---- 输出缓存 ----
-    TensorF32 xyz_new_;       // (B, L, 3, 3) 更新后的坐标
-    TensorF32 state_new_;     // (B, L, D_STATE) 更新后的 state
+    // ⚠️ 不再定义独立的 xyz_new_/state_new_：updated_coords() 是非虚函数，
+    //    block->updated_coords()（静态类型 IterBlock*）会调用基类版本返回基类成员。
+    //    派生类若再定义同名成员，RefineBlock::forward 更新派生类成员而读取端拿基类
+    //    成员 → 永远拿到默认空张量（[COPY-FAIL] src=()）。统一复用基类成员。
 
     friend class PPMLModel;  // PPMLModel 直接注入 non-owning pointers
 };
@@ -448,7 +458,11 @@ public:
     //   - SE3 3D track 需"图外值回落"驱动（graph_compute(pair)→run_se3_structural→graph_compute
     //     offset→apply_coord_update），本入口在 block 循环边界以相同方式驱动；
     //   - 输出头图节点只构建不 graph_compute，由调用方（如 train.cpp）对总 loss 图一次性计算。
-    GraphOutput forward_graph(const ModelInput& input, bool enable_se3 = true);
+    // topo_coords：可选的外部拓扑坐标（开关B/pass1 两遍 forward 用）——非空时用它初始化
+    //   current_coords（SE3 make_graph 的拓扑基准），替代默认的 input.coords（初始坐标）。
+    //   典型用法：Pass1 值版 forward 逐 block 更新得到精确 coords → 传给 Pass2 forward_graph。
+    GraphOutput forward_graph(const ModelInput& input, bool enable_se3 = true,
+                              const TensorF32* topo_coords = nullptr);
 
     TensorF32 get_templ_emb(const TensorF32& t1d, const TensorF32& t2d);
     
@@ -468,6 +482,9 @@ public:
     // 设备管理
     void to(Device device);
     Device device() const;
+
+    // 配置访问器 (供训练脚本读取 block 数量等, 不复制)
+    const PPMLConfig& config() const { return config_; }
     
     // 训练/推理模式
     void train();
@@ -768,6 +785,11 @@ private:
     std::unique_ptr<CPUBackend>       cpu_backend_;
     std::unique_ptr<CUDABackend>      cuda_backend_;
     std::unique_ptr<BackendScheduler> scheduler_;
+    // 【阶段1.5】SE3 offset 回落的独立 backend（持久成员，存活过最终 loss graph_compute）。
+    // 独立 gallocr_：offset 回落的 graph_compute 只 release se3_backend_ 自己的 buffer，
+    // 不碰主图（cpu_backend_）的 msa/pair/state。SE3 子图节点虽会 bind 到 se3_backend_
+    // buffer，但主图最终 compute 时 bind_tensor 无条件 rebind 回主 backend（正确覆盖）。
+    std::unique_ptr<CPUBackend>       se3_backend_;
     bool backend_ready_ = false;
 
     // 持有 backend buffer 的所有权（对标 ggml 中 backend 管理的 buffer 列表）

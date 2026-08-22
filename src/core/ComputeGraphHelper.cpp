@@ -6,6 +6,8 @@
 #include "ppml/ComputeGraph.h"
 
 #include <cassert>
+#include <cstdlib>   // std::free
+#include <execinfo.h> // backtrace/backtrace_symbols (Linux; 诊断用)
 
 namespace ppml {
 
@@ -379,6 +381,12 @@ TensorF32* view(TensorF32* a, const Shape& new_shape) {
             (long long)(a->shape().dims.size()>2?a->shape().dims[2]:-1),
             (long long)(a->shape().dims.size()>3?a->shape().dims[3]:-1),
             (int)a->shape().ndim(), (long long)a->numel(), (int)a->op);
+        // 打印调用栈（需 -g；Linux 下 backtrace_symbols 解析符号名）
+        void* bt[24]; int n = backtrace(bt, 24);
+        char** syms = backtrace_symbols(bt, n);
+        for (int i = 0; i < n && i < 12; i++)
+            std::fprintf(stderr, "  [VIEW-CALL] #%d %s\n", i, syms[i] ? syms[i] : "?");
+        std::free(syms);
     }
     assert(new_shape.numel() == a->numel());
     // view 不分配新数据，指针复用
@@ -579,6 +587,16 @@ TensorF32* get_rows_back(TensorF32* dy, TensorF32* idx, TensorF32* W) {
     result->src[0] = dy;    // upstream gradient (K, M)
     result->src[1] = idx;   // row indices (K,)
     result->src[2] = W;     // weight table (N, M), 仅用于取形状
+    if (getenv("GRAPH_DEBUG_ELEM")) {
+        fprintf(stderr,
+            "[GRB] dy.numel=%lld idx.numel=%lld W.numel=%lld W.dims={%lld,%lld,%lld,%lld} ndim=%d → out.numel=%lld\n",
+            (long long)dy->numel(), (long long)idx->numel(), (long long)W->numel(),
+            (long long)(W->shape().dims.size()>0?W->shape().dims[0]:-1),
+            (long long)(W->shape().dims.size()>1?W->shape().dims[1]:-1),
+            (long long)(W->shape().dims.size()>2?W->shape().dims[2]:-1),
+            (long long)(W->shape().dims.size()>3?W->shape().dims[3]:-1),
+            ndim, (long long)result->numel());
+    }
     return result;
 }
 

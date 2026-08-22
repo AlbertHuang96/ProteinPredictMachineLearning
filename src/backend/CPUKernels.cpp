@@ -344,11 +344,14 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
     if (getenv("GRAPH_DEBUG_ELEM") && p->ith == 0) {
         TensorF32* s0 = node->src[0];
         TensorF32* s1 = node->src[1];
+        TensorF32* s2 = node->src[2];
         fprintf(stderr,
-                "[ELEM-PTR] op=%d n=%lld src0=%s src1=%s | src0{op=%d buf=%p host=%d data=%p flag=%d}"
-                " src1{op=%d buf=%p host=%d data=%p flag=%d} dst{op=%d buf=%p host=%d data=%p flag=%d}\n",
+                "[ELEM-PTR] op=%d n=%lld src0=%s num0=%lld src1=%s num1=%lld src2=%s num2=%lld | src0{op=%d buf=%p host=%d data=%p flag=%d}"
+                " src1{op=%d buf=%p host=%d data=%p flag=%d} dst{op=%d buf=%p host=%d data=%p flag=%d}%s\n",
                 (int)node->op, (long long)node->numel(),
-                s0 ? "ok" : "NULL", s1 ? "ok" : "NULL",
+                s0 ? "ok" : "NULL", s0 ? (long long)s0->numel() : -1,
+                s1 ? "ok" : "NULL", s1 ? (long long)s1->numel() : -1,
+                s2 ? "ok" : "NULL", s2 ? (long long)s2->numel() : -1,
                 s0 ? (int)s0->op : -1, s0 ? (void*)s0->buffer_ : nullptr,
                 (s0 && s0->buffer_ ? (int)s0->buffer_->is_host() : -1),
                 s0 ? (void*)s0->data() : nullptr, s0 ? (int)s0->flag : -1,
@@ -357,13 +360,32 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
                 s1 ? (void*)s1->data() : nullptr, s1 ? (int)s1->flag : -1,
                 (int)node->op, (void*)(node->buffer_),
                 (node->buffer_ ? (int)node->buffer_->is_host() : -1),
-                (void*)node->data(), (int)node->flag);
+                (void*)node->data(), (int)node->flag,
+                s2 ? " src2{...}" : "");
     }
 
+    // ⚠️ 判空防护：src[0]/src[1] 为 null（图构建错误/悬垂节点）或 data() 未分配时，
+    // 直接解引用会 SIGSEGV。所有线程一致 return（与 kernel_mul_mat 一致，避免 barrier 失步）。
+    if (!node->src[0] || !node->src[1] || !node->data()) {
+        if (p->ith == 0) {
+            fprintf(stderr,
+                    "[ELEM-NULL] op=%d n=%lld src0=%p src1=%p dst_data=%p\n",
+                    (int)node->op, (long long)node->numel(),
+                    (void*)node->src[0], (void*)node->src[1], (void*)node->data());
+        }
+        return;
+    }
     const float * a = node->src[0]->data();
     const float * b = node->src[1]->data();
     float * d = node->data();
     int64_t n = node->numel();
+    if (!a || !b || !d) {
+        if (p->ith == 0) {
+            fprintf(stderr, "[ELEM-NULL2] op=%d n=%lld a=%p b=%p d=%p\n",
+                    (int)node->op, (long long)n, (const void*)a, (const void*)b, (const void*)d);
+        }
+        return;
+    }
 
     // 开发诊断（GRAPH_DEBUG_LOSS）：标量 add（total 链累加），打印两输入值与地址，定位 nan 来源
     if (p->ith == 0 && n == 1 && getenv("GRAPH_DEBUG_LOSS") && node->op == OP_ADD) {
@@ -371,27 +393,44 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
                 a[0], (const void*)a, b[0], (const void*)b, (const void*)d);
     }
 
-    // 广播支持：当 b 形状是 a 形状去掉若干"前导最内维"的后缀时（如 a=[2,7,N], b=[7,N]），
-    // b 沿 a 的前导维重复。扁平序下 a 前导维在最内，故 b 索引 = i % b_numel。
-    // 同 numel 时 b_numel==n，i%n==i，退化为逐元素，无额外开销。
+    // 广播支持：当 src 形状是 dst 形状去掉若干"前导最内维"的后缀时（如 a=[2,7,N], b=[7,N]），
+    // src 沿 dst 的前导维重复。扁平序下最内维在前，故 src 索引 = i % src_numel。
+    // 合法广播必须满足 n 是 an/bn 的整数倍；若不整除（图构建错位：view/unsqueeze/repeat 后形状
+    // 未对齐），原实现走全等分支 a[i]/b[i] 越界读 → SIGSEGV。此处改为无条件安全索引
+    // （a_full 时 a[i]，否则 a[i % an]），非法广播时数值可能错但不崩，并打印 [ELEM-BCAST] 暴露节点。
+    const int64_t an = node->src[0]->numel();
     const int64_t bn = node->src[1]->numel();
-    const bool bcast = (bn != n) && (n % bn == 0);
+    const bool a_full = (an == n);
+    const bool b_full = (bn == n);
+    const bool bad_bcast =
+        (!a_full && (an <= 0 || n % an != 0)) || (!b_full && (bn <= 0 || n % bn != 0));
+    if (bad_bcast && p->ith == 0) {
+        fprintf(stderr,
+                "[ELEM-BCAST] op=%d n=%lld an=%lld bn=%lld a_full=%d b_full=%d "
+                "a=%p b=%p d=%p | src0{op=%d buf=%p data=%p} src1{op=%d buf=%p data=%p} dst{data=%p}\n",
+                (int)node->op, (long long)n, (long long)an, (long long)bn,
+                (int)a_full, (int)b_full,
+                (const void*)a, (const void*)b, (const void*)d,
+                (int)node->src[0]->op, (void*)node->src[0]->buffer_, (const void*)a,
+                (int)node->src[1]->op, (void*)node->src[1]->buffer_, (const void*)b,
+                (const void*)d);
+    }
 
     switch (node->op) {
         case OP_ADD:
-            if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] + b[i % bn];
-            else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] + b[i];
+            for (int64_t i = p->ith; i < n; i += p->nth)
+                d[i] = a[a_full ? i : i % an] + b[b_full ? i : i % bn];
             if (getenv("GRAPH_DEBUG_ELEM_NAN") && node->numel() <= 4096) {
                 int cnt = 0;
                 // 统计 a/b 中 NaN 数（判断 node#8 dispatch 时 src 是否已含 NaN）
                 int na = 0, nb = 0;
                 for (int64_t i = 0; i < n; ++i) {
-                    if (std::isnan(a[i])) na++;
-                    if (std::isnan(bcast?b[i%bn]:b[i])) nb++;
+                    if (std::isnan(a_full ? a[i] : a[i % an])) na++;
+                    if (std::isnan(b_full ? b[i] : b[i % bn])) nb++;
                 }
                 for (int64_t i = 0; i < n; ++i) if (std::isnan(d[i])) {
                     if (cnt < 3) fprintf(stderr, "[elem-add] nan@%lld a=%f b=%f src0op=%d src1op=%d\n",
-                        (long long)i, a[i], bcast?b[i%bn]:b[i],
+                        (long long)i, a_full ? a[i] : a[i % an], b_full ? b[i] : b[i % bn],
                         (node->src[0]?(int)node->src[0]->op:-1),
                         (node->src[1]?(int)node->src[1]->op:-1));
                     cnt++;
@@ -402,16 +441,16 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
             }
             break;
         case OP_SUB:
-            if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] - b[i % bn];
-            else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] - b[i];
+            for (int64_t i = p->ith; i < n; i += p->nth)
+                d[i] = a[a_full ? i : i % an] - b[b_full ? i : i % bn];
             break;
         case OP_MUL:
-            if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] * b[i % bn];
-            else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] * b[i];
+            for (int64_t i = p->ith; i < n; i += p->nth)
+                d[i] = a[a_full ? i : i % an] * b[b_full ? i : i % bn];
             break;
         case OP_DIV:
-            if (bcast) for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] / b[i % bn];
-            else       for (int64_t i = p->ith; i < n; i += p->nth) d[i] = a[i] / b[i];
+            for (int64_t i = p->ith; i < n; i += p->nth)
+                d[i] = a[a_full ? i : i % an] / b[b_full ? i : i % bn];
             break;
     }
 }
@@ -724,7 +763,14 @@ void CPUBackend::kernel_tri_mul(TensorF32 * node, ComputeParams * p) {
                 sum += lv * rv;
             }
         }
-        dst_data[idx] = sum * inv_L;
+        float v = sum * inv_L;
+        // 数值护栏：三角乘是 NaN/Inf 高发点（left/right 经 sigmoid gate 后仍可能因上游
+        // softmax 溢出带入非有限值）。这里做 finite-clamp，避免 NaN 沿 pair 链污染 distogram
+        // head 与下游 block，导致整图 loss 变 NaN（问题4）。clamp 到 ±1e4 对 pair 表征无实质影响。
+        if (!(v == v) || v > 1e4f || v < -1e4f) {
+            v = (v != v) ? 0.0f : (v > 1e4f ? 1e4f : -1e4f);
+        }
+        dst_data[idx] = v;
     }
 
     tp->barrier_wait();

@@ -95,20 +95,62 @@ static void clear_param_grads(ComputeGraph* cgraph) {
 /// @return 总 L2 范数
 static float compute_total_grad_norm(const std::vector<TensorF32*>& param_list, ComputeGraph* cgraph) {
     double norm_sq = 0.0;  // double 防溢出
+    // 诊断：记录 L2 贡献最大的参数（scale 之前，定位爆炸源，避免被 clip 缩小后误判）
+    struct PInfo { int node_idx = -1; int64_t numel = 0; double l2 = 0; double maxabs = 0; long nnan = 0; };
+    std::vector<PInfo> pinfos;
+    pinfos.reserve(param_list.size());
     for (auto* param : param_list) {
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
         std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
         const int64_t n = grad->numel();
+        double pl2 = 0.0; double pmax = 0.0; long nnan = 0;
         for (int64_t j = 0; j < n; j++) {
-            norm_sq += static_cast<double>(g[static_cast<size_t>(j)]) *
-                       static_cast<double>(g[static_cast<size_t>(j)]);
+            const double v = static_cast<double>(g[static_cast<size_t>(j)]);
+            if (v != v) { ++nnan; continue; }   // NaN 不计入 l2/max，只统计数量
+            norm_sq += v * v;
+            pl2 += v * v;
+            const double a = std::fabs(v);
+            if (a > pmax) pmax = a;
+        }
+        PInfo pi; pi.numel = n; pi.l2 = pl2; pi.maxabs = pmax; pi.nnan = nnan;
+        pinfos.push_back(pi);
+    }
+    const float total = static_cast<float>(std::sqrt(norm_sq));
+    // 仅当范数异常（爆炸/NaN）时，在 scale 之前打印 top-8 贡献参数
+    if (total > 100000.0f || std::isnan(total)) {
+        auto find_idx = [&](const TensorF32* p) -> int {
+            for (int i = 0; i < cgraph->n_nodes(); ++i)
+                if (cgraph->graph_node(i) == p) return i;
+            return -1;
+        };
+        std::vector<std::pair<double,int>> ranked;
+        for (size_t k = 0; k < pinfos.size(); ++k) ranked.push_back({pinfos[k].l2, (int)k});
+        std::sort(ranked.begin(), ranked.end(),
+                  [](const std::pair<double,int>& a, const std::pair<double,int>& b){ return a.first > b.first; });
+        std::fprintf(stderr, "[GRAD-NORM] total=%.4e params=%zu\n", total, pinfos.size());
+        const int m = (int)ranked.size() < 8 ? (int)ranked.size() : 8;
+        for (int q = 0; q < m; ++q) {
+            const PInfo& pi = pinfos[ranked[q].second];
+            const int nidx = find_idx(param_list[ranked[q].second]);
+            std::fprintf(stderr, "  [GRAD-NORM] rank=%d node_idx=%d numel=%lld l2=%.4e max_abs=%.4e nnan=%ld",
+                         q, nidx, (long long)pi.numel, pi.l2, pi.maxabs, pi.nnan);
+        TensorF32* pn = (nidx >= 0 && nidx < cgraph->n_nodes()) ? cgraph->graph_node(nidx) : nullptr;
+        if (pn && pn->shape().ndim() >= 1 && pn->shape().ndim() <= 4) {
+            std::fprintf(stderr, " dims=[");
+            for (int d = 0; d < pn->shape().ndim(); ++d)
+                std::fprintf(stderr, "%s%lld", (d ? "," : ""), (long long)pn->shape().dims[d]);
+            std::fprintf(stderr, "] op=%d", (int)pn->op);
+        }
+        std::fprintf(stderr, "\n");
         }
     }
-    return static_cast<float>(std::sqrt(norm_sq));
+    return total;
 }
 
 /// @brief 等比例缩放所有参数梯度
+/// ⚠️ 若梯度含 NaN/Inf，直接 *=scale 会把 NaN 传播进 Adam 更新 → 参数变 NaN → 下一 epoch 前向全 NaN。
+/// 这里把非有限元素置 0（等价"该元素不贡献梯度"），打破"梯度 NaN→参数 NaN→前向 NaN"恶性循环。
 static void scale_param_grads(const std::vector<TensorF32*>& param_list, ComputeGraph* cgraph, float scale) {
     for (auto* param : param_list) {
         TensorF32* grad = cgraph->graph_get_grad(param);
@@ -116,7 +158,9 @@ static void scale_param_grads(const std::vector<TensorF32*>& param_list, Compute
         std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
         const int64_t n = grad->numel();
         for (int64_t j = 0; j < n; j++) {
-            g[static_cast<size_t>(j)] *= scale;
+            float& v = g[static_cast<size_t>(j)];
+            if (v != v || v > 3.0e38f || v < -3.0e38f) { v = 0.0f; continue; }  // NaN/Inf→0
+            v *= scale;
         }
         write_tensor_values(grad, g);  // H2D 写回
     }
@@ -149,14 +193,39 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
     auto params = collect_params(cgraph);
     if (params.empty()) return 0.0f;
 
-    float total_norm = compute_total_grad_norm(params, cgraph);
-
-    if (total_norm > max_norm && total_norm > 1e-12f) {
-        float scale = max_norm / total_norm;
-        scale_param_grads(params, cgraph, scale);
+    // ⚠️ 分离 SE3 参数（TENSOR_FLAG_SE3）单独 clip（2026-08-22 修复）：
+    // SE3 梯度尺度（~1e13）远大于主图/head 梯度（~1e5），若与主图一起做全局比例 clip，
+    // SE3 主导 scale → msa head 等正常参数被压到极小（1e-9）→ 权重几乎不动 → msa/chi 不学习
+    // （实测开 SE3 时 msa=3.13 恒定，关 SE3 时 msa 下降）。
+    // 方案：SE3 参数单独 clip 到 max_norm*0.1（更小阈值），非 SE3 参数用全局 clip（max_norm）。
+    // 这样 msa head 等正常梯度不受 SE3 主导拖累。
+    std::vector<TensorF32*> se3_params, main_params;
+    for (auto* p : params) {
+        if (p->flag & TENSOR_FLAG_SE3) se3_params.push_back(p);
+        else main_params.push_back(p);
     }
 
-    return total_norm;
+    // 1) 主图/head 参数（非 SE3）：全局 clip（正常阈值）
+    float main_norm = 0.0f;
+    if (!main_params.empty()) {
+        main_norm = compute_total_grad_norm(main_params, cgraph);
+        if (main_norm > max_norm && main_norm > 1e-12f) {
+            scale_param_grads(main_params, cgraph, max_norm / main_norm);
+        }
+    }
+
+    // 2) SE3 参数：单独 clip（阈值 = max_norm*0.1，防主导）
+    const float se3_max = max_norm * 0.1f;
+    float se3_norm = 0.0f;
+    if (!se3_params.empty()) {
+        se3_norm = compute_total_grad_norm(se3_params, cgraph);
+        if (se3_norm > se3_max && se3_norm > 1e-12f) {
+            scale_param_grads(se3_params, cgraph, se3_max / se3_norm);
+        }
+    }
+
+    // 返回总体范数（诊断用；SE3 爆炸时 main_norm 正常，se3_norm 被单独压回）
+    return main_norm + se3_norm;
 }
 
 float accumulate_per_loss_gradients(

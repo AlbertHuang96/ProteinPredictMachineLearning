@@ -255,7 +255,14 @@ void ComputeGraph::build_backward_expand(
                 continue;
             }
             //GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32 || node->src[j]->type == GGML_TYPE_F16);
-            assert(node->src[j]->type == TENSOR_TYPE_F32 || node->src[j]->type == TENSOR_TYPE_F16);
+            if (node->src[j]->type != TENSOR_TYPE_F32 && node->src[j]->type != TENSOR_TYPE_F16) {
+                std::fprintf(stderr,
+                    "[BWD-FAIL] node[%d] op=%d src[%d] type=%d (0=F32,1=F16)  src->ndim=%d numel=%lld flag=%d src_op=%d\n",
+                    i, (int)node->op, j, (int)node->src[j]->type,
+                    (int)node->src[j]->shape().ndim(), (long long)node->src[j]->numel(),
+                    (int)node->src[j]->flag, (int)node->src[j]->op);
+                assert(node->src[j]->type == TENSOR_TYPE_F32 || node->src[j]->type == TENSOR_TYPE_F16);
+            }
             node_needs_grad = true;
             break;
         }

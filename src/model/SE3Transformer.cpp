@@ -414,13 +414,20 @@ GraphData make_graph(const TensorF32& xyz,
     // xyz: (B, L, 3, 3) — 3 个骨架原子, 各 3D 坐标
 
     const auto& pair_shape = pair.shape();
-    int E = static_cast<int>(pair_shape.dims[3]);  // pair 特征维度
+    //  图模式（edge_w 图化）下，make_graph 只算拓扑（edge_index/edge_d），pair 可为空
+    // （edge_w 由主图 pair 图节点经 edge_gather_rows 在 run_se3_graph 内图化提取）。
+    // 空 pair 时 E=0，跳过 edge_w 填充。
+    const bool has_pair = pair.numel() > 0 && pair.data() != nullptr;
+    int E = has_pair ? static_cast<int>(pair_shape.dims[3]) : 0;  // pair 特征维度
 
     const float*   xyz_data  = xyz.data();   // xyz[b, i, atom, coord]
-    const float*   pair_data = pair.data();  // pair[b, i, j, e]
+    const float*   pair_data = has_pair ? pair.data() : nullptr;  // pair[b, i, j, e]
     const int64_t* idx_data  = idx.data();   // idx[b, i]
 
-    int actual_top_k = std::min(top_k, L);
+    // ⚠️ top_k 不能超过 L-1（dists 排除 i==j 后只有 L-1 个候选），否则
+    //    partial_sort(begin+actual_top_k) 与 dists[k] 越界 → heap-buffer-overflow
+    //    破坏堆 → 后续 free 报 corrupted double-linked list。这是值版 forward 崩溃根因。
+    int actual_top_k = std::min(top_k, L - 1);
 
     // ---- 第 1 步：计算 CA 距离矩阵 D 和序列间隔 sep ----
     // D:     (B, L, L)  CA 原子欧氏距离
@@ -649,6 +656,8 @@ TensorF32 SE3Basis::q_matrix(int J, int d_in, int d_out) {
     }
 
     // ---------- (d_in=1, d_out=1) ----------
+    // ⚠️ 索引必须用实际 d_o/d_i/d_J 参数化（Q 形状是 {d_o,d_i,d_J}）。
+    // 旧实现硬编码 *3/*5 与 mo=3/4，当 d_o 或 d_J < 5（如 d_out=0）时越界写 → ASAN heap-buffer-overflow。
     if (d_in == 1 && d_out == 1) {
         // CG(1,m1, 1,m2, J,M) where M = m1+m2, for J = 0, 1, 2
         auto m_val = [](int idx) { return idx - 1; };  // idx: 0,1,2 → -1,0,1
@@ -656,63 +665,54 @@ TensorF32 SE3Basis::q_matrix(int J, int d_in, int d_out) {
         if (J == 0) {
             // CG(1,m, 1,-m, 0,0) = (-1)^(1-m) / √3
             float inv_sqrt3 = 1.0f / std::sqrt(3.0f);
-            for (int mi = 0; mi < 3; ++mi) {
+            for (int mi = 0; mi < d_i; ++mi) {
                 int m = m_val(mi);
                 int mo = 0 - m + 1;  // mo = -m 的存储索引
                 float sign = ((1 - m) % 2 == 0) ? 1.0f : -1.0f;
-                q[(mo * 3 + mi) * 1 + 0] = sign * inv_sqrt3;
+                q[(mo * d_i + mi) * d_J + 0] = sign * inv_sqrt3;
             }
             return Q;
         }
 
         if (J == 1) {
             // CG(1,m1, 1,m2, 1,M) with M=m1+m2
-            // C(1,m1,1,m2,1,m1+m2) = sign * √( (1+m1)(2-m1) / 6 )  when m2 = ±1, etc.
-            // 简化: 使用标准 CG 表
+            // 标准 CG 表（m1,m2 ∈ {-1,0,1}，mo=存储索引 m1，mi=存储索引 m2，m_J=存储索引 m1+m2）
             // m1=-1: C(1,-1,1,0,1,-1) = -1/√2,  C(1,-1,1,1,1,0) = 1/√2
             // m1=0:  C(1,0,1,-1,1,-1)= 1/√2,   C(1,0,1,1,1,1) = -1/√2
             // m1=1:  C(1,1,1,-1,1,0) = 1/√2,   C(1,1,1,0,1,1) = -1/√2
             float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
-
-            // m1=-1, m2=0 → M=-1
-            q[(0 * 3 + 0) * 3 + 0] = -inv_sqrt2;  // mo=-1, mi=-1, m_J=-1
-            // m1=-1, m2=1 → M=0
-            q[(1 * 3 + 0) * 3 + 1] =  inv_sqrt2;  // mo=0, mi=-1, m_J=0
-            // m1=0, m2=-1 → M=-1
-            q[(0 * 3 + 1) * 3 + 0] =  inv_sqrt2;  // mo=-1, mi=0, m_J=-1
-            // m1=0, m2=1 → M=1
-            q[(2 * 3 + 1) * 3 + 2] = -inv_sqrt2;  // mo=1, mi=0, m_J=1
-            // m1=1, m2=-1 → M=0
-            q[(1 * 3 + 2) * 3 + 1] =  inv_sqrt2;  // mo=0, mi=1, m_J=0
-            // m1=1, m2=0 → M=1
-            q[(2 * 3 + 2) * 3 + 2] = -inv_sqrt2;  // mo=1, mi=1, m_J=1
+            // 存储索引 mo/mi: m_val 0→-1, 1→0, 2→1; m_J: 值 M ∈ {-1,0,1} → 索引 M+1
+            // (mo=-1,mi=0)→M=-1: idx mo=0, mi=1, mJ=0
+            q[(0 * d_i + 1) * d_J + 0] = -inv_sqrt2;
+            // (mo=-1,mi=1)→M=0:  idx mo=0, mi=2, mJ=1
+            q[(0 * d_i + 2) * d_J + 1] =  inv_sqrt2;
+            // (mo=0,mi=-1)→M=-1: idx mo=1, mi=0, mJ=0
+            q[(1 * d_i + 0) * d_J + 0] =  inv_sqrt2;
+            // (mo=0,mi=1)→M=1:  idx mo=1, mi=2, mJ=2
+            q[(1 * d_i + 2) * d_J + 2] = -inv_sqrt2;
+            // (mo=1,mi=-1)→M=0: idx mo=2, mi=0, mJ=1
+            q[(2 * d_i + 0) * d_J + 1] =  inv_sqrt2;
+            // (mo=1,mi=0)→M=1:  idx mo=2, mi=1, mJ=2
+            q[(2 * d_i + 1) * d_J + 2] = -inv_sqrt2;
             return Q;
         }
 
         if (J == 2) {
             // CG(1,m1, 1,m2, 2,M) where M=m1+m2
-            // C(1,-1,1,-1,2,-2) = 1
-            // C(1,-1,1,0,2,-1) = 1/√2
-            // C(1,-1,1,1,2,0) = 1/√6
-            // C(1,0,1,-1,2,-1) = 1/√2
-            // C(1,0,1,0,2,0) = √(2/3)
-            // C(1,0,1,1,2,1) = 1/√2
-            // C(1,1,1,-1,2,0) = 1/√6
-            // C(1,1,1,0,2,1) = 1/√2
-            // C(1,1,1,1,2,2) = 1
+            // 存储索引: mo/mi: m_val 0→-1,1→0,2→1; m_J: M ∈ {-2..2} → 索引 M+2
             float inv_sqrt2 = 1.0f / std::sqrt(2.0f);
             float inv_sqrt6 = 1.0f / std::sqrt(6.0f);
             float sqrt_2_3  = std::sqrt(2.0f / 3.0f);
 
-            q[(0 * 3 + 0) * 5 + 0] = 1.0f;       // (-1,-1)→M=-2
-            q[(1 * 3 + 0) * 5 + 1] = inv_sqrt2;   // (-1,0)→M=-1
-            q[(1 * 3 + 1) * 5 + 1] = inv_sqrt2;   // (0,-1)→M=-1
-            q[(2 * 3 + 0) * 5 + 2] = inv_sqrt6;   // (-1,1)→M=0
-            q[(2 * 3 + 1) * 5 + 2] = sqrt_2_3;    // (0,0)→M=0
-            q[(2 * 3 + 2) * 5 + 2] = inv_sqrt6;   // (1,-1)→M=0
-            q[(3 * 3 + 1) * 5 + 3] = inv_sqrt2;   // (0,1)→M=1
-            q[(3 * 3 + 2) * 5 + 3] = inv_sqrt2;   // (1,0)→M=1
-            q[(4 * 3 + 2) * 5 + 4] = 1.0f;        // (1,1)→M=2
+            q[(0 * d_i + 0) * d_J + 0] = 1.0f;        // (-1,-1)→M=-2
+            q[(0 * d_i + 1) * d_J + 1] = inv_sqrt2;   // (-1,0)→M=-1
+            q[(1 * d_i + 0) * d_J + 1] = inv_sqrt2;   // (0,-1)→M=-1
+            q[(0 * d_i + 2) * d_J + 2] = inv_sqrt6;   // (-1,1)→M=0
+            q[(1 * d_i + 1) * d_J + 2] = sqrt_2_3;    // (0,0)→M=0
+            q[(2 * d_i + 0) * d_J + 2] = inv_sqrt6;   // (1,-1)→M=0
+            q[(1 * d_i + 2) * d_J + 3] = inv_sqrt2;   // (0,1)→M=1
+            q[(2 * d_i + 1) * d_J + 3] = inv_sqrt2;   // (1,0)→M=1
+            q[(2 * d_i + 2) * d_J + 4] = 1.0f;        // (1,1)→M=2
             return Q;
         }
     }
@@ -918,7 +918,7 @@ G1x1SE3::G1x1SE3(const Fiber& f_in, const Fiber& f_out)
         int m_in = it->second;  // 输入该度的通道数
 
         // 创建权重矩阵: (m_out × m_in), Xavier 初始化
-        LinearLayer* W = LinearLayer::create(m_in, m_out, /*bias=*/false);
+        LinearLayer* W = LinearLayer::create(m_in, m_out, /*bias=*/false, /*se3=*/true);
         // create() 内部已经做了 Xavier 初始化 (见 Embedding.h 注释)
         weights_[d_out] = W;
     }
@@ -946,27 +946,66 @@ SE3Features G1x1SE3::forward(const SE3Features& x) {
 
     for (size_t i = 0; i < f_out_.size(); ++i) {
         int d_out = f_out_.degrees[i];
+        int m_out_d = f_out_.multiplicities[i];
+        int d_dim_d = 2 * d_out + 1;
 
         // 查找权重矩阵
         auto w_it = weights_.find(d_out);
         if (w_it == weights_.end()) {
-            continue;  // 该度无权重，跳过
+            // 该度无权重：输出全零 (N, m_out, d_dim)，保持 shape（下游 GMABSE3 读 features[i]，
+            // 默认 numel=1 Tensor 会越界）。用 x 的 N 维度（若 x 空则跳过）。
+            if (x.features.empty()) continue;
+            TensorF32 zero({x.features[0].shape().dims[0], m_out_d, d_dim_d}, x.features[0].device());
+            std::fill(zero.data(), zero.data() + zero.numel(), 0.0f);
+            output.features[i] = std::move(zero);
+            continue;
         }
 
         // 查找输入特征的索引
         auto idx_it = in_idx.find(d_out);
         if (idx_it == in_idx.end()) {
-            continue;  // 输入无该度特征，跳过
+            // 输入无该度特征：输出全零（同上有界）
+            if (x.features.empty()) continue;
+            TensorF32 zero({x.features[0].shape().dims[0], m_out_d, d_dim_d}, x.features[0].device());
+            std::fill(zero.data(), zero.data() + zero.numel(), 0.0f);
+            output.features[i] = std::move(zero);
+            continue;
         }
 
-        const TensorF32& v = x.features[idx_it->second];  // 输入特征张量
+        const TensorF32& v = x.features[idx_it->second];  // 输入特征张量 (N, m_in, d_dim)
         LinearLayer* W = w_it->second;                   // 权重矩阵 (m_out × m_in)
 
-        // matmul: (m_out×m_in) @ (batch, ..., m_in, 2d+1) → (batch, ..., m_out, 2d+1)
-        // LinearLayer::forward 内部做矩阵乘法，自动处理广播
-        // 注意: 不可用 output.features[i].copy_from(result) —— resize 默认构造 1 元素 Tensor,
-        // copy_from 要求 numel 完全一致。用移动赋值替换。
-        output.features[i] = W->forward(v);
+        // ⚠️ 不能用 W->forward(v)：LinearLayer::forward 是 2D matmul，会把 (N,m,d_dim) 3D
+        //    特征按扁平 (batch=N*d_dim, in=m_in) 处理——Wigner 分量 d_dim 与 multiplicity m
+        //    混在一起且 in_features_=m_in 与实际特征维 m_in*d_dim 不符 → batch 计算错 → 越界写。
+        //    正确语义（对齐图版块对角）：对每个 Wigner 分量 dd 独立做 out=W@v[...,dd]（只混 m）。
+        //    即 out[n, mo, dd] = sum_{mi} W[mo,mi] * v[n, mi, dd]。
+        const int64_t N = v.shape().dims[0];
+        const int64_t d_dim = v.shape().dims[2];
+        // ⚠️ 权重 shape 是 {in_features, out_features}（Embedding.cpp:98 create 里
+        //    w_dims={in,out}）→ dims[0]=in, dims[1]=out。
+        //    m_out 必须以输入张量 v 的实际通道数为准（v.shape().dims[1]），
+        //    不能假设等于权重 in_features：skip='cat' 时 out_proj_ 输入是 cat 后的
+        //    combined (N, m_total, d_dim)，m_total = m_mid + m_in 可能大于权重 m_in。
+        //    若不一致则截断（权重不足列按 0）。
+        const int64_t m_w_in  = W->weight()->shape().dims[0];   // in_features
+        const int64_t m_out = W->weight()->shape().dims[1];     // out_features
+        const int64_t m_in  = v.shape().dims[1];   // 实际输入通道数
+        const float* w_data = W->weight()->data();   // (m_out, m_w_in)
+        TensorF32 out({N, m_out, d_dim}, v.device());
+        float* o_data = out.data();
+        const float* v_data = v.data();
+        for (int64_t n = 0; n < N; ++n)
+            for (int64_t mo = 0; mo < m_out; ++mo)
+                for (int64_t dd = 0; dd < d_dim; ++dd) {
+                    float s = 0.0f;
+                    for (int64_t mi = 0; mi < m_in; ++mi) {
+                        const float wv = (mi < m_w_in) ? w_data[mo * m_w_in + mi] : 0.0f;
+                        s += wv * v_data[(n * m_in + mi) * d_dim + dd];
+                    }
+                    o_data[(n * m_out + mo) * d_dim + dd] = s;
+                }
+        output.features[i] = std::move(out);
     }
 
     return output;
@@ -982,12 +1021,12 @@ RadialFunc::RadialFunc(int num_freq, int in_dim, int out_dim, int edge_dim)
     int input_dim = edge_dim_ + 1;  // +1 是因为 edge features 会拼接距离标量
 
     // 对标 Python Sequential: Linear → BN → ReLU → Linear → BN → ReLU → Linear
-    linear1_ = LinearLayer::create(input_dim, mid_dim_, /*bias=*/true);
-    linear2_ = LinearLayer::create(mid_dim_, mid_dim_, /*bias=*/true);
-    linear3_ = LinearLayer::create(mid_dim_, num_freq_ * in_dim_ * out_dim_, /*bias=*/true);
+    linear1_ = LinearLayer::create(input_dim, mid_dim_, /*bias=*/true, /*se3=*/true);
+    linear2_ = LinearLayer::create(mid_dim_, mid_dim_, /*bias=*/true, /*se3=*/true);
+    linear3_ = LinearLayer::create(mid_dim_, num_freq_ * in_dim_ * out_dim_, /*bias=*/true, /*se3=*/true);
 
     // BN 参数: gamma 初始化为 1, beta 初始化为 0
-    // ⚠️ 用 new_param_tensor（context 管理）+ TENSOR_FLAG_PARAM：图模式下这些参数
+    //  用 new_param_tensor（context 管理）+ TENSOR_FLAG_PARAM：图模式下这些参数
     //    会进计算图，需有正确的 op=OP_NONE（免 dispatch 报 NOT_SUPPORTED）且标记
     //    PARAM（否则 build_backward_expand 不给它们梯度累加器 → graph_get_grad=nullptr，
     //    方案1 反向测试拿不到 BN 梯度）。
@@ -995,10 +1034,10 @@ RadialFunc::RadialFunc(int num_freq, int in_dim, int out_dim, int edge_dim)
     bn1_beta_  = new TensorF32(Shape({mid_dim_}), Device::CPU);
     bn2_gamma_ = new TensorF32(Shape({mid_dim_}), Device::CPU);
     bn2_beta_  = new TensorF32(Shape({mid_dim_}), Device::CPU);
-    bn1_gamma_->flag = TENSOR_FLAG_PARAM;
-    bn1_beta_->flag  = TENSOR_FLAG_PARAM;
-    bn2_gamma_->flag = TENSOR_FLAG_PARAM;
-    bn2_beta_->flag  = TENSOR_FLAG_PARAM;
+    bn1_gamma_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_SE3;
+    bn1_beta_->flag  = TENSOR_FLAG_PARAM | TENSOR_FLAG_SE3;
+    bn2_gamma_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_SE3;
+    bn2_beta_->flag  = TENSOR_FLAG_PARAM | TENSOR_FLAG_SE3;
 
     for (int i = 0; i < mid_dim_; ++i) {
         bn1_gamma_->data()[i] = 1.0f;
@@ -1082,10 +1121,11 @@ TensorF32 RadialFunc::forward(const TensorF32& x) {
 
     // reshape → (E, out_dim, 1, in_dim, 1, num_freq)
     // Python: y.view(-1, self.out_dim, 1, self.in_dim, 1, self.num_freq)
+    //  不能用 y = y.view(...)：view 不拥有数据，move 赋值先释放自身再接管悬垂指针。
     int64_t E = y.shape().dims[0];
-    y = y.view({E, out_dim_, 1, in_dim_, 1, num_freq_});
-
-    return y;
+    TensorF32 y_r({E, out_dim_, 1, in_dim_, 1, num_freq_}, y.device());
+    y_r.copy_from(y);   // 行优先扁平拷贝，reshape 安全
+    return y_r;
 }
 
 std::vector<TensorF32*> RadialFunc::parameters() {
@@ -1755,9 +1795,10 @@ TensorF32 GMABSE3::fiber2head(const TensorF32& feat, int m, int d_dim) {
     const auto& shape = feat.shape();
     int64_t X = shape.dims[0];  // N 或 E
 
-    TensorF32 result({feat.shape().dims[0], feat.shape().dims[1], feat.shape().dims[2], feat.shape().dims[3]}, feat.device());
-    result.copy_from(feat);    // 复用数据 (view 语义)
-    result = result.view({X, n_heads_, m / n_heads_, d_dim});
+    // ⚠️ 不能用 result = result.view(...)（view 不拥有数据，move 赋值悬垂）；
+    // 直接按目标 shape 构造并扁平拷贝。
+    TensorF32 result({X, n_heads_, m / n_heads_, d_dim}, feat.device());
+    result.copy_from(feat);    // 行优先扁平拷贝，reshape 安全
     return result;
 }
 
@@ -1766,9 +1807,10 @@ TensorF32 GMABSE3::fiber2head(const TensorF32& feat, int m, int d_dim) {
 // ---------------------------------------------------------------------------
 TensorF32 GMABSE3::head2fiber(const TensorF32& feat, int m, int d_dim) {
     int64_t X = feat.shape().dims[0];
-    TensorF32 result({feat.shape().dims[0], feat.shape().dims[1], feat.shape().dims[2], feat.shape().dims[3]}, feat.device());
+    //  不能用 result = result.view(...)（view 不拥有数据，move 赋值悬垂）；
+    // 直接按目标 shape 构造并扁平拷贝。
+    TensorF32 result({X, m, d_dim}, feat.device());
     result.copy_from(feat);
-    result = result.view({X, m, d_dim});
     return result;
 }
 
@@ -1936,11 +1978,20 @@ SE3Features GMABSE3::forward(const SE3Features& v,
     float* q_sq_data = q_squeezed.data();
     std::memset(q_sq_data, 0, N * n_heads_ * C_k * sizeof(float));
 
+    if (getenv("PPML_TRACE_VALUE")) {
+        fprintf(stderr, "[GMAB] f_key_.size=%zu n_heads=%d C_k=%lld\n", f_key_.size(), n_heads_, (long long)C_k);
+        for (size_t qi = 0; qi < q.features.size(); ++qi)
+            fprintf(stderr, "[GMAB] q[%zu] shape=(%lld,%lld,%lld) numel=%lld\n", qi,
+                (long long)q.features[qi].shape().dims[0], (long long)q.features[qi].shape().dims[1],
+                (long long)q.features[qi].shape().dims[2], (long long)q.features[qi].numel());
+    }
+
     int64_t q_offset = 0;
     for (size_t i = 0; i < f_key_.size(); ++i) {
         int d = f_key_.degrees[i];
         int m = f_key_.multiplicities[i];
         int d_dim = 2 * d + 1;
+        if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GMAB] q-loop i=%zu d=%d m=%d d_dim=%d\n", i, d, m, d_dim);
         const TensorF32& feat = q.features[i];  // (N, m, d_dim)
         const float* f_data = feat.data();
 
@@ -2101,11 +2152,16 @@ std::vector<TensorF32*> GMABSE3::forward_graph(
         for (int64_t c = 0; c < C; ++c) hidx[c] = static_cast<float>(c / mhdd);
         TensorF32* h_idx = constant_tensor({C}, hidx.data());
 
-        // a_v[c,e] = a[h(c),e]：get_rows 按头取行（a 行=n_heads）→ [E,C]，transpose → [C,E]
-        TensorF32* a_rows = get_rows(a, h_idx);                         // [E, C]  (dims=[E,C])
-        TensorF32* a_v    = transpose(a_rows);                          // [C, E]
+        // a_v[c,e] = a[h(c),e]：a 是 [n_heads,E]（图布局 dims=[E,n_heads]，行=n_heads 在 dims[1]），
+        // 而 get_rows 需要行在 dims[0]（行主序：N=dims[0], M=dims[1]）→ 必须先 transpose(a)。
+        // transpose(a) → dims=[n_heads, E]（N=n_heads 行, M=E 行内长）→ get_rows 按 h_idx 取头行
+        // → a_rows (C,E)：dims=[E, C]（行内长 E 最内, C 行）== 图布局 [C,E]，numel=C*E。
+        // 不再需要第二次 transpose（原实现漏掉先 transpose，导致 get_rows 把 E 当行数、n_heads 当行内长，
+        // 输出 numel=C*n_heads ≠ v_nodes[i] 的 C*E → mul 逐元素越界 → SIGSEGV）。
+        TensorF32* a_T    = transpose(a);                               // [n_heads, E]（dims=[n_heads,E]）
+        TensorF32* a_rows = get_rows(a_T, h_idx);                       // (C, E)：dims=[E, C]
 
-        TensorF32* v_scaled = mul(a_v, v_nodes[i]);                     // [C, E]
+        TensorF32* v_scaled = mul(a_rows, v_nodes[i]);                  // [C, E] ⊙ [C, E]
         out[i] = scatter_add(v_scaled, edge_tgt_idx, N);                // [C, N]
     }
     return out;
@@ -2202,15 +2258,21 @@ SE3Features GSE3Res::forward(const SE3Features& h,
     //   k = self.GMAB['k'](features, G=G, **kwargs)
     //   q = self.GMAB['q'](features)
     // ============================================================
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GSE3R] v_proj enter\n");
     SE3Features v = v_proj_->forward(h, edge_index, edge_d, edge_w, basis);  // 边级
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GSE3R] v_proj OK\n");
     SE3Features k = k_proj_->forward(h, edge_index, edge_d, edge_w, basis);  // 边级
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GSE3R] k_proj OK\n");
     SE3Features q = q_proj_->forward(h);                                      // 节点级
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GSE3R] q_proj OK\n");
 
     // ============================================================
     // Step 2: 多头注意力
     // Python: z = self.GMAB['attn'](v, k=k, q=q, G=G)
     // ============================================================
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GSE3R] attn enter\n");
     SE3Features z = attn_->forward(v, k, q, edge_index);
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GSE3R] attn OK\n");
 
     // ============================================================
     // Step 3: 残差连接 + 输出投影
@@ -2221,6 +2283,7 @@ SE3Features GSE3Res::forward(const SE3Features& h,
     //   z = self.project(z)
     //   z = self.add(z, features)
     // ============================================================
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GSE3R] step3 enter skip=%s\n", skip_.c_str());
     if (skip_ == "cat") {
         // 拼接 z (f_mid_out) 和 h (f_in_)
         SE3Features cat_features;
@@ -2289,6 +2352,7 @@ SE3Features GSE3Res::forward(const SE3Features& h,
         }
 
         z = out_proj_->forward(cat_features);
+        if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[GSE3R] step3 cat out_proj OK\n");
     } else if (skip_ == "sum") {
         // 投影 z → f_out
         SE3Features z_proj = out_proj_->forward(z);
@@ -2314,6 +2378,11 @@ SE3Features GSE3Res::forward(const SE3Features& h,
         z = std::move(z_proj);
     }
 
+    if (getenv("PPML_TRACE_VALUE")) {
+        fprintf(stderr, "[GSE3R] return z (features=%zu)\n", z.features.size());
+        for (size_t fi = 0; fi < z.features.size(); ++fi)
+            fprintf(stderr, "  z[%zu] ptr=%p numel=%lld\n", fi, (void*)z.features[fi].data(), (long long)z.features[fi].numel());
+    }
     return z;
 }
 
@@ -2444,9 +2513,12 @@ GNormBias::GNormBias(const Fiber& fiber)
         float* b_data = b.data();
 
         // 正态随机初始化
+        //  原对标 Python torch.randn(m)（std=1）。但本实现 GNormBias 的 bias 是固定随机（非 PARAM，
+        // 不训练），std=1 在输入 norm 较小时主导输出 → SE3 state 偶发巨大（chi 爆炸 680）→ 全链不稳定。
+        // 减小到 std=0.1：bias 只做 norm 微调，不主导输出，SE3 state 量级受输入控制（更稳）。
         std::random_device rd;
         std::mt19937 gen(rd());
-        std::normal_distribution<float> dist(0.0f, 1.0f);
+        std::normal_distribution<float> dist(0.0f, 0.1f);
         for (int c = 0; c < m; ++c) {
             b_data[c] = dist(gen);
         }
@@ -2703,11 +2775,25 @@ SE3Features SE3Transformer::forward(const SE3Features& h,
         // blocks_[i].gcn->forward returning a r-value, the first move was not necessary
         // the second move no need as well: forward(const&) so the value will not be moved
         //out = std::move(blocks_[i].gcn->forward(std::move(out), edge_index, edge_d, edge_w, basis));
-        out = blocks_[i].gcn->forward(out, edge_index, edge_d, edge_w, basis);
+        if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[SET] block %zu gcn enter (out.features=%zu)\n", i, out.features.size());
+        SE3Features out_gcn = blocks_[i].gcn->forward(out, edge_index, edge_d, edge_w, basis);
+        if (getenv("PPML_TRACE_VALUE")) {
+            fprintf(stderr, "[SET] block %zu gcn done (out_gcn.features=%zu)\n", i, out_gcn.features.size());
+            for (size_t fi = 0; fi < out_gcn.features.size(); ++fi)
+                fprintf(stderr, "  gcn_out[%zu] ptr=%p numel=%lld\n", fi, (void*)out_gcn.features[fi].data(), (long long)out_gcn.features[fi].numel());
+        }
+        out = std::move(out_gcn);
 
         // GNormBias: 等变非线性 (norm 分解 + ReLU + 重组)
         if (blocks_[i].norm != nullptr) {
-            out = blocks_[i].norm->forward(out);
+            if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[SET] block %zu norm enter\n", i);
+            SE3Features out_norm = blocks_[i].norm->forward(out);
+            if (getenv("PPML_TRACE_VALUE")) {
+                fprintf(stderr, "[SET] block %zu norm done (out_norm.features=%zu)\n", i, out_norm.features.size());
+                for (size_t fi = 0; fi < out_norm.features.size(); ++fi)
+                    fprintf(stderr, "  norm_out[%zu] ptr=%p numel=%lld\n", fi, (void*)out_norm.features[fi].data(), (long long)out_norm.features[fi].numel());
+            }
+            out = std::move(out_norm);
         }
     }
 

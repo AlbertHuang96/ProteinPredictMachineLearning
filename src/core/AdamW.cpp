@@ -30,6 +30,8 @@ void AdamW::init_from_graph(ComputeGraph* cgraph) {
         ParamState s;
         s.param            = node;
         s.no_weight_decay  = (node->flag & TENSOR_FLAG_NO_WEIGHT_DECAY) != 0;
+        // SE3 等变参数：梯度尺度与主图不匹配（offset→坐标→FAPE 链放大），用分层小 lr。
+        s.se3_lr_scale     = (node->flag & TENSOR_FLAG_SE3) ? 0.1f : 1.0f;
         s.m.assign(static_cast<size_t>(n), 0.0f);
         s.v.assign(static_cast<size_t>(n), 0.0f);
         states_.push_back(std::move(s));
@@ -92,6 +94,7 @@ void AdamW::step(ComputeGraph* cgraph) {
         float* m = s.m.data();
         float* v = s.v.data();
         const bool nod = s.no_weight_decay;
+        const float s3 = s.se3_lr_scale;   // SE3 参数分层 lr 缩放（默认 1.0，SE3 0.1）
 
         for (int64_t i = 0; i < n; ++i) {
             const float gi = g[static_cast<size_t>(i)];
@@ -106,10 +109,10 @@ void AdamW::step(ComputeGraph* cgraph) {
             //   weight_decay 不进 m/v，且 no_weight_decay 参数跳过 wd 项
             const float m_hat = m[i] / bc1;
             const float v_hat = v[i] / bc2;
-            const float update = lr * m_hat / (std::sqrt(v_hat) + eps);
+            const float update = lr * s3 * m_hat / (std::sqrt(v_hat) + eps);
             w[static_cast<size_t>(i)] -= update;
             if (wd != 0.0f && !nod) {
-                w[static_cast<size_t>(i)] -= lr * wd * w[static_cast<size_t>(i)];
+                w[static_cast<size_t>(i)] -= lr * s3 * wd * w[static_cast<size_t>(i)];
             }
         }
 

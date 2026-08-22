@@ -67,9 +67,14 @@ void PairTrack::inject_template(const TensorF32& in_templ) {
     auto templ = in_templ.permute({0, 2, 3, 1, 4}).view(Shape{B*L*L, 1, 64});
     CrossAttention cross_attn(D_PAIR, 64, 8);
     auto out = cross_attn.forward(pair, templ);  // (B*L*L, 1, D_PAIR)
-    out = out.view(Shape{B, L, L, D_PAIR});
-    pair = pair.view(Shape{B, L, L, D_PAIR});
-    repr_.copy_from(*add_impl(&pair, &out, /*inplace=*/false));  // 注入模板信息，直接更新 repr_
+    // ⚠️ 值版：不能用 out = out.view(...)（view 不拥有数据，move 赋值悬垂），
+    //    也不能用 add_impl（图版返回图节点 data()=nullptr）。值版逐元素加。
+    TensorF32 out_r(Shape{B, L, L, D_PAIR}, out.device());
+    out_r.copy_from(out);   // 行优先扁平 reshape 拷贝
+    float* rd = repr_.data();
+    const float* od = out_r.data();
+    const int64_t n = repr_.numel();
+    for (int64_t i = 0; i < n; ++i) rd[i] += od[i];   // repr_ += out_r（原地）
 }
 
 /* void PairTrack::update_from_msa(const TensorF32& msa) {

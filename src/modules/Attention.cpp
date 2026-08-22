@@ -1,10 +1,190 @@
 #include "ppml/Attention.h"
 #include "ppml/Embedding.h"
 #include "ppml/Context.h"
+#include <cmath>
+#include <algorithm>
 
 namespace ppml {
 
 namespace {
+
+// ===== 值版基础操作（值 forward 用；图 helper out_prod/sigmoid/relu/add_impl/mul 等
+//       返回图节点 data()=nullptr，值 copy_from 读 null 崩）=====
+TensorF32 value_sigmoid(const TensorF32& x) {
+    TensorF32 out(x.shape(), x.device());
+    const float* xp = x.data();
+    float* op = out.data();
+    for (int64_t i = 0; i < x.numel(); ++i) op[i] = 1.0f / (1.0f + std::exp(-xp[i]));
+    return out;
+}
+TensorF32 value_relu(const TensorF32& x) {
+    TensorF32 out(x.shape(), x.device());
+    const float* xp = x.data();
+    float* op = out.data();
+    for (int64_t i = 0; i < x.numel(); ++i) op[i] = xp[i] > 0.0f ? xp[i] : 0.0f;
+    return out;
+}
+// 同形逐元素乘/加（要求 numel 一致）
+TensorF32 value_mul_same(const TensorF32& a, const TensorF32& b) {
+    TensorF32 out(a.shape(), a.device());
+    const float* ap = a.data();
+    const float* bp = b.data();
+    float* op = out.data();
+    const int64_t n = a.numel();
+    for (int64_t i = 0; i < n; ++i) op[i] = ap[i] * bp[i];
+    return out;
+}
+TensorF32 value_add_same(const TensorF32& a, const TensorF32& b) {
+    TensorF32 out(a.shape(), a.device());
+    const float* ap = a.data();
+    const float* bp = b.data();
+    float* op = out.data();
+    const int64_t n = a.numel();
+    for (int64_t i = 0; i < n; ++i) op[i] = ap[i] + bp[i];
+    return out;
+}
+// 值版 reshape（返回拥有数据的拷贝）。⚠️ 值版禁止 `x = x.view(s)`：view 返回
+// own_data_=false 的共享张量，move 赋值先 deallocate() 释放自身数据再接管悬垂指针 → use-after-free。
+TensorF32 value_reshape(const TensorF32& x, const Shape& s) {
+    if (s.numel() != x.shape().numel())
+        throw PPMLError("value_reshape numel mismatch");
+    TensorF32 out(s, x.device());
+    out.copy_from(x);   // 行优先扁平拷贝，reshape 安全
+    return out;
+}
+// 值版 batched attention：Q,K,V 值布局 (batch, H, D, Lq/Lk)。
+// 与图版 out_prod(K,Q)+scale+softmax+out_prod(attn,V) 语义一致。
+// bias 可选：值布局 (B, Lk, Lq, H)（batch 沿 fold=NQ/B 广播，对齐 prepare_pair_bias），
+//   或已展开 (NQ, H, Lq, Lk)。
+TensorF32 value_attention(const TensorF32& Q, const TensorF32& K, const TensorF32& V,
+                          const TensorF32* bias) {
+    const int64_t NQ = Q.shape().dims[0];
+    const int64_t H  = Q.shape().dims[1];
+    const int64_t D  = Q.shape().dims[2];
+    const int64_t Lq = Q.shape().dims[3];
+    const int64_t Lk = K.shape().dims[3];
+    TensorF32 scores({NQ, H, Lq, Lk}, Q.device());
+    const float* qd = Q.data();
+    const float* kd = K.data();
+    float* sd = scores.data();
+    const float inv_scale = 1.0f / std::sqrt(static_cast<float>(D));
+    for (int64_t b = 0; b < NQ; ++b)
+        for (int64_t h = 0; h < H; ++h)
+            for (int64_t i = 0; i < Lq; ++i)
+                for (int64_t j = 0; j < Lk; ++j) {
+                    float s = 0.0f;
+                    const float* qp = qd + ((b * H + h) * D) * Lq + i;
+                    const float* kp = kd + ((b * H + h) * D) * Lk + j;
+                    for (int64_t d = 0; d < D; ++d) s += qp[d * Lq] * kp[d * Lk];
+                    sd[((b * H + h) * Lq + i) * Lk + j] = s * inv_scale;
+                }
+    if (bias && bias->numel() > 0) {
+        if (bias->shape().ndim() == 4 && bias->shape().dims[0] == NQ &&
+            bias->shape().dims[1] == H && bias->shape().dims[2] == Lq &&
+            bias->shape().dims[3] == Lk) {
+            for (int64_t i = 0; i < scores.numel(); ++i) sd[i] += bias->data()[i];
+        } else if (bias->shape().ndim() == 4 && bias->shape().dims[1] == Lk &&
+                   bias->shape().dims[2] == Lq && bias->shape().dims[3] == H) {
+            const int64_t B = bias->shape().dims[0];
+            const int64_t fold = NQ / B;
+            const float* bd = bias->data();
+            for (int64_t b = 0; b < B; ++b)
+                for (int64_t f = 0; f < fold; ++f)
+                    for (int64_t h = 0; h < H; ++h)
+                        for (int64_t i = 0; i < Lq; ++i)
+                            for (int64_t j = 0; j < Lk; ++j) {
+                                const float bv = bd[((b * Lk + j) * Lq + i) * H + h];  // (B,Lk,Lq,H)
+                                sd[(((b * fold + f) * H + h) * Lq + i) * Lk + j] += bv;
+                            }
+        }
+        // 其它形态忽略（原值版亦未处理 bias 广播）
+    }
+    // softmax 沿 j (Lk)
+    for (int64_t b = 0; b < NQ; ++b)
+        for (int64_t h = 0; h < H; ++h)
+            for (int64_t i = 0; i < Lq; ++i) {
+                const int64_t row = ((b * H + h) * Lq + i) * Lk;
+                float mx = sd[row];
+                for (int64_t j = 1; j < Lk; ++j) if (sd[row + j] > mx) mx = sd[row + j];
+                float sum = 0.0f;
+                for (int64_t j = 0; j < Lk; ++j) {
+                    float e = std::exp(sd[row + j] - mx);
+                    sd[row + j] = e; sum += e;
+                }
+                for (int64_t j = 0; j < Lk; ++j) sd[row + j] /= sum;
+            }
+    // output[b,h,d,i] = sum_j attn[b,h,i,j] * V[b,h,d,j]
+    TensorF32 out({NQ, H, D, Lq}, Q.device());
+    const float* vd = V.data();
+    float* od = out.data();
+    for (int64_t b = 0; b < NQ; ++b)
+        for (int64_t h = 0; h < H; ++h)
+            for (int64_t d = 0; d < D; ++d)
+                for (int64_t i = 0; i < Lq; ++i) {
+                    float s = 0.0f;
+                    const float* sp = sd + ((b * H + h) * Lq + i) * Lk;
+                    const float* vp = vd + ((b * H + h) * D + d) * Lk;
+                    for (int64_t j = 0; j < Lk; ++j) s += sp[j] * vp[j];
+                    od[((b * H + h) * D + d) * Lq + i] = s;
+                }
+    return out;
+}
+// 值版 triangle multiplication（对齐 kernel_tri_mul 语义；pair 方阵 I==J==K==L）：
+//   outgoing: dst[b,i,j,d] = (1/L) * sum_k left[b,i,k,d] * right[b,j,k,d]
+//   incoming: dst[b,i,j,d] = (1/L) * sum_k left[b,k,i,d] * right[b,k,j,d]
+// 带 finite-clamp（与 kernel 一致，防 NaN 沿 pair 链污染）。
+TensorF32 value_triangle_mul(const TensorF32& left, const TensorF32& right, float Lf, bool outgoing) {
+    const int64_t B = left.shape().dims[0];
+    const int64_t I = left.shape().dims[1];
+    const int64_t J = left.shape().dims[2];
+    const int64_t D = left.shape().dims[3];
+    TensorF32 dst({B, I, J, D}, left.device());
+    const float* l = left.data();
+    const float* r = right.data();
+    float* o = dst.data();
+    const float inv_L = 1.0f / Lf;
+    for (int64_t b = 0; b < B; ++b)
+        for (int64_t i = 0; i < I; ++i)
+            for (int64_t j = 0; j < J; ++j) {
+                const int64_t dst_off = ((b * I + i) * J + j) * D;
+                for (int64_t d = 0; d < D; ++d) {
+                    float sum = 0.0f;
+                    if (outgoing) {
+                        for (int64_t k = 0; k < J; ++k)
+                            sum += l[((b * I + i) * J + k) * D + d] * r[((b * J + j) * J + k) * D + d];
+                    } else {
+                        for (int64_t k = 0; k < I; ++k)
+                            sum += l[((b * I + k) * J + i) * D + d] * r[((b * J + k) * J + j) * D + d];
+                    }
+                    float v = sum * inv_L;
+                    if (!(v == v) || v > 1e4f || v < -1e4f)
+                        v = (v != v) ? 0.0f : (v > 1e4f ? 1e4f : -1e4f);
+                    o[dst_off + d] = v;
+                }
+            }
+    return dst;
+}
+// 值版外积（特征笛卡尔积）：left (B,..,D1), right (B,..,D2) → dst (B, I, J, D1*D2)
+// dst[b,i,j,d1*D2+d2] = left[b,i,d1] * right[b,j,d2]（此处 left/right 均为 (B,L,D) 3D）
+TensorF32 value_outer_cartesian(const TensorF32& left, const TensorF32& right) {
+    const int64_t B = left.shape().dims[0];
+    const int64_t L = left.shape().dims[1];
+    const int64_t D1 = left.shape().dims[2];
+    const int64_t D2 = right.shape().dims[2];
+    TensorF32 dst({B, L, L, D1 * D2}, left.device());
+    const float* lp = left.data();
+    const float* rp = right.data();
+    float* op = dst.data();
+    for (int64_t b = 0; b < B; ++b)
+        for (int64_t i = 0; i < L; ++i)
+            for (int64_t j = 0; j < L; ++j)
+                for (int64_t d1 = 0; d1 < D1; ++d1) {
+                    const float lv = lp[(b * L + i) * D1 + d1];
+                    for (int64_t d2 = 0; d2 < D2; ++d2)
+                        op[((b * L + i) * L + j) * (D1 * D2) + d1 * D2 + d2] = lv * rp[(b * L + j) * D2 + d2];
+                }
+    return dst;
+}
 
 // 把 to_b_ 投影出的 pair bias [H, Lq, Lk, B]（值 (B,Lk,Lq,H)）规整为
 // self_attn scores 布局 [Lk, Lq, H, B*fold]（值 (B*fold, H, Lq, Lk)），
@@ -34,43 +214,9 @@ SelfAttention::SelfAttention(const AttnConfig& config) : config_(config) {}
 SelfAttention::~SelfAttention() = default;
 
 TensorF32 SelfAttention::forward(const TensorF32& Q, const TensorF32& K, const TensorF32& V, const TensorF32* bias) {
-    // 输入约定: Q, K, V 均为 (batch, n_head, D_head, L)
-    // GGML dims = [L, D_head, n_head, batch]
-    //
-    // out_prod 语义: dst[i0,i1] = sum_k src0[i0,k] * src1[i1,k]
-    // 收缩维是 dims[1]
-
-    // ===== 1. scores = K @ Q^T  (key 最内维 dims[0], 使 softmax 沿 key 轴归一) =====
-    // out_prod(K, Q): src0=K [L_k, D_head, H, B], src1=Q [L_q, D_head, H, B]
-    // 收缩 dims[1]=D_head → scores: [L_k, L_q, H, B] = 值 (B, H, L_q, L_k)
-    auto scores = out_prod(const_cast<TensorF32*>(&K), const_cast<TensorF32*>(&Q));
-
-    // ===== 2. scale = 1/sqrt(d_head) =====
-    float scale_val = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
-    auto scaled = scale(scores, scale_val);
-
-    // ===== 3. add bias =====
-    // 遗留：值版 bias 广播未处理（同 Bug3）。bias 需先 permute+repeat 展开成与
-    // scaled 完全相同的形状再 add_impl（图模式已用 prepare_pair_bias 修复）。
-    if (bias != nullptr) {
-        scaled = add_impl(scaled, const_cast<TensorF32*>(bias), /*inplace=*/false);
-    }
-
-    // ===== 4. softmax 沿 dims[0]=L_k (key 轴) 归一 =====
-    auto attn = softmax(scaled);  // [L_k, L_q, H, B] = 值 (B, H, L_q, L_k)
-
-    // ===== 5. attn @ V =====
-    // attn: [L_k, L_q, H, B] (key dim0, query dim1)
-    // V:    [L_k, D_head, H, B] (key dim0, head_dim dim1)
-    // 需把 query 放 dim0、key 放 dim1（attn），head_dim 放 dim0、key 放 dim1（V），
-    // 使 out_prod 在 dims[1]=L_k 上收缩:
-    auto attn_t = permute(attn, {1, 0, 2, 3});                              // [L_k,L_q,H,B] → [L_q,L_k,H,B]
-    auto V_t    = permute(const_cast<TensorF32*>(&V), {1, 0, 2, 3});        // [L_k,D,H,B]   → [D,L_k,H,B]
-    auto output = out_prod(attn_t, V_t);  // 收缩 dims[1]=L_k → [L_q, D_head, H, B] = 值 (B,H,D_head,L_q)
-
-    TensorF32 result;
-    result.copy_from(*output);
-    return result;
+    // 输入约定: Q, K, V 均为 (batch, n_head, D_head, L)。纯值版实现
+    // （图版 out_prod/scale/softmax 返回图节点 data()=nullptr，值 copy_from 会崩）。
+    return value_attention(Q, K, V, bias);
 }
 
 // ===== SelfAttention::forward_graph (图模式) =====
@@ -115,32 +261,47 @@ void MSARowAttention::set_params(const AttnConfig& config,
 
 TensorF32 MSARowAttention::forward(const TensorF32& msa, const TensorF32& pair_biased) {
     auto Q    = Wq_->forward(msa);
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[MRA] in msa=(%lld,%lld,%lld,%lld) pair_biased=(%lld,%lld,%lld,%lld) Q=(%lld,%lld,%lld,%lld)\n",
+        (long long)msa.shape().dims[0], (long long)msa.shape().dims[1], (long long)msa.shape().dims[2], (long long)msa.shape().dims[3],
+        (long long)pair_biased.shape().dims[0], (long long)pair_biased.shape().dims[1], (long long)pair_biased.shape().dims[2], (long long)pair_biased.shape().dims[3],
+        (long long)Q.shape().dims[0], (long long)Q.shape().dims[1], (long long)Q.shape().dims[2], (long long)Q.shape().dims[3]);
     int B = static_cast<int>(Q.shape().dims[0]);
     int N = static_cast<int>(Q.shape().dims[1]);
     int L = static_cast<int>(Q.shape().dims[2]);
-    //int D = static_cast<int>(Q.shape().dims[3]);
     int H = config_.n_head;
-    int D = D_MSA;
-    Q = Q.view({B * N, L, H, D});
+    // D = 每头隐藏维 = 特征维/H（对齐图版；FullBlock 的 msa_full 64 维 → D=8）
+    int D = (int)Q.shape().dims[3] / H;
+    Q = value_reshape(Q, Shape({B * N, L, H, D}));
     Q = Q.permute({0, 2, 3, 1});
     // (B, H, D, L)
     auto K    = Wk_->forward(msa);
     auto V    = Wv_->forward(msa);
-    K = K.view(Shape({B * N, L, H, D}));
+    K = value_reshape(K, Shape({B * N, L, H, D}));
     K = K.permute({0, 2, 3, 1});
 
-    V = V.view(Shape({B * N, L, H, D}));
+    V = value_reshape(V, Shape({B * N, L, H, D}));
     V = V.permute({0, 2, 3, 1});
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[MRA] QKV OK (Q=%lld K=%lld V=%lld)\n",
+        (long long)Q.numel(), (long long)K.numel(), (long long)V.numel());
     auto bias = to_b_->forward(pair_biased);  // 遗留：值版 bias 广播未处理（同 Bug3）
     auto gv   = to_g_->forward(msa);
-    auto gate = sigmoid(&gv);
+    // 值版 sigmoid + 逐元素门控（图版 sigmoid/out_prod 返回图节点；out_prod 是外积非逐元素）
+    TensorF32 gate(gv.shape(), gv.device());
+    const float* gvp = gv.data();
+    float* gt = gate.data();
+    for (int64_t i = 0; i < gv.numel(); ++i) gt[i] = 1.0f / (1.0f + std::exp(-gvp[i]));
     auto attn_out = self_attn_->forward(Q, K, V, &bias);
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[MRA] self_attn OK (%lld,%lld,%lld,%lld)\n",
+        (long long)attn_out.shape().dims[0], (long long)attn_out.shape().dims[1], (long long)attn_out.shape().dims[2], (long long)attn_out.shape().dims[3]);
     // (B*N, H, D, L)
     attn_out = attn_out.permute({0, 3, 1, 2});
-    attn_out = attn_out.view(Shape({B, N, L, H * D}));
-    
-    auto gated_attn_out = out_prod(gate, &attn_out);
-    return to_out_->forward(*gated_attn_out);
+    attn_out = value_reshape(attn_out, Shape({B, N, L, H * D}));
+
+    TensorF32 gated(attn_out.shape(), attn_out.device());
+    const float* ad = attn_out.data();
+    float* gd2 = gated.data();
+    for (int64_t i = 0; i < attn_out.numel(); ++i) gd2[i] = gt[i] * ad[i];
+    return to_out_->forward(gated);
 }
 
 // ===== MSARowAttention::forward_graph (图模式) =====
@@ -208,38 +369,46 @@ void MSAColAttention::set_params(const AttnConfig& config,
 TensorF32 MSAColAttention::forward(const TensorF32& msa) {
     // Col attention: 沿 N_seq 维做 attention, L 合并进 batch
     // 输入 msa: (B, N, L, 256)
-    auto Q = Wq_->forward(msa);  // (B, N, L, 2048)
+    auto Q = Wq_->forward(msa);  // (B, N, L, H*D)
     int B = static_cast<int>(Q.shape().dims[0]);
     int N = static_cast<int>(Q.shape().dims[1]);
     int L = static_cast<int>(Q.shape().dims[2]);
     int H = config_.n_head;      // 8
-    int D = D_MSA;               // 256
+    // D = 每头隐藏维 = 特征维/H（对齐图版；FullBlock 的 msa_full 64 维 → D=8）
+    int D = (int)Q.shape().dims[3] / H;
 
-    // Split heads: (B, N, L, 2048) → (B*L, N, 8, 256) → (B*L, 8, 256, N)
-    Q = Q.view(Shape({B * L, N, H, D}));
+    // Split heads: (B, N, L, H*D) → (B*L, N, 8, D) → (B*L, 8, D, N)
+    Q = value_reshape(Q, Shape({B * L, N, H, D}));
     Q = Q.permute({0, 2, 3, 1});  // (B*L, 8, 256, N) = (batch, n_head, D_head, L_seq)
 
     auto K = Wk_->forward(msa);
-    K = K.view(Shape({B * L, N, H, D}));
+    K = value_reshape(K, Shape({B * L, N, H, D}));
     K = K.permute({0, 2, 3, 1});
 
     auto V = Wv_->forward(msa);
-    V = V.view(Shape({B * L, N, H, D}));
+    V = value_reshape(V, Shape({B * L, N, H, D}));
     V = V.permute({0, 2, 3, 1});
 
     auto gv   = to_g_->forward(msa);
-    auto gate = sigmoid(&gv);
+    // 值版 sigmoid + 逐元素门控（图版 sigmoid/out_prod 返回图节点；out_prod 是外积非逐元素）
+    TensorF32 gate(gv.shape(), gv.device());
+    const float* gvp = gv.data();
+    float* gt = gate.data();
+    for (int64_t i = 0; i < gv.numel(); ++i) gt[i] = 1.0f / (1.0f + std::exp(-gvp[i]));
 
     auto attn_out = self_attn_->forward(Q, K, V);
-    // attn_out: (B*L, 8, 256, N)
+    // attn_out: (B*L, 8, D, N)
 
-    // Merge heads: (B*L, 8, 256, N) → (B*L, N, 8*256) → (B, L, N, 2048) → (B, N, L, 2048)
-    attn_out = attn_out.permute({0, 3, 1, 2});      // (B*L, N, 8, 256)
-    attn_out = attn_out.view(Shape({B, L, N, H * D})); // (B, L, N, 2048)
-    attn_out = attn_out.permute({0, 2, 1, 3});      // (B, N, L, 2048)  恢复原始 dim 顺序
+    // Merge heads: (B*L, 8, D, N) → (B*L, N, 8*D) → (B, L, N, H*D) → (B, N, L, H*D)
+    attn_out = attn_out.permute({0, 3, 1, 2});      // (B*L, N, 8, D)
+    attn_out = value_reshape(attn_out, Shape({B, L, N, H * D})); // (B, L, N, H*D)
+    attn_out = attn_out.permute({0, 2, 1, 3});      // (B, N, L, H*D)  恢复原始 dim 顺序
 
-    auto gated_attn_out = out_prod(gate, &attn_out);
-    return to_out_->forward(*gated_attn_out);
+    TensorF32 gated(attn_out.shape(), attn_out.device());
+    const float* ad = attn_out.data();
+    float* gd2 = gated.data();
+    for (int64_t i = 0; i < attn_out.numel(); ++i) gd2[i] = gt[i] * ad[i];
+    return to_out_->forward(gated);
 }
 
 // ===== MSAColAttention::forward_graph (图模式) =====
@@ -290,13 +459,14 @@ TensorF32* MSAColAttention::forward_graph(TensorF32* msa) {
 // ===== MSAGlobalColAttention =====
 TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
     // Global Col attention: Q 在 N_seq 维取 mean, 然后 1-to-many attention
-    // 输入 msa: (B, N, L, 256)
-    auto Q_raw = Wq_->forward(msa);  // (B, N, L, 2048)
+    // 输入 msa: (B, N, L, D_MSA)。main 块 D=256；full 块(msa_full 64维) D=8。
+    auto Q_raw = Wq_->forward(msa);  // (B, N, L, H*D)
     int B = static_cast<int>(Q_raw.shape().dims[0]);
     int N = static_cast<int>(Q_raw.shape().dims[1]);
     int L = static_cast<int>(Q_raw.shape().dims[2]);
     int H = config_.n_head;      // 8
-    int D = D_MSA;               // 256
+    // D = 每头隐藏维 = 特征维/H（对齐图版 forward_graph；不能用 D_MSA=256，FullBlock 是 64 维）
+    int D = (int)Q_raw.shape().dims[3] / H;
 
     // Q: 先 mean 再 split heads
     // mean 沿 dim=1(N_seq): (B, N, L, 2048) → (B, L, 2048)
@@ -321,39 +491,48 @@ TensorF32 MSAGlobalColAttention::forward(const TensorF32& msa) {
         }
         Q = std::move(Q_mean);
     }
-    // split heads: (B, L, 2048) → (B*L, 8, 256) → (B*L, 8, 256, 1)
-    Q = Q.view(Shape({B * L, H, D}));      // (B*L, 8, 256)
-    // 需要变成 4D: (B*L, 8, 256, 1) 即 (batch, n_head, D_head, L_seq=1)
-    // 使用 view: (B*L, 8, 256) → (B*L, 8, 256, 1)
-    Q = Q.view(Shape({B * L, H, D, 1}));
+    // split heads: (B, L, H*D) → (B*L, H, D) → (B*L, H, D, 1)
+    Q = value_reshape(Q, Shape({B * L, H, D}));      // (B*L, H, D)
+    // 需要变成 4D: (B*L, H, D, 1) 即 (batch, n_head, D_head, L_seq=1)
+    Q = value_reshape(Q, Shape({B * L, H, D, 1}));
 
-    // KV: split heads → (B*L, 8, 256, N)
+    // KV: split heads → (B*L, H, D, N)
     auto K = Wk_->forward(msa);
-    K = K.view(Shape({B * L, N, H, D}));
-    K = K.permute({0, 2, 3, 1});  // (B*L, 8, 256, N)
+    K = value_reshape(K, Shape({B * L, N, H, D}));
+    K = K.permute({0, 2, 3, 1});  // (B*L, H, D, N)
 
     auto V = Wv_->forward(msa);
-    V = V.view(Shape({B * L, N, H, D}));
-    V = V.permute({0, 2, 3, 1});  // (B*L, 8, 256, N)
+    V = value_reshape(V, Shape({B * L, N, H, D}));
+    V = V.permute({0, 2, 3, 1});  // (B*L, H, D, N)
 
     auto gv   = to_g_->forward(msa);
-    auto gate = sigmoid(&gv);
+    // 值版 sigmoid（图版 sigmoid 返回图节点 data()=nullptr）
+    TensorF32 gate(gv.shape(), gv.device());
+    const float* gvp = gv.data();
+    float* gt = gate.data();
+    for (int64_t i = 0; i < gv.numel(); ++i) gt[i] = 1.0f / (1.0f + std::exp(-gvp[i]));
 
-    // Q: (B*L, 8, 256, 1), dims=[1, 256, 8, B*L], ne01=256
-    // K: (B*L, 8, 256, N), dims=[N, 256, 8, B*L], ne11=256  ✓
-    // scores = [1, N, 8, B*L] = (B*L, 8, 1, N) ✓
+    // Q: (B*L, H, D, 1), K/V: (B*L, H, D, N) → value_attention 契约
     auto attn_out = self_attn_->forward(Q, K, V);
-    // attn_out: (B*L, 8, 256, 1)
+    // attn_out: (B*L, H, D, 1)
 
-    // Merge heads: (B*L, 8, 256, 1) → (B, L, 2048)
-    attn_out = attn_out.view(Shape({B * L, H * D}));  // squeeze last dim → (B*L, 2048)
-    attn_out = attn_out.view(Shape({B, L, H * D}));   // (B, L, 2048)
-    // 扩展回 (B, N, L, 2048) 匹配 gate
-    attn_out = attn_out.view(Shape({B, 1, L, H * D})); // (B, 1, L, 2048)
-    // gate: (B, N, L, 2048), out_prod 会通过 repeat 广播 dim 1
-
-    auto gated_attn_out = out_prod(gate, &attn_out);
-    return to_out_->forward(*gated_attn_out);
+    // Merge heads: (B*L, H, D, 1) → (B, L, H*D) → (B, 1, L, H*D)
+    attn_out = value_reshape(attn_out, Shape({B * L, H * D}));  // squeeze last dim → (B*L, H*D)
+    attn_out = value_reshape(attn_out, Shape({B, L, H * D}));   // (B, L, H*D)
+    // 扩展回 (B, 1, L, H*D) 匹配 gate
+    attn_out = value_reshape(attn_out, Shape({B, 1, L, H * D})); // (B, 1, L, H*D)
+    // gate: (B, N, L, H*D) × attn_out: (B, 1, L, H*D) → broadcast-mul 沿 dim1（值版 out_prod 语义）
+    TensorF32 gated({B, N, L, H * D}, Q_raw.device());
+    const float* gd = gate.data();
+    const float* ad = attn_out.data();
+    float* o = gated.data();
+    const int64_t row_elems = (int64_t)L * H * D;
+    for (int b = 0; b < B; ++b)
+        for (int n = 0; n < N; ++n)
+            for (int64_t r = 0; r < row_elems; ++r)
+                o[((int64_t)(b * N + n) * row_elems) + r] =
+                    gd[((int64_t)(b * N + n) * row_elems) + r] * ad[(int64_t)b * row_elems + r];
+    return to_out_->forward(gated);
 }
 
 // ===== MSAGlobalColAttention::forward_graph (图模式) =====
@@ -438,41 +617,46 @@ TensorF32 PairRowAttention::forward(const TensorF32& pair, const TensorF32& str_
     // Row attention: 沿最后一个 L 维 (行) 做 attention
     // 输入 pair: (B, L_row, L_col, 128)
     // AF2 PairAxialAttention: Q/K/V 用归一化 pair，gate(to_g) 用原始 pair。
-    // Tensor 为 move-only（禁止拷贝），LayerNorm::forward 接受非 const 指针，用 const_cast（只读输入）。
-    auto& pair_normed = *norm_->forward(const_cast<TensorF32*>(&pair));
-    auto Q = Wq_->forward(pair_normed);  // (B, L_row, L_col, 256)
+    // 值版：norm 用 forward_exec，gate 用 value_sigmoid + 逐元素乘（图 helper 返回图节点）。
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PRA] in pair=(%lld,%lld,%lld,%lld) str_bias=(%lld,%lld,%lld,%lld)\n",
+        (long long)pair.shape().dims[0], (long long)pair.shape().dims[1], (long long)pair.shape().dims[2], (long long)pair.shape().dims[3],
+        (long long)str_bias.shape().dims[0], (long long)str_bias.shape().dims[1], (long long)str_bias.shape().dims[2], (long long)str_bias.shape().dims[3]);
+    TensorF32 pair_normed = norm_->forward_exec(pair);
+    auto Q = Wq_->forward(pair_normed);  // (B, L_row, L_col, H*D)
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PRA] norm+Wq OK Q=(%lld,%lld,%lld,%lld)\n",
+        (long long)Q.shape().dims[0], (long long)Q.shape().dims[1], (long long)Q.shape().dims[2], (long long)Q.shape().dims[3]);
     int B   = static_cast<int>(Q.shape().dims[0]);
     int Lr  = static_cast<int>(Q.shape().dims[1]);  // L_row
     int Lc  = static_cast<int>(Q.shape().dims[2]);  // L_col
     int H   = config_.n_head;      // 8
     int D   = D_PAIR_HIDDEN;       // 32
 
-    // Split heads: (B, L_row, L_col, 256) → (B*L_col, L_row, 8, 32) → (B*L_col, 8, 32, L_row)
-    Q = Q.view(Shape({B * Lc, Lr, H, D}));
+    // Split heads: (B, L_row, L_col, H*D) → (B*L_col, L_row, 8, 32) → (B*L_col, 8, 32, L_row)
+    Q = value_reshape(Q, Shape({B * Lc, Lr, H, D}));
     Q = Q.permute({0, 2, 3, 1});  // (B*Lc, 8, 32, Lr)
 
     auto K = Wk_->forward(pair_normed);
-    K = K.view(Shape({B * Lc, Lr, H, D}));
+    K = value_reshape(K, Shape({B * Lc, Lr, H, D}));
     K = K.permute({0, 2, 3, 1});
 
     auto V = Wv_->forward(pair_normed);
-    V = V.view(Shape({B * Lc, Lr, H, D}));
+    V = value_reshape(V, Shape({B * Lc, Lr, H, D}));
     V = V.permute({0, 2, 3, 1});
 
-    auto bias = to_b_->forward(str_bias);  // 遗留：值版 bias 广播未处理（同 Bug3）；前置不变量 pair 方阵(Lr==Lc==L)
+    auto bias = to_b_->forward(str_bias);  // (B, Lk, Lq, H) 方阵广播，value_attention 内处理
     auto gv   = to_g_->forward(pair);
-    auto gate = sigmoid(&gv);
+    TensorF32 gate = value_sigmoid(gv);
 
     auto attn_out = self_attn_->forward(Q, K, V, &bias);
     // attn_out: (B*Lc, 8, 32, Lr)
 
-    // Merge heads: (B*Lc, 8, 32, Lr) → (B*Lc, Lr, 256) → (B, Lr, Lc, 256)
-    attn_out = attn_out.permute({0, 3, 1, 2});         // (B*Lc, Lr, 8, 32)
-    attn_out = attn_out.view(Shape({B, Lc, Lr, H * D})); // (B, Lc, Lr, 256)
-    attn_out = attn_out.permute({0, 2, 1, 3});         // (B, Lr, Lc, 256)
+    // Merge heads: (B*Lc, 8, 32, Lr) → (B*Lc, Lr, H*D) → (B, Lr, Lc, H*D)
+    attn_out = attn_out.permute({0, 3, 1, 2});            // (B*Lc, Lr, 8, 32) 拥有数据
+    attn_out = value_reshape(attn_out, Shape({B, Lc, Lr, H * D})); // (B, Lc, Lr, H*D) 拷贝
+    attn_out = attn_out.permute({0, 2, 1, 3});            // (B, Lr, Lc, H*D) 拷贝（permute 是拷贝实现）
 
-    auto gated_attn_out = out_prod(gate, &attn_out);
-    return to_out_->forward(*gated_attn_out);
+    TensorF32 gated = value_mul_same(gate, attn_out);
+    return to_out_->forward(gated);
 }
 
 // ===== PairRowAttention::forward_graph (图模式) =====
@@ -543,40 +727,57 @@ TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_
     // Col attention: 沿倒数第二个 L 维 (列) 做 attention
     // 输入 pair: (B, L_row, L_col, 128)
     // AF2 PairAxialAttention: Q/K/V 用归一化 pair，gate(to_g) 用原始 pair。
-    // Tensor 为 move-only（禁止拷贝），LayerNorm::forward 接受非 const 指针，用 const_cast（只读输入）。
-    auto& pair_normed = *norm_->forward(const_cast<TensorF32*>(&pair));
-    auto Q = Wq_->forward(pair_normed);  // (B, L_row, L_col, 256)
+    // 值版：norm 用 forward_exec，gate 用 value_sigmoid + 逐元素乘（图 helper 返回图节点）。
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PCA] in pair=(%lld,%lld,%lld,%lld) str_bias=(%lld,%lld,%lld,%lld)\n",
+        (long long)pair.shape().dims[0], (long long)pair.shape().dims[1], (long long)pair.shape().dims[2], (long long)pair.shape().dims[3],
+        (long long)str_bias.shape().dims[0], (long long)str_bias.shape().dims[1], (long long)str_bias.shape().dims[2], (long long)str_bias.shape().dims[3]);
+    TensorF32 pair_normed = norm_->forward_exec(pair);
+    auto Q = Wq_->forward(pair_normed);  // (B, L_row, L_col, H*D)
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PCA] norm+Wq OK Q=(%lld,%lld,%lld,%lld)\n",
+        (long long)Q.shape().dims[0], (long long)Q.shape().dims[1], (long long)Q.shape().dims[2], (long long)Q.shape().dims[3]);
     int B   = static_cast<int>(Q.shape().dims[0]);
     int Lr  = static_cast<int>(Q.shape().dims[1]);  // L_row
     int Lc  = static_cast<int>(Q.shape().dims[2]);  // L_col
     int H   = config_.n_head;      // 8
     int D   = D_PAIR_HIDDEN;       // 32
 
-    // Split heads: (B, L_row, L_col, 256) → (B*L_row, L_col, 8, 32) → (B*L_row, 8, 32, L_col)
-    Q = Q.view(Shape({B * Lr, Lc, H, D}));
+    // Split heads: (B, L_row, L_col, H*D) → (B*L_row, L_col, 8, 32) → (B*L_row, 8, 32, L_col)
+    Q = value_reshape(Q, Shape({B * Lr, Lc, H, D}));
     Q = Q.permute({0, 2, 3, 1});  // (B*Lr, 8, 32, Lc)
 
     auto K = Wk_->forward(pair_normed);
-    K = K.view(Shape({B * Lr, Lc, H, D}));
+    K = value_reshape(K, Shape({B * Lr, Lc, H, D}));
     K = K.permute({0, 2, 3, 1});
 
     auto V = Wv_->forward(pair_normed);
-    V = V.view(Shape({B * Lr, Lc, H, D}));
+    V = value_reshape(V, Shape({B * Lr, Lc, H, D}));
     V = V.permute({0, 2, 3, 1});
 
-    auto bias = to_b_->forward(str_bias);  // 遗留：值版 bias 广播未处理（同 Bug3）；前置不变量 pair 方阵(Lr==Lc==L)
+    auto bias = to_b_->forward(str_bias);  // (B, Lk, Lq, H) 方阵广播，value_attention 内处理
     auto gv   = to_g_->forward(pair);
-    auto gate = sigmoid(&gv);
+    TensorF32 gate = value_sigmoid(gv);
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PCA] QKV+bias+gate OK (Q=%lld K=%lld V=%lld gate=%lld bias=%lld)\n",
+        (long long)Q.numel(), (long long)K.numel(), (long long)V.numel(),
+        (long long)gate.numel(), (long long)bias.numel());
 
     auto attn_out = self_attn_->forward(Q, K, V, &bias);
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PCA] self_attn OK (%lld,%lld,%lld,%lld)\n",
+        (long long)attn_out.shape().dims[0], (long long)attn_out.shape().dims[1], (long long)attn_out.shape().dims[2], (long long)attn_out.shape().dims[3]);
     // attn_out: (B*Lr, 8, 32, Lc)
 
-    // Merge heads: (B*Lr, 8, 32, Lc) → (B*Lr, Lc, 256) → (B, Lr, Lc, 256)
-    attn_out = attn_out.permute({0, 3, 1, 2});         // (B*Lr, Lc, 8, 32)
-    attn_out = attn_out.view(Shape({B, Lr, Lc, H * D})); // (B, Lr, Lc, 256)
+    // Merge heads: (B*Lr, 8, 32, Lc) → (B*Lr, Lc, H*D) → (B, Lr, Lc, H*D)
+    // ⚠️ 不能用 attn_out = attn_out.view(...)：view 不拥有数据，move 赋值先释放自身再接管悬垂指针。
+    //    view 须与底层拥有者分离声明，同作用域存活。
+    TensorF32 merged = attn_out.permute({0, 3, 1, 2});          // (B*Lr, Lc, 8, 32) 拥有数据
+    TensorF32 merged_view = merged.view(Shape({B, Lr, Lc, H * D})); // (B, Lr, Lc, H*D) 非拥有 view
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PCA] merge OK gate=%lld mv=%lld\n",
+        (long long)gate.numel(), (long long)merged_view.numel());
 
-    auto gated_attn_out = out_prod(gate, &attn_out);
-    return to_out_->forward(*gated_attn_out);
+    TensorF32 gated = value_mul_same(gate, merged_view);
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PCA] gated OK (%lld)\n", (long long)gated.numel());
+    TensorF32 result = to_out_->forward(gated);
+    if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[PCA] to_out OK\n");
+    return result;
 }
 
 // ===== PairColAttention::forward_graph (图模式) =====
@@ -680,46 +881,28 @@ TensorF32 CrossAttention::forward(const TensorF32& query, const TensorF32& kv) {
 
     // ===== 2. Split heads =====
     // Q: (B*L, 1, 64) → view → (B*L, 1, 8, 8) → permute → (B*L, 8, 8, 1)
-    Q = Q.view(Shape({BL, 1, H, D}));
+    Q = value_reshape(Q, Shape({BL, 1, H, D}));
     Q = Q.permute({0, 2, 3, 1});  // (B*L, 8, 8, 1) = (batch, n_head, D_head, L_q=1)
 
     // K: (B*L, T, 64) → view → (B*L, T, 8, 8) → permute → (B*L, 8, 8, T)
-    K = K.view(Shape({BL, T, H, D}));
+    K = value_reshape(K, Shape({BL, T, H, D}));
     K = K.permute({0, 2, 3, 1});  // (B*L, 8, 8, T)
 
     // V: 同上
-    V = V.view(Shape({BL, T, H, D}));
+    V = value_reshape(V, Shape({BL, T, H, D}));
     V = V.permute({0, 2, 3, 1});  // (B*L, 8, 8, T)
 
-    // ===== 3. Q @ K^T =====
-    // Q: [1, 8, 8, BL], K: [T, 8, 8, BL]
-    // out_prod 在 dims[1]=D_head=8 上收缩 → scores: [1, T, 8, BL] = (BL, 8, 1, T)
-    auto scores = out_prod(&Q, &K);
-
-    // ===== 4. Scale + softmax =====
-    float scale_val = 1.0f / std::sqrt(static_cast<float>(D));
-    auto scaled = scale(scores, scale_val);
-    auto attn = softmax(scaled);  // (BL, 8, 1, T), dims = [T, 1, 8, BL]
-
-    // ===== 5. attn @ V =====
-    // attn: [T, 1, 8, BL], ne01 = 1
-    // V:    [T, 8, 8, BL], ne11 = 8  → ne01 ≠ ne11
-    // 需要 permute 让收缩维对齐:
-    // attn: (BL, 8, 1, T) → permute({0,1,3,2}) → (BL, 8, T, 1)
-    //       dims = [1, T, 8, BL], ne01 = T
-    // V:    (BL, 8, 8, T) → permute({0,1,3,2}) → (BL, 8, T, 8)
-    //       dims = [8, T, 8, BL], ne11 = T  ✓
-    auto attn_t = permute(attn, {0, 1, 3, 2});
-    auto V_t    = permute(&V, {0, 1, 3, 2});
-    auto output = out_prod(attn_t, V_t);  // (BL, 8, 8, 1)
+    // ===== 3-5. Q@K^T / scale / softmax / attn@V（纯值版；图 out_prod/softmax 返回图节点）=====
+    // Q (BL,H,D,1), K/V (BL,H,D,T) 与 value_attention 输入布局一致
+    TensorF32 output = value_attention(Q, K, V, nullptr);  // (BL, H, D, 1)
 
     // ===== 6. Merge heads =====
-    // output: (BL, 8, 8, 1) → permute → (BL, 1, 8, 8) → view → (BL, 1, 64)
-    auto merged = output->permute({0, 3, 1, 2});  // (BL, 1, 8, 8)
-    merged = merged.view(Shape({BL, 1, PD}));     // (BL, 1, 64)
+    // output: (BL, H, D, 1) → permute({0,3,1,2}) → (BL, 1, H, D) → view → (BL, 1, PD)
+    TensorF32 merged = output.permute({0, 3, 1, 2});  // (BL, 1, H, D) 拥有数据
+    TensorF32 merged_v = merged.view(Shape({BL, 1, PD}));     // (BL, 1, PD) 非拥有 view
 
-    // ===== 7. 输出投影: 64 → 32 =====
-    auto result = Wo_->forward(merged);  // (B*L, 1, 32)
+    // ===== 7. 输出投影: PD → q_dim =====
+    auto result = Wo_->forward(merged_v);  // (B*L, 1, q_dim)
     return result;
 }
 
@@ -797,27 +980,28 @@ void TriangleMultiplication::set_params(int dim,
 }
 
 TensorF32 TriangleMultiplication::forward(const TensorF32& pair, bool bOutgoing) {
-    auto pair_norm = layernorm_->forward(const_cast<TensorF32*>(&pair));  // TensorF32*
-    auto left  = left_proj_->forward(*pair_norm);   // 解引用传引用
-    auto right = right_proj_->forward(*pair_norm);
-    auto lgv   = left_gate_->forward(*pair_norm);
-    auto rgv   = right_gate_->forward(*pair_norm);
-    auto left_gate  = sigmoid(&lgv);
-    auto right_gate = sigmoid(&rgv);
+    // 值版：norm 用 forward_exec，gate 用 value_sigmoid，tri_mul 用 value_triangle_mul
+    // （图版 layernorm_->forward/sigmoid/mul/triangle_mul 返回图节点 data()=nullptr）。
+    TensorF32 pair_norm = layernorm_->forward_exec(pair);
+    auto left  = left_proj_->forward(pair_norm);
+    auto right = right_proj_->forward(pair_norm);
+    auto lgv   = left_gate_->forward(pair_norm);
+    auto rgv   = right_gate_->forward(pair_norm);
+    TensorF32 left_gate  = value_sigmoid(lgv);
+    TensorF32 right_gate = value_sigmoid(rgv);
     // gate 为逐元素缩放（非 out_prod 收缩），与 forward_graph 保持一致。
-    auto left_gated  = mul(&left, left_gate);
-    auto right_gated = mul(&right, right_gate);
+    TensorF32 left_gated  = value_mul_same(left, left_gate);
+    TensorF32 right_gated = value_mul_same(right, right_gate);
 
-    auto tri_mul_forward = triangle_mul(left_gated, right_gated, float(pair.shape().dims[1]), bOutgoing);
+    TensorF32 tri_mul_forward = value_triangle_mul(left_gated, right_gated,
+                                                   float(pair.shape().dims[1]), bOutgoing);
 
-    auto tri_mul_forward_norm  = output_layernorm_->forward(tri_mul_forward);
-    auto tri_mul_forward_proj  = out_proj_->forward(*tri_mul_forward_norm);
+    TensorF32 tri_mul_forward_norm = output_layernorm_->forward_exec(tri_mul_forward);
+    TensorF32 tri_mul_forward_proj = out_proj_->forward(tri_mul_forward_norm);
 
-    auto gv = gate_->forward(*pair_norm);
-    auto gate_out = sigmoid(&gv);
-    auto tri_mul_forward_gated = mul(gate_out, &tri_mul_forward_proj);
-
-    return std::move(*tri_mul_forward_gated);
+    auto gv = gate_->forward(pair_norm);
+    TensorF32 gate_out = value_sigmoid(gv);
+    return value_mul_same(gate_out, tri_mul_forward_proj);
 }
 
 // ===== TriangleMultiplication::forward_graph (图模式) =====
@@ -863,12 +1047,12 @@ void FeedForward::set_params(int dim, int hidden_dim, float dropout,
 }
 
 TensorF32 FeedForward::forward(const TensorF32& x) {
-    auto x_norm   = layernorm_->forward(const_cast<TensorF32*>(&x));  // 返回 TensorF32*
-    auto x_hidden = linear1_->forward(*x_norm);                      // 解引用后传引用
-    auto* x_relu  = relu(&x_hidden);                                   // relu 接受指针，返回指针
-    auto x_dropped = dropout_.forward(*x_relu);                        // dropout 接受值引用
-    auto x_out = linear2_->forward(x_dropped);                        // 传引用
-    return x_out;
+    // 值版：norm 用 forward_exec，relu 用 value_relu（图版 forward/relu 返回图节点）
+    TensorF32 x_norm    = layernorm_->forward_exec(x);
+    TensorF32 x_hidden  = linear1_->forward(x_norm);
+    TensorF32 x_relu    = value_relu(x_hidden);
+    TensorF32 x_dropped = dropout_.forward(x_relu);
+    return linear2_->forward(x_dropped);
 }
 
 // ===== FeedForward::forward_graph (图模式) =====
@@ -909,44 +1093,40 @@ void TemplatePairStack::set_params(
 }
 
 TensorF32 TemplatePairStack::forward(const TensorF32& pair, TensorF32& rbf_feature, const TensorF32& state) {
-    
+    // 值版：norm 用 forward_exec，gate 用 value_outer_cartesian/value_sigmoid，
+    //       残差用 value_add_same（图 helper out_prod/sigmoid/add_impl 返回图节点）。
     TensorF32 rbf_proj = rbf_proj_->forward(rbf_feature);  // (B,L,L,128)
-    
-    auto& state_normed = *state_norm_->forward(const_cast<TensorF32*>(&state));
-    
+
+    TensorF32 state_normed = state_norm_->forward_exec(state);
+
     TensorF32 left  = left_proj_->forward(state_normed);   // (B,L,16)
     TensorF32 right = right_proj_->forward(state_normed);  // (B,L,16)
-    auto gate  = out_prod(&left, &right);                   // (B,L,L,256)
-    TensorF32 gate_proj = gate_proj_->forward(*gate);       // (B,L,L,128)
-    auto gate_sig  = sigmoid(&gate_proj);
-    auto out_rbf_feature = out_prod(&rbf_feature, gate_sig);
-    rbf_feature.copy_from(*out_rbf_feature);
+    TensorF32 gate  = value_outer_cartesian(left, right);   // (B,L,L,256)
+    TensorF32 gate_proj = gate_proj_->forward(gate);       // (B,L,L,128)
+    TensorF32 gate_sig  = value_sigmoid(gate_proj);
+    rbf_feature = value_mul_same(rbf_feature, gate_sig);   // 引用更新（对齐图版）
 
     TensorF32 pair_tmp;
     pair_tmp.copy_from(pair);
 
-    auto tri_out = tri_mul_out_->forward(pair_tmp, true);
-    auto tri_out_drop = drop_row_.forward(tri_out);
-    auto pair_tri_out = add_impl(&pair_tmp, &tri_out_drop, /*inplace=*/false);
+    TensorF32 tri_out = tri_mul_out_->forward(pair_tmp, true);
+    TensorF32 tri_out_drop = drop_row_.forward(tri_out);
+    pair_tmp = value_add_same(pair_tmp, tri_out_drop);
 
-    auto tri_in = tri_mul_in_->forward(*pair_tri_out, false);
-    auto tri_in_drop = drop_row_.forward(tri_in);
-    auto pair_tri_in = add_impl(pair_tri_out, &tri_in_drop, /*inplace=*/false);
+    TensorF32 tri_in = tri_mul_in_->forward(pair_tmp, false);
+    TensorF32 tri_in_drop = drop_row_.forward(tri_in);
+    pair_tmp = value_add_same(pair_tmp, tri_in_drop);
 
-    auto pair_row_attn = pair_row_attn_->forward(*pair_tri_in, rbf_proj);
-    auto row_drop = drop_row_.forward(pair_row_attn);
-    auto pair_after_row = add_impl(pair_tri_in, &row_drop, /*inplace=*/false);
+    TensorF32 row_attn = pair_row_attn_->forward(pair_tmp, rbf_proj);
+    TensorF32 row_drop = drop_row_.forward(row_attn);
+    pair_tmp = value_add_same(pair_tmp, row_drop);
 
-    auto pair_col_attn = pair_col_attn_->forward(*pair_after_row, rbf_proj);
-    auto col_drop = drop_col_.forward(pair_col_attn);
-    auto pair_after_col = add_impl(pair_after_row, &col_drop, /*inplace=*/false);
+    TensorF32 col_attn = pair_col_attn_->forward(pair_tmp, rbf_proj);
+    TensorF32 col_drop = drop_col_.forward(col_attn);
+    pair_tmp = value_add_same(pair_tmp, col_drop);
 
-    auto pair_ff_out = pair_ff_->forward(*pair_after_col);
-    auto pair_final = add_impl(pair_after_col, &pair_ff_out, /*inplace=*/false);
-
-    TensorF32 result;
-    result.copy_from(*pair_final);
-    return result;
+    TensorF32 pair_ff_out = pair_ff_->forward(pair_tmp);
+    return value_add_same(pair_tmp, pair_ff_out);
 }
 
 // ===== TemplatePairStack::forward_graph (图模式) =====

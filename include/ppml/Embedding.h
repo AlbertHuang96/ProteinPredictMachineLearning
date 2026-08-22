@@ -85,7 +85,8 @@ public:
     LinearLayer() = default;
 
     // 工厂函数：从 context 分配权重
-    static LinearLayer* create(int in_features, int out_features, bool bias = true);
+    // se3=true：权重/bias 打 TENSOR_FLAG_SE3（AdamW 分层小 lr，缓解 SE3 梯度尺度不匹配）。
+    static LinearLayer* create(int in_features, int out_features, bool bias = true, bool se3 = false);
 
     void zeros_weight() {
         std::memset(weight_->data(), 0, weight_->shape().numel() * sizeof(float));

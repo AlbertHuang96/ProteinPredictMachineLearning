@@ -13,6 +13,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
+#include <random>
 #include <fstream>
 #include <filesystem>
 #include <sstream>
@@ -214,13 +215,488 @@ void save_checkpoint(PPMLModel& model, const std::string& path,
               param_names);
 }
 
-int main(int argc, char* argv[]) {
-    // 1. 初始化 Python 桥接 (用于数据加载和预处理)
-    auto& py = PythonBridge::instance();
-    if (!py.initialize()) {
-        std::cerr << "Failed to initialize Python" << std::endl;
+// ============================================================================
+// 多样本训练 (gradient accumulation / virtual batching)
+//   - 模型整体仅支持 B=1, 故多样本 = 在 training_batch_data/ 中逐个蛋白做
+//     B=1 前向+反向, 跨 K 个样本累加梯度, 取平均后做一次 optimizer.step()。
+//   - FULL_TRAIN (N=512) 是默认配置且【不可降低】。若系统可用内存不足以容纳
+//     单个 N=512 样本, 直接停止训练, 绝不退化为更小的 MSA 深度。
+//   - 数据按需流式加载: 每个蛋白用完即释放 (ModelInput 出作用域), 不常驻。
+// ============================================================================
+
+namespace {
+
+// 从 a3m 文件读取 query (第一行序列). a3m 第一行 >header, 第二行即 query 序列。
+std::string read_a3m_query_sequence(const std::string& a3m_path) {
+    std::ifstream f(a3m_path);
+    if (!f) throw std::runtime_error("read_a3m_query_sequence: cannot open " + a3m_path);
+    std::string line;
+    bool seen_header = false;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        if (line[0] == '>') { seen_header = true; continue; }
+        if (seen_header) {
+            // 去掉可能的插入字符 (小写) —— query 序列用大写即可
+            std::string seq;
+            for (char c : line) if (c != '\n' && c != '\r') seq.push_back(c);
+            return seq;
+        }
+    }
+    throw std::runtime_error("read_a3m_query_sequence: no sequence found in " + a3m_path);
+}
+
+// 发现训练集: 配对 <U>_alignment.a3m 与 *_<U>_mapping.csv 目录
+struct ProteinSample { std::string a3m; std::string csv_dir; std::string uniprot; };
+std::vector<ProteinSample> discover_training_set(const std::string& root) {
+    std::vector<ProteinSample> out;
+    if (!std::filesystem::exists(root)) return out;
+    // 收集 a3m -> uniprot
+    std::map<std::string, std::string> a3m_of;
+    for (auto& e : std::filesystem::directory_iterator(root)) {
+        if (!e.is_regular_file()) continue;
+        std::string p = e.path().string();
+        if (p.size() >= 11 && p.compare(p.size() - 11, 11, "_alignment.a3m") == 0) {
+            std::string name = e.path().filename().string();
+            std::string uni = name.substr(0, name.size() - 12); // 去掉 "_alignment"
+            a3m_of[uni] = p;
+        }
+    }
+    for (auto& kv : a3m_of) {
+        const std::string& uni = kv.first;
+        const std::string& a3m = kv.second;
+        // 收集该 uniprot 的所有 *_<U>_mapping.csv 到一个目录 (用 root 本身, load_from_files 支持目录)
+        // 这里把匹配 *_<uni>_mapping.csv 的文件软归类: 直接以 root 作为 csv 目录, load_from_files 会 glob
+        // 为精确只喂该蛋白的 csv, 我们建一个临时子集目录更稳妥, 但 glob 已按文件名合并所有 uniprot,
+        // 因此这里用 uniprot 过滤: 把所有 *_<uni>_mapping.csv 拷贝/链接到独立子目录代价高。
+        // 简化: 用 root 目录, load_from_files 的 glob 会合并全部——对多样本 batch 而言每个样本都共享
+        // 全部 ground-truth 坐标其实不合理。故改为: 为每个蛋白创建 <root>/_ms_<uni>/ 子集目录。
+        std::string subset_dir = root + "/_ms_" + uni;
+        std::error_code ec;
+        std::filesystem::create_directories(subset_dir, ec);
+        bool any = false;
+        for (auto& ce : std::filesystem::directory_iterator(root)) {
+            if (!ce.is_regular_file()) continue;
+            std::string cp = ce.path().string();
+            std::string cn = ce.path().filename().string();
+            // 匹配 *_<uni>_mapping.csv 或 <uni>_mapping.csv
+            bool match = (cn.find("_" + uni + "_mapping.csv") != std::string::npos) ||
+                         (cn == uni + "_mapping.csv");
+            if (match) {
+                std::filesystem::copy_file(cp, subset_dir + "/" + cn,
+                                           std::filesystem::copy_options::overwrite_existing, ec);
+                any = true;
+            }
+        }
+        if (any) out.push_back({a3m, subset_dir, uni});
+    }
+    return out;
+}
+
+// 估计 N=512 单样本全图 (含 backward) 峰值内存 (GB)。
+// 参考: 已知 N=512 时峰值约 18-19.5GB。粗略按 L 线性外推, 给足余量。
+double estimate_peak_gb(int L, int N) {
+    // 经验公式 (N=512 全图含 backward 峰值 ~18-19.5GB, L≈100-350):
+    //   MSA 项 O(L*N) 主导 + pair/distogram 项 O(L^2) 次要。
+    double gb = 14.0 + 0.02 * (double)L * (double(N) / 512.0);
+    gb += (double(L) * double(L)) / (350.0 * 350.0) * 4.0; // O(L^2) 主导项
+    return gb * 1.15; // 15% 余量
+}
+
+// buffer 感知读写 (复刻 GradientClipper 的内部辅助, 因其未导出)
+std::vector<float> ms_read_grad(ComputeGraph* cgraph, TensorF32* param) {
+    TensorF32* grad = cgraph->graph_get_grad(param);
+    std::vector<float> buf(static_cast<size_t>(grad->numel()));
+    const size_t bytes = static_cast<size_t>(grad->numel()) * sizeof(float);
+    if (grad->buffer_) grad->buffer_->get_tensor(grad, buf.data(), grad->buffer_offs_, bytes);
+    else if (grad->data()) std::memcpy(buf.data(), grad->data(), bytes);
+    else buf.assign(buf.size(), 0.0f);
+    return buf;
+}
+void ms_write_grad(ComputeGraph* cgraph, TensorF32* param, const std::vector<float>& vals) {
+    TensorF32* grad = cgraph->graph_get_grad(param);
+    const size_t bytes = static_cast<size_t>(grad->numel()) * sizeof(float);
+    if (grad->buffer_) grad->buffer_->set_tensor(grad, vals.data(), grad->buffer_offs_, bytes);
+    else if (grad->data()) std::memcpy(grad->data(), vals.data(), bytes);
+}
+void ms_zero_grad(ComputeGraph* cgraph, TensorF32* param) {
+    TensorF32* grad = cgraph->graph_get_grad(param);
+    if (!grad) return;
+    const int64_t n = grad->numel();
+    if (grad->buffer_) {
+        std::vector<float> z(static_cast<size_t>(n), 0.0f);
+        grad->buffer_->set_tensor(grad, z.data(), grad->buffer_offs_, static_cast<size_t>(n) * sizeof(float));
+    } else if (grad->data()) {
+        std::fill(grad->data(), grad->data() + n, 0.0f);
+    }
+}
+
+} // namespace
+
+int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
+    std::cout << "\n==== Multi-Sample Training (gradient accumulation) ====" << std::endl;
+
+    const bool use_cuda =
+        (std::getenv("PPML_USE_CUDA") != nullptr) && (std::atoi(std::getenv("PPML_USE_CUDA")) != 0);
+    Backend* backend = model.active_backend();
+    auto* scheduler = (use_cuda && (std::getenv("PPML_CUDA_SCHED") != nullptr) &&
+                       std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0)
+                          ? model.scheduler() : nullptr;
+
+    // MSA 深度: FULL_TRAIN 固定 512, 不可降低 (用户要求)
+    int msa_max_seqs = (full_train ? 512 : 128);
+    if (const char* pmd = std::getenv("PPML_MSA_DEPTH")) {
+        int v = std::atoi(pmd);
+        if (v > 0) msa_max_seqs = v;
+    }
+    std::cout << "[config] MSA depth N=" << msa_max_seqs
+              << " (FULL_TRAIN=" << (full_train ? "true" : "false")
+              << ", 不可为省内存降低)" << std::endl;
+
+    // 发现数据集
+    std::string dataset_root = "data/training_batch_data";
+    if (const char* dr = std::getenv("PPML_DATASET_DIR")) dataset_root = dr;
+    auto samples = discover_training_set(dataset_root);
+    if (samples.empty()) {
+        std::cerr << "[multi-sample] 未发现任何蛋白样本于 " << dataset_root << std::endl;
         return 1;
     }
+    std::cout << "[dataset] 发现 " << samples.size() << " 个蛋白样本" << std::endl;
+
+    // ---- 空间检查 (FULL_TRAIN N=512 固定) ----
+    // 估算最大 L 对应峰值; 若可用内存不足则【停止】(不降配)
+    int max_L = 0;
+    for (auto& s : samples) {
+        try {
+            int L = static_cast<int>(read_a3m_query_sequence(s.a3m).length());
+            if (L > max_L) max_L = L;
+        } catch (...) {}
+    }
+    double need_gb = estimate_peak_gb(max_L, msa_max_seqs);
+    struct sysinfo si;
+    double free_gb = 0;
+    if (sysinfo(&si) == 0) free_gb = (double)si.freeram * si.mem_unit / (1024.0*1024.0*1024.0);
+    double min_free_gb = 22.0;
+    if (const char* mg = std::getenv("PPML_MIN_FREE_GB")) min_free_gb = std::atof(mg);
+    std::cout << "[space] 最大 L=" << max_L << " 估算峰值≈" << std::fixed << std::setprecision(1)
+              << need_gb << "GB, 系统可用≈" << free_gb << "GB, 最低要求≈"
+              << min_free_gb << "GB" << std::endl;
+    if (free_gb < min_free_gb) {
+        std::cerr << "[space] 可用内存 " << free_gb << "GB < 要求 " << min_free_gb
+                  << "GB, N=" << msa_max_seqs << " 样本无法容纳。按规则停止训练 (不降低 MSA 深度)。"
+                  << std::endl;
+        return 2; // 2 = 空间不足停止
+    }
+
+    // ---- 优化器 / 参数 ----
+    float lr = 1e-4f, wd = 0.01f;
+    if (const char* plr = std::getenv("PPML_LR")) lr = std::atof(plr);
+    if (const char* pwd = std::getenv("PPML_WD")) wd = std::atof(pwd);
+    AdamW optimizer(lr, wd);
+    // 注: optimizer 在第一个样本建图后 (循环内) 用 init_from_graph(cgraph) 初始化
+    float clip_norm = 0.1f;
+    if (const char* pc = std::getenv("PPML_CLIP_NORM")) clip_norm = std::atof(pc);
+    const int num_epochs = (std::getenv("PPML_NUM_EPOCHS") != nullptr)
+                               ? std::atoi(std::getenv("PPML_NUM_EPOCHS")) : 1;
+    const int accum_steps = (std::getenv("PPML_ACCUM") != nullptr)
+                                ? std::atoi(std::getenv("PPML_ACCUM")) : 4; // 每 K 个样本 step 一次
+    static const bool no_backward =
+        (std::getenv("PPML_NO_BACKWARD") != nullptr) && (std::atoi(std::getenv("PPML_NO_BACKWARD")) != 0);
+
+    PPMLDataLoader loader("", "", msa_max_seqs, 4, 2048);
+
+    // 持久化跨样本梯度累加器 (以 param 指针为键, 顺序稳定)
+    auto params = model.params();
+    std::vector<std::vector<float>> acc(params.size());
+    for (size_t i = 0; i < params.size(); ++i)
+        acc[i].assign(static_cast<size_t>(params[i]->numel()), 0.0f);
+    int acc_count = 0;
+    float epoch_loss_sum = 0.0f;
+    int trained_samples = 0;
+    ComputeGraph* last_cgraph = nullptr; // 保留最近一个样本图用于写回梯度
+
+    auto t_start = std::chrono::steady_clock::now();
+
+    for (int epoch = 0; epoch < num_epochs; ++epoch) {
+        std::cout << "\n--- Epoch " << (epoch + 1) << "/" << num_epochs
+                  << " (accum=" << accum_steps << ") ---" << std::endl;
+        // 每个 epoch 打乱样本顺序, 增强多样本覆盖
+        std::vector<ProteinSample> order = samples;
+        std::mt19937 rng(1234 + epoch);
+        std::shuffle(order.begin(), order.end(), rng);
+
+        for (size_t si_idx = 0; si_idx < order.size(); ++si_idx) {
+            auto& s = order[si_idx];
+            std::string sequence;
+            try { sequence = read_a3m_query_sequence(s.a3m); }
+            catch (const std::exception& e) {
+                std::cerr << "  [skip] " << s.uniprot << ": " << e.what() << std::endl;
+                continue;
+            }
+            int L = static_cast<int>(sequence.length());
+
+            // 流式加载单个样本 (B=1), 用完即释放
+            ModelInput input;
+            try {
+                input = loader.load_from_files(s.a3m, sequence, s.csv_dir, "", "");
+            } catch (const std::exception& e) {
+                std::cerr << "  [skip] " << s.uniprot << " load failed: " << e.what() << std::endl;
+                continue;
+            }
+
+            // ---- 构建图 + 前向 ----
+            auto* cgraph = ComputeGraph::new_graph(&context());
+
+            // 前向: forward_graph 内部自行包装输入 leaf, 无需在外部预 wrap
+            GraphOutput gout = model.forward_graph(input, full_train);
+            TensorF32* pred_lddt   = gout.lddt;
+            TensorF32* logits_msa  = gout.msa_logits;
+            TensorF32* distogram   = gout.distogram;
+
+            // ============================================================
+            // 组装 total_loss 的 5 个组成部分 (与单样本训练循环完全一致)
+            //   total_loss(loss_fape, loss_chi, loss_distogram, loss_msa, loss_conf)
+            // ============================================================
+            const int B = 1;
+            const int N_atoms  = B * L * 3;   // 每残基 N/CA/C
+            const int N_frames = B * L;
+
+            // --- pred / true coords 展平为 (N_atoms, 3) 图节点 ---
+            TensorF32 pred_flat = gout.coords.view({N_atoms, 3});
+            TensorF32 true_flat = input.true_coords.view({N_atoms, 3});
+            TensorF32* pred_node = wrap_value_as_leaf(pred_flat, {N_atoms, 3});
+            TensorF32* true_node = wrap_value_as_leaf(true_flat, {N_atoms, 3});
+
+            // --- FAPE frame indices: 每残基一帧 [N, CA, C] ---
+            TensorF32* frame_idx = build_frame_atom_indices(B, L);          // (B*L, 3)
+            TensorF32* frames_mask    = constant_ones({N_frames});           // (B*L,)
+            TensorF32* positions_mask = constant_ones({N_atoms});            // (B*L*3,)
+
+            // 1) FAPE loss
+            FAPEConfig fape_cfg;
+            fape_cfg.length_scale = 10.0f;
+            fape_cfg.d_clamp      = 10.0f;
+            fape_cfg.epsilon      = 1e-4f;
+            TensorF32* loss_fape_node =
+                loss(fape_loss(pred_node, true_node, frame_idx, frames_mask, positions_mask, fape_cfg));
+
+            // 2) Chi loss
+            TensorF32* loss_chi_node = loss(constant_scalar(0.0f));
+            if (input.gt_chi.numel() > 0 && gout.alpha != nullptr) {
+                int64_t chi_N = input.gt_chi.shape().dims[0] * input.gt_chi.shape().dims[1]; // B*L
+                TensorF32 chi_gt       = input.gt_chi.view({chi_N, 7, 2});
+                TensorF32 chi_mask_2d  = input.chi_mask.view({chi_N, 7});
+                TensorF32 seq_mask_2d  = TensorF32({chi_N, 1}, Device::CPU);
+                seq_mask_2d.zero_();
+                for (int64_t i = 0; i < chi_N; ++i) seq_mask_2d.data()[i] = 1.0f;
+                TensorF32* unnormed_node = view(gout.alpha, Shape{2, 7, chi_N});
+                TensorF32* gt_node       = wrap_value_as_leaf(chi_gt,       {2, 7, chi_N});
+                TensorF32* cmask_node    = wrap_value_as_leaf(chi_mask_2d,  {7, chi_N});
+                TensorF32* smask_node    = wrap_value_as_leaf(seq_mask_2d,  {1, chi_N});
+                loss_chi_node = loss(supervised_chi_loss(unnormed_node, gt_node, cmask_node, smask_node, 0.5f, 0.5f));
+            }
+
+            // 3) Distogram loss
+            TensorF32* loss_distogram_node = loss(constant_scalar(0.0f));
+            if (input.D_onehot.numel() > 0 && gout.distogram != nullptr) {
+                int64_t dg_N = input.D_onehot.shape().dims[0]
+                             * input.D_onehot.shape().dims[1]
+                             * input.D_onehot.shape().dims[2];  // B*L*L
+                TensorF32 dg_D    = input.D_onehot.view({dg_N, 60});
+                TensorF32 dg_O    = input.O_onehot.view({dg_N, 36});
+                TensorF32 dg_T    = input.T_onehot.view({dg_N, 36});
+                TensorF32 dg_P    = input.P_onehot.view({dg_N, 18});
+                TensorF32 dg_mask = input.pair_mask.view({dg_N});
+                TensorF32* l_dist = view(gout.distogram, Shape{60, dg_N});
+                TensorF32* l_omg  = view(gout.omega,     Shape{36, dg_N});
+                TensorF32* l_tht  = view(gout.theta,     Shape{36, dg_N});
+                TensorF32* l_phi  = view(gout.phi,       Shape{18, dg_N});
+                TensorF32* l_D    = wrap_value_as_leaf(dg_D,    {60, dg_N});
+                TensorF32* l_O    = wrap_value_as_leaf(dg_O,    {36, dg_N});
+                TensorF32* l_T    = wrap_value_as_leaf(dg_T,    {36, dg_N});
+                TensorF32* l_P    = wrap_value_as_leaf(dg_P,    {18, dg_N});
+                TensorF32* l_pm   = wrap_value_as_leaf(dg_mask, {dg_N});
+                loss_distogram_node = loss(distogram_loss(l_dist, l_omg, l_tht, l_phi,
+                                                           l_D, l_O, l_T, l_P, l_pm));
+            }
+
+            // 4) Masked MSA loss
+            TensorF32* loss_msa_node = loss(constant_scalar(0.0f));
+            if (input.true_msa.numel() > 0 && gout.msa_logits != nullptr) {
+                int N_seq_msa = static_cast<int>(input.true_msa.shape().dims[1]);  // N_seq
+                TensorF32 msa_true_2d = input.true_msa.view({N_seq_msa, L});
+                TensorF32 msa_mask_2d = input.bert_mask.view({N_seq_msa, L});
+                TensorF32* logits_node = view(gout.msa_logits, Shape{23, L, N_seq_msa});
+                TensorF32* true_node_m = wrap_value_as_leaf(msa_true_2d, {L, N_seq_msa});
+                TensorF32* mask_node_m = wrap_value_as_leaf(msa_mask_2d, {L, N_seq_msa});
+                loss_msa_node = loss(masked_msa_loss(logits_node, true_node_m, mask_node_m));
+            }
+
+            // 5) Confidence (pLDDT) loss
+            TensorF32* loss_conf_node = loss(constant_scalar(0.0f));
+            if (input.ca_mask.numel() > 0 && gout.lddt != nullptr && gout.coords.numel() > 0) {
+                int64_t pl_N = gout.coords.shape().dims[0] * gout.coords.shape().dims[1];  // B*L
+                TensorF32 pred_coords_cpu = gout.coords.cpu();
+                TensorF32 true_coords_cpu = input.true_coords.cpu();
+                TensorF32 ca_mask_cpu     = input.ca_mask.cpu();
+                std::vector<float> pred_ca(pl_N * 3, 0.0f), true_ca(pl_N * 3, 0.0f);
+                std::vector<float> ca_m(pl_N, 0.0f);
+                for (int64_t i = 0; i < pl_N; ++i) {
+                    pred_ca[i*3+0] = pred_coords_cpu.data()[i*9 + 1*3 + 0];
+                    pred_ca[i*3+1] = pred_coords_cpu.data()[i*9 + 1*3 + 1];
+                    pred_ca[i*3+2] = pred_coords_cpu.data()[i*9 + 1*3 + 2];
+                    true_ca[i*3+0] = true_coords_cpu.data()[i*9 + 1*3 + 0];
+                    true_ca[i*3+1] = true_coords_cpu.data()[i*9 + 1*3 + 1];
+                    true_ca[i*3+2] = true_coords_cpu.data()[i*9 + 1*3 + 2];
+                    ca_m[i] = ca_mask_cpu.data()[i];
+                }
+                const int N_BINS = 50;
+                std::vector<float> lddt(pl_N, 0.0f), onehot(pl_N * N_BINS, 0.0f);
+                compute_lddt_ca(pred_ca.data(), true_ca.data(), ca_m.data(),
+                                static_cast<int>(pl_N), 15.0f, lddt.data());
+                lddt_to_onehot(lddt.data(), static_cast<int>(pl_N), N_BINS, onehot.data());
+                TensorF32 pl_onehot(Shape({pl_N, N_BINS}), onehot.data(), Device::CPU, false);
+                TensorF32 pl_camask = input.ca_mask.view({pl_N});
+                TensorF32* l_lddt  = view(gout.lddt, Shape{N_BINS, pl_N});
+                TensorF32* l_oh    = wrap_value_as_leaf(pl_onehot, {N_BINS, pl_N});
+                TensorF32* l_cam   = wrap_value_as_leaf(pl_camask, {pl_N});
+                loss_conf_node = loss(plddt_loss(l_lddt, l_oh, l_cam));
+            }
+
+            // --- total_loss (权重已内置于函数: 0.5*FAPE + 0.5*Chi + 0.3*Distogram + 2.0*MSA + 0.01*Conf) ---
+            TensorF32* total = loss(total_loss(
+                loss_fape_node, loss_chi_node, loss_distogram_node, loss_msa_node, loss_conf_node));
+
+            // ---- 反向 (与单样本训练循环完全一致, 保证梯度正确) ----
+            PPMLContext* ctx = &context();
+            cgraph->build_forward_expand(total);
+            if (!no_backward) {
+                cgraph->build_backward_expand(ctx, nullptr);
+                // loss 梯度种子 = 1.0 (dL/dL=1), 否则反向梯度恒 0
+                TensorF32* loss_grad = cgraph->graph_get_grad(total);
+                if (loss_grad && loss_grad->data() == nullptr && loss_grad->numel() == 1) {
+                    float* p = bind_leaf_data(*ctx, loss_grad);
+                    p[0] = 1.0f;
+                }
+            }
+            // ---- 反向计算 (含 CUDA scheduler 回落 CPU 逻辑, 与单样本一致) ----
+            Status compute_st = Status::SUCCESS;
+            static const bool sched_flag =
+                (std::getenv("PPML_CUDA_SCHED") != nullptr) && (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0);
+            const bool use_sched = (model.device() == Device::CUDA && scheduler && sched_flag);
+            if (use_sched) {
+                scheduler->split_graph(cgraph);
+                if (scheduler->alloc_splits()) {
+                    compute_st = scheduler->graph_compute();
+                } else {
+                    compute_st = Status::ALLOC_FAILED;
+                }
+                if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED) {
+                    std::cerr << "[WARN] CUDA scheduler compute failed; falling back to CPU." << std::endl;
+                    compute_st = backend->graph_compute(cgraph);
+                }
+            } else {
+                compute_st = backend->graph_compute(cgraph);
+            }
+            if (compute_st != Status::SUCCESS) {
+                std::cout << "[WARN] graph_compute status=" << static_cast<int>(compute_st) << std::endl;
+            }
+
+            // ---- 读取 loss (用 5 分量加权求和, 避免 gallocr buffer 复用读出假值) ----
+            auto read_scalar = [&](TensorF32* n) -> float {
+                if (!n || n->numel() != 1) return 0.0f;
+                std::vector<float> tv = read_tensor_cpu(n);
+                return tv.empty() ? 0.0f : tv[0];
+            };
+            float batch_loss = 0.5f * read_scalar(loss_fape_node)
+                             + 0.5f * read_scalar(loss_chi_node)
+                             + 0.3f * read_scalar(loss_distogram_node)
+                             + 2.0f * read_scalar(loss_msa_node)
+                             + 0.01f * read_scalar(loss_conf_node);
+            epoch_loss_sum += batch_loss;
+            ++trained_samples;
+            ++acc_count;
+
+            // ---- 累加梯度到持久化 buffer (跨样本) ----
+            for (size_t pi = 0; pi < params.size(); ++pi) {
+                std::vector<float> g = ms_read_grad(cgraph, params[pi]);
+                int64_t n = (int64_t)acc[pi].size();
+                if ((int64_t)g.size() == n) {
+                    for (int64_t j = 0; j < n; ++j) acc[pi][(size_t)j] += g[(size_t)j];
+                }
+            }
+
+            // 释放上一个样本的图 (保留当前 cgraph 用于写回, 因参数跨图共享但 grad 节点在图内)
+            if (last_cgraph && last_cgraph != cgraph) delete last_cgraph;
+            last_cgraph = cgraph;
+
+            // 首个样本图建好后初始化 optimizer (AdamW 需遍历图节点找参数)
+            if (optimizer.param_count() == 0) optimizer.init_from_graph(cgraph);
+
+            std::cout << "  [" << s.uniprot << "] L=" << L
+                      << " loss=" << std::fixed << std::setprecision(4) << batch_loss
+                      << " (acc " << acc_count << "/" << accum_steps << ")" << std::endl;
+
+            // ---- 达到累加步数 -> 平均 + 写回 + 裁剪 + step ----
+            if (acc_count >= accum_steps) {
+                // 1) 求平均 (除以累加样本数)
+                for (size_t pi = 0; pi < params.size(); ++pi) {
+                    int64_t n = (int64_t)acc[pi].size();
+                    float inv = 1.0f / (float)acc_count;
+                    for (int64_t j = 0; j < n; ++j) acc[pi][(size_t)j] *= inv;
+                }
+                // 2) 写回平均梯度到保留的 last_cgraph 的 grad 节点
+                for (size_t pi = 0; pi < params.size(); ++pi) {
+                    ms_write_grad(last_cgraph, params[pi], acc[pi]);
+                }
+                // 3) 全局梯度裁剪 + 参数更新
+                float gnorm = clip_grad_norm(last_cgraph, clip_norm);
+                optimizer.step(last_cgraph);
+                // 4) 清零累加器
+                for (size_t pi = 0; pi < params.size(); ++pi)
+                    std::fill(acc[pi].begin(), acc[pi].end(), 0.0f);
+                acc_count = 0;
+                std::cout << "  >> step (grad_norm=" << gnorm << ")" << std::endl;
+            }
+        }
+    }
+
+    // 收尾: 若还有未 step 的残差梯度 (样本数非 accum_steps 整数倍), 同样写回+step
+    if (acc_count > 0) {
+        for (size_t pi = 0; pi < params.size(); ++pi) {
+            int64_t n = (int64_t)acc[pi].size();
+            float inv = 1.0f / (float)acc_count;
+            for (int64_t j = 0; j < n; ++j) acc[pi][(size_t)j] *= inv;
+        }
+        if (last_cgraph) {
+            for (size_t pi = 0; pi < params.size(); ++pi)
+                ms_write_grad(last_cgraph, params[pi], acc[pi]);
+            float gnorm = clip_grad_norm(last_cgraph, clip_norm);
+            optimizer.step(last_cgraph);
+            std::cout << "  >> final step (grad_norm=" << gnorm << ")" << std::endl;
+        }
+        acc_count = 0;
+    }
+    if (last_cgraph) { delete last_cgraph; last_cgraph = nullptr; }
+
+    auto t_end = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(t_end - t_start).count();
+    float avg_loss = trained_samples ? epoch_loss_sum / trained_samples : 0.0f;
+    std::cout << "\n[done] 多样本训练完成: samples=" << trained_samples
+              << " avg_loss=" << avg_loss << " elapsed=" << elapsed << "s" << std::endl;
+
+    // checkpoint
+    if (const char* ck = std::getenv("PPML_CKPT")) {
+        try { save_checkpoint(model, ck, num_epochs - 1, num_epochs, avg_loss, elapsed); }
+        catch (const std::exception& e) { std::cerr << "checkpoint failed: " << e.what() << std::endl; }
+    }
+    return 0;
+}
+
+int main(int argc, char* argv[]) {
+    // 1. 不再初始化 Python 桥接：当前训练流程为纯 C++（DataLoader 加载数据、ComputeGraph 前向/反向），
+    //    全程未调用 PythonBridge 的 run_string/call_function 等。此前无条件 Py_Initialize()+Py_Finalize()
+    //    会在退出时触发 Python GC 清理崩溃（Py_XDECREF 损坏对象，gdb 已确认 PythonBridge::finalize）。
+    //    需要 Python 能力（如 load_torch_weights / hhblits）时再按需启用。
 
     // 调试/开发开关：FULL_TRAIN=true 时切换为完整训练配置
     //   - MSA 深度 N 由 128 改回 512
@@ -265,7 +741,16 @@ int main(int argc, char* argv[]) {
         (std::getenv("PPML_USE_CUDA") != nullptr) && (std::atoi(std::getenv("PPML_USE_CUDA")) != 0);
     model.to(use_cuda ? Device::CUDA : Device::CPU);
     model.train();
-    
+
+    // ---- 多样本训练分支 (PPML_MULTI_SAMPLE=1) ----
+    // 在 training_batch_data/ 中跨多个蛋白做梯度累加训练 (FULL_TRAIN N=512 固定)。
+    // 空间不足时停止, 不降低 MSA 深度。
+    if (std::getenv("PPML_MULTI_SAMPLE") != nullptr &&
+        std::strcmp(std::getenv("PPML_MULTI_SAMPLE"), "1") == 0) {
+        int rc = run_multi_sample_training(model, full_train, dev_se3);
+        return rc;
+    }
+
     std::cout << "Model created and CPU and CUDA Backend init" << std::endl;
     
     // 4. 加载预训练权重 (通过 Python 桥接)
@@ -460,13 +945,92 @@ int main(int argc, char* argv[]) {
         
         float epoch_loss = 0.0f;
         
+        // 【开关B/pass1 两遍 forward】Pass 1：值版 forward 逐 block 更新 SE3 坐标（RF2 思路，
+        // 每个 block 用最新 coords 做 make_graph），得到精确 coords 作为 Pass 2 的拓扑基准。
+        // Pass 2：forward_graph 用 Pass1 coords（topo_coords）构图 SE3 图节点进主图 backprop。
+        // 开启条件：PPML_SE3_TOPO=pass1（值版 forward 尚未完全跑通，需调试）。
+        const char* se3_topo = getenv("PPML_SE3_TOPO");
+        const bool se3_pass1 = se3_topo && std::strcmp(se3_topo, "pass1") == 0;
+        TensorF32 pass1_coords;   // Pass1 值版 forward 的输出 coords
+        const TensorF32* topo_coords_ptr = nullptr;
+        if (se3_pass1) {
+            auto p1_start = std::chrono::high_resolution_clock::now();
+            ModelOutput out1 = model.forward(input);   // 值版（逐 block SE3 更新 coords）
+            auto p1_end = std::chrono::high_resolution_clock::now();
+            auto p1_ms = std::chrono::duration_cast<std::chrono::milliseconds>(p1_end - p1_start).count();
+            if (out1.coords.numel() > 0) {
+                pass1_coords.~TensorF32();
+                new (&pass1_coords) TensorF32(out1.coords.shape(), Device::CPU);
+                pass1_coords.copy_from(out1.coords);
+                topo_coords_ptr = &pass1_coords;
+            }
+            std::cout << "[PASS1] value-forward " << p1_ms << "ms, coords numel="
+                      << out1.coords.numel() << (out1.coords.numel()>0 ? " OK":" EMPTY") << "\n";
+        }
+        
         // 前向传播（图模式：返回可微图节点，供 loss 组装计算图）
         auto fwd_start = std::chrono::high_resolution_clock::now();
         // enable_se3：FULL_TRAIN=true 或 PPML_DEV_SE3=1 时开启 SE3 3D track（训练更新坐标）；
         // dev 默认关闭（run_se3_structural 曾为未完成崩溃，用于小样本流程验证）。
-        auto go = model.forward_graph(input, /*enable_se3=*/(full_train || dev_se3));
+        auto go = model.forward_graph(input, /*enable_se3=*/(full_train || dev_se3), topo_coords_ptr);
         auto fwd_end = std::chrono::high_resolution_clock::now();
         auto fwd_ms = std::chrono::duration_cast<std::chrono::milliseconds>(fwd_end - fwd_start).count();
+
+        // ---- 开发诊断：区分"输入就坏"还是"前向早期特征坏"（无条件，前向返回后立即扫）----
+        {
+            auto scan_val = [&](const char* tag, const TensorF32& t) {
+                if (t.numel() == 0) { std::cout << "[IN] " << tag << " empty\n"; return; }
+                const float* d = t.data();
+                if (!d) { std::cout << "[IN] " << tag << " null-data\n"; return; }
+                bool nan=false; long nnan=0, ninf=0;
+                float mn=1e30f, mx=-1e30f;
+                for (int64_t q=0;q<t.numel();++q){ float v=d[q];
+                    if (v!=v){nan=true;++nnan;} else if (std::fabs(v)>1e30f){++ninf;}
+                    else { if(v<mn)mn=v; if(v>mx)mx=v; } }
+                std::cout << "[IN] " << tag << " numel=" << t.numel()
+                          << " nnan=" << nnan << " ninf=" << ninf
+                          << " min=" << (nnan?"nan":std::to_string(mn))
+                          << " max=" << (nnan?"nan":std::to_string(mx)) << "\n";
+            };
+            auto scan_node = [&](const char* tag, TensorF32* n) {
+                if (!n || !n->data()) { std::cout << "[FWD-FEAT] " << tag << " null\n"; return; }
+                const float* d=n->data(); bool nan=false; long nnan=0;
+                float mn=1e30f, mx=-1e30f;
+                for (int64_t q=0;q<n->numel();++q){ float v=d[q];
+                    if (v!=v){nan=true;++nnan;} else { if(v<mn)mn=v; if(v>mx)mx=v; } }
+                std::cout << "[FWD-FEAT] " << tag << " numel=" << n->numel()
+                          << " nnan=" << nnan
+                          << " min=" << (nnan?"nan":std::to_string(mn))
+                          << " max=" << (nnan?"nan":std::to_string(mx)) << "\n";
+            };
+            // 所有输入 leaf（值侧）
+            scan_val("msa_latent", input.msa_latent);
+            scan_val("seq_tokens", input.seq_tokens);
+            scan_val("coords",     input.coords);
+            scan_val("true_coords",input.true_coords);
+            scan_val("bond_feats", input.bond_feats);
+            scan_val("dist_matrix",input.dist_matrix);
+            scan_val("same_chain", input.same_chain);
+            scan_val("t1d",        input.t1d);
+            scan_val("t2d",        input.t2d);
+            // residx (I64): 检查是否有负值/越界（影响任何按 residx 索引的查表）
+            {
+                if (input.residx.numel() == 0) std::cout << "[IN] residx empty\n";
+                else {
+                    const int64_t* d = input.residx.data(); long nneg=0, nbig=0;
+                    int64_t mx=-1e18, mn=1e18;
+                    for (int64_t q=0;q<input.residx.numel();++q){ int64_t v=d[q];
+                        if (v<0)++nneg; if (v>100000)++nbig; if(v>mx)mx=v; if(v<mn)mn=v; }
+                    std::cout << "[IN] residx numel=" << input.residx.numel()
+                              << " nneg=" << nneg << " nbig=" << nbig
+                              << " min=" << mn << " max=" << mx << "\n";
+                }
+            }
+            // 前向最早共享特征
+            scan_node("msa",   go.msa);
+            scan_node("pair",  go.pair);
+            scan_node("state", go.state);
+        }
         
         // ============================================================
         // 组装 total_loss 的 5 个组成部分 (调用正确的损失函数)
@@ -479,9 +1043,17 @@ int main(int argc, char* argv[]) {
         // --- pred / true coords 展平为 (N_atoms, 3) 图节点 ---
         // 注: coords 为 SE3 图外值更新（非可微），FAPE 对 coords 的反向暂不接（沿用原值版方式，
         //     wrap_value_as_leaf 断链仅影响坐标相关梯度，不影响 msa/pair/state/head 图节点）。
+        // 开关A 下 go.coords_graph 为可微坐标图节点（梯度经 coords→offset→SE3 回传），优先使用；
+        // 否则回落到 go.coords 值（wrap_value_as_leaf 断链，原行为）。
         TensorF32 pred_flat = go.coords.view({N_atoms, 3});
         TensorF32 true_flat = input.true_coords.view({N_atoms, 3});
-        TensorF32* pred_node = wrap_value_as_leaf(pred_flat, {N_atoms, 3});
+        TensorF32* pred_node = nullptr;
+        if (go.coords_graph != nullptr) {
+            // go.coords_graph 布局 [9, B*L]（9=3原子×3坐标, 原子最内）→ view (N_atoms,3) 图节点
+            pred_node = view(go.coords_graph, Shape{N_atoms, 3});
+        } else {
+            pred_node = wrap_value_as_leaf(pred_flat, {N_atoms, 3});
+        }
         TensorF32* true_node = wrap_value_as_leaf(true_flat, {N_atoms, 3});
 
         // --- FAPE frame indices: 每残基一帧 [N, CA, C] ---
@@ -609,6 +1181,23 @@ int main(int argc, char* argv[]) {
         PPMLContext* ctx = &context();
         ComputeGraph* cgraph = ComputeGraph::new_graph(ctx);
         cgraph->build_forward_expand(total_node);
+        // 【msa 子图完整性诊断】GRAPH_DEBUG_MSA_SUB=1：统计 final graph 是否包含 msa 子图节点
+        // （MUL_MAT numel=104448 = msa_emb 输出 [256,51*8*1]；若缺失 → build 跳过了 msa 子图）。
+        if (getenv("GRAPH_DEBUG_MSA_SUB")) {
+            int n_mul_104448 = 0, n_mul_9384 = 0, n_total_ops = 0;
+            for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
+                TensorF32* nd = cgraph->graph_node(gi);
+                n_total_ops++;
+                if (nd->op == 30) {  // OP_MUL_MAT
+                    int64_t n0 = nd->numel();
+                    if (n0 == 104448) n_mul_104448++;
+                    if (n0 == 9384) n_mul_9384++;
+                }
+            }
+            std::cout << "  [msa-sub] cgraph_nodes=" << cgraph->n_nodes()
+                      << " mul_mat_104448=" << n_mul_104448
+                      << " mul_mat_9384=" << n_mul_9384 << std::endl;
+        }
         // 开发诊断：打印 total 链关键节点（loss 分量及消费它的 scale/add）的 index，验证拓扑顺序
         if (getenv("GRAPH_DEBUG_LOSS")) {
             TensorF32* loss_nodes[5] = { loss_fape_node, loss_chi_node, loss_distogram_node, loss_msa_node, loss_conf_node };
@@ -719,38 +1308,55 @@ int main(int argc, char* argv[]) {
                          + 2.0f * read_scalar(loss_msa_node)
                          + 0.01f * read_scalar(loss_conf_node);
 
-        // ---- 开发诊断：pred_coords 值 + 是否被 gallocr buffer 复用覆盖 ----
-        if (getenv("GRAPH_DEBUG_GALLOCR") && pred_node) {
+        // ---- 开发诊断：pred_coords 是否含 NaN（FAPE=nan 的根因定位，无条件）----
+        if (pred_node && pred_node->data()) {
             const int64_t pdN = pred_node->numel();
-            const int64_t nprint = (pdN < 9) ? pdN : 9;
             float* pd = pred_node->data();
-            std::cout << "[gallocr][pred_coords] numel=" << pdN
-                      << " data=" << (void*)pd << std::endl;
-            if (pd) {
-                bool has_nan = false; float mn = 1e30f, mx = -1e30f;
-                for (int64_t q = 0; q < pdN; ++q) {
-                    if (pd[q] != pd[q]) { has_nan = true; break; }
-                    mn = std::min(mn, pd[q]); mx = std::max(mx, pd[q]);
-                }
-                std::cout << "  [gallocr][pred_coords] head=[";
-                for (int64_t q = 0; q < nprint; ++q)
-                    std::cout << pd[q] << (q + 1 < nprint ? "," : "");
-                std::cout << "] min=" << mn << " max=" << mx
-                          << " has_nan=" << has_nan << std::endl;
+            bool has_nan = false; float mn = 1e30f, mx = -1e30f;
+            for (int64_t k = 0; k < pdN; ++k) {
+                float v = pd[k];
+                if (v != v) { has_nan = true; break; }
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
             }
-            // 找与 pred_node 分配区间重叠的 gallocr managed 节点（覆盖源）
-            std::cout << "  [gallocr][pred_coords] aliasing pred_node:" << std::endl;
-            backend->gallocr().diagnose_aliasing(pred_node);
-            std::cout << "  [gallocr][pred_coords] aliasing true_node:" << std::endl;
-            backend->gallocr().diagnose_aliasing(true_node);
+            std::cout << "[PREDS] numel=" << pdN << " has_nan=" << has_nan
+                      << " min=" << mn << " max=" << mx << std::endl;
         }
-        // ---- 开发诊断：distogram head logits 是否含 nan（数据已算好）----
-        if (getenv("GRAPH_DEBUG_GALLOCR") && go.distogram && go.distogram->numel() > 0) {
+        // ---- 开发诊断：forward 图第一个 NaN 节点（在 backward 之前扫描，此时 buffer 未被反向破坏）----
+        {
+            for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
+                TensorF32* nd = cgraph->graph_node(gi);
+                if (!nd || !nd->data()) continue;
+                const int64_t nelt = nd->numel();
+                if (nelt <= 0) continue;
+                bool bad = false; float firstbad = 0; int64_t firstidx = -1;
+                for (int64_t v = 0; v < nelt; ++v) {
+                    float x = nd->data()[v];
+                    if (x != x || std::fabs(x) > 1e6f) { bad = true; firstbad = x; firstidx = v; break; }
+                }
+                if (bad) {
+                    std::cout << "[FWD-NAN] first_bad node_idx=" << gi << " op=" << nd->op
+                              << " numel=" << nelt << " bad=" << firstbad << " @flat=" << firstidx
+                              << " src0_op=" << (nd->src[0] ? (int)nd->src[0]->op : -1)
+                              << " src1_op=" << (nd->src[1] ? (int)nd->src[1]->op : -1);
+                    if (nd->shape().ndim() >= 1 && nd->shape().ndim() <= 4) {
+                        std::cout << " dims=[";
+                        for (int d = 0; d < nd->shape().ndim(); ++d)
+                            std::cout << (d ? "," : "") << nd->shape().dims[d];
+                        std::cout << "]";
+                    }
+                    std::cout << std::endl;
+                    break;
+                }
+            }
+        }
+        // ---- 开发诊断：distogram head logits 是否含 nan（数据已算好，无条件，替代原 GRAPH_DEBUG_GALLOCR 块）----
+        if (go.distogram && go.distogram->numel() > 0) {
             auto dump4 = [&](TensorF32* t, const char* tag) {
                 if (!t || !t->data()) { std::cout << "[dist_logits] " << tag << " data=null\n"; return; }
                 const float* gd = t->data();
                 float mn=1e30f, mx=-1e30f; bool nan=false; long nnan=0;
-                for (int64_t q=0; q<t->numel(); ++q){ float v=gd[q]; if(v!=v){nan=true;++nnan;} mn=std::min(mn,v); mx=std::max(mx,v);}
+                for (int64_t q=0; q<t->numel(); ++q){ float v=gd[q]; if(v!=v){nan=true;++nnan;} if(v<mn)mn=v; if(v>mx)mx=v;}
                 std::cout << "[dist_logits] " << tag << " numel=" << t->numel() << " min="<<mn<<" max="<<mx
                           << " nan="<<nan<<" nnan="<<nnan<<" head0="<<gd[0]<<" head1="<<gd[1]<<"\n";
             };
@@ -771,20 +1377,6 @@ int main(int argc, char* argv[]) {
             if (go.lddt && go.lddt->numel()>0) dump4(go.lddt, "lddt");
             if (go.pair && go.pair->numel()>0) dump4(go.pair, "pair");
             if (go.state && go.state->numel()>0) dump4(go.state, "state");
-            // 打印 omega/theta/state 中 nan 的确切下标（首 20 个）
-            {
-                auto nanidx = [&](TensorF32* t, const char* tag){
-                    if(!t||!t->data()) return; const float* d=t->data(); int cnt=0;
-                    std::cout << "[nanidx] " << tag << " ndim=" << t->shape().ndim();
-                    for(int i=0;i<t->shape().ndim();++i) std::cout<<" d"<<i<<"="<<t->shape().dims[i];
-                    std::cout << " nan@";
-                    for(int64_t q=0;q<t->numel()&&cnt<20;++q){ if(d[q]!=d[q]){ std::cout<<q<<","; ++cnt; } }
-                    std::cout<<" cnt="<<cnt<<"\n";
-                };
-                nanidx(go.omega, "omega");
-                nanidx(go.theta, "theta");
-                nanidx(go.state, "state");
-            }
         }
         // 诊断：统计图节点数与参数梯度幅值（确认 backward 是否产生非零梯度）
         if (getenv("PPML_DEBUG_GRAD")) {
@@ -861,6 +1453,7 @@ int main(int argc, char* argv[]) {
             }
             std::cout << "[nanop] total_bad_nodes_shown=" << hit_cnt << std::endl;
         }
+
         // 全局梯度裁剪阈值：默认 0.1（AF2 惯例），可用环境变量 PPML_CLIP_NORM 覆盖。
         float grad_norm = 0.0f;
         {
@@ -872,6 +1465,14 @@ int main(int argc, char* argv[]) {
             grad_norm = clip_grad_norm(cgraph, clip_norm);
         }
 
+        // 梯度爆炸自动报告（无需 env）：在 clip_grad_norm 之后 grad 已被缩小，
+        // 真正的原始爆炸源已由 GradientClipper.cpp 的 [GRAD-NORM]（scale 之前）打印。
+        // 此处仅保留一个轻量确认（读已裁剪的 grad 仅用于报告，不作为定位依据）。
+        if (grad_norm > 100000.0f || std::isnan(grad_norm)) {
+            std::cout << "[EXPLODE] clipped_grad_norm=" << grad_norm
+                      << " (原始爆炸源见 [GRAD-NORM] 行，在 clip 之前打印)" << std::endl;
+        }
+
         if (!optimizer_inited) {
             optimizer.init_from_graph(cgraph);             // 首次收集参数并分配 m/v
             optimizer_inited = true;
@@ -880,9 +1481,9 @@ int main(int argc, char* argv[]) {
         }
         optimizer.step(cgraph);                            // 更新权重 (decoupled weight decay)
 
-        // 开发诊断：打印各损失分量（定位 loss=0 根因）
-        // batch_loss 已在 graph_compute 后读取（见上），此处只打印分量。
-        if (getenv("GRAPH_DEBUG_LOSS")) {
+        // 开发诊断：打印各损失分量（定位 NaN 根因）。
+        // 当 batch_loss 为 NaN 或 grad_norm 异常时无条件打印（不依赖 env，绕过 env 不生效问题）。
+        if (getenv("GRAPH_DEBUG_LOSS") || std::isnan(batch_loss) || std::isnan(grad_norm) || grad_norm > 100000.0f) {
             auto print_loss = [](const char* name, TensorF32* n) {
                 if (n && n->data() && n->numel() == 1)
                     std::cout << "  [loss] " << name << " = " << n->data()[0] << std::endl;
@@ -1017,12 +1618,16 @@ int main(int argc, char* argv[]) {
                 }
             }
             // loss 节点结构诊断
+            // ⚠️ dims 是 std::vector，scalar 节点 ndim=1 时读 dims[1..3] 越界（heap-buffer-overflow）。
+            //    按 ndim 边界打印。
             auto print_loss_node = [&](const char* name, TensorF32* n) {
                 if (!n) { std::cout << "  [lossnode] " << name << " = null" << std::endl; return; }
+                const auto& shp = n->shape();
                 std::cout << "  [lossnode] " << name << " op=" << n->op << " numel=" << n->numel()
-                          << " ndim=" << n->shape().ndim()
-                          << " dims=[" << n->shape().dims[0] << "," << n->shape().dims[1] << ","
-                          << n->shape().dims[2] << "," << n->shape().dims[3] << "]"
+                          << " ndim=" << shp.ndim() << " dims=[";
+                for (int di = 0; di < shp.ndim(); ++di)
+                    std::cout << shp.dims[di] << (di + 1 < shp.ndim() ? "," : "");
+                std::cout << "]"
                           << " src0_op=" << (n->src[0] ? n->src[0]->op : -1)
                           << " src1_op=" << (n->src[1] ? n->src[1]->op : -1)
                           << std::endl;
@@ -1072,6 +1677,22 @@ int main(int argc, char* argv[]) {
                             epoch_end - epoch_start).count();
         double epoch_sec = static_cast<double>(epoch_ms) / 1000.0;
 
+        // 无条件打印 5 个 loss 分量（绕过 batch_loss 变量别名/en出问题，定位 NaN 源）
+        {
+            auto pv = [](const char* nm, TensorF32* n) {
+                if (n && n->data() && n->numel() == 1)
+                    std::cout << "  [LOSS5] " << nm << "=" << n->data()[0] << std::endl;
+                else if (n && n->data())
+                    std::cout << "  [LOSS5] " << nm << "(numel=" << n->numel() << ") v0=" << n->data()[0] << std::endl;
+                else
+                    std::cout << "  [LOSS5] " << nm << "=(null)" << std::endl;
+            };
+            pv("fape", loss_fape_node);
+            pv("chi", loss_chi_node);
+            pv("distogram", loss_distogram_node);
+            pv("msa", loss_msa_node);
+            pv("conf", loss_conf_node);
+        }
         std::cout << "Epoch " << epoch + 1 << "/" << num_epochs
                   << " completed in " << epoch_ms << " ms"
                   << " (forward " << fwd_ms << " ms)"
@@ -1144,8 +1765,6 @@ int main(int argc, char* argv[]) {
         std::cout << exporter.get_model_info(onnx_config.output_path) << std::endl;
     }
      */
-    // 8. 清理
-    py.finalize();
-    
+    // 8. 清理（Python 桥接未初始化，无需 finalize）
     return 0;
 }
