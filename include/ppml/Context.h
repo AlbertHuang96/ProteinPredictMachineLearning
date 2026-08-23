@@ -92,6 +92,13 @@ struct PPMLContext {
     // 计算所需总内存（预分配阶段使用）
     static size_t calc_mem_size(int n_tensors, int total_elements);
 
+    // ===== 训练期 arena 复用 =====
+    // 模型参数在 PPML::create 时率先分配（arena 低地址），每 epoch 的图节点随后分配（高地址）。
+    // 记录构建期末水位 mark_objects()，每 epoch 开始 reset_objects_to(mark) 即可释放上一轮图节点、
+    // 保留参数，避免 arena 跨 epoch 单调增长耗尽（Context memory exhausted 崩溃）。
+    void*  mark_objects();                 // 返回当前 objects_end 指针
+    void   reset_objects_to(void* mark);   // 将 objects_end 回退到 mark（释放 mark 之上的对象）
+
     // 获取全局单例（默认 context）
     static PPMLContext& global();
     static void         init_global(const CtxInitParams& params);

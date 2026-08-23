@@ -711,6 +711,30 @@ int main(int argc, char* argv[]) {
         (std::getenv("PPML_DEV_SE3") != nullptr) &&
         (std::strcmp(std::getenv("PPML_DEV_SE3"), "1") == 0);
 
+    // ===== FULL_TRAIN 默认配置注入（2026-08-23）=====
+    // 1) 开关B（per_block SE3 拓扑）：FULL_TRAIN 时默认开启，除非用户显式指定 PPML_SE3_TOPO。
+    if (full_train && std::getenv("PPML_SE3_TOPO") == nullptr) {
+        setenv("PPML_SE3_TOPO", "per_block", 0);  // overwrite=0：不覆盖用户显式值
+    }
+    // 2) scale 可学习策略（回答"大样本 scale 应可学习还是超参数"）：
+    //    - 大样本 + 多样本梯度累加(PPML_MULTI_SAMPLE=1)：scale 自动【可学习】。单样本实验已证
+    //      scale 梯度被 FAPE 的 Kabsch 对齐吸收(≈0)，但跨蛋白平均后 loss 对 scale 有非零敏感度，
+    //      且 log-space+relu硬clamp 保证稳定（不过拟合爆炸、不跑飞）。
+    //    - 大样本但单样本（FULL_TRAIN 非 multi_sample）：保持【超参数】模式（默认 1e-3，可用
+    //      PPML_SE3_GRAPH_SCALE 覆盖定值），避免单样本下 scale 学不动却徒增方差。
+    //    注：PPML_SE3_LEARN_SCALE=1 为显式强制学习逃生舱；PPML_SE3_GRAPH_SCALE 为显式定值逃生舱。
+    const bool multi_sample =
+        (std::getenv("PPML_MULTI_SAMPLE") != nullptr) &&
+        (std::strcmp(std::getenv("PPML_MULTI_SAMPLE"), "1") == 0);
+    if (full_train && multi_sample && std::getenv("PPML_SE3_LEARN_SCALE") == nullptr) {
+        setenv("PPML_SE3_LEARN_SCALE", "1", 0);
+    }
+    std::cout << "[FULL_TRAIN cfg] SE3_TOPO="
+              << (std::getenv("PPML_SE3_TOPO") ? std::getenv("PPML_SE3_TOPO") : "(unset)")
+              << " | scale=" << (std::getenv("PPML_SE3_LEARN_SCALE") ? "learnable"
+                                : (multi_sample ? "learnable(auto)" : "hyperparam(1e-3)"))
+              << std::endl;
+
     // 训练开始前打印 CPU / 内存 / GPU 环境概览
     print_system_info();
 
@@ -902,7 +926,22 @@ int main(int argc, char* argv[]) {
     // 若要打印初始权重占用的内存, 取消下面一行注释:
     // size_t init_param_bytes = estimate_params_memory(model);
 
+    // 训练期 arena 复用：模型参数在 PPML::create 时已率先分配到全局 context arena（低地址），
+    // 每 epoch 的 forward_graph 会新建大量图节点（高地址）且不会释放 → 跨 epoch 单调增长最终
+    // 触发 "Context memory exhausted" 崩溃。记录构建期末水位 mark，每个 epoch 开始回退 arena
+    // 释放上一轮图节点、保留参数，使长训练（多 epoch）可行。
+    // 可学习 SE3 scale：在 arena mark 之前物化 PARAM（懒创建于首次 forward，会晚于 mark
+    // 导致 reset_objects_to 在 epoch2 误删该参数）。学习开启时先触发一次以固定其在参数区。
+    if (getenv("PPML_SE3_LEARN_SCALE") && std::string(getenv("PPML_SE3_LEARN_SCALE")) == "1") {
+        model.se3_scale_tensor();  // 落地 se3_log_scale_param_ 于参数区（mark 之前）
+    }
+
+    void* se3_arena_mark = &context() ? context().mark_objects() : nullptr;
+
     for (int epoch = 0; epoch < num_epochs; ++epoch) {
+        // 释放上一 epoch 的图节点（首轮 mark 为参数末水位，等同无操作），保留参数
+        if (se3_arena_mark) context().reset_objects_to(se3_arena_mark);
+
         // ===== 计时代码: epoch 级 + 前向/损失阶段子计时 =====
         auto epoch_start = std::chrono::high_resolution_clock::now();
 
@@ -1698,6 +1737,7 @@ int main(int argc, char* argv[]) {
                   << " (forward " << fwd_ms << " ms)"
                   << ", loss: " << batch_loss
                   << ", grad_norm: " << grad_norm << std::endl;
+        model.se3_scale_report();  // 打印当前 SE3 offset scale（可学习时显示 PARAM 值）
 
         // ============================================================
         // Checkpoint 保存: 每隔 ckpt_interval 个 epoch, 以及最后一个 epoch

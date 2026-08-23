@@ -135,6 +135,29 @@ void PPMLContext::free(PPMLContext* ctx) {
     }
 }
 
+// ========== mark_objects() / reset_objects_to() ==========
+void* PPMLContext::mark_objects() {
+    return (void*)objects_end;
+}
+
+void PPMLContext::reset_objects_to(void* mark) {
+    if (mark == nullptr) return;
+    PPMLObject* m = (PPMLObject*)mark;
+    // 仅当 mark 落在当前 arena 区间内才回退（防御性）
+    if (m < objects_begin || m > objects_end) return;
+    objects_end = m;
+    // 若 mark 是首对象之前（objects_begin 之下的空状态），同步清空链表头
+    if (m == nullptr || (objects_begin != nullptr && m < objects_begin)) {
+        objects_begin = nullptr;
+        n_objects = 0;
+    } else {
+        // 重新统计 objects_begin..m 之间的对象数（近似：递减到合理值）
+        int cnt = 0;
+        for (PPMLObject* p = objects_begin; p != nullptr && p != m; p = p->next) ++cnt;
+        n_objects = cnt;
+    }
+}
+
 // ========== new_object() ==========
 PPMLObject* PPMLContext::new_object(enum PPMLObjectType type, size_t size) {
     PPMLObject* obj_cur = objects_end;

@@ -224,8 +224,12 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
         }
     }
 
-    // 返回总体范数（诊断用；SE3 爆炸时 main_norm 正常，se3_norm 被单独压回）
-    return main_norm + se3_norm;
+    // 返回实际**应用**（clip 后）的总体范数，作为收敛诊断指标。
+    // 之前返回 main_norm + se3_norm（raw，SE3 可达 1e10+）→ 误导"grad_norm 爆炸"。
+    // clip 后：主图 ≤ max_norm，SE3 ≤ se3_max，二者之和即真实步长量级。
+    const float applied_main = std::min(main_norm, max_norm);
+    const float applied_se3 = std::min(se3_norm, se3_max);
+    return applied_main + applied_se3;
 }
 
 float accumulate_per_loss_gradients(

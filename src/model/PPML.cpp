@@ -3,6 +3,7 @@
 #include "ppml/PositionalEncoding.h"
 #include "ppml/MathUtils.h"
 #include <iostream>
+#include <iomanip>          // std::fixed / std::setprecision
 #include <algorithm>        // std::max
 
 #include "ppml/Dropout.h"
@@ -180,6 +181,76 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
     }
 }
 } // namespace
+
+// ===== SE3 offset scale：可学习全局标量参数 =====
+namespace {
+    // 基于前期 sweep：0.0003 尖峰、0.003 上行、0.001 最优 → 安全区间留 [1e-4, 5e-3]
+    const float kSe3ScaleLo = 1e-4f;
+    const float kSe3ScaleHi = 5e-3f;
+}
+
+TensorF32* PPMLModel::se3_scale_tensor() {
+    // 是否启用学习：多样本训练 或 显式开启
+    static const bool kLearnScale =
+        (getenv("PPML_MULTI_SAMPLE") && std::string(getenv("PPML_MULTI_SAMPLE")) == "1") ||
+        (getenv("PPML_SE3_LEARN_SCALE") && std::string(getenv("PPML_SE3_LEARN_SCALE")) == "1");
+
+    if (!kLearnScale) {
+        // 冻结常量：env PPML_SE3_GRAPH_SCALE 覆盖，缺省 1e-3
+        static float frozen = 1e-3f;
+        if (getenv("PPML_SE3_GRAPH_SCALE")) {
+            frozen = std::strtof(getenv("PPML_SE3_GRAPH_SCALE"), nullptr);
+        }
+        return constant_tensor({1}, &frozen);
+    }
+
+    // 懒创建全局共享的 log_scale PARAM（init = log(1e-3)，落在安全区间中部）
+    if (!se3_log_scale_param_) {
+        int64_t dims1[1] = {1};
+        TensorF32* p = context().new_tensor<float>(1, dims1);
+        p->op = OP_NONE;
+        p->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_SE3;
+        float* pd = bind_leaf_data(context(), p);
+        pd[0] = std::log(1e-3f);
+        se3_log_scale_param_ = p;
+    }
+    TensorF32* log_s = se3_log_scale_param_;
+    TensorF32* scale  = exp(log_s);                       // 恒正，梯度可回传
+    // 可微硬 clamp（relu 实现，clamp/tanh/sigmoid 反向缺失）：
+    //   clamped = lo + relu( (hi-lo) - relu(hi - scale) )
+    TensorF32* hi_minus_s = sub(constant_tensor({1}, &kSe3ScaleHi), scale);
+    TensorF32* inner = relu(hi_minus_s);                  // relu(hi - scale)
+    TensorF32* span_minus = sub(constant_tensor({1}, &kSe3ScaleHi), constant_tensor({1}, &kSe3ScaleLo));
+    TensorF32* gate = sub(span_minus, inner);             // (hi-lo) - relu(hi - scale)
+    TensorF32* relu_gate = relu(gate);
+    TensorF32* clamped = add_impl(constant_tensor({1}, &kSe3ScaleLo), relu_gate, false);
+    return clamped;
+}
+
+void PPMLModel::se3_scale_report() const {
+    static const bool kLearnScale =
+        (getenv("PPML_MULTI_SAMPLE") && std::string(getenv("PPML_MULTI_SAMPLE")) == "1") ||
+        (getenv("PPML_SE3_LEARN_SCALE") && std::string(getenv("PPML_SE3_LEARN_SCALE")) == "1");
+    if (!kLearnScale) {
+        float frozen = 1e-3f;
+        if (getenv("PPML_SE3_GRAPH_SCALE")) frozen = std::strtof(getenv("PPML_SE3_GRAPH_SCALE"), nullptr);
+        std::cout << "  [SE3-SCALE] frozen(const)=" << std::fixed << std::setprecision(6) << frozen
+                  << std::defaultfloat
+                  << " (learn=" << (kLearnScale ? "on" : "off") << ")" << std::endl;
+        return;
+    }
+    if (se3_log_scale_param_ && se3_log_scale_param_->data()) {
+        float log_s = se3_log_scale_param_->data()[0];
+        float s = std::exp(log_s);
+        std::cout << "  [SE3-SCALE] learn=on log_scale=" << std::fixed
+                  << std::setprecision(6) << log_s
+                  << " -> scale=" << s
+                  << " (clamp=[" << kSe3ScaleLo << "," << kSe3ScaleHi << "])"
+                  << std::defaultfloat << std::endl;
+    } else {
+        std::cout << "  [SE3-SCALE] learn=on (param not materialized yet)" << std::endl;
+    }
+}
 
 PPMLConfig::PPMLConfig() {
     // 默认 SE3 配置
@@ -2930,6 +3001,11 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         T_data[static_cast<size_t>(6 + c) * 9 + static_cast<size_t>(6 + c)] += 1.0f;   // dC 行 += e_C(列6-8)
     }
     TensorF32* T_const = constant_tensor({9, 9}, T_data.data());                       // [9,9]
+    // 图版 FAPE 路径的 offset 缩放：默认值经扫描确定为 1e-3（offset~1e4 × 1e-3 ≈ 10Å/block 的
+    // 刚体位移，量级合理、FAPE 梯度良态、loss 收敛平滑）。原值版 apply_coord_update 用 0.03
+    // （即 300Å/block 巨型扰动，FAPE 落退化平台、梯度爆炸）。可用 PPML_SE3_GRAPH_SCALE 覆盖。
+    float kSe3OffsetScale = 0.001f;
+    if (const char* s = std::getenv("PPML_SE3_GRAPH_SCALE")) kSe3OffsetScale = std::atof(s);
 
     // 驱动单个 block 的 SE3（在每个 block 前向之后、下一个 block 之前）：
     //   1) 回落当前 pair 值；2) run_se3_structural 追加可微 SE3 图节点并回写 state；
@@ -2941,30 +3017,30 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         std::vector<TensorF32*> se3_out = blk->run_se3_structural(
             msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot);
         // 开关A（fixed）：只构图，收集 offset 图节点，block 循环后统一 compute + 读值更新。
+        // ⚠️ FAPE 梯度用的 coords_graph 不在此逐 block 累加（否则 ~7 个 block 的 offset 叠加成
+        //   ~2100Å 巨型扰动 → FAPE 发散）。改为循环结束后一次性 build（sum/N，N=block 数），
+        //   使图版坐标扰动总量≈单 block 量级，与开关B 一致，FAPE 梯度收敛。
         if (se3_fixed_topo) {
             if (se3_out.size() > 1) {
                 se3_fixed_blks_iter_.push_back(blk);
                 se3_fixed_offsets_iter_.push_back(se3_out[1]);
-                // 【FAPE 梯度回传】坐标图节点链：coords_new = coords_old + T @ offset
-                // 初始 coords 叶子（首个 block）：wrap coords_src（pass1 用 topo_coords，开关A 用 input.coords）
-                if (!coords_graph) {
-                    TensorF32 coords_flat = run_se3
-                        ? TensorF32(Shape({B * L * 9}), Device::CPU) : TensorF32();
-                    if (run_se3) {
-                        float* cf = coords_flat.data();
-                        // 值 (B,L,3,3) row-major → 图 [9, B*L]（9=原子*坐标最内, 节点=b*L+l）
-                        // 值展平序 [b][l][atom][coord] == 图展平序 [coord+3*atom][b*L+l]（一致）
-                        std::memcpy(cf, coords_src.data(), sizeof(float) * coords_src.numel());
-                    }
-                    coords_graph = wrap_input_as_leaf(coords_flat, {B * L * 9});  // 图 [9, B*L]
-                }
-                // 逐 block：coords_new = coords_old + T@offset（图 op，可微）
-                TensorF32* offset_contrib = mul_mat(T_const, se3_out[1]);          // [9, B*L]
-                coords_graph = add_impl(coords_graph, offset_contrib, /*inplace=*/false);
             }
             return;
         }
         if (se3_out.size() > 1) {
+            // 【FAPE 梯度回传 · 开关B】逐 block 累积可微坐标链：coords_new = coords_old + T@offset。
+            // 开关B 拓扑每 block 即时更新（current_coords 已含上一 block 的 offset），故各 block 的
+            // offset 是真实的结构精化，应累加（不除 N）。coords_graph 初始化于首 block，布局 [9,B*L]。
+            if (!coords_graph) {
+                TensorF32 coords_flat = TensorF32(Shape({B * L * 9}), Device::CPU);
+                std::memcpy(coords_flat.data(), coords_src.data(), sizeof(float) * coords_src.numel());
+                coords_graph = wrap_input_as_leaf(coords_flat, {B * L * 9});
+            }
+            {
+                TensorF32* offset_scaled = mul(mul_mat(T_const, se3_out[1]),
+                                               se3_scale_tensor());
+                coords_graph = add_impl(coords_graph, offset_scaled, /*inplace=*/false);
+            }
             TensorF32 offset_val;
             // 【阶段1.5】offset 回落用独立 se3_backend_（独立 gallocr_）：其 graph_compute 的
             // release 只释放 se3_backend_ 自己的 buffer，不碰主图 cpu_backend_ 的 msa/pair/state。
@@ -3033,20 +3109,21 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
             if (se3_out.size() > 1) {
                 se3_fixed_blks_ref_.push_back(blk);
                 se3_fixed_offsets_ref_.push_back(se3_out[1]);
-                // 【FAPE 梯度回传】同 iter：coords_new = coords_old + T@offset
-                if (!coords_graph) {
-                    TensorF32 coords_flat = run_se3
-                        ? TensorF32(Shape({B * L * 9}), Device::CPU) : TensorF32();
-                    if (run_se3) std::memcpy(coords_flat.data(), coords_src.data(),
-                                             sizeof(float) * coords_src.numel());
-                    coords_graph = wrap_input_as_leaf(coords_flat, {B * L * 9});
-                }
-                TensorF32* offset_contrib = mul_mat(T_const, se3_out[1]);
-                coords_graph = add_impl(coords_graph, offset_contrib, /*inplace=*/false);
             }
             return;
         }
         if (se3_out.size() > 1) {
+            // 【FAPE 梯度回传 · 开关B】 refining 阶段同样逐 block 累积可微坐标链。
+            if (!coords_graph) {
+                TensorF32 coords_flat = TensorF32(Shape({B * L * 9}), Device::CPU);
+                std::memcpy(coords_flat.data(), coords_src.data(), sizeof(float) * coords_src.numel());
+                coords_graph = wrap_input_as_leaf(coords_flat, {B * L * 9});
+            }
+            {
+                TensorF32* offset_scaled = mul(mul_mat(T_const, se3_out[1]),
+                                               se3_scale_tensor());
+                coords_graph = add_impl(coords_graph, offset_scaled, /*inplace=*/false);
+            }
             TensorF32 offset_val;
             // 【阶段1.5】offset 回落用独立 se3_backend_（见 drive_block_se3 注释）。
             { ComputeGraph* cg = ComputeGraph::new_graph(ctx);
@@ -3162,6 +3239,29 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         if (getenv("GRAPH_DEBUG_COORD")) {
             std::fprintf(stderr, "[SE3-FIXED] applied %zu iter + %zu refine offsets\n",
                 se3_fixed_offsets_iter_.size(), se3_fixed_offsets_ref_.size());
+        }
+        // 【FAPE 梯度回传】一次性构建 coords_graph = coords_src + (Σ offset×scale)/N，
+        // N = block 数。避免逐 block 累加导致 ~N× 巨型坐标扰动（FAPE 发散）。offset 图节点
+        // 仍连主图 → 梯度可回流 SE3 参数；除以 N 使图版坐标扰动≈单 block 量级（与开关B 一致）。
+        {
+            const int N = (int)(se3_fixed_offsets_iter_.size() + se3_fixed_offsets_ref_.size());
+            TensorF32 coords_flat = TensorF32(Shape({B * L * 9}), Device::CPU);
+            std::memcpy(coords_flat.data(), coords_src.data(), sizeof(float) * coords_src.numel());
+            TensorF32* cg_init = wrap_input_as_leaf(coords_flat, {B * L * 9});  // [9, B*L]
+            TensorF32* accum = nullptr;
+            auto add_one = [&](TensorF32* o) {
+                TensorF32* os = mul(mul_mat(T_const, o), se3_scale_tensor());
+                accum = accum ? add_impl(accum, os, false) : os;
+            };
+            for (TensorF32* o : se3_fixed_offsets_iter_) add_one(o);
+            for (TensorF32* o : se3_fixed_offsets_ref_) add_one(o);
+            if (accum && N > 0) {
+                const float invN = 1.0f / (float)N;
+                accum = mul(accum, constant_tensor({1}, &invN));  // /N
+                coords_graph = add_impl(cg_init, accum, false);
+            } else {
+                coords_graph = cg_init;
+            }
         }
     }
 

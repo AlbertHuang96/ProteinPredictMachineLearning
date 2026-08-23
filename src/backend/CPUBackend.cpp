@@ -280,6 +280,47 @@ void CPUBackend::compute_thread(ThreadState * state) {
             tp->barrier_wait();
         }
 
+        // ---- 开发诊断：找第一个输出含巨大值(爆炸源)的节点（GRAPH_DEBUG_NAN=1）----
+        // 在 NaN 之前抓真正的爆炸起点：max|v| > EXPLODE_THRESH 即报（不放过已是 NaN 的）。
+        if (ith == 0 && getenv("GRAPH_DEBUG_NAN") && node->data() && node->op != OP_NONE) {
+            const float EXPLODE_THRESH = 1e4f;
+            const int64_t ne_e = node->numel();
+            const float* nde = node->data();
+            static long long explode_count = 0;
+            for (int64_t q = 0; q < ne_e && explode_count < 8; ++q) {
+                float v = nde[q];
+                if (std::isfinite(v) && (v > EXPLODE_THRESH || v < -EXPLODE_THRESH)) {
+                    auto opname = [](TensorF32* t)->int { return t ? (int)t->op : -1; };
+                    TensorF32* s0 = node->src[0];
+                    TensorF32* s1 = node->src[1];
+                    fprintf(stderr,
+                            "[explode-node] #%lld node_n=%d op=%d src0op=%d src1op=%d "
+                            "dims=[%lld,%lld,%lld,%lld] numel=%lld idx=%lld val=%g | "
+                            "s0:(op=%d dims=[%lld,%lld,%lld,%lld]) s0.s0:(op=%d) s1:(op=%d dims=[%lld,%lld,%lld,%lld]) s1.s0:(op=%d)\n",
+                            explode_count, node_n, (int)node->op, opname(s0), opname(s1),
+                            (long long)(node->shape().ndim()>0?node->shape().dims[0]:-1),
+                            (long long)(node->shape().ndim()>1?node->shape().dims[1]:-1),
+                            (long long)(node->shape().ndim()>2?node->shape().dims[2]:-1),
+                            (long long)(node->shape().ndim()>3?node->shape().dims[3]:-1),
+                            (long long)ne_e, (long long)q, (double)v,
+                            opname(s0),
+                            (long long)(s0&&s0->shape().ndim()>0?s0->shape().dims[0]:-1),
+                            (long long)(s0&&s0->shape().ndim()>1?s0->shape().dims[1]:-1),
+                            (long long)(s0&&s0->shape().ndim()>2?s0->shape().dims[2]:-1),
+                            (long long)(s0&&s0->shape().ndim()>3?s0->shape().dims[3]:-1),
+                            opname(s0?s0->src[0]:nullptr),
+                            opname(s1),
+                            (long long)(s1&&s1->shape().ndim()>0?s1->shape().dims[0]:-1),
+                            (long long)(s1&&s1->shape().ndim()>1?s1->shape().dims[1]:-1),
+                            (long long)(s1&&s1->shape().ndim()>2?s1->shape().dims[2]:-1),
+                            (long long)(s1&&s1->shape().ndim()>3?s1->shape().dims[3]:-1),
+                            opname(s1?s1->src[0]:nullptr));
+                    ++explode_count;
+                    break;
+                }
+            }
+        }
+
         // ---- 开发诊断：找第一个输出含 NaN 的节点（GRAPH_DEBUG_NAN=1）----
         if (ith == 0 && getenv("GRAPH_DEBUG_NAN") && node->data() && node->op != OP_NONE) {
             const int64_t ne_ = node->numel();

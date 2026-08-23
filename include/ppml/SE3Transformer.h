@@ -548,7 +548,11 @@ private:
     Fiber fiber_;
 
     std::unordered_map<int, TensorF32> bias_;  // bias_[degree]: (1, m) 逐通道偏置
-    float eps_ = 1e-12f;  // 防止除零
+    // 防除零 eps。原先 1e-12 太小：当某节点 degree-1 特征范数 norm→0（图版 forward_graph
+    // 经 view+sum_rows 重算 norm，与 mul 用的原 x 非同一路径，norm 近零时 scale3=bias/eps
+    // 爆成 ~1e12·bias，沿 SE3 offset 链 MUL_MAT/ROPE 溢出成 inf→NaN。改 1e-5（AF2 标准量级）
+    // 将 scale3 与梯度钳制在 ~1e5 内，消除 NaN 级联；norm 正常时 1e-5 相对 norm=O(1) 可忽略。
+    float eps_ = 1e-5f;  // 防止除零
 
 };
 

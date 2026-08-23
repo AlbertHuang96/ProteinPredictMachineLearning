@@ -500,6 +500,16 @@ public:
     // 不支持的自动跨后端拷贝回落 CPU。
     BackendScheduler* scheduler();
 
+    // 【SE3 offset scale · 可学习标量参数】(2026-08-23)
+    // 返回 SE3 offset scale 图节点（已 clamp 到安全区间）。
+    // 多样本/显式学习模式下为可训练 PARAM（log-space + relu 硬 clamp，梯度可回传）；
+    // 否则为冻结常量（env PPML_SE3_GRAPH_SCALE 覆盖，缺省 1e-3）。
+    // 该节点在所有 block 间共享同一实例，确保全局一致且优化器能跨图找到它。
+    TensorF32* se3_scale_tensor();
+
+    // 仅诊断：打印当前 SE3 scale（学习模式下为 PARAM 值 exp(log_scale)，否则冻结常量）。
+    void se3_scale_report() const;
+
 private:
     PPMLConfig config_;
     Device device_ = Device::CPU;
@@ -791,6 +801,14 @@ private:
     // buffer，但主图最终 compute 时 bind_tensor 无条件 rebind 回主 backend（正确覆盖）。
     std::unique_ptr<CPUBackend>       se3_backend_;
     bool backend_ready_ = false;
+
+    // 【SE3 offset scale · 可学习标量参数】(2026-08-23)
+    // 全局共享一个 log-space 标量 PARAM：实际 scale = exp(log_scale)，保证恒正；
+    // 再经 relu 实现的可微硬 clamp 约束到 [kSe3ScaleLo, kSe3ScaleHi]（基于前期 sweep：
+    // 0.0003 尖峰、0.003 上行、0.001 最优 → 留 [1e-4, 5e-3] 余量）。
+    // 仅多样本训练(PPML_MULTI_SAMPLE=1)或显式 PPML_SE3_LEARN_SCALE=1 时注册为可训练 PARAM；
+    // 否则回落为冻结常量（env PPML_SE3_GRAPH_SCALE 覆盖，缺省 1e-3）。
+    TensorF32* se3_log_scale_param_ = nullptr;  // 懒创建，跨 block/epoch 共享同一对象
 
     // 持有 backend buffer 的所有权（对标 ggml 中 backend 管理的 buffer 列表）
     std::vector<std::unique_ptr<Buffer>> param_buffers_;
