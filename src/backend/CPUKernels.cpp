@@ -404,7 +404,7 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
     const bool b_full = (bn == n);
     const bool bad_bcast =
         (!a_full && (an <= 0 || n % an != 0)) || (!b_full && (bn <= 0 || n % bn != 0));
-    if (bad_bcast && p->ith == 0) {
+    if (bad_bcast && p->ith == 0 && getenv("GRAPH_DEBUG_BCAST")) {
         fprintf(stderr,
                 "[ELEM-BCAST] op=%d n=%lld an=%lld bn=%lld a_full=%d b_full=%d "
                 "a=%p b=%p d=%p | src0{op=%d buf=%p data=%p} src1{op=%d buf=%p data=%p} dst{data=%p}\n",
@@ -1392,7 +1392,19 @@ void CPUBackend::kernel_permute(TensorF32 * node, ComputeParams * p) {
     const int ndim = a->shape().ndim();
     // 从 op_params 读 dims 映射（permute/transpose 构造器已写入）
     int dims[4] = {0, 1, 2, 3};
-    for (int i = 0; i < ndim && i < 4; i++) dims[i] = node->op_params[i];
+    for (int i = 0; i < ndim && i < 4; i++) dims[i] = (int)node->op_params[i];
+    // 防御：op_params 未初始化（垃圾）会导致 i[dims[p]] 越界写 → SIGSEGV。
+    for (int i = 0; i < ndim && i < 4; i++) {
+        if (dims[i] < 0 || dims[i] >= ndim) {
+            fprintf(stderr, "[permute-FAIL] node=%p ndim=%d dims=[%d %d %d %d] "
+                            "op_params=[%lld %lld %lld %lld] numel=%lld\n",
+                    (void*)node, ndim, dims[0], dims[1], dims[2], dims[3],
+                    (long long)node->op_params[0], (long long)node->op_params[1],
+                    (long long)node->op_params[2], (long long)node->op_params[3],
+                    (long long)node->numel());
+            return;  // 跳过非法 permute，避免越界写
+        }
+    }
 
     int64_t sd[4] = {1, 1, 1, 1};   // src 各维大小
     int64_t dd[4] = {1, 1, 1, 1};   // dst 各维大小

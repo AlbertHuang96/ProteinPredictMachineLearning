@@ -503,7 +503,6 @@ private:
     // alloc_splits invoke this function to allocate the memory
     bool reserve_graph_memory();
 
-    static constexpr int MAX_SPLITS = 64;
     static constexpr int MAX_SPLIT_INPUTS = 32;
 
     // ===== SplitInfo =====
@@ -552,9 +551,9 @@ private:
     std::vector<std::pair<TensorF32*, float*>> host_stage_;   // <tensor, 原 device 指针>
     std::vector<std::vector<float>>            host_scratch_; // 暂存 host 缓冲
 
-    // 分裂结果
+    // 分裂结果（动态扩容：图节点 1e4+、GPU/CPU 交替频繁，split 数可上千）
     int n_splits_ = 0;
-    SplitInfo splits_[MAX_SPLITS];
+    std::vector<SplitInfo> splits_;
 
     // 图输入收集
     int n_graph_inputs_ = 0;

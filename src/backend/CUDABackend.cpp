@@ -81,9 +81,10 @@ bool CUDABackend::supports_op(TensorF32* node) const {
     }
 
     // no-op / view ops 始终支持（不需要 kernel）
+    // ⚠️ OP_PERMUTE/OP_TRANSPOSE 是真数据重排且 CUDA 无 kernel（graph_compute 跳过执行），
+    //    必须强制回落 CPU，否则分到 GPU split 后 dst 数据不重排 → 数值错/下游读空。
     if (node->op == OP_NONE    || node->op == OP_RESHAPE ||
-        node->op == OP_VIEW    || node->op == OP_PERMUTE ||
-        node->op == OP_TRANSPOSE) {
+        node->op == OP_VIEW) {
         return true;
     }
 

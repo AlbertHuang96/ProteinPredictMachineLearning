@@ -1338,7 +1338,20 @@ int main(int argc, char* argv[]) {
         // 加权和=真实 total）经 read_tensor_cpu 可靠读取加权求和。每个分量标量 numel==1。
         auto read_scalar = [&](TensorF32* n) -> float {
             if (!n || n->numel() != 1) return 0.0f;
+            if (getenv("PPML_DEBUG_LOSSREAD")) {
+                std::cout << "  [LOSS-READ] ptr=" << (void*)n
+                          << " dev=" << (int)n->device()
+                          << " buffer=" << (void*)n->buffer_
+                          << " data=" << (void*)n->data()
+                          << " view_src=" << (void*)n->view_src
+                          << " op=" << (int)n->op << std::endl;
+            }
             std::vector<float> tv = read_tensor_cpu(n);
+            if (getenv("PPML_DEBUG_LOSSREAD")) {
+                std::cout << "  [LOSS-READ] tv0=" << (tv.empty() ? -9.9f : tv[0])
+                          << " nelt=" << (n ? n->numel() : -1)
+                          << " nbytes=" << (n ? n->nbytes() : -1) << std::endl;
+            }
             return tv.empty() ? 0.0f : tv[0];
         };
         float batch_loss = 0.5f * read_scalar(loss_fape_node)
@@ -1366,6 +1379,9 @@ int main(int argc, char* argv[]) {
             for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
                 TensorF32* nd = cgraph->graph_node(gi);
                 if (!nd || !nd->data()) continue;
+                // ⚠️ CUDA 混合模式下 data() 可能是 device 指针/已释放悬垂指针，直接读会 SIGSEGV。
+                //    只扫描 host 数据节点（CPU 模式全通过；scheduler 下 device 节点跳过）。
+                if (nd->buffer_ && !nd->buffer_->is_host()) continue;
                 const int64_t nelt = nd->numel();
                 if (nelt <= 0) continue;
                 bool bad = false; float firstbad = 0; int64_t firstidx = -1;
@@ -1393,6 +1409,8 @@ int main(int argc, char* argv[]) {
         if (go.distogram && go.distogram->numel() > 0) {
             auto dump4 = [&](TensorF32* t, const char* tag) {
                 if (!t || !t->data()) { std::cout << "[dist_logits] " << tag << " data=null\n"; return; }
+                // ⚠️ CUDA 混合模式：data() 可能是 device/悬垂指针，直接读会 SIGSEGV
+                if (t->buffer_ && !t->buffer_->is_host()) { std::cout << "[dist_logits] " << tag << " on-device(skip)\n"; return; }
                 const float* gd = t->data();
                 float mn=1e30f, mx=-1e30f; bool nan=false; long nnan=0;
                 for (int64_t q=0; q<t->numel(); ++q){ float v=gd[q]; if(v!=v){nan=true;++nnan;} if(v<mn)mn=v; if(v>mx)mx=v;}
@@ -1524,6 +1542,10 @@ int main(int argc, char* argv[]) {
         // 当 batch_loss 为 NaN 或 grad_norm 异常时无条件打印（不依赖 env，绕过 env 不生效问题）。
         if (getenv("GRAPH_DEBUG_LOSS") || std::isnan(batch_loss) || std::isnan(grad_norm) || grad_norm > 100000.0f) {
             auto print_loss = [](const char* name, TensorF32* n) {
+                if (n && n->buffer_ && !n->buffer_->is_host()) {   // ⚠️ CUDA 混合：device 数据不能直接读
+                    std::cout << "  [loss] " << name << " = (on-device, skip)" << std::endl;
+                    return;
+                }
                 if (n && n->data() && n->numel() == 1)
                     std::cout << "  [loss] " << name << " = " << n->data()[0] << std::endl;
                 else if (n && n->data()) {
@@ -1544,7 +1566,8 @@ int main(int argc, char* argv[]) {
             std::cout << "  [loss] total = " << batch_loss << std::endl;
             // 手动重算 total（用 loss 分量 data()），对比 graph total，判断 total 诊断 nan 是否 buffer 复用假象
             {
-                auto v1 = [](TensorF32* n){ return (n && n->data() && n->numel()==1) ? n->data()[0] : 0.0f; };
+                auto v1 = [](TensorF32* n){ return (n && n->buffer_ && !n->buffer_->is_host()) ? 0.0f
+                                          : ((n && n->data() && n->numel()==1) ? n->data()[0] : 0.0f); };
                 double manual = 0.5*v1(loss_fape_node) + 0.5*v1(loss_chi_node) + 0.3*v1(loss_distogram_node)
                               + 2.0*v1(loss_msa_node) + 0.01*v1(loss_conf_node);
                 std::cout << "  [loss] manual_total = " << manual << std::endl;
@@ -1719,6 +1742,10 @@ int main(int argc, char* argv[]) {
         // 无条件打印 5 个 loss 分量（绕过 batch_loss 变量别名/en出问题，定位 NaN 源）
         {
             auto pv = [](const char* nm, TensorF32* n) {
+                if (n && n->buffer_ && !n->buffer_->is_host()) {
+                    std::cout << "  [LOSS5] " << nm << "=(on-device,skip)" << std::endl;
+                    return;
+                }
                 if (n && n->data() && n->numel() == 1)
                     std::cout << "  [LOSS5] " << nm << "=" << n->data()[0] << std::endl;
                 else if (n && n->data())

@@ -21,7 +21,7 @@ static size_t cuda_free_vram_bytes() {
 // ============================================================
 
 BackendScheduler::BackendScheduler() {
-    std::memset(splits_, 0, sizeof(splits_));
+    splits_.clear();  // 动态 vector，无需 memset
     ctx_ = &context();  // 从全局 context 分配子图
 }
 
@@ -42,7 +42,10 @@ void BackendScheduler::add_backend(Backend * backend) {
 // ============================================================
 
 bool BackendScheduler::is_view_op(int op) const {
-    return op == OP_VIEW || op == OP_RESHAPE || op == OP_PERMUTE || op == OP_TRANSPOSE;
+    // OP_PERMUTE/OP_TRANSPOSE 是真数据重排（kernel 读写 dst），不是零拷贝视图：
+    // 若当 view 跳过，split 范围仍会 dispatch 它们，CPU 会读写 GPU buffer → SIGSEGV。
+    // 因此只保留 OP_VIEW/OP_RESHAPE（零拷贝共享）为 view op。
+    return op == OP_VIEW || op == OP_RESHAPE;
 }
 
 // host producer 判定：数据实际在 host 的节点（参数 param / 常量 / 已绑定 host data / 共享 host 的
@@ -59,7 +62,17 @@ bool BackendScheduler::node_is_host_producer(TensorF32* node) const {
     // 沿 view_src 链找底层数据载体（view 共享源数据，data 在源头）
     const TensorF32* base = node;
     int guard = 0;
+    if (getenv("GRAPH_DEBUG_SCHED")) {
+        fprintf(stderr, "[nhip] node=%p op=%d view_src=%p buffer_=%p data=%p CALLER=%p\n",
+                (void*)node, (int)node->op, (void*)node->view_src,
+                (void*)node->buffer_, (void*)node->data(),
+                __builtin_return_address(0));
+    }
     while (base->view_src && guard++ < 64) base = base->view_src;
+    if (getenv("GRAPH_DEBUG_SCHED") && base != node) {
+        fprintf(stderr, "[nhip]   base=%p op=%d buffer_=%p data=%p\n",
+                (void*)base, (int)base->op, (void*)base->buffer_, (void*)base->data());
+    }
     if (base->op == OP_NONE) return true;  // 参数/常量
     if (base->data() != nullptr) {
         if (base->buffer_ && !base->buffer_->is_host()) return false;  // device data
@@ -610,6 +623,7 @@ bool BackendScheduler::reserve_graph_memory() {
 void BackendScheduler::split_graph(ComputeGraph * graph) {
     current_graph_ = graph;  // 保存当前图引用，供 alloc_splits 使用
     n_splits_ = 0;
+    splits_.clear();
     n_graph_inputs_ = 0;
     backend_map_.clear();
     copy_tensor_map_.clear();
@@ -730,6 +744,16 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
 void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
     for (int i = 0; i < graph->n_nodes(); i++) {
         TensorF32* node = graph->graph_node(i);
+        if (getenv("GRAPH_DEBUG_SCHED")) {
+            // 诊断：检测栈/堆地址范围的 node，定位悬垂指针
+            uintptr_t a = (uintptr_t)node;
+            int in_stack = (a >= 0x700000000000ULL && a <= 0x800000000000ULL);
+            fprintf(stderr,
+                "[sched] node[%d]=%p op=%d ndim=%d numel=%lld flag=0x%x %s\n",
+                i, (void*)node, (int)node->op, (int)node->shape().ndim(),
+                (long long)node->numel(), (unsigned)node->flag,
+                in_stack ? "<STACK?!>" : "");
+        }
         if (is_view_op(node->op)) continue;
 
         auto it = backend_map_.find(node);
@@ -863,6 +887,7 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
     if (i >= n_nodes) return;  // 全是 view op
 
     // ===== Step 2: 创建第一个 split =====
+    splits_.resize(1);
     SplitInfo* split = &splits_[0];
     split->backend_id = tensor_backend_id(graph->graph_node(i), 0);
     split->i_start    = 0;
@@ -914,8 +939,8 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
             split->i_end = i;
             n_splits_++;
 
-            if (n_splits_ >= MAX_SPLITS) return;  // 超过最大 split 数
-
+            // 动态扩容（不再受固定 MAX_SPLITS 限制）
+            splits_.resize(static_cast<size_t>(n_splits_) + 1);
             split = &splits_[n_splits_];
             split->backend_id = node_backend_id;
             split->i_start    = i;
@@ -1047,6 +1072,15 @@ Status BackendScheduler::graph_compute() {
         // 对标 ggml_graph_view(graph, i_start, i_end)
         // 由于 ComputeGraph 是 placement new 的固定大小结构，
         // 这里直接修改 nodes 指针数组的起始位置来模拟子图
+        if (getenv("GRAPH_DEBUG_SCHED")) {
+            int n_scalar = 0;
+            for (int k = sp.i_start; k < sp.i_end; k++) {
+                TensorF32* nd = current_graph_->graph_node(k);
+                if (nd && nd->numel() == 1) n_scalar++;
+            }
+            fprintf(stderr, "[sched] COMPUTE split=%d backend=%d i=[%d,%d) nodes=%d scalar(numel=1)=%d\n",
+                    si, sp.backend_id, sp.i_start, sp.i_end, sp.i_end - sp.i_start, n_scalar);
+        }
         int sub_n_nodes = sp.i_end - sp.i_start;
         TensorF32** saved_nodes = current_graph_->nodes;
         int saved_n_nodes = current_graph_->n_nodes_;

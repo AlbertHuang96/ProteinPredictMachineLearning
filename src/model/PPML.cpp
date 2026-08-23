@@ -179,6 +179,22 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
             }
         }
     }
+    // ===== 关键：清理子图节点残留的 buffer_/data 引用（2026-08-23）=====
+    // SE3 offset 回落（compute_and_read 用独立 se3_backend_）的 graph_compute 结束后，
+    // gallocr 已释放该后端 buffer，但中间节点 buffer_/data() 指针未清空 → 悬垂。
+    // 主图 build_forward_expand 会复用这些节点（coords_graph 引用链），split_graph 的
+    // node_is_host_producer 检查 base->buffer_->is_host() 时对悬垂 GPU buffer 做虚调用 → SIGSEGV。
+    // 值已读回 dst，子图不再需要 buffer；主图最终 compute 由 bind_tensor 无条件 rebind，故直接清零安全。
+    // ⚠️ 只清中间计算结果节点：参数节点（TENSOR_FLAG_PARAM）保有 host data，不可清空，
+    //   否则 gallocr 会把它们误判为 managed 需分配 → 大量 WARN 且参数数据丢失。
+    for (int i = 0; i < cgraph->n_nodes(); i++) {
+        TensorF32* nd = cgraph->graph_node(i);
+        if (!nd) continue;
+        if (nd->flag & TENSOR_FLAG_PARAM) continue;  // 参数保留 data
+        nd->buffer_      = nullptr;
+        nd->buffer_offs_ = 0;
+        nd->bind_data(nullptr);  // 清 data_（值已拷回 dst）
+    }
 }
 } // namespace
 
