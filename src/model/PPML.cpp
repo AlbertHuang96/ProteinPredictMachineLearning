@@ -934,11 +934,16 @@ std::vector<TensorF32*> IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pa
     TensorF32 l1 = compute_l1_features(coords);                      // (B*L, 3, 3)
     const int m1     = 3;                                             // 度1 通道数（值版 l1_feats 固定 3）
     const int d_dim1 = 3;                                             // 度1 → 2*1+1
+    // ⚠️ 2026-08-24 布局修复：此前 `(a*d_dim1+c)*N + n`（特征外层、节点内层）与图布局相反。
+    //    ggml dims[0]=最内维 → 图节点 [m1*d_dim1, N] 数据序应为 [节点][特征]（节点外层）。
+    //    kernel_mul_mat 读 a[i*K+k]（i=节点行, k=特征K）要求 [节点][特征] 序。
+    //    原序导致 G1x1SE3 度1 输出错位放大 ~26 倍（l1_feats ~100 → ±2680，值版仅 3.75）。
+    //    修复后 l1data[n*(m1*d_dim1) + (a*d_dim1+c)] 与值版 (N, m, d_dim)（n 外层, Wigner 最内）一致。
     std::vector<float> l1data(static_cast<size_t>(m1) * d_dim1 * N, 0.0f);
     for (int64_t n = 0; n < N; ++n)
         for (int a = 0; a < m1; ++a)
             for (int c = 0; c < d_dim1; ++c)
-                l1data[(static_cast<size_t>(a) * d_dim1 + c) * N + n] =
+                l1data[static_cast<size_t>(n) * (m1 * d_dim1) + (a * d_dim1 + c)] =
                     l1.data()[n * 9 + a * 3 + c];
     TensorF32* node1 = constant_tensor({m1 * d_dim1, N}, l1data.data());
 
@@ -1829,11 +1834,16 @@ std::vector<TensorF32*> RefineBlock::run_se3_graph_refine(TensorF32*& msa, Tenso
     TensorF32 l1 = compute_l1_features(coords);                        // (B*L, 3, 3)
     const int m1     = 3;                                              // 度1 通道数（值版 l1_feats 固定 3）
     const int d_dim1 = 3;                                              // 度1 → 2*1+1
+    // ⚠️ 2026-08-24 布局修复：此前 `(a*d_dim1+c)*N + n`（特征外层、节点内层）与图布局相反。
+    //    ggml dims[0]=最内维 → 图节点 [m1*d_dim1, N] 数据序应为 [节点][特征]（节点外层）。
+    //    kernel_mul_mat 读 a[i*K+k]（i=节点行, k=特征K）要求 [节点][特征] 序。
+    //    原序导致 G1x1SE3 度1 输出错位放大 ~26 倍（l1_feats ~100 → ±2680，值版仅 3.75）。
+    //    修复后 l1data[n*(m1*d_dim1) + (a*d_dim1+c)] 与值版 (N, m, d_dim)（n 外层, Wigner 最内）一致。
     std::vector<float> l1data(static_cast<size_t>(m1) * d_dim1 * N, 0.0f);
     for (int64_t n = 0; n < N; ++n)
         for (int a = 0; a < m1; ++a)
             for (int c = 0; c < d_dim1; ++c)
-                l1data[(static_cast<size_t>(a) * d_dim1 + c) * N + n] =
+                l1data[static_cast<size_t>(n) * (m1 * d_dim1) + (a * d_dim1 + c)] =
                     l1.data()[n * 9 + a * 3 + c];
     TensorF32* node1 = constant_tensor({m1 * d_dim1, N}, l1data.data());
 

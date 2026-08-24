@@ -543,14 +543,19 @@ bool BackendScheduler::reserve_graph_memory() {
     reserved_buffers_.clear();
 
     // 1. 更新 node_backend_id_ / leaf_backend_id_
+    // ⚠️ 2026-08-24 修复：默认值必须与 build_splits 一致（n_backends_-1=CPU），不能用 0(GPU)。
+    //    backend_map_ 里没有的节点（view 类 op 在 build_splits 被 is_view_op 跳过、从不填
+    //    backend_map_）若此处默认 GPU，gallocr 会在 GPU buffer 分配它，但 build_splits 默认
+    //    CPU 归入 CPU split → CPU kernel 写无效 dst->data()（GPU buffer/未分配）→ SIGSEGV。
+    //    崩溃实证：op=98(OP_TRANSPOSE) dst{data=nil buf=nil}，epoch3 跨后端混合模式下段错误。
     node_backend_id_.resize(current_graph_->n_nodes());
     for (int i = 0; i < current_graph_->n_nodes(); i++) {
-        node_backend_id_[i] = tensor_backend_id(current_graph_->graph_node(i), 0);
+        node_backend_id_[i] = tensor_backend_id(current_graph_->graph_node(i), n_backends_ - 1);
     }
 
     leaf_backend_id_.resize(current_graph_->n_leafs());
     for (int i = 0; i < current_graph_->n_leafs(); i++) {
-        leaf_backend_id_[i] = tensor_backend_id(current_graph_->graph_leaf(i), 0);
+        leaf_backend_id_[i] = tensor_backend_id(current_graph_->graph_leaf(i), n_backends_ - 1);
     }
 
     // 2. 更新 bufts（缓存 buffer types）
@@ -566,8 +571,11 @@ bool BackendScheduler::reserve_graph_memory() {
     }
 
     // 4. 张量 → 后端 id 映射
+    // ⚠️ 2026-08-24 修复：默认 CPU（n_backends_-1），与 build_splits 的默认值一致。
+    //    默认 GPU(0) 会让 backend_map_ 未覆盖的 view 节点在 gallocr 分配到 GPU buffer，
+    //    而 build_splits 把它们归 CPU split → CPU kernel 写无效指针段错误。
     auto backend_id_of = [&](TensorF32* t) -> int {
-        return tensor_backend_id(t, 0);
+        return tensor_backend_id(t, n_backends_ - 1);
     };
 
     // 5. Phase1：计算各后端峰值
@@ -796,6 +804,9 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                 best_backend = n_backends_ - 1;  // CPU
             }
 
+            // （已回滚 2026-08-24：OUT_PROD/OUTER_PROD_BACK 强制 CPU 引入更多跨后端 H2D，loss 更不稳。
+            //   跨后端需系统性修 Step 1/1b 的 D2H/H2D buffer 生命周期，见 memory。）
+
             // ===== 混合训练正确性护栏（避免段错误）=====
             // 仅广播 op 强制回落 CPU：CUDA elemwise kernel 用扁平 idx<n 索引，
             // 不支持广播（src numel != dst numel 越界）。host 源不再整节点禁用 GPU，
@@ -899,7 +910,12 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
         TensorF32* node = graph->graph_node(i);
         if (is_view_op(node->op)) continue;
 
-        int node_backend_id = tensor_backend_id(node, 0);
+        // ⚠️ 2026-08-24 修复：未分配节点默认 CPU（最后后端）而非 GPU。
+        //   原 default_id=0(GPU) 会把未分配的反向 op（如 OP_OUTER_PROD_MEAN_BACK，CUDA
+        //   supports_op=false）当 GPU → 在 GPU split dispatch → CUDA 无 kernel 却走默认
+        //   launch 路径 → buffer_offs 巨大 → invalid argument → 偶发 nan（msa 梯度缺失）。
+        //   默认 CPU 安全：任何未分配节点都能被 CPU 后端执行。
+        int node_backend_id = tensor_backend_id(node, n_backends_ - 1);
 
         // ---- 3a. 判断是否需要开新 split ----
         bool need_new_split = false;
@@ -993,6 +1009,40 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
     // ===== Step 4: 最后一个 split =====
     split->i_end = n_nodes;
     n_splits_++;
+
+    // ===== Step 5: 合并连续同 backend 的小 split（2026-08-23 提速）=====
+    // 碎片化根因：op 级 backend 交替（GPU 只支持少量 op），连续同 backend 的 split 被
+    // 切成极小段（1~4 节点），每个都做一次 backend->graph_compute（含 buffer/同步开销）。
+    // 同 backend 的连续 split 合并后，Step 1 扫描范围 / Step 2 子图执行天然正确
+    // （跨后端边界不变，仅同后端段变宽）。
+    if (n_splits_ > 1 && !(getenv("PPML_NO_MERGE") && std::string(getenv("PPML_NO_MERGE")) == "1")) {
+        const int kMergeMaxNodes = 64;   // 合并后 split 节点上限（防止 CPU 大 split 阻塞线程池）
+        std::vector<SplitInfo> merged;
+        merged.reserve(static_cast<size_t>(n_splits_));
+        SplitInfo acc = splits_[0];
+        for (int si = 1; si < n_splits_; si++) {
+            SplitInfo& cur = splits_[si];
+            if (cur.backend_id == acc.backend_id &&
+                (cur.i_end - acc.i_start) <= kMergeMaxNodes) {
+                acc.i_end = cur.i_end;   // 同 backend：直接扩展范围
+                // n_inputs 仅 build_splits 记录用（Step 1 实际扫描节点范围），合并后取较大值即可
+                if (cur.n_inputs > acc.n_inputs) {
+                    for (int k = 0; k < cur.n_inputs; k++) acc.inputs[k] = cur.inputs[k];
+                    acc.n_inputs = cur.n_inputs;
+                }
+            } else {
+                merged.push_back(acc);
+                acc = cur;
+            }
+        }
+        merged.push_back(acc);
+        // 写回
+        splits_ = std::move(merged);
+        n_splits_ = static_cast<int>(splits_.size());
+    }
+    if (getenv("GRAPH_DEBUG_SCHED")) {
+        fprintf(stderr, "[sched] split_graph: after merge n_splits=%d\n", n_splits_);
+    }
 }
 
 // ============================================================
@@ -1025,6 +1075,23 @@ Status BackendScheduler::graph_compute() {
                 int src_bid = tensor_backend_id(src, -1);
                 if (src_bid == sp.backend_id) continue;
                 if (tensor_buffer_compatible(src, sp.backend_id)) continue;
+                if (getenv("GRAPH_DEBUG_CROSSBK")) {
+                    // 精确诊断：跨后端拷贝（尤其 get_rows 输出 → CPU transpose 的 D2H）
+                    fprintf(stderr,
+                        "[crossbk] S1 split=%d bk=%d src_op=%d src_ndim=%d src_dims=[%lld,%lld,%lld,%lld] "
+                        "src_numel=%lld src_data=%p src_buf=%p src_buf_host=%d src_offs=%zu "
+                        "cpy_numel=%lld -> 消费节点 op=%d\n",
+                        si, sp.backend_id,
+                        (int)src->op, (int)src->shape().ndim(),
+                        (long long)(src->shape().ndim()>0?src->shape().dims[0]:-1),
+                        (long long)(src->shape().ndim()>1?src->shape().dims[1]:-1),
+                        (long long)(src->shape().ndim()>2?src->shape().dims[2]:-1),
+                        (long long)(src->shape().ndim()>3?src->shape().dims[3]:-1),
+                        (long long)src->numel(), (void*)src->data(),
+                        (void*)src->buffer_, (src->buffer_ ? (int)src->buffer_->is_host() : -1),
+                        (size_t)src->buffer_offs_, (long long)cpy->numel(),
+                        (int)node->op);
+                }
                 backend_tensor_copy(src, cpy);
             }
         }
@@ -1050,6 +1117,21 @@ Status BackendScheduler::graph_compute() {
                     // 注意：不能看 src->src[0]->is_host()（旧逻辑误把"cpy 源仍是 device"当跳过条件，
                     // 反而漏掉未完成拷贝的 device src → CPU kernel 段错误）。改为：cpy 自身已是 host 才跳。
                     if (src->op == OP_DUP && src->src[0] && !is_device_pointer(src, src->data())) continue;
+                    if (getenv("GRAPH_DEBUG_CROSSBK")) {
+                        // 精确诊断：CPU split 消费的 device src（get_rows 输出等）D2H 暂存
+                        fprintf(stderr,
+                            "[crossbk] S1b split=%d 消费节点 op=%d src_op=%d src_ndim=%d "
+                            "src_dims=[%lld,%lld,%lld,%lld] src_numel=%lld src_data=%p src_buf=%p "
+                            "src_buf_host=%d src_offs=%zu is_device=%d\n",
+                            si, (int)node->op, (int)src->op, (int)src->shape().ndim(),
+                            (long long)(src->shape().ndim()>0?src->shape().dims[0]:-1),
+                            (long long)(src->shape().ndim()>1?src->shape().dims[1]:-1),
+                            (long long)(src->shape().ndim()>2?src->shape().dims[2]:-1),
+                            (long long)(src->shape().ndim()>3?src->shape().dims[3]:-1),
+                            (long long)src->numel(), (void*)src->data(),
+                            (void*)src->buffer_, (src->buffer_ ? (int)src->buffer_->is_host() : -1),
+                            (size_t)src->buffer_offs_, (int)is_device);
+                    }
                     // D2H 暂存（device 张量必有 buffer_，但无 buffer_ 时用裸 cudaMemcpy 兜底）
                     const int64_t n = src->numel();
                     host_stage_.emplace_back(src, src->data());
@@ -1095,9 +1177,45 @@ Status BackendScheduler::graph_compute() {
         Status st = backend->graph_compute(current_graph_);
         backend->set_skip_alloc(false);
 
+        // ⚠️ 2026-08-24 修复异步竞态：GPU split 的 kernel 是异步执行的，
+        //   若不等其完成就进入下一个 CPU split 的 Step 1b D2H（get_tensor/cudaMemcpy），
+        //   可能读到未完成/垃圾数据 → 偶发 loss 巨大(nan)/segfault（每次运行结果不同）。
+        //   在 GPU split 结束后强制同步（CPU split 同步是空操作，无开销）。
+        if (sp.backend_id != n_backends_ - 1) {
+            backend->synchronize();
+        }
+
         // 恢复原始图状态
         current_graph_->nodes = saved_nodes;
         current_graph_->n_nodes_ = saved_n_nodes;
+
+        // ---- Step 2b: 主动 D2H（生产者 split 后立即落地跨后端输出，2026-08-24）----
+        // 本 split 算完的节点若被其他后端消费（copy_tensor_map_ 记录了 (src,backend)→cpy），
+        // 立即 backend_tensor_copy 落地到 cpy（target 后端 buffer）。
+        // 作用：避免"被动时机"（消费者 split 的 Step 1 才拷贝）读到被 gallocr 复用的 GPU buffer
+        //   → 偶发巨大值（k_cat CONCAT 报 -1.98e6、新版 a_rows 跨后端 NaN）。
+        //   生产后立即落地，src 数据刚算完，且 CPU 消费者用 cpy（host）不依赖 src GPU buffer 存活。
+        // 主动落地（PPML_EAGER_D2H=1 启用）：生产者 split 后立即拷贝跨后端输出。
+        // ⚠️ 2026-08-24：默认关（试验发现可能触发 op=108 OUTER_PROD_MEAN_BACK 在 GPU launch
+        //    invalid argument，且与方案A is_output 叠加后偶发 loss 巨大）。保留开关待进一步调试。
+        if (getenv("PPML_EAGER_D2H") && std::strcmp(getenv("PPML_EAGER_D2H"), "1") == 0) {
+            for (auto& kv : copy_tensor_map_) {
+                const TensorF32* src = kv.first.first;
+                int target_bk = kv.first.second;
+                TensorF32* cpy = kv.second;
+                if (!src || !cpy) continue;
+                if (target_bk == sp.backend_id) continue;      // 同后端无需跨后端拷贝
+                // 只处理本 split 计算产生的 src（src 在本 split 节点范围且已被计算）
+                bool in_range = false;
+                for (int k = sp.i_start; k < sp.i_end; k++) {
+                    if (current_graph_->graph_node(k) == src) { in_range = true; break; }
+                }
+                if (!in_range) continue;
+                if (!src->data()) continue;                    // 尚未计算
+                if (tensor_buffer_compatible(src, target_bk)) continue;
+                backend_tensor_copy(const_cast<TensorF32*>(src), cpy);
+            }
+        }
 
         // 恢复本 split 被临时 rebind 到 host 的 device 指针（Step 1b 暂存）
         for (auto& pr : host_stage_) {

@@ -780,6 +780,9 @@ private:
     static void kernel_silu_cuda   (TensorF32 * node);
     static void kernel_tanh_cuda   (TensorF32 * node);
     static void kernel_exp_cuda    (TensorF32 * node);
+
+    // 统一 unary dispatch（2026-08-23 提速）：按 unary_op 子类型走 unary_cuda kernel
+    static void kernel_unary_cuda(TensorF32 * node, unary_op uop, ComputeParams * p);
 };
 
 } // namespace ppml

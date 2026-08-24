@@ -34,6 +34,9 @@ extern void out_prod_cuda(
     int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
     int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3);
 
+// Unary ops（RELU/SQRT/EXP 等，实现于 src/cuda/CUDAKernels.cu）
+extern void unary_cuda(const float * src, float * dst, int N, int uop, int block_size);
+
 // N-ary concat：srcs/start/len 均须为 device 指针（见 concat_nary_cuda）。
 // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致。
 extern void concat_nary_cuda(
@@ -137,12 +140,32 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             kernel_norm_back_cuda(node, p);
             break;
 
+        case OP_UNARY: {
+            const unary_op uop = get_unary_op(node);
+            kernel_unary_cuda(node, uop, p);
+            break;
+        }
+
         // ===== 无实现的 op：统一返回 NOT_SUPPORTED =====
         default:
+            if (getenv("GRAPH_DEBUG_CUDA_OP")) {
+                fprintf(stderr, "[cuda-dispatch] UNSUPPORTED op=%d numel=%lld src0=%p src1=%p\n",
+                        (int)node->op, (long long)node->numel(),
+                        (void*)(node->src[0] ? node->src[0]->data() : nullptr),
+                        (void*)(node->src[1] ? node->src[1]->data() : nullptr));
+            }
             st = Status::NOT_SUPPORTED;
             break;
     }
     return st;
+}
+
+void CUDABackend::kernel_unary_cuda(TensorF32 * node, unary_op uop, ComputeParams * p) {
+    (void)p;
+    int N = static_cast<int>(node->numel());
+    float * dst = node->data();
+    const float * src = node->src[0]->data();
+    unary_cuda(src, dst, N, static_cast<int>(uop), 256);
 }
 
 // ============================================================
@@ -328,7 +351,43 @@ void CUDABackend::kernel_scatter_add_cuda(TensorF32 * node, ComputeParams * p) {
     const int N = node->op_params[0];
     const int M = static_cast<int>(msg->shape().dims[0]);
     const int E = static_cast<int>(msg->shape().dims[1]);
+    // ⚠️ 诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：打印 scatter_add 实际 launch 参数与指针状态，
+    //    定位 [CUDA-ERR] op=108(OP_SCATTER_ADD) invalid argument 根因（grid 超限 / 指针非法）。
+    if (getenv("GRAPH_DEBUG_CUDA_SCATTER")) {
+        const int gz = (int)(((int64_t)N * M + 255) / 256);
+        const int ge = (int)(((int64_t)E + 255) / 256);
+        fprintf(stderr,
+                "[scatter-add-dbg] N=%d M=%d E=%d gz=%d ge=%d | dst=%p msg=%p tgt=%p "
+                "dst_buf=%p(is_host=%d) msg_buf=%p(is_host=%d) tgt_buf=%p(is_host=%d)\n",
+                N, M, E, gz, ge,
+                (void*)node->data(), (void*)msg->data(), (void*)tgt_idx->data(),
+                (void*)(node->buffer_?node->buffer_:nullptr), (node->buffer_?(int)node->buffer_->is_host():-1),
+                (void*)(msg->buffer_?msg->buffer_:nullptr), (msg->buffer_?(int)msg->buffer_->is_host():-1),
+                (void*)(tgt_idx->buffer_?tgt_idx->buffer_:nullptr), (tgt_idx->buffer_?(int)tgt_idx->buffer_->is_host():-1));
+        // ⚠️ 指针属性检查：确认 data() 在 GPU launch 时是 device 指针（cudaMemoryTypeDevice=2）。
+        //    若 msg/tgt/dst 的 data() 是 host 或 unregistered（跨后端 data()/buffer_ 不一致），
+        //    CUDA kernel 读 host 指针 → invalid argument / illegal address。
+        cudaPointerAttributes pa_dst{}, pa_msg{}, pa_tgt{};
+        cudaPointerGetAttributes(&pa_dst, node->data());
+        cudaPointerGetAttributes(&pa_msg, msg->data());
+        cudaPointerGetAttributes(&pa_tgt, tgt_idx->data());
+        fprintf(stderr,
+                "[scatter-ptr] dst type=%d(2=dev,1=host,3=managed,0=unreg) msg type=%d tgt type=%d\n",
+                (int)pa_dst.type, (int)pa_msg.type, (int)pa_tgt.type);
+    }
     scatter_add_cuda(msg->data(), tgt_idx->data(), node->data(), N, M, E);
+    // ⚠️ 诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：launch 后立即查错误——确认 scatter 自身
+    //    launch 是否真的失败（node 0 的 [CUDA-ERR] op=108 来源）。
+    if (getenv("GRAPH_DEBUG_CUDA_SCATTER")) {
+        cudaError_t ler = cudaGetLastError();
+        if (ler != cudaSuccess) {
+            fprintf(stderr,
+                    "[scatter-launch-ERR] N=%d M=%d E=%d gz=%d: %s\n",
+                    N, M, E,
+                    E > 0 ? ((E + 255) / 256) : 1, cudaGetErrorString(ler));
+            cudaGetLastError();  // 清错误
+        }
+    }
 }
 
 void CUDABackend::kernel_per_edge_matmul_back_kernel_cuda(TensorF32 * node, ComputeParams * p) {

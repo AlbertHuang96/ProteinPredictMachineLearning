@@ -585,4 +585,40 @@ void concat_nary_cuda(
     cudaCheck(cudaGetLastError());
 }
 
+// ============================================================
+// Unary Ops CUDA Kernel（RELU/SQRT/EXP 等常用激活，2026-08-23 提速）
+// uop 与 unary_op 枚举对齐（ComputeGraph.h）：0=ABS,4=RELU,10=SQRT,13=EXP,5=GELU,...
+// ============================================================
+
+__global__ void unary_kernel(
+    const float * __restrict__ src, float * __restrict__ dst, int N, int uop) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= N) return;
+    float x = src[tid];
+    float y;
+    // ⚠️ uop 必须与 unary_op 枚举精确对齐（ComputeGraph.h）：
+    //    0=ABS, 4=RELU, 5=GELU, 7=SILU, 8=TANH, 10=SIGMOID, 12=HARDSWISH,
+    //    13=EXP, 14=LOG, 15=SQRT。之前把 10 当 SQRT（实为 SIGMOID）→ sqrt(负)→NaN。
+    switch (uop) {
+        case 0:  y = fabsf(x);        break;   // ABS
+        case 4:  y = fmaxf(x, 0.0f);  break;   // RELU
+        case 5:  y = 0.5f * x * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x))); break;  // GELU
+        case 7:  y = x / (1.0f + expf(-x)); break;  // SILU
+        case 8:  y = tanhf(x);        break;   // TANH
+        case 10: y = 1.0f / (1.0f + expf(-x)); break;  // SIGMOID
+        case 12: y = x * fmaxf(0.0f, fminf(1.0f, x / 6.0f + 0.5f)); break;  // HARDSWISH
+        case 13: y = expf(x);         break;   // EXP
+        case 14: y = logf(x);         break;   // LOG
+        case 15: y = sqrtf(x);        break;   // SQRT
+        default: y = x;               break;
+    }
+    dst[tid] = y;
+}
+
+void unary_cuda(const float * src, float * dst, int N, int uop, int block_size) {
+    int grid_size = ceil_div(N, block_size);
+    unary_kernel<<<grid_size, block_size>>>(src, dst, N, uop);
+    cudaCheck(cudaGetLastError());
+}
+
 } // namespace ppml

@@ -315,6 +315,65 @@ void CPUBackend::compute_thread(ThreadState * state) {
                             (long long)(s1&&s1->shape().ndim()>2?s1->shape().dims[2]:-1),
                             (long long)(s1&&s1->shape().ndim()>3?s1->shape().dims[3]:-1),
                             opname(s1?s1->src[0]:nullptr));
+                    // ⚠️ OP_DIV 专项（GNormBias 的 scale3=t/(norm+eps)）：打印 t(src0=relu) 与
+                    //    denom(src1=norm+eps) 统计。若 t≈norm 但 norm 巨大而输入 x 正常 → 布局错位。
+                    if ((int)node->op == 8 /*OP_DIV*/ && node->shape().ndim() >= 3) {
+                        const float* td = s0 ? s0->data() : nullptr;
+                        const float* dd_ = s1 ? s1->data() : nullptr;
+                        if (td && s0->numel() > 0) {
+                            float tmin = td[0], tmax = td[0];
+                            for (int64_t kk = 1; kk < s0->numel(); ++kk) { float tv = td[kk]; if (tv<tmin)tmin=tv; if (tv>tmax)tmax=tv; }
+                            fprintf(stderr, "  [div-gnorm] t(src0=relu) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
+                                    (long long)(s0->shape().ndim()>0?s0->shape().dims[0]:-1),
+                                    (long long)(s0->shape().ndim()>1?s0->shape().dims[1]:-1),
+                                    (long long)(s0->shape().ndim()>2?s0->shape().dims[2]:-1),
+                                    (double)tmin, (double)tmax, (long long)s0->numel());
+                        }
+                        if (dd_ && s1->numel() > 0) {
+                            float dmin = dd_[0], dmax = dd_[0];
+                            for (int64_t kk = 1; kk < s1->numel(); ++kk) { float dv = dd_[kk]; if (dv<dmin)dmin=dv; if (dv>dmax)dmax=dv; }
+                            fprintf(stderr, "  [div-gnorm] denom(src1=norm+eps) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
+                                    (long long)(s1->shape().ndim()>0?s1->shape().dims[0]:-1),
+                                    (long long)(s1->shape().ndim()>1?s1->shape().dims[1]:-1),
+                                    (long long)(s1->shape().ndim()>2?s1->shape().dims[2]:-1),
+                                    (double)dmin, (double)dmax, (long long)s1->numel());
+                        }
+                    }
+                    // ⚠️ PER_EDGE_MATMUL 专项：打印 kernel(src0) / gathered(src1) 的统计，
+                    //    定位 SE3 核生成爆炸是 kernel 值异常还是 gathered(节点特征) 异常。
+                    if ((int)node->op == 107 /*OP_PER_EDGE_MATMUL*/) {
+                        const float* kd = s0 ? s0->data() : nullptr;
+                        const float* gd = s1 ? s1->data() : nullptr;
+                        if (kd && s0->numel() > 0) {
+                            float kmin = kd[0], kmax = kd[0];
+                            for (int64_t kk = 1; kk < s0->numel(); ++kk) {
+                                float kv = kd[kk];
+                                if (kv < kmin) kmin = kv;
+                                if (kv > kmax) kmax = kv;
+                            }
+                            fprintf(stderr, "  [per-edge] KERNEL dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
+                                    (long long)(s0->shape().ndim()>0?s0->shape().dims[0]:-1),
+                                    (long long)(s0->shape().ndim()>1?s0->shape().dims[1]:-1),
+                                    (long long)(s0->shape().ndim()>2?s0->shape().dims[2]:-1),
+                                    (double)kmin, (double)kmax, (long long)s0->numel());
+                        } else {
+                            fprintf(stderr, "  [per-edge] KERNEL data=null\n");
+                        }
+                        if (gd && s1->numel() > 0) {
+                            float gmin = gd[0], gmax = gd[0];
+                            for (int64_t kk = 1; kk < s1->numel(); ++kk) {
+                                float gv = gd[kk];
+                                if (gv < gmin) gmin = gv;
+                                if (gv > gmax) gmax = gv;
+                            }
+                            fprintf(stderr, "  [per-edge] GATHERED dims=[%lld,%lld] min=%g max=%g numel=%lld\n",
+                                    (long long)(s1->shape().ndim()>0?s1->shape().dims[0]:-1),
+                                    (long long)(s1->shape().ndim()>1?s1->shape().dims[1]:-1),
+                                    (double)gmin, (double)gmax, (long long)s1->numel());
+                        } else {
+                            fprintf(stderr, "  [per-edge] GATHERED data=null\n");
+                        }
+                    }
                     ++explode_count;
                     break;
                 }

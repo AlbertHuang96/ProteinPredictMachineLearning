@@ -161,6 +161,26 @@ size_t total_bytes_of(const std::vector<TensorF32*>& params) {
 }
 
 // ============================================================================
+// 加载 checkpoint (GGUF): 从文件读权重覆盖模型当前参数。
+//   path: 输入 gguf 文件路径
+//   ⚠️ 当前假设加载的权重与模型内架构/命名/顺序一致（collect_params_with_names 的
+//      顺序 = save_gguf 的写入顺序 = load_gguf 的读取顺序）。load_gguf 内部校验
+//      张量数量与形状，不一致会抛异常。
+// ============================================================================
+void load_checkpoint(PPMLModel& model, const std::string& path) {
+    std::vector<TensorF32*> params;
+    std::vector<std::string> param_names;
+    model.collect_params_with_names(params, param_names);
+    if (params.empty()) {
+        throw std::runtime_error("load_checkpoint: no parameters in model");
+    }
+    std::cout << "[Load-CKPT] loading " << path << " -> "
+              << params.size() << " params (assume arch/names match)" << std::endl;
+    load_gguf(path, params, param_names);
+    std::cout << "[Load-CKPT] OK: " << params.size() << " params loaded" << std::endl;
+}
+
+// ============================================================================
 // 保存 checkpoint (方案 b): 先把所有参数临时拷贝到 CPU, 再写入 GGUF
 //   path: 输出 gguf 文件路径
 //   epoch: 当前已完成 epoch (0-based), total_epochs, loss, elapsed_sec
@@ -251,13 +271,18 @@ std::vector<ProteinSample> discover_training_set(const std::string& root) {
     std::vector<ProteinSample> out;
     if (!std::filesystem::exists(root)) return out;
     // 收集 a3m -> uniprot
+    // ⚠️ 2026-08-24 修复：后缀 "_alignment.a3m" 长 14 字符，此前用 11/12 导致永远匹配不到
+    //    a3m → 多样本"未发现任何蛋白样本"。实证: p[-11:]="ignment.a3m"≠"_alignment."
+    //    p[-14:]="_alignment.a3m"✓；name[:-12]="O60260_a"✗, name[:-14]="O60260"✓。
+    const std::string kA3mSuffix = "_alignment.a3m";  // 14 chars
     std::map<std::string, std::string> a3m_of;
     for (auto& e : std::filesystem::directory_iterator(root)) {
         if (!e.is_regular_file()) continue;
         std::string p = e.path().string();
-        if (p.size() >= 11 && p.compare(p.size() - 11, 11, "_alignment.a3m") == 0) {
+        if (p.size() >= kA3mSuffix.size() &&
+            p.compare(p.size() - kA3mSuffix.size(), kA3mSuffix.size(), kA3mSuffix) == 0) {
             std::string name = e.path().filename().string();
-            std::string uni = name.substr(0, name.size() - 12); // 去掉 "_alignment"
+            std::string uni = name.substr(0, name.size() - kA3mSuffix.size()); // 去掉 "_alignment.a3m"
             a3m_of[uni] = p;
         }
     }
@@ -776,8 +801,22 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Model created and CPU and CUDA Backend init" << std::endl;
+
+    // 4. 从 checkpoint (GGUF) 加载权重 — 默认关闭, 环境变量 PPML_LOAD_CKPT 指定路径时启用
+    //    当前假设加载的权重与模型内架构/命名/顺序一致 (同 save_checkpoint 输出)。
+    //    应在数据加载前执行 (权重加载与数据无关), 且早于首次 forward 构图。
+    if (const char* lc = std::getenv("PPML_LOAD_CKPT")) {
+        try {
+            load_checkpoint(model, std::string(lc));
+        } catch (const std::exception& e) {
+            std::cerr << "[Load-CKPT] FAILED: " << e.what() << std::endl;
+            return 1;
+        }
+    } else {
+        std::cout << "[Load-CKPT] disabled (set PPML_LOAD_CKPT=/path/to.gguf to load)" << std::endl;
+    }
     
-    // 4. 加载预训练权重 (通过 Python 桥接)
+    // 4b. 加载预训练权重 (通过 Python 桥接)
     // 暂时没有预训练权重, 先注释掉, 待有权重文件后再启用
     // if (argc > 1) {
     //     std::string weights_path = argv[1];
@@ -1008,6 +1047,15 @@ int main(int argc, char* argv[]) {
         }
         
         // 前向传播（图模式：返回可微图节点，供 loss 组装计算图）
+        // 进度日志：首次构图（epoch0）全尺寸（FULL_TRAIN N=512, 大 L）可能耗时数十秒~分钟，
+        // 纯构图阶段无其他输出，易被误判为"停住/死锁"。此处显式打印开始/完成，区分构图慢 vs 卡死。
+        if (epoch == 0) {
+            std::cout << "[FWD-GRAPH] 开始首次构图 (epoch 0)... 大模型全尺寸构图可能耗时 "
+                      << "(L=" << L << ", N=" << input.msa_latent.shape().dims[1]
+                      << ", se3=" << (full_train || dev_se3) << ")，请耐心等待" << std::endl;
+        } else {
+            std::cout << "[FWD-GRAPH] epoch " << epoch << " 开始构图..." << std::endl;
+        }
         auto fwd_start = std::chrono::high_resolution_clock::now();
         // enable_se3：FULL_TRAIN=true 或 PPML_DEV_SE3=1 时开启 SE3 3D track（训练更新坐标）；
         // dev 默认关闭（run_se3_structural 曾为未完成崩溃，用于小样本流程验证）。
@@ -1122,6 +1170,23 @@ int main(int argc, char* argv[]) {
             seq_mask_2d.zero_();
             for (int64_t i = 0; i < chi_N; ++i) seq_mask_2d.data()[i] = 1.0f;  // 全残基有效
             TensorF32* unnormed_node = view(go.alpha, Shape{2, 7, chi_N});  // 图节点（梯度回传）
+            if (getenv("GRAPH_DEBUG_CHI")) {
+                // 诊断 go.alpha（chi logits 源）的数值范围：D2H 读回 host 再扫
+                std::vector<float> av = read_tensor_cpu(go.alpha);
+                double mn=1e30, mx=-1e30, s=0; int nnan=0, ninf=0;
+                for (size_t q = 0; q < av.size(); q++) {
+                    float v = av[q];
+                    if (v != v) { nnan++; continue; }
+                    if (v > 3.0e38f || v < -3.0e38f) { ninf++; continue; }
+                    if (v < mn) mn = v; if (v > mx) mx = v; s += (double)v;
+                }
+                std::cout << "  [CHI-DBG] alpha numel=" << av.size()
+                          << " min=" << mn << " max=" << mx << " sum=" << s
+                          << " nnan=" << nnan << " ninf=" << ninf
+                          << " alpha_buf=" << (void*)go.alpha->buffer_
+                          << " alpha_buf_host=" << (go.alpha->buffer_ ? (int)go.alpha->buffer_->is_host() : -1)
+                          << std::endl;
+            }
             TensorF32* gt_node       = wrap_value_as_leaf(chi_gt,       {2, 7, chi_N});
             TensorF32* cmask_node    = wrap_value_as_leaf(chi_mask_2d,  {7, chi_N});
             TensorF32* smask_node    = wrap_value_as_leaf(seq_mask_2d,  {1, chi_N});
@@ -1394,6 +1459,27 @@ int main(int argc, char* argv[]) {
                               << " numel=" << nelt << " bad=" << firstbad << " @flat=" << firstidx
                               << " src0_op=" << (nd->src[0] ? (int)nd->src[0]->op : -1)
                               << " src1_op=" << (nd->src[1] ? (int)nd->src[1]->op : -1);
+                    // ⚠️ GET_ROWS 专项：打印权重表(src0)与索引(src1)统计，区分"表值巨大"vs"索引越界"
+                    if (nd->op == 41 /*OP_GET_ROWS*/) {
+                        TensorF32* W = nd->src[0];
+                        TensorF32* I = nd->src[1];
+                        if (W && W->data() && W->numel() > 0) {
+                            float wmin = W->data()[0], wmax = W->data()[0];
+                            for (int64_t wv = 1; wv < W->numel(); ++wv) { float x = W->data()[wv]; if (x<wmin)wmin=x; if (x>wmax)wmax=x; }
+                            std::cout << " W{op=" << (int)W->op << " numel=" << W->numel()
+                                      << " dims0=" << (W->shape().ndim()>0?W->shape().dims[0]:-1)
+                                      << " dims1=" << (W->shape().ndim()>1?W->shape().dims[1]:-1)
+                                      << " min=" << wmin << " max=" << wmax << "}";
+                        } else {
+                            std::cout << " W{data=null}";
+                        }
+                        if (I && I->data() && I->numel() > 0) {
+                            float imin = I->data()[0], imax = I->data()[0];
+                            for (int64_t iv = 1; iv < I->numel(); ++iv) { float x = I->data()[iv]; if (x<imin)imin=x; if (x>imax)imax=x; }
+                            std::cout << " idx{op=" << (int)I->op << " numel=" << I->numel()
+                                      << " min=" << imin << " max=" << imax << "}";
+                        }
+                    }
                     if (nd->shape().ndim() >= 1 && nd->shape().ndim() <= 4) {
                         std::cout << " dims=[";
                         for (int d = 0; d < nd->shape().ndim(); ++d)
@@ -1469,11 +1555,92 @@ int main(int argc, char* argv[]) {
                 [](const PStat* a, const PStat* b){ return a->l2 > b->l2; });
             int nprint = (int)ord.size() < 12 ? (int)ord.size() : 12;
             for (int q = 0; q < nprint; q++) {
+                TensorF32* pnd = cgraph->graph_node(ord[q]->idx);
                 std::cout << "  [grad-param] rank=" << q
                           << " node_idx=" << ord[q]->idx
                           << " numel=" << ord[q]->numel
+                          << " op=" << (pnd ? (int)pnd->op : -1)
+                          << " dims=["
+                          << (pnd && pnd->shape().ndim()>0 ? pnd->shape().dims[0] : -1)
+                          << ","
+                          << (pnd && pnd->shape().ndim()>1 ? pnd->shape().dims[1] : -1)
+                          << ","
+                          << (pnd && pnd->shape().ndim()>2 ? pnd->shape().dims[2] : -1)
+                          << ","
+                          << (pnd && pnd->shape().ndim()>3 ? pnd->shape().dims[3] : -1)
+                          << "]"
                           << " l2=" << ord[q]->l2
                           << " max_abs=" << ord[q]->maxabs << std::endl;
+            }
+            // ⚠️ 诊断（PPML_DEBUG_GRAD=1）：扫描全部 PARAM 参数，打印 numel/dims/flag/是否有grad/
+            //    是否被图中节点消费。用于区分：
+            //    (a) 非 PARAM 或未被任何节点消费（不在前向链）→ NO GRAD 合理；
+            //    (b) PARAM 且被消费（参与 loss 链）却 NO GRAD → 反向断链异常。
+            {
+                int nparam_total = 0, n_no_grad = 0, n_no_grad_consumed = 0, n_zero = 0;
+                std::cout << "[grad-scan] scanning ALL PARAM nodes:" << std::endl;
+                for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
+                    TensorF32* nd = cgraph->graph_node(gi);
+                    if (!(nd->flag & TENSOR_FLAG_PARAM)) continue;
+                    nparam_total++;
+                    // 检查该参数是否被图中任何节点作为 src 消费（是否参与前向链），并记录消费它的 op
+                    bool consumed = false;
+                    int consumer_op = -1, consumer_gi = -1;
+                    for (int cj = 0; cj < cgraph->n_nodes(); ++cj) {
+                        TensorF32* cn = cgraph->graph_node(cj);
+                        for (int s = 0; s < 5; ++s) {  // GGML_MAX_SRC 常用前 5
+                            if (cn->src[s] == nd) { consumed = true; consumer_op = (int)cn->op; consumer_gi = cj; break; }
+                        }
+                        if (consumed) break;
+                    }
+                    const int64_t n = nd->numel();
+                    TensorF32* gr = cgraph->graph_get_grad(nd);
+                    const int fl = (int)nd->flag;
+                    if (!gr) {
+                        n_no_grad++;
+                        if (consumed) n_no_grad_consumed++;
+                        std::cout << "  [grad-scan] node=" << gi << " numel=" << n
+                                  << " op=" << (int)nd->op
+                                  << " dims=["
+                                  << (nd->shape().ndim()>0 ? nd->shape().dims[0] : -1)
+                                  << ","
+                                  << (nd->shape().ndim()>1 ? nd->shape().dims[1] : -1)
+                                  << ","
+                                  << (nd->shape().ndim()>2 ? nd->shape().dims[2] : -1)
+                                  << ","
+                                  << (nd->shape().ndim()>3 ? nd->shape().dims[3] : -1)
+                                  << "]"
+                                  << " flag=" << fl
+                                  << " consumed=" << consumed
+                                  << " consumer_op=" << consumer_op
+                                  << " consumer_node=" << consumer_gi
+                                  << " NO_GRAD" << std::endl;
+                        continue;
+                    }
+                    std::vector<float> gv = read_tensor_cpu(gr);
+                    double l2 = 0, mx = 0; long nz = 0;
+                    for (float v : gv) { l2 += (double)(v*v); if (std::fabs(v)>mx) mx=std::fabs(v); if (v!=0.0f) nz++; }
+                    if (l2 == 0.0 && mx == 0.0) n_zero++;
+                    std::cout << "  [grad-scan] node=" << gi << " numel=" << n
+                              << " op=" << (int)nd->op
+                              << " dims=["
+                              << (nd->shape().ndim()>0 ? nd->shape().dims[0] : -1)
+                              << ","
+                              << (nd->shape().ndim()>1 ? nd->shape().dims[1] : -1)
+                              << ","
+                              << (nd->shape().ndim()>2 ? nd->shape().dims[2] : -1)
+                              << ","
+                              << (nd->shape().ndim()>3 ? nd->shape().dims[3] : -1)
+                              << "]"
+                              << " flag=" << fl
+                              << " consumed=" << consumed
+                              << " l2=" << l2 << " max_abs=" << mx << " nz=" << nz
+                              << " GRAD_IS_ZERO=" << (l2 == 0.0 && mx == 0.0 ? "YES" : "no") << std::endl;
+                }
+                std::cout << "[grad-scan] SUMMARY: total_param=" << nparam_total
+                          << " no_grad=" << n_no_grad
+                          << " no_grad_consumed=" << n_no_grad_consumed
+                          << " grad_zero=" << n_zero << std::endl;
             }
         }
         // 定位纯 forward 里第一个产生 NaN/巨大值(>1e6) 的图节点（hash 修复后完整图执行，用于定位 NaN op 源）
@@ -1542,13 +1709,21 @@ int main(int argc, char* argv[]) {
         // 当 batch_loss 为 NaN 或 grad_norm 异常时无条件打印（不依赖 env，绕过 env 不生效问题）。
         if (getenv("GRAPH_DEBUG_LOSS") || std::isnan(batch_loss) || std::isnan(grad_norm) || grad_norm > 100000.0f) {
             auto print_loss = [](const char* name, TensorF32* n) {
-                if (n && n->buffer_ && !n->buffer_->is_host()) {   // ⚠️ CUDA 混合：device 数据不能直接读
-                    std::cout << "  [loss] " << name << " = (on-device, skip)" << std::endl;
+                // ⚠️ CUDA 混合：有 buffer_ 判 is_host；无 buffer_ 的裸指针用 D2H 探测兜底。
+                //    漏判 device 指针会在读 data() 时 SIGSEGV（见历史崩溃 main+20152）。
+                if (!n) { std::cout << "  [loss] " << name << " = (null)" << std::endl; return; }
+                if (n->buffer_) {
+                    if (!n->buffer_->is_host()) {
+                        std::cout << "  [loss] " << name << " = (on-device, skip)" << std::endl;
+                        return;
+                    }
+                } else if (n->data() && is_device_pointer(n, n->data())) {
+                    std::cout << "  [loss] " << name << " = (device-ptr, skip)" << std::endl;
                     return;
                 }
-                if (n && n->data() && n->numel() == 1)
+                if (n->data() && n->numel() == 1)
                     std::cout << "  [loss] " << name << " = " << n->data()[0] << std::endl;
-                else if (n && n->data()) {
+                else if (n->data()) {
                     // 非标量 loss：打印完整 sum 判断是否含 nan
                     double s = 0; int64_t cn = n->numel();
                     for (int64_t q = 0; q < cn; q++) s += n->data()[q];
@@ -1611,20 +1786,29 @@ int main(int argc, char* argv[]) {
                 TensorF32* cur = total_node;
                 for (int depth = 0; cur && depth < 8; depth++) {
                     double s = 0; int64_t cn = cur->numel();
-                    if (cur->data()) for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
+                    // ⚠️ CUDA 混合：device/悬垂指针跳过，避免读崩
+                    if (cur->buffer_ && !cur->buffer_->is_host()) break;
+                    if (cur->data() && !is_device_pointer(cur, cur->data()))
+                        for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
+                    TensorF32* s1 = cur->src[1];
+                    bool s1_dev = s1 && ((s1->buffer_ && !s1->buffer_->is_host()) ||
+                                         (s1->data() && is_device_pointer(s1, s1->data())));
                     std::cout << "  [total-chain] d=" << depth << " op=" << cur->op
                               << " numel=" << cn << " sum=" << s << " addr=" << (void*)cur->data()
-                              << (cn > 0 && cur->data() ? " v0=" + std::to_string(cur->data()[0]) : "")
-                              << " src1_sum=" << (cur->src[1] && cur->src[1]->data() ?
-                                  std::to_string([&](){double ss=0; for(int64_t q=0;q<cur->src[1]->numel();q++) ss+=cur->src[1]->data()[q]; return ss;}()) : "null")
-                              << " src1_addr=" << (void*)(cur->src[1] ? cur->src[1]->data() : nullptr)
+                              << (cn > 0 && cur->data() && !is_device_pointer(cur, cur->data())
+                                  ? " v0=" + std::to_string(cur->data()[0]) : "")
+                              << " src1_sum=" << (s1 && s1->data() && !s1_dev ?
+                                  std::to_string([&](){double ss=0; for(int64_t q=0;q<s1->numel();q++) ss+=s1->data()[q]; return ss;}()) : "null")
+                              << " src1_addr=" << (void*)(s1 ? s1->data() : nullptr)
                               << std::endl;
                     cur = cur->src[0];
                 }
             }
             std::cout << "  [loss] msa_logits=" << (go.msa_logits ? "node" : "null")
                       << " distogram=" << (go.distogram ? "node" : "null") << std::endl;
-            if (go.msa_logits && go.msa_logits->data()) {
+            if (go.msa_logits && go.msa_logits->data() &&
+                !(go.msa_logits->buffer_ && !go.msa_logits->buffer_->is_host()) &&
+                !is_device_pointer(go.msa_logits, go.msa_logits->data())) {
                 int64_t ne = go.msa_logits->numel();
                 std::cout << "  [msa_logits] numel=" << ne << " dims=["
                           << go.msa_logits->shape().dims[0] << "," << go.msa_logits->shape().dims[1] << ","
@@ -1702,10 +1886,13 @@ int main(int argc, char* argv[]) {
                 TensorF32* cur = loss_msa_node;
                 for (int depth = 0; cur && depth < 6; depth++) {
                     double s = 0; int64_t cn = cur->numel();
-                    if (cur->data()) for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
+                    // ⚠️ CUDA 混合：device/悬垂指针跳过，避免读崩
+                    bool cur_dev = (cur->buffer_ && !cur->buffer_->is_host()) ||
+                                   (cur->data() && is_device_pointer(cur, cur->data()));
+                    if (!cur_dev && cur->data()) for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
                     std::cout << "  [msa-loss-chain] d=" << depth << " op=" << cur->op
                               << " numel=" << cn << " sum=" << s
-                              << (cn > 0 && cur->data() ? " v0=" + std::to_string(cur->data()[0]) : "")
+                              << (cn > 0 && cur->data() && !cur_dev ? " v0=" + std::to_string(cur->data()[0]) : "")
                               << std::endl;
                     cur = cur->src[0];
                 }

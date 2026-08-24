@@ -31,7 +31,9 @@ void AdamW::init_from_graph(ComputeGraph* cgraph) {
         s.param            = node;
         s.no_weight_decay  = (node->flag & TENSOR_FLAG_NO_WEIGHT_DECAY) != 0;
         // SE3 等变参数：梯度尺度与主图不匹配（offset→坐标→FAPE 链放大），用分层小 lr。
-        s.se3_lr_scale     = (node->flag & TENSOR_FLAG_SE3) ? 0.1f : 1.0f;
+        // 2026-08-24: 0.1→0.01（新版 a_rows 正确 shape 后 SE3 权重梯度 l2~1e25，
+        //   0.1 分层仍致权重漂移/epoch2 爆炸；降到 0.01 减缓更新步长）。
+        s.se3_lr_scale     = (node->flag & TENSOR_FLAG_SE3) ? 0.01f : 1.0f;
         s.m.assign(static_cast<size_t>(n), 0.0f);
         s.v.assign(static_cast<size_t>(n), 0.0f);
         states_.push_back(std::move(s));

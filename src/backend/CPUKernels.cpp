@@ -149,6 +149,9 @@ Status CPUBackend::dispatch_body(TensorF32* node, ComputeParams* p) {
         case OP_OUTER_PROD_BACK: kernel_outer_prod_back(node, p); break;
         case OP_UNARY:  {
             const unary_op uop = get_unary_op(node);
+            if (getenv("GRAPH_DEBUG_UNARY")) {
+                fprintf(stderr, "[unary] uop=%d numel=%lld\n", (int)uop, (long long)node->numel());
+            }
             switch (uop) {
                 case UNARY_OP_ABS:
                     compute_forward_abs(p, node);        break;
@@ -405,15 +408,38 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
     const bool bad_bcast =
         (!a_full && (an <= 0 || n % an != 0)) || (!b_full && (bn <= 0 || n % bn != 0));
     if (bad_bcast && p->ith == 0 && getenv("GRAPH_DEBUG_BCAST")) {
+        const Shape& sa = node->src[0]->shape();
+        const Shape& sb = node->src[1]->shape();
+        const Shape& sd = node->shape();
+        TensorF32* s0 = node->src[0];
+        TensorF32* s0src = (s0 && s0->src[0]) ? s0->src[0] : nullptr;
+        TensorF32* s0src2 = (s0src && s0src->src[0]) ? s0src->src[0] : nullptr;
+        TensorF32* s1 = node->src[1];
+        TensorF32* s1src = (s1 && s1->src[0]) ? s1->src[0] : nullptr;
+        TensorF32* s1src2 = (s1src && s1src->src[0]) ? s1src->src[0] : nullptr;
+        TensorF32* s1src3 = (s1src2 && s1src2->src[0]) ? s1src2->src[0] : nullptr;
         fprintf(stderr,
-                "[ELEM-BCAST] op=%d n=%lld an=%lld bn=%lld a_full=%d b_full=%d "
-                "a=%p b=%p d=%p | src0{op=%d buf=%p data=%p} src1{op=%d buf=%p data=%p} dst{data=%p}\n",
+                "[ELEM-BCAST] op=%d n=%lld an=%lld bn=%lld "
+                "| src0{op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld src1op=%d src2op=%d} "
+                "src1{op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld s1_src0op=%d s1_src1op=%d s1_src2op=%d} "
+                "dst{ndim=%d dims=[%lld,%lld,%lld,%lld]}\n",
                 (int)node->op, (long long)n, (long long)an, (long long)bn,
-                (int)a_full, (int)b_full,
-                (const void*)a, (const void*)b, (const void*)d,
-                (int)node->src[0]->op, (void*)node->src[0]->buffer_, (const void*)a,
-                (int)node->src[1]->op, (void*)node->src[1]->buffer_, (const void*)b,
-                (const void*)d);
+                (int)s0->op, (int)sa.ndim(),
+                (long long)(sa.ndim()>0?sa.dims[0]:-1), (long long)(sa.ndim()>1?sa.dims[1]:-1),
+                (long long)(sa.ndim()>2?sa.dims[2]:-1), (long long)(sa.ndim()>3?sa.dims[3]:-1),
+                (long long)sa.numel(),
+                (s0src ? (int)s0src->op : -1),
+                (s0src2 ? (int)s0src2->op : -1),
+                (int)s1->op, (int)sb.ndim(),
+                (long long)(sb.ndim()>0?sb.dims[0]:-1), (long long)(sb.ndim()>1?sb.dims[1]:-1),
+                (long long)(sb.ndim()>2?sb.dims[2]:-1), (long long)(sb.ndim()>3?sb.dims[3]:-1),
+                (long long)sb.numel(),
+                (s1src ? (int)s1src->op : -1),
+                (s1src2 ? (int)s1src2->op : -1),
+                (s1src3 ? (int)s1src3->op : -1),
+                (int)sd.ndim(),
+                (long long)(sd.ndim()>0?sd.dims[0]:-1), (long long)(sd.ndim()>1?sd.dims[1]:-1),
+                (long long)(sd.ndim()>2?sd.dims[2]:-1), (long long)(sd.ndim()>3?sd.dims[3]:-1));
     }
 
     switch (node->op) {

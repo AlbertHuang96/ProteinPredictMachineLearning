@@ -127,6 +127,15 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_SCATTER_ADD:
         case OP_PER_EDGE_MATMUL_BACK_KERNEL:
         case OP_PER_EDGE_MATMUL_BACK_GATHERED:
+            // ⚠️ 诊断开关（PPML_CUDA_NO_SCATTER=1）：强制 SCATTER_ADD 回落 CPU，
+            //    验证 [CUDA-ERR] op=108(OP_SCATTER_ADD) invalid argument 是否为
+            //    混合 SE3 链数值不稳的根因（若 CUDA-ERR 消失且 loss 正常 → 是根因；
+            //    若 loss 仍爆炸 → 非根因，是 SE3 前向放大）。
+            if (node->op == OP_SCATTER_ADD &&
+                getenv("PPML_CUDA_NO_SCATTER") &&
+                std::strcmp(getenv("PPML_CUDA_NO_SCATTER"), "1") == 0) {
+                return false;
+            }
             return true;
 
         case OP_SOFT_MAX_BACK:
@@ -163,9 +172,32 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_FLASH_ATTN_EXT:
         case OP_FLASH_ATTN_BACK:
         case OP_CROSS_ENTROPY_LOSS:
-        case OP_UNARY:  // 所有 unary op kernel 均为空函数体
         default:
             return false;
+
+        case OP_UNARY: {
+            // 2026-08-24：unary CUDA 默认禁用（跨后端 H2D 未可靠 → chi 链 relu 读 CPU 指针当 device
+            //   → chi loss 巨大 185万）。PPML_CUDA_UNARY=1 显式启用（待跨后端 H2D 修好后恢复提速）。
+            if (!(getenv("PPML_CUDA_UNARY") && std::strcmp(getenv("PPML_CUDA_UNARY"), "1") == 0)) {
+                return false;
+            }
+            // 仅支持已在 unary_cuda kernel 实现的 subtype
+            const unary_op uop = get_unary_op(node);
+            switch (uop) {
+                case UNARY_OP_ABS:
+                case UNARY_OP_RELU:
+                case UNARY_OP_GELU:
+                case UNARY_OP_SILU:
+                case UNARY_OP_TANH:
+                case UNARY_OP_SIGMOID:
+                case UNARY_OP_EXP:
+                case UNARY_OP_LOG:
+                case UNARY_OP_SQRT:
+                    return true;
+                default:
+                    return false;
+            }
+        }
     }
 }
 
@@ -207,6 +239,21 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
     int cuda_dispatch_op = -1;
     for (int node_n = 0; node_n < cgraph->n_nodes(); node_n++) {
         TensorF32* node = cgraph->graph_node(node_n);
+
+        // ⚠️ 前置异步错误检查（GRAPH_DEBUG_CUDA_ASYNC=1）：CUDA 错误是异步滞留的——
+        //    launch 返回时 kernel 可能未执行完，错误到下一个 cudaGetLastError 才暴露。
+        //    此前 [CUDA-ERR] op=108(node 0) 打印的是"检查点节点"而非真正失败的 kernel。
+        //    此处在本节点 launch 前检查，捕获上一个节点的真实失败。配合 cudaDeviceSynchronize
+        //    确保错误已发生（慢，仅诊断用）。
+        if (getenv("GRAPH_DEBUG_CUDA_ASYNC")) {
+            cudaError_t perr = cudaDeviceSynchronize();
+            if (perr != cudaSuccess) {
+                fprintf(stderr,
+                        "[CUDA-ASYNC-ERR] PRIOR kernel failed before node_n=%d op=%d: %s\n",
+                        node_n, (int)node->op, cudaGetErrorString(perr));
+                cudaGetLastError();  // 清错误
+            }
+        }
 
         // 跳过 no-op
         if (node->op == OP_NONE || node->op == OP_VIEW ||
@@ -365,7 +412,33 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
                     "[cuda-op] dispatch op=%d node=%d dst_numel=%lld src0=%lld src1=%lld src2=%lld\n",
                     (int)node->op, node_n, dn, s0, s1, s2);
         }
+        // ⚠️ 诊断（GRAPH_DEBUG_BACKNODE=1）：GPU split 里出现 op>=100（_BACK）时的节点详情。
+        //    确认 op=108 OUTER_PROD_MEAN_BACK 是否真的被 GPU dispatch、其 src 形状/数据状态。
+        if (getenv("GRAPH_DEBUG_BACKNODE") && (int)node->op >= 100 && (int)node->op <= 120) {
+            fprintf(stderr,
+                    "[cuda-backnode] GPU dispatch op=%d node_n=%d ndim=%d dims=[%lld,%lld,%lld,%lld] "
+                    "data=%p buf=%p offs=%zu view_src=%p src0={op=%d data=%p buf=%p offs=%zu} "
+                    "src1={op=%d data=%p buf=%p offs=%zu} src2={op=%d data=%p buf=%p offs=%zu} "
+                    "src3={op=%d data=%p} src4={op=%d data=%p}\n",
+                    (int)node->op, node_n, (int)node->shape().ndim(),
+                    (long long)(node->shape().ndim()>0?node->shape().dims[0]:-1),
+                    (long long)(node->shape().ndim()>1?node->shape().dims[1]:-1),
+                    (long long)(node->shape().ndim()>2?node->shape().dims[2]:-1),
+                    (long long)(node->shape().ndim()>3?node->shape().dims[3]:-1),
+                    (void*)node->data(), (void*)node->buffer_, (size_t)node->buffer_offs_, (void*)node->view_src,
+                    (node->src[0]?(int)node->src[0]->op:-1), (void*)(node->src[0]?node->src[0]->data():nullptr),
+                    (void*)(node->src[0]?node->src[0]->buffer_:nullptr), (size_t)(node->src[0]?node->src[0]->buffer_offs_:0),
+                    (node->src[1]?(int)node->src[1]->op:-1), (void*)(node->src[1]?node->src[1]->data():nullptr),
+                    (void*)(node->src[1]?node->src[1]->buffer_:nullptr), (size_t)(node->src[1]?node->src[1]->buffer_offs_:0),
+                    (node->src[2]?(int)node->src[2]->op:-1), (void*)(node->src[2]?node->src[2]->data():nullptr),
+                    (void*)(node->src[2]?node->src[2]->buffer_:nullptr), (size_t)(node->src[2]?node->src[2]->buffer_offs_:0),
+                    (node->src[3]?(int)node->src[3]->op:-1), (void*)(node->src[3]?node->src[3]->data():nullptr),
+                    (node->src[4]?(int)node->src[4]->op:-1), (void*)(node->src[4]?node->src[4]->data():nullptr));
+        }
         Status st = dispatch_node(node, &params);
+        if (getenv("GRAPH_DEBUG_CUDA_OP")) {
+            fprintf(stderr, "[cuda-dispatch] op=%d st=%d\n", (int)node->op, (int)st);
+        }
         if (st != Status::SUCCESS) {
             return st;
         }
@@ -375,9 +448,27 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
         {
             cudaError_t kerr = cudaGetLastError();
             if (kerr != cudaSuccess) {
+                // ⚠️ 区分 launch 错误 vs 执行期错误：launch 错误由本节点 kernel 引起（可立即查），
+                //    执行期错误（illegal address）需同步才暴露——用 cudaDeviceSynchronize 确认。
+                //    此前 [CUDA-ERR] op=108 (node 0) 可能是"上一个 kernel 执行期错误"在下一个
+                //    检查点暴露。同步后能打印真正的错误源。
                 fprintf(stderr,
                         "[CUDA-ERR] kernel launch failed at op=%d (node %d): %s\n",
                         (int)node->op, node_n, cudaGetErrorString(kerr));
+                cudaGetLastError();  // 清错
+                if (getenv("GRAPH_DEBUG_CUDA_SYNC")) {
+                    cudaError_t serr = cudaDeviceSynchronize();
+                    if (serr != cudaSuccess) {
+                        fprintf(stderr,
+                                "[CUDA-SYNC-ERR] exec error after op=%d (node %d): %s\n",
+                                (int)node->op, node_n, cudaGetErrorString(serr));
+                        cudaGetLastError();
+                    } else {
+                        fprintf(stderr,
+                                "[CUDA-SYNC-OK] no exec error after op=%d (node %d) — pure launch error\n",
+                                (int)node->op, node_n);
+                    }
+                }
                 return Status::ABORTED;
             }
             if (getenv("GRAPH_DEBUG_CUDA")) {

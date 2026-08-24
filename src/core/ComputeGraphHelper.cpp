@@ -20,11 +20,23 @@ TensorF32 * add_impl(
     // 只要 numel 相同（同数据布局的视图）或 b 可广播到 a，累加均合法（kernel_add 逐元素加）。
     if (b->numel() != a->numel() && !b->can_repeat(*a)) {
         if (getenv("GRAPH_DEBUG_NODE")) {
-            fprintf(stderr, "[add_impl] FAIL a(acc) op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld | b(new) op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld\n",
+            fprintf(stderr, "[add_impl] FAIL a(acc) op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld a_src0_op=%d a_src0_ndim=%d a_src0_dims=[%lld,%lld,%lld,%lld] | b(new) op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld b_src0_op=%d b_src0_ndim=%d b_src0_dims=[%lld,%lld,%lld,%lld]\n",
                     a->op, a->shape().ndim(), (long long)a->shape().dims[0], (long long)a->shape().dims[1],
                     (long long)a->shape().dims[2], (long long)a->shape().dims[3], (long long)a->numel(),
+                    (a->src[0] ? (int)a->src[0]->op : -1),
+                    (a->src[0] ? (int)a->src[0]->shape().ndim() : -1),
+                    (a->src[0] ? (long long)a->src[0]->shape().dims[0] : -1),
+                    (a->src[0] ? (long long)a->src[0]->shape().dims[1] : -1),
+                    (a->src[0] ? (long long)a->src[0]->shape().dims[2] : -1),
+                    (a->src[0] ? (long long)a->src[0]->shape().dims[3] : -1),
                     b->op, b->shape().ndim(), (long long)b->shape().dims[0], (long long)b->shape().dims[1],
-                    (long long)b->shape().dims[2], (long long)b->shape().dims[3], (long long)b->numel());
+                    (long long)b->shape().dims[2], (long long)b->shape().dims[3], (long long)b->numel(),
+                    (b->src[0] ? (int)b->src[0]->op : -1),
+                    (b->src[0] ? (int)b->src[0]->shape().ndim() : -1),
+                    (b->src[0] ? (long long)b->src[0]->shape().dims[0] : -1),
+                    (b->src[0] ? (long long)b->src[0]->shape().dims[1] : -1),
+                    (b->src[0] ? (long long)b->src[0]->shape().dims[2] : -1),
+                    (b->src[0] ? (long long)b->src[0]->shape().dims[3] : -1));
         }
         assert(false);  // numel 不同且不可广播 → 真实 shape 错误
     }

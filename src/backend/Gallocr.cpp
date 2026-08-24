@@ -125,15 +125,53 @@ void Gallocr::compute_refcounts(
     // view 特例：view 共享底层数据，view 本身非 managed（无独立 buffer）。
     //  - view 节点的 src（底层）不计数：view 不"消费/释放"底层，是共享。
     //  - 消费者引用 view 时：同时给 view 与其底层计数，保证底层在 view 的消费者间存活。
+    // 跨后端消费保护（2026-08-23，方案A）：跨后端被消费的 managed 中间节点标记 is_output
+    // （空间不复用），保证数据在跨后端拷贝（D2H/H2D）时有效。
+    // 诊断开关：PPML_NO_CROSSBK_GUARD=1 禁用（排查保护是否引入其他问题）。
+    const bool kGuard = !(getenv("PPML_NO_CROSSBK_GUARD") &&
+                          std::strcmp(getenv("PPML_NO_CROSSBK_GUARD"), "1") == 0);
+    // ⚠️ 2026-08-24 跨 split 保活（方案A 补强）：OP_DUP（build_splits 创建的跨后端 cpy 节点）
+    //    的 src[0]（原始跨后端输入）必须保活。机制：build_splits 把 node->src[j] 替换为 cpy，
+    //    gallocr 认为原始 src 只被 cpy 消费（n_children=1）→ alloc 时 src 空间被后续节点复用；
+    //    但 graph_compute 的 Step 1 D2H 在 split 执行时才读原始 src → 读到被覆盖数据
+    //    （GPU scatter 输入 msg 的 buffer 悬垂 → CUDA invalid argument / loss 爆炸）。
+    //    标 is_output 后原始 src 空间不释放、不复用，保证 Step 1 D2H 数据有效。
+    //    开关：PPML_ALIVE_CROSS_SPLIT=0 禁用（默认开）。
+    const bool kAliveSplit = !(getenv("PPML_ALIVE_CROSS_SPLIT") &&
+                               std::strcmp(getenv("PPML_ALIVE_CROSS_SPLIT"), "0") == 0);
     for (int i = 0; i < graph->n_nodes(); i++) {
         TensorF32* node = graph->graph_node(i);
         if (node->view_src) continue;  // view 节点：不把底层当作被消费计数
+        int node_bk = backend_id_of(node);
+        // OP_DUP（cpy）的 src[0] 是跨后端输入源，必须保活到 Step 1 D2H 之后。
+        if (kAliveSplit && node->op == OP_DUP && node->src[0]) {
+            auto dit = node_map_.find(node->src[0]);
+            if (dit != node_map_.end() && dit->second->managed) {
+                dit->second->is_output = true;
+            }
+        }
+        // ⚠️ 2026-08-24 精准修复：SCATTER_ADD / EDGE_GATHER_ROWS 的 src[1]（边索引 leaf，
+        //    如 SE3 的 edge_src/edge_tgt）必须独立 buffer——scatter_add 同时读 msg(src[0])
+        //    和 tgt_idx(src[1])，gallocr 空间复用会让它们共享同一 buffer（实测 msg_buf==
+        //    tgt_buf → CUDA scatter invalid argument / 数值错乱）。索引 leaf 标 is_output
+        //    后 buffer 独立存活，不再与 msg 别名。只对这两个 op 的索引输入生效（避免
+        //    误伤其他 CONST 常量，防止全量 is_output 导致 segfault）。
+        if ((node->op == OP_SCATTER_ADD || node->op == OP_EDGE_GATHER_ROWS) && node->src[1]) {
+            auto iit = node_map_.find(node->src[1]);
+            if (iit != node_map_.end() && iit->second->managed) {
+                iit->second->is_output = true;
+            }
+        }
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             TensorF32* src = node->src[s];
             if (!src) continue;
             auto it = node_map_.find(src);
             if (it == node_map_.end()) continue;
             NodeInfo* sni = it->second;
+            if (kGuard && sni->backend_id >= 0 && node_bk >= 0 &&
+                sni->backend_id != node_bk && sni->managed) {
+                sni->is_output = true;
+            }
             if (src->view_src) {
                 // src 是 view：消费者依赖 view 及 view 的底层数据
                 sni->n_children++;  // view 本身（非 managed，仅跟踪释放时序）
@@ -142,6 +180,11 @@ void Gallocr::compute_refcounts(
                     auto uit = node_map_.find(under);
                     if (uit != node_map_.end() && uit->second->managed) {
                         uit->second->n_children++;  // 底层在 view 的消费者间存活
+                        // 跨后端消费底层同样保护（同 node 循环条件）
+                        if (uit->second->backend_id >= 0 && node_bk >= 0 &&
+                            uit->second->backend_id != node_bk) {
+                            uit->second->is_output = true;
+                        }
                     }
                 }
             } else if (sni->managed) {
@@ -162,12 +205,18 @@ void Gallocr::compute_refcounts(
             TensorF32* gnode = grads_arr[gi];
             if (!gnode) continue;
             if (gnode->view_src) continue;
+            int gnode_bk = backend_id_of(gnode);
             for (int s = 0; s < GGML_MAX_SRC; s++) {
                 TensorF32* src = gnode->src[s];
                 if (!src) continue;
                 auto it = node_map_.find(src);
                 if (it == node_map_.end()) continue;
                 NodeInfo* sni = it->second;
+                // 跨后端保护（同 node 循环）：跨后端 managed 中间节点 is_output（kGuard 同 node 循环）
+                if (kGuard && sni->backend_id >= 0 && gnode_bk >= 0 &&
+                    sni->backend_id != gnode_bk && sni->managed) {
+                    sni->is_output = true;
+                }
                 if (src->view_src) {
                     sni->n_children++;
                     TensorF32* under = src->src[0];
@@ -175,6 +224,10 @@ void Gallocr::compute_refcounts(
                         auto uit = node_map_.find(under);
                         if (uit != node_map_.end() && uit->second->managed) {
                             uit->second->n_children++;
+                            if (kGuard && uit->second->backend_id >= 0 && gnode_bk >= 0 &&
+                                uit->second->backend_id != gnode_bk) {
+                                uit->second->is_output = true;
+                            }
                         }
                     }
                 } else if (sni->managed) {

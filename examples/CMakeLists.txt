@@ -10,6 +10,10 @@ target_link_libraries(ppml_infer PRIVATE ppml_core ppml_python)
 add_executable(ppml_measure measure_graph.cpp)
 target_link_libraries(ppml_measure PRIVATE ppml_core ppml_python)
 
+# 多样本加载测试：不训练，仅加载数据集前几个样本打印维度
+add_executable(ppml_test_dataloader test_dataloader.cpp)
+target_link_libraries(ppml_test_dataloader PRIVATE ppml_core)
+
 # 模板注入验证：加载带/无模板数据对比 forward_graph 的 state/pair（CPU）
 add_executable(ppml_verify_template verify_template.cpp)
 target_link_libraries(ppml_verify_template PRIVATE ppml_core ppml_python)

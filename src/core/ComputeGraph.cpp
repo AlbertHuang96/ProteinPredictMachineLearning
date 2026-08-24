@@ -98,6 +98,19 @@ size_t ComputeGraph::visit_parents_graph(TensorF32 * node, bool compute) {
     if (node->op != OP_NONE && compute) {
         node->flag |= TENSOR_FLAG_COMPUTE;
     }
+
+    // ⚠️ 诊断（GRAPH_DEBUG_BACKNODE=1）：追踪所有 op>=100 的节点（_BACK op）何时被 visit
+    // —— 这是进入 graph->nodes() 的唯一路径。若 back_node(op=108) 从未在此打印，说明
+    // compute_backward 创建的 back_node 根本不进 nodes，dispatch 的 op=108 另有来源。
+    if (getenv("GRAPH_DEBUG_BACKNODE") && (int)node->op >= 100 && (int)node->op <= 120) {
+        fprintf(stderr, "[backnode-visit] op=%d compute=%d ptr=%p src0_op=%d src1_op=%d src2_op=%d src3_op=%d src4_op=%d\n",
+                (int)node->op, (int)compute, (void*)node,
+                (node->src[0] ? (int)node->src[0]->op : -1),
+                (node->src[1] ? (int)node->src[1]->op : -1),
+                (node->src[2] ? (int)node->src[2]->op : -1),
+                (node->src[3] ? (int)node->src[3]->op : -1),
+                (node->src[4] ? (int)node->src[4]->op : -1));
+    }
  
     const size_t node_hash_pos = hash_find(&this->visited_hash_set, node);
     //GGML_ASSERT(node_hash_pos != GGML_HASHSET_FULL);
@@ -296,7 +309,33 @@ void ComputeGraph::build_backward_expand(
         // use allocator to automatically make inplace operations
         compute_backward(ctx, i, grads_needed);
     }
- 
+
+    // ⚠️ 诊断（GRAPH_DEBUG_BACKNODE=1）：确认多输出反向 op（OP_TRI_MUL_BACK/OUTER_PROD_MEAN_BACK/
+    // OUTER_PROD_BACK）是否真的进入了 graph->nodes()。compute_backward 创建 back_node 后仅
+    // add_or_set(grad_left/grad_right)（叶子），理论上 back_node 不会进 nodes —— 若打印显示
+    // 它们不在 nodes，则 CUDA dispatch 里的 op=108 来自别的路径，需另查。
+    if (getenv("GRAPH_DEBUG_BACKNODE")) {
+        int n_back = 0;
+        for (int k = 0; k < (int)this->n_nodes_; k++) {
+            TensorF32* nd = this->nodes[k];
+            if (nd->op == OP_TRI_MUL_BACK || nd->op == OP_OUTER_PROD_MEAN_BACK ||
+                nd->op == OP_OUTER_PROD_BACK) {
+                fprintf(stderr,
+                        "[backnode] node[%d] op=%d IN_NODES src0_op=%d src1_op=%d src2_op=%d "
+                        "src3_op=%d src4_op=%d numel=%lld ndim=%d\n",
+                        k, (int)nd->op,
+                        (nd->src[0] ? (int)nd->src[0]->op : -1),
+                        (nd->src[1] ? (int)nd->src[1]->op : -1),
+                        (nd->src[2] ? (int)nd->src[2]->op : -1),
+                        (nd->src[3] ? (int)nd->src[3]->op : -1),
+                        (nd->src[4] ? (int)nd->src[4]->op : -1),
+                        (long long)nd->numel(), (int)nd->shape().ndim());
+                n_back++;
+            }
+        }
+        fprintf(stderr, "[backnode] multi-output back ops in graph->nodes() = %d\n", n_back);
+    }
+
     free(grads_needed);
 }
 
@@ -310,7 +349,7 @@ void ComputeGraph::compute_backward(
     ComputeGraph * cgraph = this;
     TensorF32 * tensor = this->nodes[i];
     TensorF32 * grad   = graph_get_grad(tensor);
- 
+
     if (!grad) {
         return;
     }
@@ -537,6 +576,30 @@ void ComputeGraph::compute_backward(
                             transpose(src0)));
             }
         } break;
+        case OP_OUT_PROD: {
+            // out_prod(a, b): dst[i0,i1,i2,i3] = Σ_{i01} a[i0,i01,i2,i3] * b[i1,i01,i2,i3]
+            //   收缩 src0 的 dims[1]（=src1 的 dims[1]）。a=(M,K), b=(N,K) → dst=(M,N)。
+            //   用于注意力分数 scores = out_prod(K,Q)（收缩 D_head=K）。
+            //
+            // 反向（mul_mat(x,y)=xᵀ@y 收缩 x 的 dims[0]）：
+            //   dL/da[i0,i01] = Σ_i1 grad[i0,i1] * b[i1,i01]
+            //     → mul_mat(grad, b)：grad=(M,N) 作 x(dims[0]=N,dims[1]=M)，b=(N,K) 作 y(dims[0]=K,dims[1]=N)
+            //       收缩 x.dims[0]=N 与 y.dims[1]=N ✓ → out=(K,M)→dims=[M,K]==a
+            //   dL/db[i1,i01] = Σ_i0 grad[i0,i1] * a[i0,i01]
+            //     → mul_mat(transpose(grad), a)：transpose(grad)=(N,M) 作 x(dims[0]=M,dims[1]=N)，
+            //       a=(M,K) 作 y(dims[0]=K,dims[1]=M) 收缩 x.dims[0]=M 与 y.dims[1]=M ✓
+            //       → out=(K,N)→dims=[N,K]==b
+            if (src0_needs_grads) {
+                TensorF32* tmp = mul_mat(grad, src1);
+                if (!tmp->same_shape(*src0)) tmp = repeat_back(tmp, src0);
+                add_or_set(ctx, cgraph, isrc0, tmp);
+            }
+            if (src1_needs_grads) {
+                TensorF32* tmp = mul_mat(transpose(grad), src0);
+                if (!tmp->same_shape(*src1)) tmp = repeat_back(tmp, src1);
+                add_or_set(ctx, cgraph, isrc1, tmp);
+            }
+        } break;
         case OP_SCALE: {
             if (src0_needs_grads) {
                 // d(s * a)/da = s * grad
@@ -641,6 +704,13 @@ void ComputeGraph::compute_backward(
                 back_node->src[4]  = grad_right;
                 memcpy(back_node->op_params,     tensor->op_params,     8);  // L + outgoing
 
+                // ⚠️ 关键修复：多输出反向 op 必须显式 expand 进图，否则 back_node 不在
+                //    graph->nodes() 里、kernel 永不执行，grad_left/grad_right 恒 0 → 梯度断链。
+                //    add_or_set 只把输出槽叶子加入 graph，不会把生产者 back_node 加入。
+                //    参考 ggml：ggml_build_backward_expand 对 grad 调 ggml_build_forward_expand 时，
+                //    反向节点本身会被 visit 进图（多输出 op 的 grads 槽也作为 src 参与遍历）。
+                build_forward_expand(back_node);
+
                 if (src0_needs_grads && grad_left)
                     add_or_set(ctx, cgraph, isrc0, grad_left);
                 if (src1_needs_grads && grad_right)
@@ -664,6 +734,23 @@ void ComputeGraph::compute_backward(
                 back_node->src[4]  = grad_right;
                 memcpy(back_node->op_params, tensor->op_params, sizeof(float));  // N
 
+                // ⚠️ 关键修复（同 OP_TRI_MUL）：多输出反向 op 显式 expand 进图，
+                //    否则 back_node 不在 nodes()、kernel 不执行、msa2pair 梯度断链。
+                build_forward_expand(back_node);
+
+                if (getenv("GRAPH_DEBUG_BACKNODE")) {
+                    fprintf(stderr,
+                            "[backnode] created OP_OUTER_PROD_MEAN_BACK bn=%p grad_op=%d src0_op=%d "
+                            "src1_op=%d gl_op=%d gr_op=%d  (expanded=%d)\n",
+                            (void*)back_node,
+                            (grad ? (int)grad->op : -1),
+                            (src0 ? (int)src0->op : -1),
+                            (src1 ? (int)src1->op : -1),
+                            (grad_left ? (int)grad_left->op : -1),
+                            (grad_right ? (int)grad_right->op : -1),
+                            (int)this->n_nodes_);
+                }
+
                 if (src0_needs_grads && grad_left)
                     add_or_set(ctx, cgraph, isrc0, grad_left);
                 if (src1_needs_grads && grad_right)
@@ -685,6 +772,9 @@ void ComputeGraph::compute_backward(
                 back_node->src[2]  = src1;       // right [D,L,B]
                 back_node->src[3]  = grad_left;
                 back_node->src[4]  = grad_right;
+
+                // ⚠️ 关键修复（同 OP_TRI_MUL / OP_OUTER_PROD_MEAN）：多输出反向 op 显式 expand 进图。
+                build_forward_expand(back_node);
 
                 if (src0_needs_grads && grad_left)
                     add_or_set(ctx, cgraph, isrc0, grad_left);
@@ -960,6 +1050,19 @@ void ComputeGraph::add_or_set(
     TensorF32 * src = static_cast<TensorF32 *>(cgraph->visited_hash_set.keys[isrc]);
     //GGML_ASSERT(src);
     assert(src);
+    if (getenv("GRAPH_DEBUG_GRADACC") && cgraph->grads[isrc]) {
+        fprintf(stderr, "[gradacc] src op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld | "
+                        "grad_old op=%d numel=%lld | grad_new op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld\n",
+                src->op, (int)src->shape().ndim(),
+                (long long)src->shape().dims[0], (long long)src->shape().dims[1],
+                (long long)src->shape().dims[2], (long long)src->shape().dims[3],
+                (long long)src->numel(),
+                cgraph->grads[isrc]->op, (long long)cgraph->grads[isrc]->numel(),
+                tensor->op, (int)tensor->shape().ndim(),
+                (long long)tensor->shape().dims[0], (long long)tensor->shape().dims[1],
+                (long long)tensor->shape().dims[2], (long long)tensor->shape().dims[3],
+                (long long)tensor->numel());
+    }
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = add_impl(cgraph->grads[isrc], tensor, /*inplace =*/ cgraph->grad_accs[isrc]);
     } else {

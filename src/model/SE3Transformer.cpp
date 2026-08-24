@@ -1550,6 +1550,17 @@ TensorF32 GConvSE3Partial::udf_u_mul_e(
         }
     }
 
+    // ⚠️ 诊断（GRAPH_DEBUG_SE3_WEIGHT=1）：值版 GConv 消息量级，与图版 PER_EDGE_MATMUL 输出对比。
+    if (getenv("GRAPH_DEBUG_SE3_WEIGHT")) {
+        const int64_t mn = E * m_out * d_dim_out;
+        float mmin = msg_data[0], mmax = msg_data[0]; double msum2 = 0;
+        for (int64_t k = 1; k < mn; ++k) { float v = msg_data[k]; if (v<mmin)mmin=v; if (v>mmax)mmax=v; msum2 += (double)v*v; }
+        msum2 += (double)msg_data[0]*msg_data[0];
+        fprintf(stderr, "[udf-u-mul-e VAL] d_out=%d msg dims=[%lld,%lld,%lld] numel=%lld min=%g max=%g l2=%.4g\n",
+            d_out, (long long)E, (long long)m_out, (long long)d_dim_out, (long long)mn,
+            (double)mmin, (double)mmax, (double)msum2);
+    }
+
     return msg;
 }
 
@@ -1714,6 +1725,18 @@ std::vector<TensorF32*> GConvSE3Partial::forward_graph(
             TensorF32* kernel = k_it->second;
             // 按源节点 gather: (E, m_in*d_dim_in) dims=[m_in*d_dim_in, E]
             TensorF32* gathered = edge_gather_rows(h_nodes[i], edge_src_idx);
+            // ⚠️ 诊断（GRAPH_DEBUG_SE3_WEIGHT=1）：打印消息传递输入 gathered（节点特征）值域，
+            //    判断爆炸发生在"进入 GConv 前"（h_nodes 已大）还是"GConv 核乘"放大。
+            if (getenv("GRAPH_DEBUG_SE3_WEIGHT")) {
+                fprintf(stderr, "[GConv-dbg] d_in=%d(m=%d,dd=%d) d_out=%d(m=%d,dd=%d) h_nodes[%zu] dims=[%lld,%lld] numel=%lld kernel dims=[%lld,%lld,%lld]\n",
+                    d_in, m_in, d_dim_in, d_out, m_out, d_dim_out, i,
+                    (long long)(h_nodes[i]->shape().ndim()>0?h_nodes[i]->shape().dims[0]:-1),
+                    (long long)(h_nodes[i]->shape().ndim()>1?h_nodes[i]->shape().dims[1]:-1),
+                    (long long)h_nodes[i]->numel(),
+                    (long long)(kernel->shape().ndim()>0?kernel->shape().dims[0]:-1),
+                    (long long)(kernel->shape().ndim()>1?kernel->shape().dims[1]:-1),
+                    (long long)(kernel->shape().ndim()>2?kernel->shape().dims[2]:-1));
+            }
             // 逐边 matmul: (E, m_out*d_dim_out) dims=[m_out*d_dim_out, E]
             TensorF32* part = per_edge_matmul(kernel, gathered);
             msg = (msg == nullptr) ? part : add_impl(msg, part, /*inplace=*/false);
@@ -1751,6 +1774,22 @@ std::vector<TensorF32*> G1x1SE3::forward_graph(const std::vector<TensorF32*>& x_
 
         const float* w_data = weights_[d]->weight()->data();  // (m_out, m_in)
         const float* b_data = weights_[d]->bias() ? weights_[d]->bias()->data() : nullptr;
+        // ⚠️ 诊断（GRAPH_DEBUG_SE3_WEIGHT=1）：打印 G1x1SE3 权重/偏置值域，判断是否 Xavier 初始化过大。
+        if (getenv("GRAPH_DEBUG_SE3_WEIGHT")) {
+            const int64_t wn = (int64_t)weights_[d]->weight()->numel();
+            const int64_t bn = b_data ? (int64_t)weights_[d]->bias()->numel() : 0;
+            float wmin = w_data[0], wmax = w_data[0]; double wsum2 = 0;
+            for (int64_t k = 1; k < wn; ++k) { float v = w_data[k]; if (v<wmin)wmin=v; if (v>wmax)wmax=v; wsum2 += (double)v*v; }
+            wsum2 += (double)w_data[0]*w_data[0];
+            float bmin=0,bmax=0;
+            if (b_data && bn>0) { bmin=b_data[0]; bmax=b_data[0]; for (int64_t k=1;k<bn;++k){float v=b_data[k]; if(v<bmin)bmin=v; if(v>bmax)bmax=v;} }
+            fprintf(stderr, "[G1x1-dbg] d=%d m_in=%d m_out=%d d_dim=%d W dims=[%lld,%lld] numel=%lld min=%g max=%g l2=%.4g | bias numel=%lld min=%g max=%g\n",
+                d, (int)f_in_.multiplicities[in_idx], m_out, d_dim,
+                (long long)(weights_[d]->weight()->shape().ndim()>0?weights_[d]->weight()->shape().dims[0]:-1),
+                (long long)(weights_[d]->weight()->shape().ndim()>1?weights_[d]->weight()->shape().dims[1]:-1),
+                (long long)wn, (double)wmin, (double)wmax, (double)wsum2,
+                (long long)bn, (double)bmin, (double)bmax);
+        }
 
         // 构建块对角 W_expanded dims=[m_out*d_dim, m_in*d_dim]（最内维 = m_in*d_dim）
         const int64_t out_F = m_out * d_dim, in_F = m_in * d_dim;
@@ -2101,6 +2140,30 @@ std::vector<TensorF32*> GMABSE3::forward_graph(
         int N) {
     const int64_t E = edge_tgt_idx->shape().dims[0];
 
+    if (getenv("GRAPH_DEBUG_SE3")) {
+        fprintf(stderr, "[GMAB-dbg] E=%lld edge_tgt_idx ndim=%d dims=[%lld,%lld,%lld]\n",
+                (long long)E, (int)edge_tgt_idx->shape().ndim(),
+                (long long)(edge_tgt_idx->shape().ndim()>0?edge_tgt_idx->shape().dims[0]:-1),
+                (long long)(edge_tgt_idx->shape().ndim()>1?edge_tgt_idx->shape().dims[1]:-1),
+                (long long)(edge_tgt_idx->shape().ndim()>2?edge_tgt_idx->shape().dims[2]:-1));
+        for (size_t i = 0; i < v_nodes.size(); ++i) {
+            fprintf(stderr, "[GMAB-dbg] v_nodes[%zu] ndim=%d dims=[%lld,%lld,%lld] numel=%lld\n",
+                    i, (int)v_nodes[i]->shape().ndim(),
+                    (long long)(v_nodes[i]->shape().ndim()>0?v_nodes[i]->shape().dims[0]:-1),
+                    (long long)(v_nodes[i]->shape().ndim()>1?v_nodes[i]->shape().dims[1]:-1),
+                    (long long)(v_nodes[i]->shape().ndim()>2?v_nodes[i]->shape().dims[2]:-1),
+                    (long long)v_nodes[i]->numel());
+        }
+        for (size_t i = 0; i < k_nodes.size(); ++i) {
+            fprintf(stderr, "[GMAB-dbg] k_nodes[%zu] ndim=%d dims=[%lld,%lld,%lld] numel=%lld\n",
+                    i, (int)k_nodes[i]->shape().ndim(),
+                    (long long)(k_nodes[i]->shape().ndim()>0?k_nodes[i]->shape().dims[0]:-1),
+                    (long long)(k_nodes[i]->shape().ndim()>1?k_nodes[i]->shape().dims[1]:-1),
+                    (long long)(k_nodes[i]->shape().ndim()>2?k_nodes[i]->shape().dims[2]:-1),
+                    (long long)k_nodes[i]->numel());
+        }
+    }
+
     // ---- 键/查询总通道数 ----
     int64_t K_total = 0;
     for (size_t i = 0; i < f_key_.size(); ++i)
@@ -2121,7 +2184,16 @@ std::vector<TensorF32*> GMABSE3::forward_graph(
     for (int64_t c = 0; c < K_total; ++c)
         hdata[c * n_heads_ + (c / C_k)] = 1.0f;                        // dims=[K_total, n_heads]
     TensorF32* H = constant_tensor({K_total, n_heads_}, hdata.data());
-    TensorF32* e = mul_mat(dot, H);                                    // [n_heads, E]  e[h,e]
+    if (getenv("GRAPH_DEBUG_SE3")) {
+        const Shape& sd = dot->shape(); const Shape& sh = H->shape();
+        fprintf(stderr, "[GMAB-dbg] K_total=%lld n_heads=%d | dot dims=[%lld,%lld] numel=%lld | H dims=[%lld,%lld] numel=%lld\n",
+                (long long)K_total, (int)n_heads_,
+                (long long)sd.dims[0], (long long)sd.dims[1], (long long)sd.numel(),
+                (long long)sh.dims[0], (long long)sh.dims[1], (long long)sh.numel());
+    }
+    // 布局（ggml dims[0]=最内/列）：dot=[K_total,E] 视 (M=E, K=K_total)：dot.dims[1]=E=M, dot.dims[0]=K_total=K。
+    // H=[K_total,n_heads] 视 (N=n_heads, K=K_total)：H.dims[1]=n_heads=N, H.dims[0]=K_total=K。K 匹配。
+    TensorF32* e = mul_mat(dot, H);                                      // [n_heads, E]  e[h,e]
     e = scale(e, 1.0f / std::sqrt(static_cast<float>(K_total)));
 
     // ===== Step 4: edge_softmax（max 减稳，避免 exp 溢出）=====
@@ -2152,14 +2224,20 @@ std::vector<TensorF32*> GMABSE3::forward_graph(
         for (int64_t c = 0; c < C; ++c) hidx[c] = static_cast<float>(c / mhdd);
         TensorF32* h_idx = constant_tensor({C}, hidx.data());
 
-        // a_v[c,e] = a[h(c),e]：a 是 [n_heads,E]（图布局 dims=[E,n_heads]，行=n_heads 在 dims[1]），
-        // 而 get_rows 需要行在 dims[0]（行主序：N=dims[0], M=dims[1]）→ 必须先 transpose(a)。
-        // transpose(a) → dims=[n_heads, E]（N=n_heads 行, M=E 行内长）→ get_rows 按 h_idx 取头行
-        // → a_rows (C,E)：dims=[E, C]（行内长 E 最内, C 行）== 图布局 [C,E]，numel=C*E。
-        // 不再需要第二次 transpose（原实现漏掉先 transpose，导致 get_rows 把 E 当行数、n_heads 当行内长，
-        // 输出 numel=C*n_heads ≠ v_nodes[i] 的 C*E → mul 逐元素越界 → SIGSEGV）。
-        TensorF32* a_T    = transpose(a);                               // [n_heads, E]（dims=[n_heads,E]）
-        TensorF32* a_rows = get_rows(a_T, h_idx);                       // (C, E)：dims=[E, C]
+        // a_v[c,e] = a[h(c),e]：a 是 [n_heads,E]（mul_mat 输出 dims=[n_heads, E]，
+        // dims[0]=n_heads 行, dims[1]=E 行内长——get_rows 恰好需要行在 dims[0]）。
+        // 直接 get_rows(a, h_idx)：按 dims[0]=n_heads 取 h_idx(C 个) 头行，行内长 dims[1]=E
+        // → 输出 dims=[E, C]（行内长 E 最内, C 行）。⚠️ 不能先 transpose(a)（会把 E 变成行数、
+        // n_heads 变行内长 → 输出 dims=[n_heads, C] numel=C*n_heads ≠ v_nodes 的 C*E → mul 广播越界）。
+        // 再 transpose → dims=[C, E]（dims[0]=C 通道, dims[1]=E 边）== v_nodes[i] 布局，逐元素对齐。
+        // a_v[c,e] = a[h(c),e]：a 是 [n_heads,E]（mul_mat 输出 dims=[n_heads, E]，
+        // dims[0]=n_heads 行, dims[1]=E 行内长）。get_rows 需要行在 dims[0]。
+        // ⚠️ 2026-08-23 方案A修复后采用新版：直接 get_rows(a)（行在 dims[0]=n_heads）→ [E, C]，
+        //    再 transpose → [C, E]（shape 正确，无 ELEM-BCAST）。其跨后端
+        //    （get_rows 读 GPU 的 a → transpose CPU）已由 Gallocr GPU→CPU is_output 保护修复，
+        //    混合训练 loss 13.86 正常（原旧版 13.49，新版略高但 shape 正确且无广播警告）。
+        TensorF32* a_rows_raw = get_rows(a, h_idx);                     // dims=[E, C]
+        TensorF32* a_rows     = transpose(a_rows_raw);                  // dims=[C, E]
 
         TensorF32* v_scaled = mul(a_rows, v_nodes[i]);                  // [C, E] ⊙ [C, E]
         out[i] = scatter_add(v_scaled, edge_tgt_idx, N);                // [C, N]
@@ -2620,6 +2698,24 @@ std::vector<TensorF32*> GNormBias::forward_graph(
         TensorF32* v3     = view(x, Shape({d_dim, m, N}));      // [d_dim, m, N]（d_dim 最内）
         TensorF32* sum_sq = sum_rows(sqr(v3));                  // [1, m, N]（沿 d_dim 归约）
         TensorF32* norm   = sqrt(sum_sq);                       // [1, m, N]
+        // ⚠️ 诊断（GRAPH_DEBUG_SE3_WEIGHT=1）：打印 GNormBias 输入 x 与 norm 值域。
+        //    爆炸链 node=1605 DIV=t/(norm+eps)=13442 且输入 x~l1_feats(~100) 矛盾
+        //    → 怀疑 norm 计算或 x 布局错位（跨节点混值）。此诊断确认 x/norm 实际量级。
+        if (getenv("GRAPH_DEBUG_SE3_WEIGHT")) {
+            const int64_t xn = x->numel();
+            if (xn > 0 && x->data()) {
+                const float* xd = x->data();
+                float xmn = xd[0], xmx = xd[0];
+                for (int64_t k = 1; k < xn; ++k) { float v = xd[k]; if (v<xmn)xmn=v; if (v>xmx)xmx=v; }
+                fprintf(stderr, "[GNorm-dbg] d=%d m=%d d_dim=%d N=%lld x dims=[%lld,%lld] min=%g max=%g numel=%lld\n",
+                    d, m, d_dim, (long long)N,
+                    (long long)(x->shape().ndim()>0?x->shape().dims[0]:-1),
+                    (long long)(x->shape().ndim()>1?x->shape().dims[1]:-1),
+                    (double)xmn, (double)xmx, (long long)xn);
+            } else {
+                fprintf(stderr, "[GNorm-dbg] d=%d x data=null numel=%lld\n", d, (long long)xn);
+            }
+        }
 
         // ---- Step 2: t = ReLU(norm + bias) ----
         // bias: (m,) → [1,m,1]，repeat 广播到 norm 形状 [1,m,N]
@@ -2637,6 +2733,18 @@ std::vector<TensorF32*> GNormBias::forward_graph(
         TensorF32* scale3d  = repeat(scale3, v3);                       // [d_dim, m, N]
         TensorF32* scale_f  = view(scale3d, Shape({m * d_dim, N}));     // [m*d_dim, N]
         out[i] = mul(x, scale_f);                                       // [m*d_dim, N]
+
+        // ⚠️ 图版激活控制（2026-08-24）：GNormBias 数学上保持量级（out≈x），但图版 SE3 消息传递
+        //    逐层放大（首层 gathered 已 ±2680，值版仅 3.75）。此控制对输出乘全局衰减 scale
+        //    （等变安全：标量缩放），抑制爆炸向后续层传播。env PPML_SE3_GNORM_SCALE 默认 0.1；
+        //    =1.0 关闭（保持原行为）。注：这是缓解措施，根因是图版度1 特征构建/传递的布局错位
+        //    （l1_feats ~100 变 ±2680），需另行根治。
+        if (const char* gs = std::getenv("PPML_SE3_GNORM_SCALE")) {
+            float gscale = std::atof(gs);
+            if (gscale > 0.0f && gscale < 1.0f) {
+                out[i] = scale(out[i], gscale);
+            }
+        }
     }
     return out;
 }
