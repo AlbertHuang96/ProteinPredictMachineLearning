@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <sstream>
 #include <vector>
+#include <map>
 
 namespace ppml {
 
@@ -134,9 +135,11 @@ static GGUFLayout compute_layout(
     const std::vector<TensorF32*>& params,
     const std::vector<std::pair<std::string, float>>& float_meta,
     const std::vector<std::pair<std::string, std::string>>& str_meta,
-    const std::vector<std::string>& tensor_names = {})
+    const std::vector<std::string>& tensor_names = {},
+    const std::vector<GGUFRawTensor>& extra_tensors = {})
 {
     GGUFLayout L;
+    const size_t n_all = params.size() + extra_tensors.size();
 
     // ===== 1. Header 固定大小 =====
     L.header_bytes = 4 + 4 + 8 + 8;   // magic + version + tensor_count + kv_count = 24
@@ -147,17 +150,23 @@ static GGUFLayout compute_layout(
     for (auto& [k, v] : str_meta)    L.metadata_bytes += GGUFLayout::kv_size_string(k, v);
 
     // ===== 3. Tensor Infos 大小 =====
+    //    模型参数 (params) + 优化器状态 (extra_tensors, 1D)。extra 不参与 layout_hash。
     L.tensor_infos_bytes = 0;
-    for (size_t i = 0; i < params.size(); i++) {
-        // 优先使用语义名; 未提供时退回 tensor_{i} 编号, 便于可读
+    for (size_t i = 0; i < n_all; i++) {
         std::string name;
-        if (i < tensor_names.size() && !tensor_names[i].empty())
-            name = tensor_names[i];
-        else
-            name = "tensor_" + std::to_string(i);
+        if (i < params.size()) {
+            if (i < tensor_names.size() && !tensor_names[i].empty())
+                name = tensor_names[i];
+            else
+                name = "tensor_" + std::to_string(i);
+        } else {
+            name = extra_tensors[i - params.size()].name;
+        }
+        const size_t ndim = (i < params.size())
+            ? static_cast<size_t>(params[i]->shape().ndim()) : 1;
         L.tensor_infos_bytes += SIZE_T_LEN + name.size()    // name_len + name
                                + 4                           // n_dims
-                               + params[i]->shape().ndim() * SIZE_T_LEN  // dims[]
+                               + ndim * SIZE_T_LEN           // dims[]
                                + 4                           // type
                                + 8;                          // offset
     }
@@ -168,11 +177,14 @@ static GGUFLayout compute_layout(
         GGUF_ALIGN);
 
     // ===== 5. 每个 Tensor 的数据偏移 =====
-    L.tensor_offsets.resize(params.size());
+    L.tensor_offsets.resize(n_all);
     size_t cur = L.data_start_offset;
-    for (size_t i = 0; i < params.size(); i++) {
+    for (size_t i = 0; i < n_all; i++) {
         L.tensor_offsets[i] = cur;
-        size_t bytes = params[i]->numel() * sizeof(float);  // F32
+        const size_t numel = (i < params.size())
+            ? static_cast<size_t>(params[i]->numel())
+            : extra_tensors[i - params.size()].data.size();
+        size_t bytes = numel * sizeof(float);  // F32
         cur = align_up(cur + bytes, GGUF_ALIGN);
     }
 
@@ -183,9 +195,14 @@ void save_gguf(const std::vector<TensorF32*>& params,
                const std::string& path,
                const std::vector<std::pair<std::string, float>>& float_meta,
                const std::vector<std::pair<std::string, std::string>>& str_meta,
-               const std::vector<std::string>& tensor_names)
+               const std::vector<std::string>& tensor_names,
+               const std::vector<GGUFRawTensor>& extra_tensors)
 {
-    // ===== 阶段 0: 计算布局指纹 (名字+形状) 并注入元数据 =====
+    const size_t n_all = params.size() + extra_tensors.size();
+
+    // ===== 阶段 0: 计算布局指纹 (仅模型参数: 名字+形状) 并注入元数据 =====
+    //   extra_tensors (优化器 m/v) 不参与 hash → 旧文件 (无 opt) 与 新文件 (有 opt)
+    //   的 layout_hash 一致，保证向后兼容。
     std::vector<std::vector<uint64_t>> shapes;
     shapes.reserve(params.size());
     for (auto* t : params) {
@@ -203,7 +220,7 @@ void save_gguf(const std::vector<TensorF32*>& params,
     str_meta_in.insert(str_meta_in.end(), str_meta.begin(), str_meta.end());
 
     // ===== 阶段 A: 纯算术计算布局 =====
-    GGUFLayout L = compute_layout(params, float_meta, str_meta_in, tensor_names);
+    GGUFLayout L = compute_layout(params, float_meta, str_meta_in, tensor_names, extra_tensors);
 
     // ===== 阶段 B: 顺序写入文件 (一次性, 不 seek 回跳) =====
     std::ofstream ofs(path, std::ios::binary);
@@ -213,7 +230,7 @@ void save_gguf(const std::vector<TensorF32*>& params,
     // ------ B1: Header ------
     w.u32(GGUF_MAGIC);
     w.u32(GGUF_VERSION);
-    w.u64(params.size());                              // tensor_count
+    w.u64(n_all);                                      // tensor_count (含 opt)
     w.u64(float_meta.size() + str_meta_in.size());     // kv_count
 
     // ------ B2: Metadata (float) ------
@@ -231,21 +248,30 @@ void save_gguf(const std::vector<TensorF32*>& params,
     }
 
     // ------ B4: Tensor Infos ------
-    for (size_t i = 0; i < params.size(); i++) {
-        TensorF32* t = params[i];
-
-        // 名称 (优先语义名; 否则退回 index 编号)
+    for (size_t i = 0; i < n_all; i++) {
+        // 名称
         std::string tname;
-        if (i < tensor_names.size() && !tensor_names[i].empty())
-            tname = tensor_names[i];
-        else
-            tname = "tensor_" + std::to_string(i);
+        size_t ndim;
+        if (i < params.size()) {
+            if (i < tensor_names.size() && !tensor_names[i].empty())
+                tname = tensor_names[i];
+            else
+                tname = "tensor_" + std::to_string(i);
+            ndim = static_cast<size_t>(params[i]->shape().ndim());
+        } else {
+            tname = extra_tensors[i - params.size()].name;
+            ndim  = 1;   // 优化器状态为 1D
+        }
         w.str(tname);
+        w.u32(static_cast<uint32_t>(ndim));
 
         // 维度
-        w.u32(static_cast<uint32_t>(t->shape().ndim()));
-        for (int d = 0; d < t->shape().ndim(); d++) {
-            w.u64(static_cast<uint64_t>(t->shape().dims[d]));
+        if (i < params.size()) {
+            TensorF32* t = params[i];
+            for (size_t d = 0; d < ndim; d++)
+                w.u64(static_cast<uint64_t>(t->shape().dims[d]));
+        } else {
+            w.u64(extra_tensors[i - params.size()].data.size());  // [N]
         }
 
         // 类型 (F32)
@@ -259,10 +285,15 @@ void save_gguf(const std::vector<TensorF32*>& params,
     w.pad_to(L.data_start_offset);
 
     // ------ B6: Tensor 数据 ------
-    for (size_t i = 0; i < params.size(); i++) {
-        TensorF32* t = params[i];
-        size_t bytes = t->numel() * sizeof(float);
-        w.raw(t->data(), bytes);
+    for (size_t i = 0; i < n_all; i++) {
+        if (i < params.size()) {
+            TensorF32* t = params[i];
+            size_t bytes = t->numel() * sizeof(float);
+            w.raw(t->data(), bytes);
+        } else {
+            const std::vector<float>& d = extra_tensors[i - params.size()].data;
+            w.raw(d.data(), d.size() * sizeof(float));
+        }
         w.pad_to(GGUF_ALIGN);  // 对齐下一个 tensor
     }
 
@@ -271,7 +302,9 @@ void save_gguf(const std::vector<TensorF32*>& params,
 
 void load_gguf(const std::string& path,
                std::vector<TensorF32*>& params,
-               const std::vector<std::string>& tensor_names)
+               const std::vector<std::string>& tensor_names,
+               std::map<std::string, float>* float_meta_out,
+               std::map<std::string, std::vector<float>>* raw_tensors_out)
 {
     std::ifstream ifs(path, std::ios::binary);
     if (!ifs) throw std::runtime_error("Cannot open: " + path);
@@ -289,11 +322,12 @@ void load_gguf(const std::string& path,
     uint64_t tensor_count = r64();
     uint64_t kv_count     = r64();
 
-    if (tensor_count != params.size())
+    // 文件张量数 ≥ 模型参数数：多余的为优化器状态 (opt.*)。缺失 → 布局错。
+    if (tensor_count < params.size())
         throw std::runtime_error("Tensor count mismatch: file=" + 
             std::to_string(tensor_count) + " params=" + std::to_string(params.size()));
 
-    // ------ 2. 跳过 Metadata (捕获 layout_hash 供后续校验) ------
+    // ------ 2. 解析 Metadata (捕获 layout_hash 供校验 + 数值 meta 供续训/状态恢复) ------
     std::string saved_layout_hash;
     for (uint64_t i = 0; i < kv_count; i++) {
         std::string key = rstr();
@@ -303,10 +337,28 @@ void load_gguf(const std::string& path,
             case GGUFValueType::BOOL:   ifs.seekg(1, std::ios::cur); break;
             case GGUFValueType::UINT16: case GGUFValueType::INT16:
                                         ifs.seekg(2, std::ios::cur); break;
-            case GGUFValueType::UINT32: case GGUFValueType::INT32:
-            case GGUFValueType::FLOAT32: ifs.seekg(4, std::ios::cur); break;
-            case GGUFValueType::UINT64: case GGUFValueType::INT64:
-            case GGUFValueType::FLOAT64: ifs.seekg(8, std::ios::cur); break;
+            case GGUFValueType::FLOAT32: {
+                // 注意: 必须是 bit-copy 到 float, 不能 (float)v32 强转 (会把 0x3F800000
+                // = 1.0f 的原始字节读成整数 1065353216)
+                float v; ifs.read((char*)&v, 4);
+                if (float_meta_out) (*float_meta_out)[key] = v;
+                break;
+            }
+            case GGUFValueType::UINT32: case GGUFValueType::INT32: {
+                uint32_t v32; ifs.read((char*)&v32, 4);
+                if (float_meta_out) (*float_meta_out)[key] = (float)v32;
+                break;
+            }
+            case GGUFValueType::UINT64: case GGUFValueType::INT64: {
+                uint64_t v64; ifs.read((char*)&v64, 8);
+                if (float_meta_out) (*float_meta_out)[key] = (float)v64;
+                break;
+            }
+            case GGUFValueType::FLOAT64: {
+                double v; ifs.read((char*)&v, 8);
+                if (float_meta_out) (*float_meta_out)[key] = (float)v;
+                break;
+            }
             case GGUFValueType::STRING:
                 if (key == "layout_hash") saved_layout_hash = rstr();
                 else rstr();
@@ -336,32 +388,44 @@ void load_gguf(const std::string& path,
     }
 
     // ------ 4. 定位到每个 offset 读数据 ------
+    //  前 params.size() 个 = 模型参数 (校验形状 + 读入)；多余 = 优化器状态 (opt.*)。
     for (uint64_t i = 0; i < tensor_count; i++) {
-        // 校验形状 (轻量)
-        TensorF32* t = params[i];
-        if (static_cast<uint32_t>(t->shape().ndim()) != tinfos[i].dims.size())
-            throw std::runtime_error("Dimension count mismatch for tensor " + std::to_string(i));
-        for (size_t d = 0; d < tinfos[i].dims.size(); d++) {
-            if (static_cast<uint64_t>(t->shape().dims[d]) != tinfos[i].dims[d])
-                throw std::runtime_error("Shape mismatch for tensor " + std::to_string(i) +
-                    " dim[" + std::to_string(d) + "]");
+        if (i < params.size()) {
+            // 模型参数：形状校验 + 读入
+            TensorF32* t = params[i];
+            if (static_cast<uint32_t>(t->shape().ndim()) != tinfos[i].dims.size())
+                throw std::runtime_error("Dimension count mismatch for tensor " + std::to_string(i));
+            for (size_t d = 0; d < tinfos[i].dims.size(); d++) {
+                if (static_cast<uint64_t>(t->shape().dims[d]) != tinfos[i].dims[d])
+                    throw std::runtime_error("Shape mismatch for tensor " + std::to_string(i) +
+                        " dim[" + std::to_string(d) + "]");
+            }
+            ifs.seekg(tinfos[i].offset, std::ios::beg);
+            size_t bytes = t->numel() * sizeof(float);
+            ifs.read(reinterpret_cast<char*>(t->data()), bytes);
+        } else {
+            // 优化器状态：仅收集 "opt." 前缀的 1D 张量 (AdamW m/v)；其他忽略
+            if (!raw_tensors_out) continue;
+            if (tinfos[i].name.rfind("opt.", 0) != 0) continue;
+            if (tinfos[i].dims.size() != 1) continue;
+            std::vector<float> data(static_cast<size_t>(tinfos[i].dims[0]));
+            ifs.seekg(tinfos[i].offset, std::ios::beg);
+            ifs.read(reinterpret_cast<char*>(data.data()), data.size() * sizeof(float));
+            (*raw_tensors_out)[tinfos[i].name] = std::move(data);
         }
-
-        // 定位 + 读
-        ifs.seekg(tinfos[i].offset, std::ios::beg);
-        size_t bytes = t->numel() * sizeof(float);
-        ifs.read(reinterpret_cast<char*>(t->data()), bytes);
     }
 
     // ------ 5. 布局指纹校验 (若文件存有 layout_hash) ------
     if (!saved_layout_hash.empty()) {
-        // 用文件中的 (名字, 形状) 重算指纹；名字缺省时退回编号，保持与保存侧一致
+        // 用文件中的 (名字, 形状) 重算指纹；⚠️ 只取前 params.size() 个（模型参数），
+        // 优化器状态 (opt.*) 不参与 hash（与保存侧一致，否则含 opt 的新文件会误报 mismatch）
+        const size_t hash_n = std::min<size_t>(static_cast<size_t>(tensor_count), params.size());
         std::vector<std::string> file_names;
-        file_names.reserve(tensor_count);
-        for (auto& ti : tinfos) file_names.push_back(ti.name);
+        file_names.reserve(hash_n);
+        for (size_t k = 0; k < hash_n; ++k) file_names.push_back(tinfos[k].name);
         std::vector<std::vector<uint64_t>> file_shapes;
-        file_shapes.reserve(tensor_count);
-        for (auto& ti : tinfos) file_shapes.push_back(ti.dims);
+        file_shapes.reserve(hash_n);
+        for (size_t k = 0; k < hash_n; ++k) file_shapes.push_back(tinfos[k].dims);
 
         uint64_t cur_hash = fnv1a_layout_hash(file_names, file_shapes);
         std::string cur_hex = to_hex64(cur_hash);

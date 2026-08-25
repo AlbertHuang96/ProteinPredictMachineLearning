@@ -541,9 +541,14 @@ bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
 bool BackendScheduler::reserve_graph_memory() {
     // 释放上次分配的 buffer
     reserved_buffers_.clear();
+    // 必须先 release 上一轮 gallocr buffer：Gallocr::alloc 每次 push 新 buffer 到
+    //    ba.buffers（只有 release() 才 delete）。混合多样本下每个样本都走 reserve+alloc，
+    //    若不先释放，旧 buffer 永不回收 → RSS 每样本 +5~6GB 单调增长直至 OOM。
+    //    实测（2026-08-25）：纯 CPU 多样本 RSS 稳定 ~4.9GB；混合模式每样本 +5GB。
+    gallocr_.release();
 
     // 1. 更新 node_backend_id_ / leaf_backend_id_
-    // ⚠️ 2026-08-24 修复：默认值必须与 build_splits 一致（n_backends_-1=CPU），不能用 0(GPU)。
+    //  2026-08-24 修复：默认值必须与 build_splits 一致（n_backends_-1=CPU），不能用 0(GPU)。
     //    backend_map_ 里没有的节点（view 类 op 在 build_splits 被 is_view_op 跳过、从不填
     //    backend_map_）若此处默认 GPU，gallocr 会在 GPU buffer 分配它，但 build_splits 默认
     //    CPU 归入 CPU split → CPU kernel 写无效 dst->data()（GPU buffer/未分配）→ SIGSEGV。
@@ -571,7 +576,7 @@ bool BackendScheduler::reserve_graph_memory() {
     }
 
     // 4. 张量 → 后端 id 映射
-    // ⚠️ 2026-08-24 修复：默认 CPU（n_backends_-1），与 build_splits 的默认值一致。
+    //  2026-08-24 修复：默认 CPU（n_backends_-1），与 build_splits 的默认值一致。
     //    默认 GPU(0) 会让 backend_map_ 未覆盖的 view 节点在 gallocr 分配到 GPU buffer，
     //    而 build_splits 把它们归 CPU split → CPU kernel 写无效指针段错误。
     auto backend_id_of = [&](TensorF32* t) -> int {

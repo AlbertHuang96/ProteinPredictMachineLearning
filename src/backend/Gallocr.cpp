@@ -130,7 +130,7 @@ void Gallocr::compute_refcounts(
     // 诊断开关：PPML_NO_CROSSBK_GUARD=1 禁用（排查保护是否引入其他问题）。
     const bool kGuard = !(getenv("PPML_NO_CROSSBK_GUARD") &&
                           std::strcmp(getenv("PPML_NO_CROSSBK_GUARD"), "1") == 0);
-    // ⚠️ 2026-08-24 跨 split 保活（方案A 补强）：OP_DUP（build_splits 创建的跨后端 cpy 节点）
+    //  2026-08-24 跨 split 保活（方案A 补强）：OP_DUP（build_splits 创建的跨后端 cpy 节点）
     //    的 src[0]（原始跨后端输入）必须保活。机制：build_splits 把 node->src[j] 替换为 cpy，
     //    gallocr 认为原始 src 只被 cpy 消费（n_children=1）→ alloc 时 src 空间被后续节点复用；
     //    但 graph_compute 的 Step 1 D2H 在 split 执行时才读原始 src → 读到被覆盖数据
@@ -150,7 +150,7 @@ void Gallocr::compute_refcounts(
                 dit->second->is_output = true;
             }
         }
-        // ⚠️ 2026-08-24 精准修复：SCATTER_ADD / EDGE_GATHER_ROWS 的 src[1]（边索引 leaf，
+        //  2026-08-24 精准修复：SCATTER_ADD / EDGE_GATHER_ROWS 的 src[1]（边索引 leaf，
         //    如 SE3 的 edge_src/edge_tgt）必须独立 buffer——scatter_add 同时读 msg(src[0])
         //    和 tgt_idx(src[1])，gallocr 空间复用会让它们共享同一 buffer（实测 msg_buf==
         //    tgt_buf → CUDA scatter invalid argument / 数值错乱）。索引 leaf 标 is_output

@@ -41,9 +41,9 @@ if(MSVC)
     add_compile_options(/W4)
     # /O2
 else()
-    # 训练性能需要：朴素矩阵乘等在 -O0 下极慢(5-20x)，开 -O2(保留 -g 符号, RelWithDebInfo 风格)。
-    # 若需完整调试可改回 -O0/-g，但训练 forward/backward 会极慢。
-    add_compile_options(-Wall -fPIC -O2)
+    # 训练性能需要：朴素矩阵乘等在 -O0 下极慢(5-20x)，开 -O2 保留 -g 符号 (RelWithDebInfo 风格)。
+    # 若需完整调试可改回 -O0，但训练 forward/backward 会极慢。
+    add_compile_options(-Wall -fPIC -O2 -g)
 endif()
 
 # ============================================================

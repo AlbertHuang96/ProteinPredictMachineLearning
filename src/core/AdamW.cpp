@@ -123,6 +123,56 @@ void AdamW::step(ComputeGraph* cgraph) {
     }
 }
 
+// ---- 断点续训：导出 m/v 动量 (与 params 同序) ----
+void AdamW::export_momentum(const std::vector<TensorF32*>& params,
+                            const std::vector<std::string>& param_names,
+                            std::vector<std::vector<float>>& ms,
+                            std::vector<std::vector<float>>& vs) const {
+    ms.clear(); vs.clear();
+    ms.reserve(params.size()); vs.reserve(params.size());
+    for (TensorF32* p : params) {
+        // 按指针在 states_ 中找该参数状态
+        const ParamState* st = nullptr;
+        for (const auto& s : states_) {
+            if (s.param == p) { st = &s; break; }
+        }
+        if (st) {
+            ms.push_back(st->m);
+            vs.push_back(st->v);
+        } else {
+            ms.emplace_back();   // 无状态 → 空 (save 侧跳过)
+            vs.emplace_back();
+        }
+        (void)param_names;
+    }
+}
+
+// ---- 断点续训：恢复 m/v 动量 (须在 init_from_graph 之后) ----
+void AdamW::import_momentum(const std::vector<TensorF32*>& params,
+                            const std::vector<std::string>& param_names,
+                            const std::map<std::string, std::vector<float>>& raw_tensors) {
+    for (size_t i = 0; i < params.size(); ++i) {
+        TensorF32* p = params[i];
+        if (i >= param_names.size()) break;
+        // 按指针在 states_ 中找
+        ParamState* st = nullptr;
+        for (auto& s : states_) {
+            if (s.param == p) { st = &s; break; }
+        }
+        if (!st) continue;
+
+        const std::string key_m = "opt.m." + param_names[i];
+        const std::string key_v = "opt.v." + param_names[i];
+        auto itm = raw_tensors.find(key_m);
+        auto itv = raw_tensors.find(key_v);
+        // 尺寸必须与当前状态一致 (m/v 与参数 numel 相同)；否则跳过 (保持 0)
+        if (itm != raw_tensors.end() && itm->second.size() == st->m.size())
+            st->m = itm->second;
+        if (itv != raw_tensors.end() && itv->second.size() == st->v.size())
+            st->v = itv->second;
+    }
+}
+
 void AdamW::zero_grad(ComputeGraph* cgraph) {
     for (int i = 0; i < cgraph->n_nodes(); i++) {
         TensorF32* node = cgraph->graph_node(i);

@@ -18,8 +18,10 @@
 #include <filesystem>
 #include <sstream>
 #include <iomanip>
+#include <map>
 #include <unistd.h>        // sysconf 用于页大小/物理页数 (内存)
 #include <sys/sysinfo.h>   // sysinfo 用于总/可用内存
+#include <sys/resource.h>  // getrusage 用于 RSS 峰值
 #include <cuda_runtime.h>  // cudaGetDeviceProperties 用于 GPU 信息
 
 using namespace ppml;
@@ -163,11 +165,14 @@ size_t total_bytes_of(const std::vector<TensorF32*>& params) {
 // ============================================================================
 // 加载 checkpoint (GGUF): 从文件读权重覆盖模型当前参数。
 //   path: 输入 gguf 文件路径
+//   meta_out (可选): 收集文件中数值型元数据 (epoch/sample_pos 等)，供多样本断点续训。
 //   ⚠️ 当前假设加载的权重与模型内架构/命名/顺序一致（collect_params_with_names 的
 //      顺序 = save_gguf 的写入顺序 = load_gguf 的读取顺序）。load_gguf 内部校验
-//      张量数量与形状，不一致会抛异常。
+//      张量数量与形状，不一致会抛异常（由调用方决定 WARN 继续或退出）。
 // ============================================================================
-void load_checkpoint(PPMLModel& model, const std::string& path) {
+void load_checkpoint(PPMLModel& model, const std::string& path,
+                     std::map<std::string, float>* meta_out = nullptr,
+                     std::map<std::string, std::vector<float>>* opt_tensors_out = nullptr) {
     std::vector<TensorF32*> params;
     std::vector<std::string> param_names;
     model.collect_params_with_names(params, param_names);
@@ -176,8 +181,10 @@ void load_checkpoint(PPMLModel& model, const std::string& path) {
     }
     std::cout << "[Load-CKPT] loading " << path << " -> "
               << params.size() << " params (assume arch/names match)" << std::endl;
-    load_gguf(path, params, param_names);
-    std::cout << "[Load-CKPT] OK: " << params.size() << " params loaded" << std::endl;
+    load_gguf(path, params, param_names, meta_out, opt_tensors_out);
+    std::cout << "[Load-CKPT] OK: " << params.size() << " params loaded";
+    if (opt_tensors_out) std::cout << " (+ " << opt_tensors_out->size() << " opt tensors)";
+    std::cout << std::endl;
 }
 
 // ============================================================================
@@ -186,7 +193,9 @@ void load_checkpoint(PPMLModel& model, const std::string& path) {
 //   epoch: 当前已完成 epoch (0-based), total_epochs, loss, elapsed_sec
 // ============================================================================
 void save_checkpoint(PPMLModel& model, const std::string& path,
-                     int epoch, int total_epochs, float loss, double elapsed_sec) {
+                     int epoch, int total_epochs, float loss, double elapsed_sec,
+                     const std::vector<std::pair<std::string, float>>& extra_meta = {},
+                     AdamW* opt = nullptr) {
     // 1. 收集参数 (及一一对应的语义名, 含 block/attention 等信息)
     std::vector<TensorF32*> params;
     std::vector<std::string> param_names;
@@ -220,19 +229,36 @@ void save_checkpoint(PPMLModel& model, const std::string& path,
     }
 
     // 4. 写入 GGUF, 内嵌训练状态元数据 + 语义化张量名
-    save_gguf(gguf_params, path,
-              {
-                  {"epoch", float(epoch + 1)},       // 1-based epoch 序号
-                  {"total_epochs", float(total_epochs)},
-                  {"loss", loss},
-                  {"elapsed_sec", float(elapsed_sec)},
-                  {"param_bytes", float(total_bytes_of(params))},
-              },
+    //    extra_meta (多样本续训用): sample_pos / resume_epoch 等, 优先于内置字段
+    std::vector<std::pair<std::string, float>> fm = extra_meta;
+    fm.emplace_back("epoch", float(epoch + 1));          // 1-based epoch 序号
+    fm.emplace_back("total_epochs", float(total_epochs));
+    fm.emplace_back("loss", loss);
+    fm.emplace_back("elapsed_sec", float(elapsed_sec));
+    fm.emplace_back("param_bytes", float(total_bytes_of(params)));
+
+    // 5. 优化器状态 (AdamW m/v) → GGUF extra 张量 "opt.m.<name>"/"opt.v.<name>"
+    //    (仅当传入 optimizer 且已 init; 旧 checkpoint 无此部分 → 兼容)
+    std::vector<GGUFRawTensor> opt_tensors;
+    if (opt && opt->param_count() > 0) {
+        std::vector<std::vector<float>> ms, vs;
+        opt->export_momentum(params, param_names, ms, vs);
+        for (size_t i = 0; i < params.size(); ++i) {
+            if (i < ms.size() && !ms[i].empty())
+                opt_tensors.push_back({"opt.m." + param_names[i], ms[i]});
+            if (i < vs.size() && !vs[i].empty())
+                opt_tensors.push_back({"opt.v." + param_names[i], vs[i]});
+        }
+        // 顺带把 step 次数写入 meta, 供恢复偏差校正 (bias correction 依赖 t)
+        fm.emplace_back("opt_step", float(opt->step_count()));
+    }
+
+    save_gguf(gguf_params, path, fm,
               {
                   {"arch", "ppml_v1"},
                   {"checkpoint", "train"},
               },
-              param_names);
+              param_names, opt_tensors);
 }
 
 // ============================================================================
@@ -328,8 +354,11 @@ double estimate_peak_gb(int L, int N) {
 }
 
 // buffer 感知读写 (复刻 GradientClipper 的内部辅助, 因其未导出)
+// ⚠️ graph_get_grad(param) 对"未参与本图 loss 路径"的参数返回 nullptr（如 SE3 部分参数/未激活分支），
+// 必须判空：read 返回全零（等价该参数本样本梯度为 0），write 跳过（避免写坏 last_cgraph）。
 std::vector<float> ms_read_grad(ComputeGraph* cgraph, TensorF32* param) {
     TensorF32* grad = cgraph->graph_get_grad(param);
+    if (!grad) return std::vector<float>(static_cast<size_t>(param->numel()), 0.0f);
     std::vector<float> buf(static_cast<size_t>(grad->numel()));
     const size_t bytes = static_cast<size_t>(grad->numel()) * sizeof(float);
     if (grad->buffer_) grad->buffer_->get_tensor(grad, buf.data(), grad->buffer_offs_, bytes);
@@ -339,6 +368,7 @@ std::vector<float> ms_read_grad(ComputeGraph* cgraph, TensorF32* param) {
 }
 void ms_write_grad(ComputeGraph* cgraph, TensorF32* param, const std::vector<float>& vals) {
     TensorF32* grad = cgraph->graph_get_grad(param);
+    if (!grad) return;
     const size_t bytes = static_cast<size_t>(grad->numel()) * sizeof(float);
     if (grad->buffer_) grad->buffer_->set_tensor(grad, vals.data(), grad->buffer_offs_, bytes);
     else if (grad->data()) std::memcpy(grad->data(), vals.data(), bytes);
@@ -353,6 +383,34 @@ void ms_zero_grad(ComputeGraph* cgraph, TensorF32* param) {
     } else if (grad->data()) {
         std::fill(grad->data(), grad->data() + n, 0.0f);
     }
+}
+
+// 内存检查点：PPML_PRINT_RSS=1 时打印 VmRSS/VmSize/VmHWM + rss 峰值 + context arena 使用。
+// 用于验证多样本/多 epoch 循环中"上一图内存是否释放"（arena 节点累积 vs gallocr buffer 复用）。
+void print_rss(const char* tag) {
+    if (!std::getenv("PPML_PRINT_RSS")) return;
+    long long vmrss = -1, vmsize = -1, vmhwm = -1;
+    {
+        std::ifstream f("/proc/self/status");
+        std::string line;
+        while (std::getline(f, line)) {
+            if (line.rfind("VmRSS:", 0) == 0)      vmrss  = std::atoll(line.c_str() + 6);
+            else if (line.rfind("VmSize:", 0) == 0) vmsize = std::atoll(line.c_str() + 7);
+            else if (line.rfind("VmHWM:", 0) == 0)  vmhwm  = std::atoll(line.c_str() + 6);
+        }
+    }
+    struct rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    const PPMLContext& ctx = context();
+    size_t arena_used = 0;                       // context 固定缓冲区已用字节
+    if (ctx.objects_end) arena_used = ctx.objects_end->offs + ctx.objects_end->size;
+    std::cout << "[RSS:" << tag << "] VmRSS=" << (vmrss / 1024)
+              << "MB VmSize=" << (vmsize / 1024)
+              << "MB VmHWM=" << (vmhwm / 1024)
+              << "MB rss_max=" << (ru.ru_maxrss / 1024)
+              << "MB arena_used=" << (arena_used / (1024 * 1024))
+              << "MB n_objects=" << ctx.n_objects
+              << " scratch_blocks=" << ctx.scratch_.size() << std::endl;
 }
 
 } // namespace
@@ -424,6 +482,44 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                                ? std::atoi(std::getenv("PPML_NUM_EPOCHS")) : 1;
     const int accum_steps = (std::getenv("PPML_ACCUM") != nullptr)
                                 ? std::atoi(std::getenv("PPML_ACCUM")) : 4; // 每 K 个样本 step 一次
+
+    // ---- 断点续训: PPML_LOAD_CKPT 加载权重 + 读多样本进度 (样本粒度) ----
+    // GGUF meta: resume_epoch (0-based) = 当前所在 epoch; sample_pos = 该 epoch 内
+    // 已完成样本数 (即下一个待处理样本在 order 中的索引)。shuffle 种子固定
+    // rng(1234+epoch)，重启后同一 epoch 样本顺序可精确重建，故可从
+    // (resume_epoch, sample_pos) 无缝续训。权重加载失败/不匹配 → WARN 从 0 开始。
+    int resume_epoch = 0;
+    int resume_sample = -1;   // -1 = 无样本进度 (从 epoch 开头)
+    std::map<std::string, std::vector<float>> ckpt_opt_tensors;  // AdamW m/v (opt.m./opt.v.)
+    int ckpt_opt_step = -1;
+    if (const char* lc = std::getenv("PPML_LOAD_CKPT")) {
+        std::map<std::string, float> ck_meta;
+        try {
+            load_checkpoint(model, std::string(lc), &ck_meta, &ckpt_opt_tensors);
+            auto it_ep = ck_meta.find("resume_epoch");
+            auto it_sp = ck_meta.find("sample_pos");
+            if (it_ep != ck_meta.end()) {
+                int e = static_cast<int>(it_ep->second);
+                if (e >= 0 && e < num_epochs) resume_epoch = e;
+            }
+            if (it_sp != ck_meta.end()) {
+                int s = static_cast<int>(it_sp->second);
+                if (s >= 0) resume_sample = s;
+            }
+            auto it_os = ck_meta.find("opt_step");
+            if (it_os != ck_meta.end()) {
+                ckpt_opt_step = static_cast<int>(it_os->second);
+            }
+            std::cout << "[resume] 从 epoch=" << resume_epoch
+                      << " sample_pos=" << resume_sample << " 继续 ("
+                      << (resume_sample >= 0 ? "从该样本开始" : "该 epoch 从头") << ")"
+                      << (ckpt_opt_step >= 0 ? ", opt_step=" + std::to_string(ckpt_opt_step) : "")
+                      << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "[Load-CKPT] WARN: " << e.what()
+                      << " → 忽略该 checkpoint, 使用默认权重从 0 开始" << std::endl;
+        }
+    }
     static const bool no_backward =
         (std::getenv("PPML_NO_BACKWARD") != nullptr) && (std::atoi(std::getenv("PPML_NO_BACKWARD")) != 0);
 
@@ -438,10 +534,25 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
     float epoch_loss_sum = 0.0f;
     int trained_samples = 0;
     ComputeGraph* last_cgraph = nullptr; // 保留最近一个样本图用于写回梯度
+    // ⚠️ 多样本 arena 复用（与单样本 main 一致）：
+    //   ComputeGraph 分配于 context arena（1GB 固定缓冲），不能 delete（invalid free 崩溃）。
+    //   模型参数已全部创建（params() 已收集）→ 记录参数末水位 mark；每样本 step 完成后
+    //   reset_objects_to(mark) 回退释放上一样本图节点，保留参数，避免 arena 跨样本单调增长
+    //   （实测每样本 +84MB 图节点、n_objects 翻倍，N 样本后 RSS 翻倍直至 OOM/崩）。
+    //   可学习 SE3 scale 懒创建于首次 forward，须在 mark 前物化（否则 reset 会误删该参数）。
+    if (getenv("PPML_SE3_LEARN_SCALE") && std::string(getenv("PPML_SE3_LEARN_SCALE")) == "1") {
+        model.se3_scale_tensor();
+    }
+    void* ms_arena_mark = context().mark_objects();
+    // scratch 水位：模型参数（new_param_tensor）创建于 scratch_ 前部，之后才是各样本
+    // 构建期 leaf/常量数据（bind_leaf_data）。记录水位，样本 reset 后仅释放水位之后新增的块，
+    // 避免跨样本累积（实测每样本 +45 块 ~464MB，多 epoch 后无界增长）。
+    const size_t ms_scratch_mark = context().scratch_.size();
 
     auto t_start = std::chrono::steady_clock::now();
+    print_rss("multi-start");
 
-    for (int epoch = 0; epoch < num_epochs; ++epoch) {
+    for (int epoch = resume_epoch; epoch < num_epochs; ++epoch) {
         std::cout << "\n--- Epoch " << (epoch + 1) << "/" << num_epochs
                   << " (accum=" << accum_steps << ") ---" << std::endl;
         // 每个 epoch 打乱样本顺序, 增强多样本覆盖
@@ -449,7 +560,21 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
         std::mt19937 rng(1234 + epoch);
         std::shuffle(order.begin(), order.end(), rng);
 
-        for (size_t si_idx = 0; si_idx < order.size(); ++si_idx) {
+        // 续训: 若 resume_epoch 的样本已全部完成 (sample_pos>=order.size) → 跳到下一 epoch
+        size_t si_start = 0;
+        if (epoch == resume_epoch && resume_sample >= 0) {
+            if (resume_sample >= (int)order.size()) {
+                std::cout << "  [resume] epoch " << (epoch + 1)
+                          << " 的样本已全部完成, 进入下一 epoch" << std::endl;
+                resume_epoch = epoch + 1;
+                resume_sample = -1;
+                continue;
+            }
+            si_start = (size_t)resume_sample;
+            std::cout << "  [resume] 跳过前 " << si_start << " 个样本" << std::endl;
+        }
+
+        for (size_t si_idx = si_start; si_idx < order.size(); ++si_idx) {
             auto& s = order[si_idx];
             std::string sequence;
             try { sequence = read_a3m_query_sequence(s.a3m); }
@@ -458,6 +583,9 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                 continue;
             }
             int L = static_cast<int>(sequence.length());
+
+            // 内存检查点：上一样本已 delete last_cgraph，此点应体现其内存是否回落
+            print_rss("sample-begin");
 
             // 流式加载单个样本 (B=1), 用完即释放
             ModelInput input;
@@ -472,7 +600,8 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
             auto* cgraph = ComputeGraph::new_graph(&context());
 
             // 前向: forward_graph 内部自行包装输入 leaf, 无需在外部预 wrap
-            GraphOutput gout = model.forward_graph(input, full_train);
+            // enable_se3 与单样本 main 一致：FULL_TRAIN 或 PPML_DEV_SE3=1 时开启 SE3 3D track
+            GraphOutput gout = model.forward_graph(input, full_train || dev_se3);
             TensorF32* pred_lddt   = gout.lddt;
             TensorF32* logits_msa  = gout.msa_logits;
             TensorF32* distogram   = gout.distogram;
@@ -650,12 +779,29 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                 }
             }
 
-            // 释放上一个样本的图 (保留当前 cgraph 用于写回, 因参数跨图共享但 grad 节点在图内)
-            if (last_cgraph && last_cgraph != cgraph) delete last_cgraph;
+            // 内存检查点：本样本 compute 完 + 梯度已读出（step 前）的峰值状态
+            print_rss("sample-end");
+
+            // ⚠️ 不能 delete：ComputeGraph 分配于 context arena（invalid free 崩溃）。
+            // 仅保留引用供 step 写回；arena 释放由 step 完成后的 reset_objects_to 统一回退。
             last_cgraph = cgraph;
 
             // 首个样本图建好后初始化 optimizer (AdamW 需遍历图节点找参数)
-            if (optimizer.param_count() == 0) optimizer.init_from_graph(cgraph);
+            if (optimizer.param_count() == 0) {
+                optimizer.init_from_graph(cgraph);
+                // 断点续训: 恢复 AdamW m/v 动量 + 偏差校正 step 计数
+                // (须在 init_from_graph 之后；缺失/尺寸不符 → 保持 0 初始化)
+                if (!ckpt_opt_tensors.empty()) {
+                    std::vector<TensorF32*> ps;
+                    std::vector<std::string> ns;
+                    model.collect_params_with_names(ps, ns);
+                    optimizer.import_momentum(ps, ns, ckpt_opt_tensors);
+                    if (ckpt_opt_step >= 0) optimizer.set_step_count(ckpt_opt_step);
+                    std::cout << "  [resume] 已恢复优化器状态 (opt tensors="
+                              << ckpt_opt_tensors.size() << ", step="
+                              << optimizer.step_count() << ")" << std::endl;
+                }
+            }
 
             std::cout << "  [" << s.uniprot << "] L=" << L
                       << " loss=" << std::fixed << std::setprecision(4) << batch_loss
@@ -681,6 +827,42 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                     std::fill(acc[pi].begin(), acc[pi].end(), 0.0f);
                 acc_count = 0;
                 std::cout << "  >> step (grad_norm=" << gnorm << ")" << std::endl;
+
+                // 5) step 完成：本样本图已不再需要（grad 已读入 acc、参数已更新）
+                //    → reset arena 回退释放 mark 之后的所有图节点（保留参数区），
+                //      防止多样本跨样本 arena 单调增长（实测每样本 +84MB/n_objects 翻倍）。
+                //    仅 acc 未满时不清（last_cgraph 需留到下次 step）。
+                if (ms_arena_mark) context().reset_objects_to(ms_arena_mark);
+                // 同步释放本样本新增的 scratch leaf 数据（图节点已 reset，数据无引用者）
+                for (size_t si = ms_scratch_mark; si < context().scratch_.size(); ++si) {
+                    ::free(context().scratch_[si]);
+                }
+                context().scratch_.resize(ms_scratch_mark);
+                last_cgraph = nullptr;
+                print_rss("sample-released");
+            }
+
+            // ---- 断点续训 checkpoint：每样本完成后保存权重+进度 ----
+            //  SIGKILL/OOM 中途退出后，重启加 PPML_LOAD_CKPT=<path> 即可从
+            //  sample_pos 无缝续训（此样本已完整计算+step，sample_pos=si_idx+1）。
+            //  默认每样本写；PPML_CKPT_EVERY_SAMPLE=0 关闭中途保存（仅结束保存）。
+            static const bool ms_every_sample = [] {
+                const char* e = std::getenv("PPML_CKPT_EVERY_SAMPLE");
+                return !(e && std::atoi(e) == 0);
+            }();
+            if (ms_every_sample) {
+                if (const char* ckp = std::getenv("PPML_CKPT")) {
+                    double el = std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - t_start).count();
+                    try {
+                        save_checkpoint(model, ckp, epoch, num_epochs, batch_loss, el,
+                                        {{"sample_pos", float((int)si_idx + 1)},
+                                         {"resume_epoch", float(epoch)}},
+                                        &optimizer);
+                    } catch (const std::exception& e) {
+                        std::cerr << "  [ckpt-inter] FAILED: " << e.what() << std::endl;
+                    }
+                }
             }
         }
     }
@@ -700,8 +882,13 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
             std::cout << "  >> final step (grad_norm=" << gnorm << ")" << std::endl;
         }
         acc_count = 0;
+        // 收尾 step 完成：同样 reset 释放最后图（若 acc 未满时 last_cgraph 仍驻留）
+        if (ms_arena_mark) context().reset_objects_to(ms_arena_mark);
+        last_cgraph = nullptr;
     }
-    if (last_cgraph) { delete last_cgraph; last_cgraph = nullptr; }
+    // arena 对象不 delete（由 context 统一管理），仅清引用
+    last_cgraph = nullptr;
+    print_rss("multi-end");
 
     auto t_end = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
@@ -710,8 +897,16 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
               << " avg_loss=" << avg_loss << " elapsed=" << elapsed << "s" << std::endl;
 
     // checkpoint
+    // ⚠️ 末次保存必须带 extra_meta（sample_pos/resume_epoch），否则会覆盖掉中途每样本
+    //    保存写入的进度，导致续训读不到 sample_pos（实测 strings 无 sample_pos、
+    //    resume 退化到 sample_pos=-1）。末次 = 最后一个 epoch 全部完成。
     if (const char* ck = std::getenv("PPML_CKPT")) {
-        try { save_checkpoint(model, ck, num_epochs - 1, num_epochs, avg_loss, elapsed); }
+        try {
+            save_checkpoint(model, ck, num_epochs - 1, num_epochs, avg_loss, elapsed,
+                            {{"sample_pos", float((int)samples.size())},
+                             {"resume_epoch", float(num_epochs - 1)}},
+                            &optimizer);
+        }
         catch (const std::exception& e) { std::cerr << "checkpoint failed: " << e.what() << std::endl; }
     }
     return 0;
@@ -805,12 +1000,20 @@ int main(int argc, char* argv[]) {
     // 4. 从 checkpoint (GGUF) 加载权重 — 默认关闭, 环境变量 PPML_LOAD_CKPT 指定路径时启用
     //    当前假设加载的权重与模型内架构/命名/顺序一致 (同 save_checkpoint 输出)。
     //    应在数据加载前执行 (权重加载与数据无关), 且早于首次 forward 构图。
+    // 断点续训: 缓存加载到的优化器状态 (AdamW m/v) 与 step 计数, 供 init_from_graph 后恢复
+    std::map<std::string, std::vector<float>> ckpt_opt_tensors;
+    int ckpt_opt_step = -1;
     if (const char* lc = std::getenv("PPML_LOAD_CKPT")) {
         try {
-            load_checkpoint(model, std::string(lc));
+            std::map<std::string, float> ck_meta;
+            load_checkpoint(model, std::string(lc), &ck_meta, &ckpt_opt_tensors);
+            auto it_os = ck_meta.find("opt_step");
+            if (it_os != ck_meta.end()) ckpt_opt_step = static_cast<int>(it_os->second);
         } catch (const std::exception& e) {
-            std::cerr << "[Load-CKPT] FAILED: " << e.what() << std::endl;
-            return 1;
+            // 2026-08-26: 权重已废弃/布局不匹配 → 不中断训练, 仅 WARN 并继续用默认权重
+            // (从零训练即是本行为; 不 return, 让训练正常跑)
+            std::cerr << "[Load-CKPT] WARN: 加载失败 (" << e.what()
+                      << ") → 忽略该 checkpoint, 继续使用默认权重训练" << std::endl;
         }
     } else {
         std::cout << "[Load-CKPT] disabled (set PPML_LOAD_CKPT=/path/to.gguf to load)" << std::endl;
@@ -951,8 +1154,13 @@ int main(int argc, char* argv[]) {
 
     // ---- Checkpoint 配置 ----
     // 每隔 checkpoint_interval 个 epoch 保存一次权重 (GGUF)。
-    // FULL_TRAIN=true 开启 checkpoint 保存（每 2 epoch）；否则 dev 模式默认不保存。
-    int ckpt_interval = full_train ? 2 : 0;    // 0 = 禁用 checkpoint
+    // FULL_TRAIN=true 默认每 4 epoch 保存（10 epoch 存 2 次），PPML_CKPT_INTERVAL 可覆盖；
+    // dev 模式默认不保存。0 = 禁用。
+    int ckpt_interval = full_train ? 4 : 0;
+    if (const char* ci = std::getenv("PPML_CKPT_INTERVAL")) {
+        int v = std::atoi(ci);
+        if (v >= 0) ckpt_interval = v;
+    }
     const std::string ckpt_dir = "checkpoints"; // checkpoint 输出目录
 
     // ---- AdamW 优化器配置 (decoupled weight decay) ----
@@ -1699,6 +1907,18 @@ int main(int argc, char* argv[]) {
 
         if (!optimizer_inited) {
             optimizer.init_from_graph(cgraph);             // 首次收集参数并分配 m/v
+            // 断点续训: 恢复 AdamW m/v 动量 + 偏差校正 step 计数
+            // (须在 init_from_graph 之后；缺失/尺寸不符 → 保持 0 初始化)
+            if (!ckpt_opt_tensors.empty()) {
+                std::vector<TensorF32*> ps;
+                std::vector<std::string> ns;
+                model.collect_params_with_names(ps, ns);
+                optimizer.import_momentum(ps, ns, ckpt_opt_tensors);
+                if (ckpt_opt_step >= 0) optimizer.set_step_count(ckpt_opt_step);
+                std::cout << "  [resume] 已恢复优化器状态 (opt tensors="
+                          << ckpt_opt_tensors.size() << ", step="
+                          << optimizer.step_count() << ")" << std::endl;
+            }
             optimizer_inited = true;
             std::cout << "[AdamW] initialized, params=" << optimizer.param_count()
                       << std::endl;
@@ -1975,7 +2195,9 @@ int main(int argc, char* argv[]) {
             try {
                 // before save: use backend->synchronize force cpu to wait all gpu work finish
                 // cudaStreamSynchronize or cudaDeviceSynchronize
-                save_checkpoint(model, path, epoch, num_epochs, batch_loss, epoch_sec);
+                // 2026-08-26: 传入 &optimizer 序列化 AdamW m/v 动量 (断点续训用)
+                save_checkpoint(model, path, epoch, num_epochs, batch_loss, epoch_sec,
+                                {}, &optimizer);
                 auto ckpt_end = std::chrono::high_resolution_clock::now();
                 auto ckpt_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                    ckpt_end - ckpt_start).count();

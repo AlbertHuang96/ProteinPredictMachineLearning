@@ -4,6 +4,7 @@
 #include "ComputeGraph.h"
 
 #include <vector>
+#include <map>
 #include <cstdint>
 
 namespace ppml {
@@ -38,10 +39,23 @@ public:
     // 清空所有参数的梯度缓冲区（可选，单次 backward 全链回传时通常无需手动清零）。
     void zero_grad(ComputeGraph* cgraph);
 
+    // ---- 断点续训：序列化 m/v 动量 (与 GGUF extra 张量 "opt.m.<name>"/"opt.v.<name>" 对应) ----
+    // 导出：按 (params, param_names) 同序输出；未参与本图 (无状态) 的参数给空向量。
+    void export_momentum(const std::vector<TensorF32*>& params,
+                         const std::vector<std::string>& param_names,
+                         std::vector<std::vector<float>>& ms,
+                         std::vector<std::vector<float>>& vs) const;
+    // 恢复：从名字映射读回 m/v。须在 init_from_graph 之后调用（states_ 已按 param 建好）。
+    // 尺寸不匹配或缺失 → 保持原状（0 初始化），不会破坏训练。
+    void import_momentum(const std::vector<TensorF32*>& params,
+                         const std::vector<std::string>& param_names,
+                         const std::map<std::string, std::vector<float>>& raw_tensors);
+
     float lr() const            { return lr_; }
     void  set_lr(float lr)      { lr_ = lr; }
     size_t param_count() const  { return states_.size(); }
     int   step_count() const    { return step_count_; }
+    void  set_step_count(int c) { step_count_ = c; }
 
 private:
     struct ParamState {
