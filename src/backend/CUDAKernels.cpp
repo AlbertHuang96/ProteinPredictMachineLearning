@@ -37,6 +37,10 @@ extern void out_prod_cuda(
 // Unary ops（RELU/SQRT/EXP 等，实现于 src/cuda/CUDAKernels.cu）
 extern void unary_cuda(const float * src, float * dst, int N, int uop, int block_size);
 
+// OP_SUM/OP_MEAN 全元素归约（实现于 src/cuda/CUDAKernels.cu）：dst 须已清零
+extern void sum_cuda(const float * src, float * dst, long long n);
+extern void mean_cuda(const float * src, float * dst, long long n);
+
 // N-ary concat：srcs/start/len 均须为 device 指针（见 concat_nary_cuda）。
 // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致。
 extern void concat_nary_cuda(
@@ -145,6 +149,14 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             kernel_unary_cuda(node, uop, p);
             break;
         }
+
+        case OP_SUM:
+            kernel_sum_cuda(node, &st);
+            break;
+
+        case OP_MEAN:
+            kernel_mean_cuda(node, &st);
+            break;
 
         // ===== 无实现的 op：统一返回 NOT_SUPPORTED =====
         default:
@@ -277,11 +289,33 @@ void CUDABackend::kernel_add1_cuda(TensorF32 * node, Status* st) {
 }
 
 void CUDABackend::kernel_sum_cuda(TensorF32 * node, Status* st) {
-    (void)node; if (st) *st = Status::NOT_SUPPORTED;
+    // OP_SUM：全元素求和 → 标量 [1]
+    // src0 全元素 grid-stride + warp shuffle 两级规约，block 间 atomicAdd 到 dst[0]。
+    if (!node->src[0] || !node->src[0]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    // dst 必须先清零（atomicAdd 累加）。对标 out_prod_cuda 的 cudaMemset 模式。
+    cudaMemset(node->data(), 0, node->nbytes());
+    const float* src = node->src[0]->data();
+    const long long n = node->src[0]->numel();
+    sum_cuda(src, node->data(), n);
+    if (st) *st = Status::SUCCESS;
 }
 
 void CUDABackend::kernel_mean_cuda(TensorF32 * node, Status* st) {
-    (void)node; if (st) *st = Status::NOT_SUPPORTED;
+    // OP_MEAN：全元素平均 → 标量 [1]
+    // 复用 OP_SUM 两级规约 kernel，最终标量乘 1/N（Σ(val_b/N) = Σ(val_b)/N）。
+    if (!node->src[0] || !node->src[0]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    // dst 必须先清零（atomicAdd 累加）。对标 out_prod_cuda 的 cudaMemset 模式。
+    cudaMemset(node->data(), 0, node->nbytes());
+    const float* src = node->src[0]->data();
+    const long long n = node->src[0]->numel();
+    mean_cuda(src, node->data(), n);
+    if (st) *st = Status::SUCCESS;
 }
 
 void CUDABackend::kernel_relu_cuda(TensorF32 * node) { (void)node; }
@@ -351,7 +385,7 @@ void CUDABackend::kernel_scatter_add_cuda(TensorF32 * node, ComputeParams * p) {
     const int N = node->op_params[0];
     const int M = static_cast<int>(msg->shape().dims[0]);
     const int E = static_cast<int>(msg->shape().dims[1]);
-    // ⚠️ 诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：打印 scatter_add 实际 launch 参数与指针状态，
+    //  诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：打印 scatter_add 实际 launch 参数与指针状态，
     //    定位 [CUDA-ERR] op=108(OP_SCATTER_ADD) invalid argument 根因（grid 超限 / 指针非法）。
     if (getenv("GRAPH_DEBUG_CUDA_SCATTER")) {
         const int gz = (int)(((int64_t)N * M + 255) / 256);
@@ -364,7 +398,7 @@ void CUDABackend::kernel_scatter_add_cuda(TensorF32 * node, ComputeParams * p) {
                 (void*)(node->buffer_?node->buffer_:nullptr), (node->buffer_?(int)node->buffer_->is_host():-1),
                 (void*)(msg->buffer_?msg->buffer_:nullptr), (msg->buffer_?(int)msg->buffer_->is_host():-1),
                 (void*)(tgt_idx->buffer_?tgt_idx->buffer_:nullptr), (tgt_idx->buffer_?(int)tgt_idx->buffer_->is_host():-1));
-        // ⚠️ 指针属性检查：确认 data() 在 GPU launch 时是 device 指针（cudaMemoryTypeDevice=2）。
+        //  指针属性检查：确认 data() 在 GPU launch 时是 device 指针（cudaMemoryTypeDevice=2）。
         //    若 msg/tgt/dst 的 data() 是 host 或 unregistered（跨后端 data()/buffer_ 不一致），
         //    CUDA kernel 读 host 指针 → invalid argument / illegal address。
         cudaPointerAttributes pa_dst{}, pa_msg{}, pa_tgt{};
@@ -376,7 +410,7 @@ void CUDABackend::kernel_scatter_add_cuda(TensorF32 * node, ComputeParams * p) {
                 (int)pa_dst.type, (int)pa_msg.type, (int)pa_tgt.type);
     }
     scatter_add_cuda(msg->data(), tgt_idx->data(), node->data(), N, M, E);
-    // ⚠️ 诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：launch 后立即查错误——确认 scatter 自身
+    //  诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：launch 后立即查错误——确认 scatter 自身
     //    launch 是否真的失败（node 0 的 [CUDA-ERR] op=108 来源）。
     if (getenv("GRAPH_DEBUG_CUDA_SCATTER")) {
         cudaError_t ler = cudaGetLastError();

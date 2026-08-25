@@ -81,7 +81,7 @@ bool CUDABackend::supports_op(TensorF32* node) const {
     }
 
     // no-op / view ops 始终支持（不需要 kernel）
-    // ⚠️ OP_PERMUTE/OP_TRANSPOSE 是真数据重排且 CUDA 无 kernel（graph_compute 跳过执行），
+    //  OP_PERMUTE/OP_TRANSPOSE 是真数据重排且 CUDA 无 kernel（graph_compute 跳过执行），
     //    必须强制回落 CPU，否则分到 GPU split 后 dst 数据不重排 → 数值错/下游读空。
     if (node->op == OP_NONE    || node->op == OP_RESHAPE ||
         node->op == OP_VIEW) {
@@ -127,7 +127,7 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_SCATTER_ADD:
         case OP_PER_EDGE_MATMUL_BACK_KERNEL:
         case OP_PER_EDGE_MATMUL_BACK_GATHERED:
-            // ⚠️ 诊断开关（PPML_CUDA_NO_SCATTER=1）：强制 SCATTER_ADD 回落 CPU，
+            //  诊断开关（PPML_CUDA_NO_SCATTER=1）：强制 SCATTER_ADD 回落 CPU，
             //    验证 [CUDA-ERR] op=108(OP_SCATTER_ADD) invalid argument 是否为
             //    混合 SE3 链数值不稳的根因（若 CUDA-ERR 消失且 loss 正常 → 是根因；
             //    若 loss 仍爆炸 → 非根因，是 SE3 前向放大）。
@@ -149,12 +149,16 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_NORM_BACK:
             return true;
 
+        case OP_SUM:
+        case OP_MEAN:
+            // 2026-08-25：OP_SUM/OP_MEAN 全元素归约已实现（warp shuffle 两级规约 + atomicAdd，
+            // mean 复用同一 kernel 最终标量乘 1/N）
+            return true;
+
         // ===== kernel 为空函数体或 NOT_SUPPORTED，暂不支持 =====
         // OP_DUP      → kernel_dup_cuda 空函数体，无实现
         // OP_ADD1     → kernel_add1_cuda 返回 NOT_SUPPORTED
         // OP_SCALE    → kernel_scale_cuda 返回 NOT_SUPPORTED
-        // OP_SUM      → kernel_sum_cuda 返回 NOT_SUPPORTED
-        // OP_MEAN     → kernel_mean_cuda 返回 NOT_SUPPORTED
         // OP_CPY      → dispatch_node 中无 case
         // OP_SET_ROWS → dispatch_node 中无 case
         // UNARY_OP_*  → kernel_relu/gelu/sigmoid/silu/tanh/exp_cuda 均为空函数体
@@ -163,8 +167,6 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_DUP:
         case OP_ADD1:
         case OP_SCALE:
-        case OP_SUM:
-        case OP_MEAN:
         case OP_CPY:
         case OP_SET_ROWS:
         case OP_RMS_NORM:
@@ -240,7 +242,7 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
     for (int node_n = 0; node_n < cgraph->n_nodes(); node_n++) {
         TensorF32* node = cgraph->graph_node(node_n);
 
-        // ⚠️ 前置异步错误检查（GRAPH_DEBUG_CUDA_ASYNC=1）：CUDA 错误是异步滞留的——
+        //  前置异步错误检查（GRAPH_DEBUG_CUDA_ASYNC=1）：CUDA 错误是异步滞留的——
         //    launch 返回时 kernel 可能未执行完，错误到下一个 cudaGetLastError 才暴露。
         //    此前 [CUDA-ERR] op=108(node 0) 打印的是"检查点节点"而非真正失败的 kernel。
         //    此处在本节点 launch 前检查，捕获上一个节点的真实失败。配合 cudaDeviceSynchronize
@@ -412,7 +414,7 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
                     "[cuda-op] dispatch op=%d node=%d dst_numel=%lld src0=%lld src1=%lld src2=%lld\n",
                     (int)node->op, node_n, dn, s0, s1, s2);
         }
-        // ⚠️ 诊断（GRAPH_DEBUG_BACKNODE=1）：GPU split 里出现 op>=100（_BACK）时的节点详情。
+        //  诊断（GRAPH_DEBUG_BACKNODE=1）：GPU split 里出现 op>=100（_BACK）时的节点详情。
         //    确认 op=108 OUTER_PROD_MEAN_BACK 是否真的被 GPU dispatch、其 src 形状/数据状态。
         if (getenv("GRAPH_DEBUG_BACKNODE") && (int)node->op >= 100 && (int)node->op <= 120) {
             fprintf(stderr,
@@ -448,7 +450,7 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
         {
             cudaError_t kerr = cudaGetLastError();
             if (kerr != cudaSuccess) {
-                // ⚠️ 区分 launch 错误 vs 执行期错误：launch 错误由本节点 kernel 引起（可立即查），
+                //  区分 launch 错误 vs 执行期错误：launch 错误由本节点 kernel 引起（可立即查），
                 //    执行期错误（illegal address）需同步才暴露——用 cudaDeviceSynchronize 确认。
                 //    此前 [CUDA-ERR] op=108 (node 0) 可能是"上一个 kernel 执行期错误"在下一个
                 //    检查点暴露。同步后能打印真正的错误源。

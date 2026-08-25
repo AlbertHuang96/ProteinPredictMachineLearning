@@ -621,4 +621,68 @@ void unary_cuda(const float * src, float * dst, int N, int uop, int block_size) 
     cudaCheck(cudaGetLastError());
 }
 
+// ============================================================
+// OP_SUM / OP_MEAN: 全元素归约 → 标量 [1]
+// 两级规约：Warp shuffle（用户参考实现）+ grid-stride + block 间 atomicAdd。
+// 二者共用同一 reduce kernel，区别仅在最终标量乘 scale：
+//   sum  → scale=1.0f；mean → scale=1/N（数学上 Σ(val_b/N) = Σ(val_b)/N）。
+// ============================================================
+
+__device__ float sum_warp_reduce(float val) {
+    // 每次将右半边的值加到左半边（全 warp 同步）
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffffu, val, offset);
+    }
+    return val;  // lane 0 持有最终结果
+}
+
+// 每个 block 处理一段元素：grid-stride 累积到 val，warp 内规约，shared 归并，block 结果 atomicAdd 到 dst
+__global__ void sum_reduce_kernel(const float * __restrict__ src, float * __restrict__ dst,
+                                  long long n, int block_size, float scale) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    float val = 0.0f;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        val += src[i];
+    }
+
+    const int lane = threadIdx.x % 32;
+    const int wid  = threadIdx.x / 32;
+    // 第一级：Warp 内规约
+    val = sum_warp_reduce(val);
+
+    __shared__ float warp_results[32];  // block_size<=1024 → 最多 32 warp
+    if (lane == 0) warp_results[wid] = val;
+    __syncthreads();
+
+    // 第二级：Warp 0 归并各 warp 结果
+    const int num_warps = block_size / 32;
+    if (wid == 0) {
+        val = (lane < num_warps) ? warp_results[lane] : 0.0f;
+        val = sum_warp_reduce(val);
+        if (lane == 0) atomicAdd(dst, val * scale);
+    }
+}
+
+// 内部实现：dst 须已清零（由 kernel_*_cuda 负责 memset device 0）
+static void sum_impl(const float * src, float * dst, long long n, float scale) {
+    if (n <= 0) return;
+    constexpr int BLOCK = 256;
+    // 每线程至少处理 1 个元素，block 数上限 ~4096 防 launch 超限
+    long long want_blocks = (n + BLOCK - 1) / BLOCK;
+    if (want_blocks > 4096) want_blocks = 4096;
+    const int grid = (int)want_blocks;
+    sum_reduce_kernel<<<grid, BLOCK>>>(src, dst, n, BLOCK, scale);
+    cudaCheck(cudaGetLastError());
+}
+
+void sum_cuda(const float * src, float * dst, long long n) {
+    sum_impl(src, dst, n, 1.0f);
+}
+
+void mean_cuda(const float * src, float * dst, long long n) {
+    // 空数组保护：mean=0（对齐 CPU kernel_mean 语义）
+    const float inv_n = (n > 0) ? (1.0f / (float)n) : 0.0f;
+    sum_impl(src, dst, n, inv_n);
+}
+
 } // namespace ppml
