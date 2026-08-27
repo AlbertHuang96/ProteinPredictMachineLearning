@@ -126,7 +126,16 @@ namespace ppml {
 
         // 统一 view 成 2D [D_in, M]（1D [D_in] 视为 M=1），再 mul_mat → [D_out, M]
         TensorF32* x_flat = (x_ndim == 2) ? x : view(x, Shape{in_features_, M});
-        TensorF32* y = mul_mat(x_flat, weight_);                  // [D_out, M]
+        TensorF32* y = mul_mat(x_flat, weight_);                  // [D_out, M] = W0 @ x
+
+        // LoRA 低秩旁路: y += (alpha/rank) * B @ A @ x
+        if (lora_A_ && lora_B_) {
+            TensorF32* z  = mul_mat(x_flat, lora_A_);            // [rank, M]  = Aᵀx
+            TensorF32* p  = mul_mat(z,     lora_B_);            // [out, M]  = Bᵀ(Aᵀx)
+            const float lora_s = lora_alpha_ / lora_rank_;       // * α/r
+            TensorF32* ps = scale(p, lora_s);
+            y = add_impl(y, ps, /*inplace=*/false);            // 并联相加
+        }
 
         if (has_bias_) {
             // bias [D_out] 广播到 [D_out, M]（kernel_repeat 尾部对齐，1D→2D）
@@ -166,6 +175,22 @@ namespace ppml {
                 for (int i = 0; i < in_features_; ++i) {
                     sum += x.data()[b * in_features_ + i] * weight_->data()[o * in_features_ + i];
                 }
+                // LoRA 旁路: + (alpha/rank) * Σ_r B[o][r] * (Σ_i A[r][i] * x[b][i])
+                //   A 存 [in,rank] → A[r][i] flat = i + r*in_features_
+                //   B 存 [rank,out] → B[o][r] flat = r + o*lora_rank_
+                if (lora_A_ && lora_B_) {
+                    const float scale = lora_alpha_ / lora_rank_;
+                    float z = 0.f;
+                    for (int r = 0; r < lora_rank_; ++r) {
+                        float acc = 0.f;
+                        for (int i = 0; i < in_features_; ++i) {
+                            acc += x.data()[b * in_features_ + i]
+                                 * lora_A_->data()[i + r * in_features_];
+                        }
+                        z += lora_B_->data()[r + o * lora_rank_] * acc;
+                    }
+                    sum += scale * z;
+                }
                 // dim of output: (..., out_features)，行优先扁平索引与 (batch,out) 一致
                 output.data()[b * out_features_ + o] = sum;
             }
@@ -189,6 +214,36 @@ namespace ppml {
         if (has_bias_) {
             std::memset(bias_->data(), 0, out_features_ * sizeof(float));
         }
+    }
+
+    // ===== LoRA 低秩微调 =====
+    // A 存 [in, rank]（dims[0]=in 最内，与 weight_ 同布局），B 存 [rank, out]。
+    // mul_mat(a,b)=aᵀ@b，b 的 K=dims[0]、N=dims[1]：
+    //   mul_mat(x[in,M], A[in,rank]) → [rank,M]   （A 的 K=in,N=rank）
+    //   mul_mat(z[rank,M], B[rank,out]) → [out,M] （B 的 K=rank,N=out）
+    void LinearLayer::enable_lora(int rank, float alpha) {
+        if (rank <= 0 || lora_A_) return;   // 已启用则幂等
+        lora_rank_  = rank;
+        lora_alpha_ = alpha;
+        int64_t a_dims[2] = {in_features_, rank};
+        int64_t b_dims[2] = {rank, out_features_};
+        lora_A_ = context().new_param_tensor<float>(2, a_dims);
+        lora_B_ = context().new_param_tensor<float>(2, b_dims);
+        lora_A_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_LORA;
+        lora_B_->flag = TENSOR_FLAG_PARAM | TENSOR_FLAG_LORA;
+        lora_init();
+        // 启用 LoRA 后默认冻结主权重（仅训旁路）
+        freeze();
+    }
+
+    void LinearLayer::lora_init() {
+        // 标准 LoRA 初始化：A ~ N(0, 0.02)，B = 0 → 初始 B@A=0，前向=原 W0，不破坏预训练
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::normal_distribution<float> dist(0.0f, 0.02f);
+        for (int64_t i = 0; i < lora_A_->numel(); ++i)
+            lora_A_->data()[i] = dist(gen);
+        std::memset(lora_B_->data(), 0, lora_B_->numel() * sizeof(float));
     }
    
 

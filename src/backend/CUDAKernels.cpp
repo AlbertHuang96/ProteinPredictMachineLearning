@@ -41,6 +41,13 @@ extern void unary_cuda(const float * src, float * dst, int N, int uop, int block
 extern void sum_cuda(const float * src, float * dst, long long n);
 extern void mean_cuda(const float * src, float * dst, long long n);
 
+// OP_REPEAT_BACK 归约（实现于 src/cuda/CUDAKernels.cu）：src(大) → dst(小)，dst[j]=Σ src[j+k*dd]
+// 仅支持同 ndim（src 各维 = dst 各维 × 整数重复因子），跨 ndim 广播由 CPU 回落。
+extern void repeat_back_cuda(
+    const float * src, float * dst,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3);
+
 // N-ary concat：srcs/start/len 均须为 device 指针（见 concat_nary_cuda）。
 // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致。
 extern void concat_nary_cuda(
@@ -156,6 +163,10 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
 
         case OP_MEAN:
             kernel_mean_cuda(node, &st);
+            break;
+
+        case OP_REPEAT_BACK:
+            kernel_repeat_back_cuda(node, &st);
             break;
 
         // ===== 无实现的 op：统一返回 NOT_SUPPORTED =====
@@ -315,6 +326,41 @@ void CUDABackend::kernel_mean_cuda(TensorF32 * node, Status* st) {
     const float* src = node->src[0]->data();
     const long long n = node->src[0]->numel();
     mean_cuda(src, node->data(), n);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_repeat_back_cuda(TensorF32 * node, Status* st) {
+    // OP_REPEAT_BACK：dst[j] = Σ_k src[j + k*dd]（repeat 的逆，梯度和）。
+    // 与 CPU kernel_repeat_back 对齐；仅支持同 ndim（src 各维 = dst 各维 × 整数重复因子），
+    // 跨 ndim 广播（src 前导维多于 dst）由 supports_op 判 false 回落 CPU。
+    if (!node->src[0] || !node->src[0]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const TensorF32* src0 = node->src[0];
+    TensorF32*       dst  = node;
+
+    const int64_t ne00 = src0->shape().dims[0];
+    const int64_t ne01 = (src0->shape().ndim() > 1) ? src0->shape().dims[1] : 1;
+    const int64_t ne02 = (src0->shape().ndim() > 2) ? src0->shape().dims[2] : 1;
+    const int64_t ne03 = (src0->shape().ndim() > 3) ? src0->shape().dims[3] : 1;
+
+    const int64_t ne0 = dst->shape().dims[0];
+    const int64_t ne1 = (dst->shape().ndim() > 1) ? dst->shape().dims[1] : 1;
+    const int64_t ne2 = (dst->shape().ndim() > 2) ? dst->shape().dims[2] : 1;
+    const int64_t ne3 = (dst->shape().ndim() > 3) ? dst->shape().dims[3] : 1;
+
+    // 整除前置校验（同 ndim 下应成立；否则回落 CPU 避免除零/越界）
+    if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0 ||
+        ne00 % ne0 != 0 || ne01 % ne1 != 0 || ne02 % ne2 != 0 || ne03 % ne3 != 0) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+
+    repeat_back_cuda(
+        src0->data(), dst->data(),
+        ne00, ne01, ne02, ne03,
+        ne0,  ne1,  ne2,  ne3);
     if (st) *st = Status::SUCCESS;
 }
 

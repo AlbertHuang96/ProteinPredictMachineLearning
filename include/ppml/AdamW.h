@@ -27,11 +27,16 @@ namespace ppml {
 class AdamW {
 public:
     AdamW(float lr, float weight_decay, float beta1 = 0.9f, float beta2 = 0.999f,
-          float eps = 1e-8f, bool bias_correction = true);
+          float eps = 1e-8f, bool bias_correction = true,
+          float lora_lr_scale = 10.0f);
 
     // 收集 cgraph 中所有带梯度的 PARAM 参数，初始化一阶/二阶矩缓冲。
     // 同时记录每个参数的 no_weight_decay 标志。模型结构不变时只需调用一次。
     void init_from_graph(ComputeGraph* cgraph);
+
+    // LoRA 参数 lr 放大倍率（TENSOR_FLAG_LORA 标记，默认 10.0）
+    float lora_lr_scale() const { return lora_lr_scale_; }
+    void  set_lora_lr_scale(float s) { lora_lr_scale_ = s; }
 
     // 单步更新：须在 build_backward_expand + graph_compute(+clip_grad_norm) 之后调用。
     void step(ComputeGraph* cgraph);
@@ -61,7 +66,8 @@ private:
     struct ParamState {
         TensorF32*         param;
         bool               no_weight_decay;
-        float              se3_lr_scale = 1.0f;  // SE3 参数分层 lr 缩放（TENSOR_FLAG_SE3 时 0.1）
+        float              se3_lr_scale  = 1.0f;  // SE3 参数分层 lr 缩放（TENSOR_FLAG_SE3 时 0.01）
+        float              lora_lr_scale = 1.0f;  // LoRA 参数分层 lr 缩放（TENSOR_FLAG_LORA 时放大）
         std::vector<float> m;   // 一阶矩
         std::vector<float> v;   // 二阶矩
     };
@@ -73,6 +79,7 @@ private:
     float beta2_;
     float eps_;
     bool  bias_correction_;
+    float lora_lr_scale_ = 10.0f;   // LoRA 参数 lr 放大倍率（默认 10.0）
     int   step_count_ = 0;
 };
 

@@ -105,17 +105,35 @@ public:
     // 获取权重指针（加载/保存用）
     TensorF32* weight() { return weight_; }
     TensorF32* bias()   { return bias_; }
-    
+
+    // ===== LoRA 低秩微调 =====
+    // 冻结主权重（去 PARAM 标，断梯度；权值保留参与前向）
+    void freeze() {
+        if (weight_) weight_->flag &= ~TENSOR_FLAG_PARAM;
+        if (bias_)   bias_->flag   &= ~TENSOR_FLAG_PARAM;
+    }
+    // 启用 LoRA：分配旁路 A/B（A 存 [in,rank]，B 存 [rank,out]，与 weight_ 同布局），
+    // A~N(0,0.02)、B=0（初始旁路输出=0，不破坏预训练权重）。默认同时冻结主权重。
+    void enable_lora(int rank, float alpha);
+    // LoRA 旁路访问（save/load/调试用）
+    TensorF32* lora_A()  { return lora_A_; }
+    TensorF32* lora_B()  { return lora_B_; }
+    int   lora_rank()  const { return lora_rank_; }
+    float lora_alpha() const { return lora_alpha_; }
+
 private:
     void init_weights();
-        
-    
+    void lora_init();   // A~N(0,σ), B=0
+
     int in_features_, out_features_;
     bool has_bias_;
     TensorF32* weight_ = nullptr;  // ← 改为指针, Context 管理
     TensorF32* bias_   = nullptr;
-    //TensorF32 weight_;
-    //TensorF32 bias_;
+    // LoRA 旁路：主权重冻结，仅训 A/B
+    TensorF32* lora_A_  = nullptr;   // dims=[in, rank]  （mul_mat 的 b 作转置，K=in 最内）
+    TensorF32* lora_B_  = nullptr;   // dims=[rank, out] （mul_mat 的 b 作转置，K=rank 最内）
+    int   lora_rank_  = 0;
+    float lora_alpha_ = 0.f;
 };
 
 // LayerNorm

@@ -51,10 +51,16 @@ void print_system_info() {
         for (int d = 0; d < dev_count; ++d) {
             cudaDeviceProp prop;
             if (cudaGetDeviceProperties(&prop, d) == cudaSuccess) {
+                // Tensor Core 判定: CC>=7.0(Volta 起)即支持; 唯一例外是 Turing GTX 16 系
+                const bool is_gtx16 = (std::strstr(prop.name, "GTX 16") != nullptr) ||
+                                      (std::strstr(prop.name, "GTX1650") != nullptr) ||
+                                      (std::strstr(prop.name, "GTX1660") != nullptr);
+                const bool has_tc = (prop.major >= 7) && !is_gtx16;
                 std::cout << "  GPU[" << d << "] : " << prop.name
                           << ", compute " << prop.major << "." << prop.minor
                           << ", VRAM " << std::fixed << std::setprecision(2)
                           << (prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0)) << " GB"
+                          << ", Tensor Core " << (has_tc ? "YES" : "no")
                           << std::endl;
             }
         }
@@ -985,6 +991,25 @@ int main(int argc, char* argv[]) {
         (std::getenv("PPML_USE_CUDA") != nullptr) && (std::atoi(std::getenv("PPML_USE_CUDA")) != 0);
     model.to(use_cuda ? Device::CUDA : Device::CPU);
     model.train();
+
+    // ---- LoRA 低秩微调 (PPML_LORA_RANK>0) ----
+    // 在 load_weights/首次 forward 之前启用：给 (PPML_LORA_SUBSTR 过滤的) LinearLayer
+    // 注入 A/B 旁路并冻结主权重。旁路参数自动进入 collect_params → GGUF 保存/AdamW 优化。
+    if (const char* plr = std::getenv("PPML_LORA_RANK")) {
+        const int  lora_rank  = std::atoi(plr);
+        const float lora_alpha = std::getenv("PPML_LORA_ALPHA")
+                                     ? (float)std::atof(std::getenv("PPML_LORA_ALPHA")) : 16.f;
+        const std::string substr = std::getenv("PPML_LORA_SUBSTR")
+                                       ? std::string(std::getenv("PPML_LORA_SUBSTR")) : "";
+        if (lora_rank > 0) {
+            int n = model.enable_lora_all(lora_rank, lora_alpha, substr);
+            if (n == 0) {
+                std::cerr << "[lora] WARN: 无匹配层启用 LoRA (substr=\"" << substr << "\")" << std::endl;
+            }
+        } else {
+            std::cerr << "[lora] PPML_LORA_RANK=" << lora_rank << " 无效, 忽略" << std::endl;
+        }
+    }
 
     // ---- 多样本训练分支 (PPML_MULTI_SAMPLE=1) ----
     // 在 training_batch_data/ 中跨多个蛋白做梯度累加训练 (FULL_TRAIN N=512 固定)。

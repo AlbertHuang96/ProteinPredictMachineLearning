@@ -685,4 +685,78 @@ void mean_cuda(const float * src, float * dst, long long n) {
     sum_impl(src, dst, n, inv_n);
 }
 
+// ============================================================
+// OP_REPEAT_BACK: 归约（repeat 的逆操作，梯度和）
+// 语义（对齐 CPU kernel_repeat_back，仅支持同 ndim，即 src 与 dst 尾部对齐且
+//       src 各维 = dst 各维 × 整数重复因子）:
+//   dst[j] = Σ_{k} src[j + k*dd] ，其中对每个维度 d:
+//     - dd[d] = dst 该维大小，ne0d = src 该维大小，重复因子 rd[d] = ne0d / dd[d]
+//     - k 遍历 [0, rd[d])。
+// 结构: 每线程一个 dst 元素，单线程串行累加所有重复拷贝（原结构，无 warp reduce）。
+// 越界防护: 原版只检查 tid0>=ne0 就 return，tid1/tid2/tid3 越界线程会越界写 dst；
+//          本版改为 3D grid-stride 全覆盖：tid23 在 kernel 内按 gridDim.z*blockDim.z
+//          步进遍历，tid0/tid1 越界 return，tid2/tid3 由 tid23<ne2*ne3 保证合法。
+// 使用场景: OP_ADD/OP_MUL/OP_REPEAT 反向中 repeat_back(grad, src)。
+// ============================================================
+template <typename T>
+__global__ void repeat_back_kernel(
+    const T * __restrict__ src, T * __restrict__ dst,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+    const int64_t ne0,  const int64_t ne1,  const int64_t ne2,  const int64_t ne3) {
+    const int64_t tid0  = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    const int64_t tid1  = int64_t(blockIdx.y) * blockDim.y + threadIdx.y;
+    // tid23 覆盖 [0, ne2*ne3)，grid-stride 遍历防 gridDim.z 超限（原版只算一次）
+    const int64_t tid23_base   = int64_t(blockIdx.z) * blockDim.z + threadIdx.z;
+    const int64_t tid23_stride = int64_t(gridDim.z) * blockDim.z;
+    // 越界防护：tid0/tid1 越界直接退出（原版只查 tid0）
+    if (tid0 >= ne0 || tid1 >= ne1) return;
+    for (int64_t tid23 = tid23_base; tid23 < ne2 * ne3; tid23 += tid23_stride) {
+        const int64_t tid2 = tid23 % ne2;
+        const int64_t tid3 = tid23 / ne2;
+        T sum = 0;
+        for (int64_t i3 = tid3; i3 < ne03; i3 += ne3) {
+            for (int64_t i2 = tid2; i2 < ne02; i2 += ne2) {
+                for (int64_t i1 = tid1; i1 < ne01; i1 += ne1) {
+                    for (int64_t i0 = tid0; i0 < ne00; i0 += ne0) {
+                        sum += src[((i3 * ne02 + i2) * ne01 + i1) * ne00 + i0];
+                    }
+                }
+            }
+        }
+        dst[(tid3 * ne2 + tid2) * ne1 * ne0 + tid1 * ne0 + tid0] = sum;
+    }
+}
+
+void repeat_back_cuda(
+    const float * src, float * dst,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3) {
+    if (ne00 <= 0 || ne0 <= 0) return;
+    if (ne01 <= 0) ne01 = 1;
+    if (ne02 <= 0) ne02 = 1;
+    if (ne03 <= 0) ne03 = 1;
+    if (ne1  <= 0) ne1  = 1;
+    if (ne2  <= 0) ne2  = 1;
+    if (ne3  <= 0) ne3  = 1;
+
+    // block 总线程数须 ≤ 1024 (32*8*4 = 1024)。曾用 BLOCK_Z=32 使 32*8*32=8192 超限 → launch 静默失败。
+    constexpr int BLOCK_X = 32;
+    constexpr int BLOCK_Y = 8;
+    constexpr int BLOCK_Z = 4;
+
+    const int64_t grid_x = (ne0 + BLOCK_X - 1) / BLOCK_X;
+    const int64_t grid_y = (ne1 + BLOCK_Y - 1) / BLOCK_Y;
+    const int64_t grid_z = (ne2 * ne3 + BLOCK_Z - 1) / BLOCK_Z;
+
+    dim3 block(BLOCK_X, BLOCK_Y, BLOCK_Z);
+    // gridDim.z 硬件上限 65535，超出部分由 kernel 内 tid23 grid-stride 兜底
+    const int64_t gz = (grid_z > 65535) ? 65535 : grid_z;
+    dim3 grid((unsigned)grid_x, (unsigned)grid_y, (unsigned)gz);
+    repeat_back_kernel<float><<<grid, block>>>(
+        src, dst,
+        ne00, ne01, ne02, ne03,
+        ne0,  ne1,  ne2,  ne3);
+    cudaCheck(cudaGetLastError());
+}
+
 } // namespace ppml

@@ -8,13 +8,14 @@
 namespace ppml {
 
 AdamW::AdamW(float lr, float weight_decay, float beta1, float beta2,
-             float eps, bool bias_correction)
+             float eps, bool bias_correction, float lora_lr_scale)
     : lr_(lr),
       weight_decay_(weight_decay),
       beta1_(beta1),
       beta2_(beta2),
       eps_(eps),
-      bias_correction_(bias_correction)
+      bias_correction_(bias_correction),
+      lora_lr_scale_(lora_lr_scale)
 {}
 
 void AdamW::init_from_graph(ComputeGraph* cgraph) {
@@ -33,7 +34,8 @@ void AdamW::init_from_graph(ComputeGraph* cgraph) {
         // SE3 等变参数：梯度尺度与主图不匹配（offset→坐标→FAPE 链放大），用分层小 lr。
         // 2026-08-24: 0.1→0.01（新版 a_rows 正确 shape 后 SE3 权重梯度 l2~1e25，
         //   0.1 分层仍致权重漂移/epoch2 爆炸；降到 0.01 减缓更新步长）。
-        s.se3_lr_scale     = (node->flag & TENSOR_FLAG_SE3) ? 0.01f : 1.0f;
+        s.se3_lr_scale     = (node->flag & TENSOR_FLAG_SE3)  ? 0.01f : 1.0f;
+        s.lora_lr_scale    = (node->flag & TENSOR_FLAG_LORA) ? lora_lr_scale_ : 1.0f;
         s.m.assign(static_cast<size_t>(n), 0.0f);
         s.v.assign(static_cast<size_t>(n), 0.0f);
         states_.push_back(std::move(s));
@@ -96,7 +98,8 @@ void AdamW::step(ComputeGraph* cgraph) {
         float* m = s.m.data();
         float* v = s.v.data();
         const bool nod = s.no_weight_decay;
-        const float s3 = s.se3_lr_scale;   // SE3 参数分层 lr 缩放（默认 1.0，SE3 0.1）
+        // SE3 与 LoRA 分层 lr 可叠加（不同 flag 不冲突）：最终缩放 = 两者乘积
+        const float lr_scale = s.se3_lr_scale * s.lora_lr_scale;
 
         for (int64_t i = 0; i < n; ++i) {
             const float gi = g[static_cast<size_t>(i)];
@@ -107,14 +110,14 @@ void AdamW::step(ComputeGraph* cgraph) {
             v[i] = b2 * v[i] + (1.0f - b2) * gi * gi;
 
             // decoupled AdamW 更新：
-            //   p -= lr * m_hat / (sqrt(v_hat) + eps) + lr * wd * p
+            //   p -= lr * lr_scale * m_hat / (sqrt(v_hat) + eps) + lr * lr_scale * wd * p
             //   weight_decay 不进 m/v，且 no_weight_decay 参数跳过 wd 项
             const float m_hat = m[i] / bc1;
             const float v_hat = v[i] / bc2;
-            const float update = lr * s3 * m_hat / (std::sqrt(v_hat) + eps);
+            const float update = lr * lr_scale * m_hat / (std::sqrt(v_hat) + eps);
             w[static_cast<size_t>(i)] -= update;
             if (wd != 0.0f && !nod) {
-                w[static_cast<size_t>(i)] -= lr * s3 * wd * w[static_cast<size_t>(i)];
+                w[static_cast<size_t>(i)] -= lr * lr_scale * wd * w[static_cast<size_t>(i)];
             }
         }
 

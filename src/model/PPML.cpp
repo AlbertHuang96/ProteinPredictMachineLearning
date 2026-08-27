@@ -3616,17 +3616,34 @@ void PPMLModel::collect_all_params(std::vector<TensorF32*>& param_tensors) {
 // ============================================================
 void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors,
                                           std::vector<std::string>& param_names) {
+    collect_params_with_names(param_tensors, param_names, nullptr);
+}
+
+void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors,
+                                          std::vector<std::string>& param_names,
+                                          std::vector<LinearLayer*>* linear_layers_out) {
     // 辅助 lambda：收集 LinearLayer / LayerNorm / EmbeddingLayer 的参数及名字
     // 注：param_tensors 与 param_names 必须严格一一对应（save_checkpoint 校验数量一致）。
     // 之前用 `if(!param_names.empty())` 守卫名字，导致从空向量开始时名字永远不 push → 数量不匹配 bug。
     auto collect_linear = [&](LinearLayer* ll, const std::string& name) {
-        if (ll && ll->weight()) {
+        if (!ll) return;
+        if (linear_layers_out) linear_layers_out->push_back(ll);   // 每层收集一次（LoRA 用）
+        if (ll->weight()) {
             param_tensors.push_back(ll->weight());
             param_names.push_back(name + ".weight");
         }
-        if (ll && ll->bias()) {
+        if (ll->bias()) {
             param_tensors.push_back(ll->bias());
             param_names.push_back(name + ".bias");
+        }
+        // LoRA 旁路参数（A/B）：启用后追加（命名 <name>.lora_A/.lora_B，含 rank 维度）
+        if (ll->lora_A()) {
+            param_tensors.push_back(ll->lora_A());
+            param_names.push_back(name + ".lora_A");
+        }
+        if (ll->lora_B()) {
+            param_tensors.push_back(ll->lora_B());
+            param_names.push_back(name + ".lora_B");
         }
     };
     auto collect_layernorm = [&](LayerNorm* ln, const std::string& name) {
@@ -3854,6 +3871,73 @@ void PPMLModel::collect_params_with_names(std::vector<TensorF32*>& param_tensors
         collect_linear(refine_embed_e2_[i], b + ".embed_e2");
         collect_layernorm(refine_norm_edge2_[i], b + ".norm_edge2");
     }
+}
+
+// ===== LoRA 低秩微调 =====
+// 收集所有 LinearLayer 指针（与 collect_params_with_names 的遍历顺序一致，每层一次）。
+std::vector<LinearLayer*> PPMLModel::collect_linear_layers() {
+    std::vector<TensorF32*> tmp;
+    std::vector<std::string> names;
+    std::vector<LinearLayer*> layers;
+    collect_params_with_names(tmp, names, &layers);
+    return layers;
+}
+
+int PPMLModel::enable_lora_all(int rank, float alpha, const std::string& name_substr) {
+    std::vector<TensorF32*> tmp;
+    std::vector<std::string> names;
+    std::vector<LinearLayer*> layers;
+    collect_params_with_names(tmp, names, &layers);
+
+    int n = 0;
+    // names 与 layers 一一对应（collect_linear 每层 push 一次 layers，且 weight/bias 顺序）
+    // 但 collect_linear 在 weight 前 push layer，故每层对应名字 = 第一个属于它的名字 (name.weight)。
+    // 更稳健：用 "x.weight" 前缀匹配。layers 顺序 == 每个 collect_linear 调用顺序，但名字
+    // 可能含 weight/bias 两项 → 需按层聚合名字。改为：收集时记录层名，这里用遍历对齐：
+    // 由于 layers 数量 = 有 weight 或 bias 的层数（每 collect_linear 一次），而 names 含
+    // weight+bias+lora 多项，无法直接一一对齐。故采用双收集：先收集 (layers, 每层首名)。
+    // 简化：直接遍历 layers，用 weight 指针在 tmp 中反查所属名字。
+    std::vector<std::string> layer_names;
+    layer_names.reserve(layers.size());
+    for (LinearLayer* ll : layers) {
+        // 找到该层 weight 在 tmp 中的索引 → 对应 names 里的名字（去尾 .weight/.bias）
+        std::string nm;
+        for (size_t i = 0; i < tmp.size(); ++i) {
+            if (tmp[i] == (ll->weight() ? ll->weight() : ll->bias())) {
+                nm = names[i];
+                break;
+            }
+        }
+        // 去掉 ".weight"/".bias" 后缀得层名
+        const std::string suffix_w = ".weight";
+        const std::string suffix_b = ".bias";
+        if (nm.size() > suffix_w.size() && nm.compare(nm.size()-suffix_w.size(), suffix_w.size(), suffix_w) == 0)
+            nm = nm.substr(0, nm.size() - suffix_w.size());
+        else if (nm.size() > suffix_b.size() && nm.compare(nm.size()-suffix_b.size(), suffix_b.size(), suffix_b) == 0)
+            nm = nm.substr(0, nm.size() - suffix_b.size());
+        layer_names.push_back(nm);
+    }
+
+    for (size_t i = 0; i < layers.size(); ++i) {
+        if (!name_substr.empty() && layer_names[i].find(name_substr) == std::string::npos) continue;
+        if (layers[i]->lora_rank() > 0) continue;   // 已启用，跳过
+        layers[i]->enable_lora(rank, alpha);
+        n++;
+    }
+    if (n > 0) {
+        std::cerr << "[lora] enable_lora_all: rank=" << rank << " alpha=" << alpha
+                  << " substr=\"" << name_substr << "\" → " << n << " layers" << std::endl;
+    }
+    return n;
+}
+
+void PPMLModel::freeze_all() {
+    std::vector<TensorF32*> tmp;
+    std::vector<std::string> names;
+    std::vector<LinearLayer*> layers;
+    collect_params_with_names(tmp, names, &layers);
+    for (LinearLayer* ll : layers) ll->freeze();
+    std::cerr << "[lora] freeze_all: " << layers.size() << " linear layers frozen" << std::endl;
 }
 
 std::vector<TensorF32*> PPMLModel::params() {

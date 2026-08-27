@@ -27,6 +27,8 @@ enum tensor_flag {
     //     不置位 = 动态一次性常量（如 dropout 随机掩码，Gallocr 填充后清空+shrink const_data_）。
     TENSOR_FLAG_SE3     = 128,          // SE3 等变模块参数：梯度尺度与主图不匹配（offset 直接连坐标，
     //     FAPE 梯度经 coords→offset→SE3 权重放大），AdamW 对其用分层小 lr（se3_lr_scale，默认 0.1）。
+    TENSOR_FLAG_LORA    = 256,          // LoRA 低秩旁路参数（A/B）：冻结主权重，仅训旁路。
+    //     AdamW 对其用放大 lr（lora_lr_scale，默认 10.0），微调通常比预训练 lr 高 1~2 个量级。
 };
 
 enum tensor_type {

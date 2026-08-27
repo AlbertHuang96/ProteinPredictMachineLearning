@@ -274,6 +274,160 @@ TEST(CudaBackendTest, Concat) {
     cudaFree(la->data()); cudaFree(lb->data());
 }
 
+// ============================================================
+// OP_REPEAT_BACK：归约（repeat 的逆操作，梯度和）
+//   dst[j] = Σ_k src[j + k*dd]，每维 k ∈ [0, src_dim/dst_dim)。
+//   CUDA kernel 为「原结构：每线程一 dst 元素，串行累加所有重复拷贝」，
+//   越界修复：tid0/tid1 越界 return + tid23 grid-stride 覆盖。
+//   本测试用多个形状（含非 block 整数倍维度，触发越界线程路径）与 CPU 参考对比。
+// ============================================================
+
+// CPU 参考：同 ndim 的 repeat_back（对齐 CPUBackend::kernel_repeat_back）
+// src_dims/dst_dims 为 ggml 布局（dims[0] 最内维）。
+std::vector<float> repeat_back_reference(
+    const std::vector<float>& src,
+    const std::vector<int64_t>& src_dims,
+    const std::vector<int64_t>& dst_dims) {
+    const int64_t sd[4] = {
+        src_dims.size() > 0 ? src_dims[0] : 1,
+        src_dims.size() > 1 ? src_dims[1] : 1,
+        src_dims.size() > 2 ? src_dims[2] : 1,
+        src_dims.size() > 3 ? src_dims[3] : 1};
+    const int64_t dd[4] = {
+        dst_dims.size() > 0 ? dst_dims[0] : 1,
+        dst_dims.size() > 1 ? dst_dims[1] : 1,
+        dst_dims.size() > 2 ? dst_dims[2] : 1,
+        dst_dims.size() > 3 ? dst_dims[3] : 1};
+    const int64_t rd[4] = {sd[0]/dd[0], sd[1]/dd[1], sd[2]/dd[2], sd[3]/dd[3]};
+
+    const int64_t total = dd[0]*dd[1]*dd[2]*dd[3];
+    std::vector<float> dst(total, 0.f);
+    for (int64_t idx = 0; idx < total; ++idx) {
+        int64_t t = idx;
+        const int64_t j0 = t % dd[0]; t /= dd[0];
+        const int64_t j1 = t % dd[1]; t /= dd[1];
+        const int64_t j2 = t % dd[2]; t /= dd[2];
+        const int64_t j3 = t;
+        float sum = 0.f;
+        for (int64_t k0 = 0; k0 < rd[0]; k0++) {
+            const int64_t s0 = j0 + k0*dd[0];
+            for (int64_t k1 = 0; k1 < rd[1]; k1++) {
+                const int64_t s1 = j1 + k1*dd[1];
+                for (int64_t k2 = 0; k2 < rd[2]; k2++) {
+                    const int64_t s2 = j2 + k2*dd[2];
+                    for (int64_t k3 = 0; k3 < rd[3]; k3++) {
+                        const int64_t s3 = j3 + k3*dd[3];
+                        sum += src[((s3*sd[2] + s2)*sd[1] + s1)*sd[0] + s0];
+                    }
+                }
+            }
+        }
+        dst[idx] = sum;
+    }
+    return dst;
+}
+
+// 运行 CUDA repeat_back 并返回结果
+std::vector<float> run_cuda_repeat_back(
+    const std::vector<float>& src_data,
+    const std::vector<int64_t>& src_dims,
+    const std::vector<int64_t>& dst_dims) {
+    PPMLContext& ctx = context();
+    TensorF32* la = make_device_leaf(ctx, src_dims, src_data);
+    TensorF32* out = make_node(ctx, OP_REPEAT_BACK, dst_dims, la);
+
+    ComputeGraph* g = ComputeGraph::new_graph(&ctx);
+    g->build_forward_expand(out);
+
+    CUDABackend backend(0);
+    EXPECT_EQ(backend.graph_compute(g), Status::SUCCESS);  // helper 非 void，用 EXPECT
+    backend.synchronize();
+
+    std::vector<float> got;
+    copy_to_host(out, got);
+    cudaFree(la->data());
+    return got;
+}
+
+TEST(CudaBackendTest, RepeatBack2D) {
+    if (!cuda_available()) { GTEST_SKIP() << "CUDA 不可用"; }
+
+    // src [4,12] → dst [2,3]：ne0 重复 2x，ne1 重复 4x。
+    // 非 block 整数倍维度（ne0=2, ne1=3）触发越界线程路径。
+    const std::vector<int64_t> src_dims = {4, 12};
+    const std::vector<int64_t> dst_dims = {2, 3};
+    const int64_t n_src = 4*12;
+    std::vector<float> src(n_src);
+    for (int i = 0; i < n_src; ++i) src[i] = (float)(i % 17) * 0.5f - 3.f;
+
+    std::vector<float> got = run_cuda_repeat_back(src, src_dims, dst_dims);
+    std::vector<float> exp = repeat_back_reference(src, src_dims, dst_dims);
+
+    ASSERT_EQ(got.size(), exp.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], exp[i], 1e-4f) << "i=" << i;
+    }
+}
+
+TEST(CudaBackendTest, RepeatBack3D) {
+    if (!cuda_available()) { GTEST_SKIP() << "CUDA 不可用"; }
+
+    // src [6,10,3] → dst [3,5,3]：ne0 重复 2x，ne1 重复 2x，ne2 相同。
+    const std::vector<int64_t> src_dims = {6, 10, 3};
+    const std::vector<int64_t> dst_dims = {3, 5, 3};
+    const int64_t n_src = 6*10*3;
+    std::vector<float> src(n_src);
+    for (int i = 0; i < n_src; ++i) src[i] = (float)(i % 23) * 0.25f + 1.f;
+
+    std::vector<float> got = run_cuda_repeat_back(src, src_dims, dst_dims);
+    std::vector<float> exp = repeat_back_reference(src, src_dims, dst_dims);
+
+    ASSERT_EQ(got.size(), exp.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], exp[i], 1e-4f) << "i=" << i;
+    }
+}
+
+TEST(CudaBackendTest, RepeatBack4D) {
+    if (!cuda_available()) { GTEST_SKIP() << "CUDA 不可用"; }
+
+    // src [2,3,4,6] → dst [2,3,2,2]：ne2 重复 2x，ne3 重复 3x。
+    // 覆盖 tid23 折叠（ne2*ne3=4*6=24 > BLOCK_Z=32? 否, 但 ne2*ne3 非 BLOCK_Z 整数倍）
+    const std::vector<int64_t> src_dims = {2, 3, 4, 6};
+    const std::vector<int64_t> dst_dims = {2, 3, 2, 2};
+    const int64_t n_src = 2*3*4*6;
+    std::vector<float> src(n_src);
+    for (int i = 0; i < n_src; ++i) src[i] = (float)(i % 31) * 0.1f - 2.f;
+
+    std::vector<float> got = run_cuda_repeat_back(src, src_dims, dst_dims);
+    std::vector<float> exp = repeat_back_reference(src, src_dims, dst_dims);
+
+    ASSERT_EQ(got.size(), exp.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], exp[i], 1e-4f) << "i=" << i;
+    }
+}
+
+// 训练真实场景：msa 掩码广播 [1,1,N,1] → [D,L,N,B] 的逆归约
+// （src 为 repeat 后的梯度 [D,L,N,B]，dst 归约回 [1,1,N,1]）。
+TEST(CudaBackendTest, RepeatBackMask4D) {
+    if (!cuda_available()) { GTEST_SKIP() << "CUDA 不可用"; }
+
+    const std::vector<int64_t> src_dims = {256, 12, 8, 2};  // [D,L,N,B]
+    const std::vector<int64_t> dst_dims = {1, 1, 8, 2};     // [1,1,N,B]
+    const int64_t n_src = 256*12*8*2;
+    std::vector<float> src(n_src);
+    for (int i = 0; i < n_src; ++i) src[i] = (float)(i % 5) - 2.f;
+
+    std::vector<float> got = run_cuda_repeat_back(src, src_dims, dst_dims);
+    std::vector<float> exp = repeat_back_reference(src, src_dims, dst_dims);
+
+    ASSERT_EQ(got.size(), exp.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        EXPECT_NEAR(got[i], exp[i], 1e-4f) << "i=" << i;
+    }
+}
+
 // LayerNorm（OP_NORM）：每行独立归一化（不带 affine）
 TEST(CudaBackendTest, LayerNorm) {
     if (!cuda_available()) { GTEST_SKIP() << "CUDA 不可用"; }

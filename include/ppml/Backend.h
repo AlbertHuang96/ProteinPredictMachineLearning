@@ -765,6 +765,7 @@ private:
     static void kernel_sum_cuda      (TensorF32 * node, Status* st);
     static void kernel_mean_cuda     (TensorF32 * node, Status* st);
     static void kernel_concat_cuda   (TensorF32 * node, Status* st);
+    static void kernel_repeat_back_cuda(TensorF32 * node, Status* st);
 
     // SE3 消息传递三件套（方案 B）+ per_edge_matmul 反向核
     static void kernel_edge_gather_rows_cuda (TensorF32 * node, ComputeParams * p);

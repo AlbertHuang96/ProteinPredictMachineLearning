@@ -478,7 +478,23 @@ public:
     // param_names[i] 与 param_tensors[i] 严格对应, 不可交错。
     void collect_params_with_names(std::vector<TensorF32*>& param_tensors,
                                    std::vector<std::string>& param_names);
-    
+
+    // 可选输出：收集所有 LinearLayer 指针（与 collect_params 的收集顺序一致，
+    // 每个收集到 weight/bias 的层出现一次）。供 LoRA 启用/冻结用。
+    // 注：该参数为可选；不传则行为与旧版完全一致。
+    void collect_params_with_names(std::vector<TensorF32*>& param_tensors,
+                                   std::vector<std::string>& param_names,
+                                   std::vector<LinearLayer*>* linear_layers_out);
+
+    // ===== LoRA 低秩微调 =====
+    // 收集所有 LinearLayer 指针（与 collect_params_with_names 遍历顺序一致）
+    std::vector<LinearLayer*> collect_linear_layers();
+    // 对 (name 含 substr；空=全部) 的 LinearLayer 启用 LoRA 旁路并冻结主权重。
+    // 返回启用数量。须在 load_weights/第一次 forward 之前调用。
+    int enable_lora_all(int rank, float alpha, const std::string& name_substr = "");
+    // 冻结全部主权重（LoRA 微调时通常只需旁路可训练；也可配合 enable_lora 单独冻结）
+    void freeze_all();
+
     // 设备管理
     void to(Device device);
     Device device() const;

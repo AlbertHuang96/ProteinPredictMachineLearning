@@ -155,6 +155,24 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             // mean 复用同一 kernel 最终标量乘 1/N）
             return true;
 
+        case OP_REPEAT_BACK: {
+            // 2026-08-27：OP_REPEAT_BACK CUDA kernel（原结构：每线程一 dst 元素，串行累加
+            // 所有重复拷贝；越界已修复）。仅支持同 ndim 且 src/dst 各维整数倍（CUDA kernel
+            // 为 4D 对齐布局）；跨 ndim 广播（src 前导维多于 dst）回落 CPU。
+            if (!src0) return false;
+            if (src0->type != TENSOR_TYPE_F32 || node->type != TENSOR_TYPE_F32) return false;
+            const int nd_src = src0->shape().ndim();
+            const int nd_dst = node->shape().ndim();
+            if (nd_src != nd_dst) return false;   // 跨 ndim 广播 → CPU
+            // 各维 src/dst 需整数倍（保证归约次数 rd>=1 无除零）
+            for (int d = 0; d < 4; d++) {
+                const int64_t sd = (d < nd_src) ? src0->shape().dims[d] : 1;
+                const int64_t dd = (d < nd_dst) ? node->shape().dims[d] : 1;
+                if (dd <= 0 || sd % dd != 0) return false;
+            }
+            return true;
+        }
+
         // ===== kernel 为空函数体或 NOT_SUPPORTED，暂不支持 =====
         // OP_DUP      → kernel_dup_cuda 空函数体，无实现
         // OP_ADD1     → kernel_add1_cuda 返回 NOT_SUPPORTED
