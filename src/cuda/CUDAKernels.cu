@@ -79,6 +79,58 @@ void layernorm_forward_cuda(
 }
 
 // ============================================================
+// RMS Norm CUDA Kernel (OP_RMS_NORM)
+// 语义对齐 CPU kernel_rms_norm (CPUKernels.cpp:1218):
+//   dst[d] = src[d] * 1/sqrt(mean(src^2) + eps) ，沿 dims[0](最内维, 长 ncols) 归一化
+// 布局: 每 block 处理一行 (nrows 行, 每行 ncols 列)
+//   一个 warp(32 线程) 瓜分一行的 ncols 列 → 串行步长 WARP_SIZE 累加 x^2
+//   → __shfl_xor_sync 蝴蝶全归约(所有 32 lane 都拿到 sum, 后续每个线程都要用 scale)
+//   → 每个线程写回自己那列 dst = scale * x
+// 前置条件: ncols % WARP_SIZE == 0 (与参考实现一致, 不满足时回落 CPU)
+// ============================================================
+#define WARP_SIZE 32
+
+__global__ void rms_norm_f32_kernel(
+    const float * x, float * dst, const int ncols, const float eps) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+
+    float tmp = 0.0f; // partial sum: 每个线程累加 (ncols/32) 个 x^2
+    for (int col = tid; col < ncols; col += WARP_SIZE) {
+        const float xi = x[(int64_t)row * ncols + col];
+        tmp += xi * xi;
+    }
+
+    // warp 内蝴蝶全归约: 5 轮后所有 32 个 lane 都持有整行的 x^2 之和
+    // 用 __shfl_xor_sync (全归约) 而非 __shfl_down_sync:
+    //   RMS 归约后每个线程都要用 scale 写自己那列, xor 一次归约即广播到全员;
+    //   down 只把和归到 lane0, 还需额外一次 __shfl_sync(tmp,0) 广播, 多一跳。
+    #pragma unroll
+    for (int mask = WARP_SIZE / 2; mask > 0; mask >>= 1) {
+        tmp += __shfl_xor_sync(0xffffffff, tmp, mask, WARP_SIZE);
+    }
+
+    const float mean  = tmp / ncols;          // mean(x^2)
+    const float scale = rsqrtf(mean + eps);   // 1/sqrt(mean+eps)
+
+    for (int col = tid; col < ncols; col += WARP_SIZE) {
+        dst[(int64_t)row * ncols + col] = scale * x[(int64_t)row * ncols + col];
+    }
+}
+
+void rms_norm_cuda(const float * x, float * dst,
+                   const int64_t ncols, const int64_t nrows,
+                   const float eps, cudaStream_t stream) {
+    if (ncols <= 0 || nrows <= 0) return;
+    // 前置: ncols 必须 32 整除, 否则每个 warp 覆盖不完整行, 回落 CPU
+    if (ncols % WARP_SIZE != 0) return;
+    const dim3 block_dims(WARP_SIZE, 1, 1);
+    rms_norm_f32_kernel<<<(unsigned)nrows, block_dims, 0, stream>>>(
+        x, dst, (int)ncols, eps);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
 // LayerNorm Backward CUDA Kernel
 // ============================================================
 

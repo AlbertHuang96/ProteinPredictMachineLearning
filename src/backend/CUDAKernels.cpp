@@ -48,6 +48,12 @@ extern void repeat_back_cuda(
     int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
     int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3);
 
+// OP_RMS_NORM（实现于 src/cuda/CUDAKernels.cu）：沿 dims[0] 归一化 dst=x/sqrt(mean(x²)+eps)
+// 前置: ncols % 32 == 0，否则 CUDA 侧直接 return，由调度回落 CPU
+extern void rms_norm_cuda(const float * x, float * dst,
+                          int64_t ncols, int64_t nrows,
+                          float eps, cudaStream_t stream);
+
 // N-ary concat：srcs/start/len 均须为 device 指针（见 concat_nary_cuda）。
 // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致。
 extern void concat_nary_cuda(
@@ -145,6 +151,17 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             const float * bias   = nullptr;
 
             layernorm_forward_cuda(out, mean, rstd, inp, weight, bias, rows, 1, C, 256);
+        } break;
+
+        case OP_RMS_NORM: {
+            // 沿 dims[0] (最内维) 归一化。dst = src / sqrt(mean(src^2)+eps)
+            // supports_op 已保证: F32 + dims[0] % 32 == 0 (CUDA kernel warp 每行 32 线程瓜分)
+            int C    = static_cast<int>(node->shape().dims[0]);
+            int rows = static_cast<int>(node->numel() / C);
+            const float * inp = node->src[0]->data();
+            float * out       = node->data();
+            const float eps   = reinterpret_cast<const float&>(node->op_params[0]);
+            rms_norm_cuda(inp, out, C, rows, eps, /*stream=*/0);
         } break;
 
         case OP_NORM_BACK:

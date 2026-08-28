@@ -149,6 +149,14 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_NORM_BACK:
             return true;
 
+        case OP_RMS_NORM:
+            // 2026-08-28: CUDA kernel (rms_norm_cuda) 已实现, 沿 dims[0] 归一化。
+            // 前置: F32 + 最内维长度 % 32 == 0 (warp 每行 32 线程瓜分)。
+            // 非 32 倍数由 supports_op 返回 false → 整个 op 回落到 CPU 后端,
+            // 不能在 CUDA dispatch 内联 CPU 计算 (device 指针不可在 host 解引用)。
+            if (!src0 || src0->type != TENSOR_TYPE_F32) return false;
+            return node->shape().dims[0] % 32 == 0;
+
         case OP_SUM:
         case OP_MEAN:
             // 2026-08-25：OP_SUM/OP_MEAN 全元素归约已实现（warp shuffle 两级规约 + atomicAdd，
@@ -187,7 +195,6 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_SCALE:
         case OP_CPY:
         case OP_SET_ROWS:
-        case OP_RMS_NORM:
         case OP_GET_ROWS_BACK:
         case OP_FLASH_ATTN_EXT:
         case OP_FLASH_ATTN_BACK:
