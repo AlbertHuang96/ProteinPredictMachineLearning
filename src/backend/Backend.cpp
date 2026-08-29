@@ -3,6 +3,7 @@
 #include "ppml/Context.h"
 #include <algorithm>
 #include <cstring>
+#include <cstdio>
 #include <cuda_runtime.h>   // cudaMemGetInfo 用于 GPU 显存预算
 
 namespace ppml {
@@ -247,6 +248,20 @@ bool BackendScheduler::alloc_splits() {
 // ============================================================
 Buffer* alloc_buffer(BufferType* buft, size_t size, BufferUsage usage) {
     if (!buft) return nullptr;
+
+    // 诊断（2026-08-29）：打印每次 buffer 分配的大小与类型。
+    // 触发环境变量: PPML_DEBUG_ALLOC=1（打印全部分配）;
+    // 始终打印 >=1GB 的大分配（定位 OOM/预留失败）。
+    const char* buf_name = buft->get_name();
+    const size_t size_gb = size / (1024ull * 1024ull * 1024ull);
+    if (getenv("PPML_DEBUG_ALLOC") != nullptr || size >= (1024ull*1024ull*1024ull)) {
+        fprintf(stderr, "[alloc-buffer] %-20s size=%.2f GB (%zu bytes)\n",
+                buf_name, (double)size / (1024.0*1024.0*1024.0), size);
+        if (size_gb > 40) {
+            fprintf(stderr, "[alloc-buffer] ⚠️ 超大分配(>40GB) type=%s size=%.2f GB\n",
+                    buf_name, (double)size / (1024.0*1024.0*1024.0));
+        }
+    }
 
     // 零大小：返回空 buffer（对标 ggml 的 dummy buffer）
     if (size == 0) {

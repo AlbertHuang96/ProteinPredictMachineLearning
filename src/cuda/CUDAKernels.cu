@@ -131,6 +131,103 @@ void rms_norm_cuda(const float * x, float * dst,
 }
 
 // ============================================================
+// OP_GET_ROWS (embedding 查表前向) CUDA kernel
+// 简化 2D 版, 对齐 CPU kernel_get_rows (CPUKernels.cpp:1928):
+//   W   (N, M) 行主序, dims[0]=N 行数, dims[1]=M 行内长
+//   idx (K,)   float-encoded int 行索引
+//   dst (K, M) 行主序: dst[k,:] = W[idx[k],:]
+// 越界: 与 CPU 一致 —— idx<0 钳到 0, idx>=N 钳到 N-1
+// 并行: blockIdx.x → 行 k (每行一个 block);
+//       行内 M 维由 blockIdx.y*blockDim.x + threadIdx.x grid-stride 覆盖
+// ============================================================
+__global__ void get_rows_f32_kernel(
+    const float * __restrict__ W,   // (N, M)
+    const float * __restrict__ idx, // (K,)
+    float       * __restrict__ dst, // (K, M)
+    const int64_t N, const int64_t M, const int64_t K) {
+
+    const int64_t k = blockIdx.x;                 // 一个 block 处理一行 dst[k,:]
+    if (k >= K) return;
+
+    // 读行索引并钳制 (对齐 CPU: i<0→0, i>=N→N-1)
+    const float idxv = idx[k];
+    int64_t i = (int64_t)idxv;
+    if (i < 0)    i = 0;
+    if (i >= N)   i = N - 1;
+
+    // 沿 M 维 grid-stride 拷贝 (合并访存: W[i*M+m] 与 dst[k*M+m] 均连续)
+    const float * __restrict__ src_row = W + i * M;
+    float       * __restrict__ dst_row = dst + k * M;
+    const int64_t tid = blockIdx.y * blockDim.x + threadIdx.x;
+    const int64_t stride = gridDim.y * blockDim.x;
+    for (int64_t m = tid; m < M; m += stride) {
+        dst_row[m] = src_row[m];
+    }
+}
+
+void get_rows_cuda(const float * W, const float * idx, float * dst,
+                   int64_t N, int64_t M, int64_t K, cudaStream_t stream) {
+    if (N <= 0 || M <= 0 || K <= 0) return;
+
+    // block: 每 block 256 线程; grid.x = K 行, grid.y 覆盖 M 维 (gridDim.y 上限 65535)
+    constexpr int BLOCK = 256;
+    const int64_t need_y = (M + BLOCK - 1) / BLOCK;
+    const int64_t gy = (need_y > 65535) ? 65535 : need_y;
+    dim3 grid((unsigned)K, (unsigned)gy, 1);
+    dim3 block(BLOCK, 1, 1);
+
+    get_rows_f32_kernel<<<grid, block, 0, stream>>>(W, idx, dst, N, M, K);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_GET_ROWS_BACK (embedding 查表反向) CUDA kernel — 方案 A
+// 对齐 CPU kernel_get_rows_back (CPUKernels.cpp:1961):
+//   dy (K,M) 上游梯度, idx(K,) float-encoded 行索引, W (N,M) 取形状
+//   dst dW (N,M): 先清零, 再按 idx 散点累加 dW[i,:] += dy[k,:]
+// 越界: i<0 || i>=N 丢弃 (对齐 CPU)
+// 并行: 每线程处理一个 grad 行 k 的一列 col, atomicAdd 累加
+//   → O(K*M) 复杂度 (对齐 CPU), 同一 dst 行被多 k 引用时 atomic 保证正确
+// dst 清零由 host 侧 cudaMemset 完成 (对齐 CPU memset)
+// ============================================================
+__global__ void get_rows_back_scatter_kernel(
+    const float * __restrict__ dy,   // (K, M)
+    const float * __restrict__ idx,  // (K,)
+    float       * __restrict__ dW,   // (N, M) 已清零
+    const int64_t N, const int64_t M, const int64_t K) {
+
+    // 线程网格: x → k, y → col (M 维分块)
+    const int64_t k = blockIdx.x;
+    if (k >= K) return;
+    const int64_t i = (int64_t)idx[k];
+    if (i < 0 || i >= N) return;   // 越界丢弃 (对齐 CPU)
+
+    const int64_t col = blockIdx.y * blockDim.x + threadIdx.x;
+    const int64_t stride = gridDim.y * blockDim.x;
+    for (int64_t c = col; c < M; c += stride) {
+        atomicAdd(&dW[i * M + c], dy[k * M + c]);
+    }
+}
+
+void get_rows_back_cuda(const float * dy, const float * idx, float * dW,
+                        int64_t N, int64_t M, int64_t K, cudaStream_t stream) {
+    if (N <= 0 || M <= 0 || K <= 0) return;
+
+    // 先清零 (对齐 CPU: memset 0 再散点累加)
+    cudaMemset(dW, 0, (size_t)N * M * sizeof(float));
+
+    // block: 每 block 256 线程; grid.x = K (grad 行), grid.y 覆盖 M 维
+    constexpr int BLOCK = 256;
+    const int64_t need_y = (M + BLOCK - 1) / BLOCK;
+    const int64_t gy = (need_y > 65535) ? 65535 : need_y;
+    dim3 grid((unsigned)K, (unsigned)gy, 1);
+    dim3 block(BLOCK, 1, 1);
+
+    get_rows_back_scatter_kernel<<<grid, block, 0, stream>>>(dy, idx, dW, N, M, K);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
 // LayerNorm Backward CUDA Kernel
 // ============================================================
 

@@ -64,6 +64,7 @@ bool CUDABackend::supports_buffer_type(const BufferType* buft) const {
 bool CUDABackend::supports_op(TensorF32* node) const {
     const TensorF32* src0 = node->src[0];
     const TensorF32* src1 = node->src[1];
+    const TensorF32* src2 = node->src[2];
 
     // 诊断二分：PPML_CUDA_DISABLE_OPS 指定要强制回落 CPU 的 op（数字，逗号/空格分隔）。
     // 用于定位哪个 CUDA kernel 有越界/异步崩溃：逐个把可疑 op 禁掉，看崩溃是否消失。
@@ -143,6 +144,23 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             return src0->type == TENSOR_TYPE_F32 &&
                    src1->type == TENSOR_TYPE_F32;
 
+        case OP_GET_ROWS:
+            // 2026-08-29: CUDA kernel (get_rows_cuda) 已实现, embedding 查表。
+            // 前置: W/idx/dst 均 F32; idx 须 1D; W 须 2D (N,M)。
+            // 越界钳制 (i<0→0, i>=N→N-1) 已在 kernel 内处理, 无需额外约束。
+            if (!src0 || !src1) return false;
+            if (src0->type != TENSOR_TYPE_F32 || src1->type != TENSOR_TYPE_F32 ||
+                node->type != TENSOR_TYPE_F32) return false;
+            return src1->shape().ndim() == 1 && src0->shape().ndim() == 2;
+
+        case OP_GET_ROWS_BACK:
+            // 2026-08-29: CUDA kernel (get_rows_back_cuda) 已实现, 反向散点累加。
+            // 前置: dy/idx/W 均 F32; idx 须 1D; W 须 2D (N,M)。越界丢弃已在 kernel 内处理。
+            if (!src0 || !src1 || !src2) return false;
+            if (src0->type != TENSOR_TYPE_F32 || src1->type != TENSOR_TYPE_F32 ||
+                src2->type != TENSOR_TYPE_F32 || node->type != TENSOR_TYPE_F32) return false;
+            return src1->shape().ndim() == 1 && src2->shape().ndim() == 2;
+
         case OP_NORM:
             return true;
 
@@ -195,7 +213,6 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_SCALE:
         case OP_CPY:
         case OP_SET_ROWS:
-        case OP_GET_ROWS_BACK:
         case OP_FLASH_ATTN_EXT:
         case OP_FLASH_ATTN_BACK:
         case OP_CROSS_ENTROPY_LOSS:

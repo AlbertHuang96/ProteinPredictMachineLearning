@@ -54,6 +54,18 @@ extern void rms_norm_cuda(const float * x, float * dst,
                           int64_t ncols, int64_t nrows,
                           float eps, cudaStream_t stream);
 
+// OP_GET_ROWS（实现于 src/cuda/CUDAKernels.cu）：embedding 查表
+//   W (N,M) 行主序, idx(K,) float-encoded 行索引 → dst(K,M) 行主序
+//   越界钳制: i<0→0, i>=N→N-1 (对齐 CPU kernel_get_rows)
+extern void get_rows_cuda(const float * W, const float * idx, float * dst,
+                          int64_t N, int64_t M, int64_t K, cudaStream_t stream);
+
+// OP_GET_ROWS_BACK（实现于 src/cuda/CUDAKernels.cu）：embedding 查表反向
+//   dy(K,M) 梯度, idx(K,) 行索引 → dW(N,M) 先清零再散点累加 (atomicAdd)
+//   越界: i<0||i>=N 丢弃 (对齐 CPU kernel_get_rows_back)
+extern void get_rows_back_cuda(const float * dy, const float * idx, float * dW,
+                               int64_t N, int64_t M, int64_t K, cudaStream_t stream);
+
 // N-ary concat：srcs/start/len 均须为 device 指针（见 concat_nary_cuda）。
 // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致。
 extern void concat_nary_cuda(
@@ -185,6 +197,42 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
         case OP_REPEAT_BACK:
             kernel_repeat_back_cuda(node, &st);
             break;
+
+        case OP_GET_ROWS: {
+            // embedding 查表: W (N,M), idx(K,) → dst (K,M)
+            // 布局对齐 CPU kernel_get_rows (CPUKernels.cpp:1928)
+            const TensorF32* W   = node->src[0];
+            const TensorF32* idx = node->src[1];
+            if (!W || !idx || !W->data() || !idx->data()) {
+                st = Status::NOT_SUPPORTED;
+                break;
+            }
+            const int64_t N = W->shape().dims[0];
+            const int64_t M = W->shape().dims[1];
+            const int64_t K = idx->shape().dims[0];
+            get_rows_cuda(W->data(), idx->data(), node->data(),
+                          N, M, K, /*stream=*/0);
+            st = Status::SUCCESS;
+        } break;
+
+        case OP_GET_ROWS_BACK: {
+            // 反向: dy(K,M), idx(K,) → dW(N,M) 清零+散点累加
+            // 对齐 CPU kernel_get_rows_back (CPUKernels.cpp:1961)
+            // src0=dy, src1=idx, src2=W(取形状 N,M), dst=dW
+            const TensorF32* dy  = node->src[0];
+            const TensorF32* idx = node->src[1];
+            const TensorF32* W   = node->src[2];
+            if (!dy || !idx || !W || !dy->data() || !idx->data()) {
+                st = Status::NOT_SUPPORTED;
+                break;
+            }
+            const int64_t N = W->shape().dims[0];
+            const int64_t M = W->shape().dims[1];
+            const int64_t K = idx->shape().dims[0];
+            get_rows_back_cuda(dy->data(), idx->data(), node->data(),
+                               N, M, K, /*stream=*/0);
+            st = Status::SUCCESS;
+        } break;
 
         // ===== 无实现的 op：统一返回 NOT_SUPPORTED =====
         default:
