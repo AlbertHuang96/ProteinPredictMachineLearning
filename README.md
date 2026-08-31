@@ -39,7 +39,7 @@ Env: Intel i5-1335U 12 Core / 15 GB RAM / NVIDIA GeForce RTX 2050 4GB (compute 8
 | 4/5   | 25045    | 23489        | 2.85e-05  | 0.11 |
 | 5/5   | 25942    | 24138        | 2.85e-05  | 0.11 |
 
-GPU stat（nvidia-smi 1s sample，112 sample points）: VRAM peak 3923/4096 MiB (95.8%), usage 99%, avg usage 2.8%, nonzero sample 8.9%
+GPU stat（nvidia-smi 1s sample，112 sample points）: VRAM peak 3923/4096 MiB (95.8%), usage peak 99%, avg usage 2.8%, nonzero sample 8.9%
 显存峰值 3923/4096 MiB (95.8%) / 利用率峰值 99% / 平均利用率 2.8% / 非零采样占比 8.9%
 
 - 5 epoch finished EXIT=0，loss limited, grad_norm stable=0.11
