@@ -4,6 +4,7 @@
 #include "ppml/Backend.h"
 #include <cstdlib>
 #include <cstdio>
+#include <cstring>
 
 namespace ppml {
 
@@ -149,15 +150,32 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
     // 混训时 scheduler 已通过 reserve_graph_memory 预分配了全部张量，置 skip_alloc_=true，
     // 这里跳过本端自己的 gallocr，避免两套 gallocr 反复 re-bind 张量导致跨 split 读到错位 buffer。
     if (!skip_alloc_) {
-        // 释放上一图分配的 buffer（上一图消费方已在上次 graph_compute 返回后读取完 data()）。
-        gallocr_.release();
-        // ⚠️ need_alloc 必须恒 true：release() 已释放全部 buffer 并复位快照内节点 data()，
-        //    但跨图共享节点（SE3 的 compute_and_read 独立 cg 与主图共享 backend gallocr_）
-        //    的 data() 可能仍非空且指向已释放 buffer —— 若依赖 data()==nullptr 判定跳过
-        //    重新分配，主图 compute 就会读悬垂指针 → SIGSEGV（[ELEM-PTR] 显示 data 非空仍崩）。
-        //    skip_alloc_=true（scheduler 预分配）时整个分支跳过，不受影响。
-        bool need_alloc = true;
-        if (need_alloc) {
+        // ---- needs_realloc 接入（2026-08-31，单后端 CPU）：布局未变则复用 buffer ----
+        // 复用前提：can_reuse（已分配过 && has_snapshot && !needs_realloc）→ 不 release、
+        // 不重建，直接 alloc 走复用路径（只重绑 data）。解决跨 graph_compute buffer 悬垂。
+        // 回退开关：PPML_NO_GALLOCR_REUSE=1 时走原逻辑（每轮 release + reserve + alloc）。
+        // 注意：can_reuse 只对"图结构/张量大小未变"成立；compute_and_read 增量图 n_nodes
+        //   每次变化 → needs_realloc 恒 true → 走重建（无回归）。
+        bool gallocr_reuse = true;
+        if (getenv("PPML_NO_GALLOCR_REUSE")) {
+            gallocr_reuse = (std::strcmp(getenv("PPML_NO_GALLOCR_REUSE"), "1") != 0);
+        }
+        if (gallocr_reuse && gallocr_.can_reuse(cgraph)) {
+            gallocr_.backends()[0].buft = CPUBufferType::instance();
+            auto backend_id_of = [](TensorF32*) -> int { return 0; };
+            if (!gallocr_.alloc(cgraph, backend_id_of, 1)) {
+                return Status::ALLOC_FAILED;
+            }
+        } else {
+            // 释放上一图分配的 buffer（上一图消费方已在上次 graph_compute 返回后读取完 data()）。
+            gallocr_.release();
+            // ⚠️ need_alloc 必须恒 true：release() 已释放全部 buffer 并复位快照内节点 data()，
+            //    但跨图共享节点（SE3 的 compute_and_read 独立 cg 与主图共享 backend gallocr_）
+            //    的 data() 可能仍非空且指向已释放 buffer —— 若依赖 data()==nullptr 判定跳过
+            //    重新分配，主图 compute 就会读悬垂指针 → SIGSEGV（[ELEM-PTR] 显示 data 非空仍崩）。
+            //    skip_alloc_=true（scheduler 预分配）时整个分支跳过，不受影响。
+            bool need_alloc = true;
+            if (need_alloc) {
             gallocr_.set_n_backends(1);
             gallocr_.backends()[0].buft = CPUBufferType::instance();
             auto backend_id_of = [](TensorF32*) -> int { return 0; };
@@ -175,7 +193,8 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
                         gallocr_.backend_peak(0),
                         gallocr_.backend_peak(0) / (1024.0 * 1024.0 * 1024.0));
             }
-        }
+            }
+        }   // else（重建路径）闭合
     }
 
     // ---- 提交前单线程解析所有 view src ----

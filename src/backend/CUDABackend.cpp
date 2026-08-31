@@ -181,6 +181,15 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             // mean 复用同一 kernel 最终标量乘 1/N）
             return true;
 
+        case OP_REPEAT:
+            // 2026-08-31：OP_REPEAT 前向 CUDA kernel（简化版：一维 grid-stride +
+            // 尾部对齐取模，对齐 CPU kernel_repeat）。仅需 F32 + src0 存在；
+            // 跨 ndim 广播（src 缺维/维=1）由 kernel 内"缺维取模 1"统一处理，
+            // 无需 REPEAT_BACK 的同 ndim/整除限制（整除性由 repeat() helper 保证，
+            // dispatch 内仍作防御性校验）。
+            if (!src0) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
         case OP_REPEAT_BACK: {
             // 2026-08-27：OP_REPEAT_BACK CUDA kernel（原结构：每线程一 dst 元素，串行累加
             // 所有重复拷贝；越界已修复）。仅支持同 ndim 且 src/dst 各维整数倍（CUDA kernel
@@ -199,20 +208,58 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             return true;
         }
 
+        case OP_SET_ROWS:
+            // 2026-08-31: OP_SET_ROWS CUDA kernel（散点覆写，对齐 CPU kernel_set_rows）。
+            // 前置: a/c/dst 均 F32; a 须 2D(N,M); b 须 1D(K,); c 须 2D 且 (K,M)。
+            if (!src0 || !src1 || !src2) return false;
+            if (src0->type != TENSOR_TYPE_F32 || src1->type != TENSOR_TYPE_F32 ||
+                src2->type != TENSOR_TYPE_F32 || node->type != TENSOR_TYPE_F32) return false;
+            if (src0->shape().ndim() != 2 || src1->shape().ndim() != 1 || src2->shape().ndim() != 2)
+                return false;
+            return src0->shape().dims[0] == src2->shape().dims[0] &&  // N
+                   src0->shape().dims[1] == src2->shape().dims[1];     // M
+
+        case OP_SCALE:
+            // 2026-08-31: OP_SCALE CUDA kernel（dst = src*s，s 在 op_params[0]）。
+            // 前置: F32 + src0 存在。
+            if (!src0) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
+        case OP_ADD1:
+            // 2026-08-31: OP_ADD1 CUDA kernel（dst = src + b，b 为 src[1] 标量，D2H 读取）。
+            // 前置: F32 + src0/src1 存在 + src1 为标量。
+            if (!src0 || !src1) return false;
+            if (src0->type != TENSOR_TYPE_F32 || src1->type != TENSOR_TYPE_F32 ||
+                node->type != TENSOR_TYPE_F32) return false;
+            return src1->numel() == 1;
+
+        case OP_MAX_ALL:
+            // 2026-08-31: OP_MAX_ALL CUDA kernel（全元素归约 max → 标量，跳 NaN）。
+            // 前置: F32 + src0 存在。
+            if (!src0) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
+        case OP_SUM_ROWS:
+            // 2026-08-31: OP_SUM_ROWS CUDA kernel（block-per-row，沿最内维归约）。
+            // 前置: F32 + src0 存在。
+            if (!src0) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
+        case OP_RELU_BACK:
+            // 2026-08-31: OP_RELU_BACK CUDA kernel（relu 梯度：x>0 透传 grad，否则 0）。
+            // 前置: F32 + src0/src1 存在。
+            if (!src0 || !src1) return false;
+            return src0->type == TENSOR_TYPE_F32 && src1->type == TENSOR_TYPE_F32 &&
+                   node->type == TENSOR_TYPE_F32;
+
         // ===== kernel 为空函数体或 NOT_SUPPORTED，暂不支持 =====
         // OP_DUP      → kernel_dup_cuda 空函数体，无实现
-        // OP_ADD1     → kernel_add1_cuda 返回 NOT_SUPPORTED
-        // OP_SCALE    → kernel_scale_cuda 返回 NOT_SUPPORTED
         // OP_CPY      → dispatch_node 中无 case
-        // OP_SET_ROWS → dispatch_node 中无 case
         // UNARY_OP_*  → kernel_relu/gelu/sigmoid/silu/tanh/exp_cuda 均为空函数体
 
         // ===== 未实现的 op =====
         case OP_DUP:
-        case OP_ADD1:
-        case OP_SCALE:
         case OP_CPY:
-        case OP_SET_ROWS:
         case OP_FLASH_ATTN_EXT:
         case OP_FLASH_ATTN_BACK:
         case OP_CROSS_ENTROPY_LOSS:
@@ -258,23 +305,40 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
     // ---- no_alloc 延迟分配：对 data_==nullptr 的中间节点分配 GPU buffer ----
     // 混训时 scheduler 已预分配，置 skip_alloc_=true 跳过，避免两套 gallocr 冲突。
     if (!skip_alloc_) {
-        gallocr_.release();
-        bool need_alloc = false;
-        for (int i = 0; i < cgraph->n_nodes(); ++i) {
-            if (cgraph->graph_node(i)->data() == nullptr) { need_alloc = true; break; }
+        // ---- needs_realloc 接入（2026-08-31，单后端 GPU）：布局未变则复用 buffer ----
+        // 同 CPU：can_reuse（已分配过 && has_snapshot && !needs_realloc）成立则复用
+        // （不 release、不重建，只重绑 data）。注意 can_reuse 须在 release 前判断——
+        // 原逻辑先 release 再按 data()==nullptr 判定，release 已清空 data() 恒 need_alloc。
+        // 回退开关：PPML_NO_GALLOCR_REUSE=1 时走原逻辑（每轮 release + 判定 + 重建）。
+        bool gallocr_reuse = true;
+        if (getenv("PPML_NO_GALLOCR_REUSE")) {
+            gallocr_reuse = (std::strcmp(getenv("PPML_NO_GALLOCR_REUSE"), "1") != 0);
         }
-        if (!need_alloc) {
-            for (int i = 0; i < cgraph->n_leafs(); ++i) {
-                if (cgraph->graph_leaf(i)->data() == nullptr) { need_alloc = true; break; }
-            }
-        }
-        if (need_alloc) {
-            gallocr_.set_n_backends(1);
+        if (gallocr_reuse && gallocr_.can_reuse(cgraph)) {
             gallocr_.backends()[0].buft = const_cast<BufferType*>(buffer_type());
             auto backend_id_of = [](TensorF32*) -> int { return 0; };
-            if (!gallocr_.reserve(cgraph, backend_id_of, 1) ||
-                !gallocr_.alloc(cgraph, backend_id_of, 1)) {
+            if (!gallocr_.alloc(cgraph, backend_id_of, 1)) {
                 return Status::ALLOC_FAILED;
+            }
+        } else {
+            gallocr_.release();
+            bool need_alloc = false;
+            for (int i = 0; i < cgraph->n_nodes(); ++i) {
+                if (cgraph->graph_node(i)->data() == nullptr) { need_alloc = true; break; }
+            }
+            if (!need_alloc) {
+                for (int i = 0; i < cgraph->n_leafs(); ++i) {
+                    if (cgraph->graph_leaf(i)->data() == nullptr) { need_alloc = true; break; }
+                }
+            }
+            if (need_alloc) {
+                gallocr_.set_n_backends(1);
+                gallocr_.backends()[0].buft = const_cast<BufferType*>(buffer_type());
+                auto backend_id_of = [](TensorF32*) -> int { return 0; };
+                if (!gallocr_.reserve(cgraph, backend_id_of, 1) ||
+                    !gallocr_.alloc(cgraph, backend_id_of, 1)) {
+                    return Status::ALLOC_FAILED;
+                }
             }
         }
     }

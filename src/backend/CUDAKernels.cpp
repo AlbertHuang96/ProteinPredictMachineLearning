@@ -21,6 +21,15 @@ extern void elementwise_add_cuda(float * A, float * B, float * C, int N, int blo
 extern void elementwise_sub_cuda(float * A, float * B, float * C, int N, int block_size);
 extern void elementwise_mul_cuda(float * A, float * B, float * C, int N, int block_size);
 extern void elementwise_div_cuda(float * A, float * B, float * C, int N, int block_size);
+
+// 广播逐元素 op（实现于 src/cuda/CUDAKernels.cu）：dst[i] = op(a[i%an], b[i%bn])
+// 对齐 CPU kernel_elemwise 的"尾部对齐后缀"广播语义；eop: 0=add 1=sub 2=mul 3=div
+extern void bcast_elemwise_cuda(
+    const float * a, const float * b, float * dst,
+    int64_t n, int64_t an, int64_t bn, int eop);
+
+// OP_ADD1 前向（实现于 src/cuda/CUDAKernels.cu）：dst[i] = src[i] + b（b 标量，D2H 读取）
+extern void add1_cuda(const float * src, float * dst, float b, int64_t n);
 extern void softmax_cuda(float * input, float * output, int M, int N, int block_size);
 extern void softmax_backward_cuda(
     const float * grad, const float * output, float * dst,
@@ -41,12 +50,40 @@ extern void unary_cuda(const float * src, float * dst, int N, int uop, int block
 extern void sum_cuda(const float * src, float * dst, long long n);
 extern void mean_cuda(const float * src, float * dst, long long n);
 
+// OP_MAX_ALL 全元素归约（实现于 src/cuda/CUDAKernels.cu）：max → 标量，跳 NaN
+extern void max_all_cuda(const float * src, float * dst, long long n);
+
+// OP_SUM_ROWS 沿最内维归约（实现于 src/cuda/CUDAKernels.cu）：每行一个 block，
+// grid=nrows，dst[row] = Σ_{col<ncols} src[row*ncols+col]
+extern void sum_rows_cuda(const float * src, float * dst, int64_t ncols, int64_t nrows);
+
+// OP_RELU_BACK（实现于 src/cuda/CUDAKernels.cu）：dst[i] = (x[i]>0) ? grad[i] : 0
+extern void relu_back_cuda(const float * grad, const float * x, float * dst, int64_t n);
+
 // OP_REPEAT_BACK 归约（实现于 src/cuda/CUDAKernels.cu）：src(大) → dst(小)，dst[j]=Σ src[j+k*dd]
 // 仅支持同 ndim（src 各维 = dst 各维 × 整数重复因子），跨 ndim 广播由 CPU 回落。
 extern void repeat_back_cuda(
     const float * src, float * dst,
     int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
     int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3);
+
+// OP_REPEAT 前向（实现于 src/cuda/CUDAKernels.cu）：dst[j] = src[s]，s_d = j_d % src_dims[d]
+// 简化版：一维 grid-stride + 尾部对齐取模，dst 各维须为 src 各维整数倍；
+// src 缺维/维=1 由 kernel 内"缺维取模 1"统一处理（跨 ndim 广播）。
+extern void repeat_cuda(
+    const float * src, float * dst,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3);
+
+// OP_SET_ROWS 前向（实现于 src/cuda/CUDAKernels.cu）：散点覆写，对齐 CPU kernel_set_rows。
+// dst = a 全量拷贝（保留未覆盖行），再把 c[k] 覆写到 b[k] 指定行（越界钳制）。
+// a/c/dst 严格 2D(N,M)，b 为 (K,) float 编码索引。重复索引预扫在包装函数内（宿主 D2H）。
+extern void set_rows_cuda(
+    const float * a, const float * b, const float * c, float * dst,
+    int64_t N, int64_t M, int64_t K);
+
+// OP_SCALE 前向（实现于 src/cuda/CUDAKernels.cu）：dst[i] = scale * x[i]
+extern void scale_cuda(const float * x, float * dst, float scale, int64_t nelements);
 
 // OP_RMS_NORM（实现于 src/cuda/CUDAKernels.cu）：沿 dims[0] 归一化 dst=x/sqrt(mean(x²)+eps)
 // 前置: ncols % 32 == 0，否则 CUDA 侧直接 return，由调度回落 CPU
@@ -194,6 +231,30 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             kernel_mean_cuda(node, &st);
             break;
 
+        case OP_MAX_ALL:
+            kernel_max_all_cuda(node, &st);
+            break;
+
+        case OP_SUM_ROWS:
+            kernel_sum_rows_cuda(node, &st);
+            break;
+
+        case OP_RELU_BACK:
+            kernel_relu_back_cuda(node, &st);
+            break;
+
+        case OP_ADD1:
+            kernel_add1_cuda(node, &st);
+            break;
+
+        case OP_SCALE:
+            kernel_scale_cuda(node, &st);
+            break;
+
+        case OP_REPEAT:
+            kernel_repeat_cuda(node, &st);
+            break;
+
         case OP_REPEAT_BACK:
             kernel_repeat_back_cuda(node, &st);
             break;
@@ -212,6 +273,24 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             const int64_t K = idx->shape().dims[0];
             get_rows_cuda(W->data(), idx->data(), node->data(),
                           N, M, K, /*stream=*/0);
+            st = Status::SUCCESS;
+        } break;
+
+        case OP_SET_ROWS: {
+            // 散点覆写: a(N,M) 拷贝 + b[k] 行覆写 c[k]（对齐 CPU kernel_set_rows）
+            // src0=a 目标, src1=b 行索引(K,), src2=c 值源(K,M), dst=(N,M)
+            const TensorF32* a = node->src[0];
+            const TensorF32* b = node->src[1];
+            const TensorF32* c = node->src[2];
+            if (!a || !b || !c || !a->data() || !b->data() || !c->data()) {
+                st = Status::NOT_SUPPORTED;
+                break;
+            }
+            const int64_t N = a->shape().dims[0];
+            const int64_t M = a->shape().dims[1];
+            const int64_t K = b->shape().dims[0];
+            set_rows_cuda(a->data(), b->data(), c->data(), node->data(),
+                          N, M, K);
             st = Status::SUCCESS;
         } break;
 
@@ -261,35 +340,39 @@ void CUDABackend::kernel_unary_cuda(TensorF32 * node, unary_op uop, ComputeParam
 // ============================================================
 
 void CUDABackend::kernel_elemwise_add_cuda(TensorF32 * node, ComputeParams * p) {
-    int N = static_cast<int>(node->numel());
-    float * A = node->src[0]->data();
-    float * B = node->src[1]->data();
-    float * C = node->data();
-    elementwise_add_cuda(A, B, C, N, 256);
+    (void)p;
+    const int64_t n  = node->numel();
+    const int64_t an = node->src[0]->numel();
+    const int64_t bn = node->src[1]->numel();
+    bcast_elemwise_cuda(node->src[0]->data(), node->src[1]->data(), node->data(),
+                        n, an, bn, /*eop=*/0);
 }
 
 void CUDABackend::kernel_elemwise_sub_cuda(TensorF32 * node, ComputeParams * p) {
-    int N = static_cast<int>(node->numel());
-    float * A = node->src[0]->data();
-    float * B = node->src[1]->data();
-    float * C = node->data();
-    elementwise_sub_cuda(A, B, C, N, 256);
+    (void)p;
+    const int64_t n  = node->numel();
+    const int64_t an = node->src[0]->numel();
+    const int64_t bn = node->src[1]->numel();
+    bcast_elemwise_cuda(node->src[0]->data(), node->src[1]->data(), node->data(),
+                        n, an, bn, /*eop=*/1);
 }
 
 void CUDABackend::kernel_elemwise_mul_cuda(TensorF32 * node, ComputeParams * p) {
-    int N = static_cast<int>(node->numel());
-    float * A = node->src[0]->data();
-    float * B = node->src[1]->data();
-    float * C = node->data();
-    elementwise_mul_cuda(A, B, C, N, 256);
+    (void)p;
+    const int64_t n  = node->numel();
+    const int64_t an = node->src[0]->numel();
+    const int64_t bn = node->src[1]->numel();
+    bcast_elemwise_cuda(node->src[0]->data(), node->src[1]->data(), node->data(),
+                        n, an, bn, /*eop=*/2);
 }
 
 void CUDABackend::kernel_elemwise_div_cuda(TensorF32 * node, ComputeParams * p) {
-    int N = static_cast<int>(node->numel());
-    float * A = node->src[0]->data();
-    float * B = node->src[1]->data();
-    float * C = node->data();
-    elementwise_div_cuda(A, B, C, N, 256);
+    (void)p;
+    const int64_t n  = node->numel();
+    const int64_t an = node->src[0]->numel();
+    const int64_t bn = node->src[1]->numel();
+    bcast_elemwise_cuda(node->src[0]->data(), node->src[1]->data(), node->data(),
+                        n, an, bn, /*eop=*/3);
 }
 
 // doublecheck:
@@ -357,11 +440,31 @@ void CUDABackend::kernel_dup_cuda(TensorF32 * node) {
 }
 
 void CUDABackend::kernel_scale_cuda(TensorF32 * node, Status* st) {
-    (void)node; if (st) *st = Status::NOT_SUPPORTED;
+    // OP_SCALE：dst = src * s（s 存 op_params[0] float 位模式，对齐 CPU kernel_scale）。
+    // ggml scale_f32 参考版带 bias 参数，项目 scale() helper 无 bias（仅标量乘），故省略。
+    if (!node->src[0] || !node->src[0]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const float s   = reinterpret_cast<const float&>(node->op_params[0]);
+    const float * src = node->src[0]->data();
+    float       * dst = node->data();
+
+    scale_cuda(src, dst, s, node->numel());
+    if (st) *st = Status::SUCCESS;
 }
 
 void CUDABackend::kernel_add1_cuda(TensorF32 * node, Status* st) {
-    (void)node; if (st) *st = Status::NOT_SUPPORTED;
+    // OP_ADD1：dst = src + b（b 为 src[1] 标量张量，device 指针 → D2H 读 b[0]，
+    // 对齐 CPU kernel_add1 的 host 读取语义）。
+    if (!node->src[0] || !node->src[1] || !node->src[0]->data() || !node->src[1]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    float b = 0.f;
+    cudaMemcpy(&b, node->src[1]->data(), sizeof(float), cudaMemcpyDeviceToHost);  // 同步小拷贝
+    add1_cuda(node->src[0]->data(), node->data(), b, node->numel());
+    if (st) *st = Status::SUCCESS;
 }
 
 void CUDABackend::kernel_sum_cuda(TensorF32 * node, Status* st) {
@@ -376,6 +479,46 @@ void CUDABackend::kernel_sum_cuda(TensorF32 * node, Status* st) {
     const float* src = node->src[0]->data();
     const long long n = node->src[0]->numel();
     sum_cuda(src, node->data(), n);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_relu_back_cuda(TensorF32 * node, Status* st) {
+    // OP_RELU_BACK：dst[i] = (x[i]>0) ? grad[i] : 0（src0=grad, src1=x，
+    // 对齐 CPU kernel_relu_back；x=0 边界梯度置 0，与 PyTorch 同约定）。
+    if (!node->src[0] || !node->src[1] ||
+        !node->src[0]->data() || !node->src[1]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    relu_back_cuda(node->src[0]->data(), node->src[1]->data(),
+                   node->data(), node->numel());
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_max_all_cuda(TensorF32 * node, Status* st) {
+    // OP_MAX_ALL：全元素归约 max → 标量 [1]（对齐 CPU kernel_max_all：跳 NaN）。
+    if (!node->src[0] || !node->src[0]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    max_all_cuda(node->src[0]->data(), node->data(), node->src[0]->numel());
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_sum_rows_cuda(TensorF32 * node, Status* st) {
+    // OP_SUM_ROWS：沿最内维 dims[0] 归约，输出 {1, dims[1..3]}（对齐 CPU kernel_sum_rows）。
+    // block-per-row：ncols = ne0（行长度），nrows = ne1*ne2*ne3（行数）。
+    if (!node->src[0] || !node->src[0]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const TensorF32* src = node->src[0];
+    const int64_t ne0 = src->shape().dims[0];
+    const int64_t ne1 = (src->shape().ndim() > 1) ? src->shape().dims[1] : 1;
+    const int64_t ne2 = (src->shape().ndim() > 2) ? src->shape().dims[2] : 1;
+    const int64_t ne3 = (src->shape().ndim() > 3) ? src->shape().dims[3] : 1;
+
+    sum_rows_cuda(src->data(), node->data(), ne0, ne1 * ne2 * ne3);
     if (st) *st = Status::SUCCESS;
 }
 
@@ -426,6 +569,62 @@ void CUDABackend::kernel_repeat_back_cuda(TensorF32 * node, Status* st) {
         src0->data(), dst->data(),
         ne00, ne01, ne02, ne03,
         ne0,  ne1,  ne2,  ne3);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_repeat_cuda(TensorF32 * node, Status* st) {
+    // OP_REPEAT 前向：dst[j] = src[s]，s_d = j_d % src_dims[d]。
+    // 与 CPU kernel_repeat 对齐；src[1] 仅为形状模板（不读数据）。
+    // 跨 ndim 广播（src 缺维/维=1）由 kernel 内"缺维取模 1"统一处理。
+    if (!node->src[0] || !node->src[0]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const TensorF32* src0 = node->src[0];
+    TensorF32*       dst  = node;
+
+    const int64_t ne00 = src0->shape().dims[0];
+    const int64_t ne01 = (src0->shape().ndim() > 1) ? src0->shape().dims[1] : 1;
+    const int64_t ne02 = (src0->shape().ndim() > 2) ? src0->shape().dims[2] : 1;
+    const int64_t ne03 = (src0->shape().ndim() > 3) ? src0->shape().dims[3] : 1;
+
+    const int64_t ne0 = dst->shape().dims[0];
+    const int64_t ne1 = (dst->shape().ndim() > 1) ? dst->shape().dims[1] : 1;
+    const int64_t ne2 = (dst->shape().ndim() > 2) ? dst->shape().dims[2] : 1;
+    const int64_t ne3 = (dst->shape().ndim() > 3) ? dst->shape().dims[3] : 1;
+
+    // 防御性校验：dst 各维须为 src 各维整数倍（repeat 语义保证；否则回落 CPU 避免语义偏差）
+    if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0 ||
+        ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || ne03 <= 0 ||
+        ne0 % ne00 != 0 || ne1 % ne01 != 0 || ne2 % ne02 != 0 || ne3 % ne03 != 0) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+
+    repeat_cuda(
+        src0->data(), dst->data(),
+        ne00, ne01, ne02, ne03,
+        ne0,  ne1,  ne2,  ne3);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_set_rows_cuda(TensorF32 * node, Status* st) {
+    // OP_SET_ROWS 前向：dst = a 全量拷贝 + 按 b[k] 覆写 c[k] 行（散点覆写）。
+    // 对齐 CPU kernel_set_rows (CPUKernels.cpp:1873)；严格 2D(N,M)。
+    // 重复索引预扫在 set_rows_cuda 内（宿主侧 D2H，对齐 CPU "有重复则跳过 scatter"）。
+    const TensorF32* a = node->src[0];
+    const TensorF32* b = node->src[1];
+    const TensorF32* c = node->src[2];
+    if (!a || !b || !c || !a->data() || !b->data() || !c->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int64_t N = a->shape().dims[0];
+    const int64_t M = a->shape().dims[1];
+    const int64_t K = b->shape().dims[0];
+
+    set_rows_cuda(a->data(), b->data(), c->data(), node->data(),
+                  N, M, K);
     if (st) *st = Status::SUCCESS;
 }
 
@@ -519,6 +718,15 @@ void CUDABackend::kernel_scatter_add_cuda(TensorF32 * node, ComputeParams * p) {
         fprintf(stderr,
                 "[scatter-ptr] dst type=%d(2=dev,1=host,3=managed,0=unreg) msg type=%d tgt type=%d\n",
                 (int)pa_dst.type, (int)pa_msg.type, (int)pa_tgt.type);
+    }
+    //  诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：进入 scatter 前先清一次错误——
+    //    区分"H2D 拷贝等前置遗留错误"（被 cudaGetLastError 残留捕获）与 scatter 自身 launch 错误。
+    if (getenv("GRAPH_DEBUG_CUDA_SCATTER")) {
+        cudaError_t prior = cudaGetLastError();
+        if (prior != cudaSuccess) {
+            fprintf(stderr, "[scatter-prior-ERR] BEFORE scatter launch: %s\n",
+                    cudaGetErrorString(prior));
+        }
     }
     scatter_add_cuda(msg->data(), tgt_idx->data(), node->data(), N, M, E);
     //  诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：launch 后立即查错误——确认 scatter 自身

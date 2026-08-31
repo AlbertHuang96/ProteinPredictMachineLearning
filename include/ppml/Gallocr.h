@@ -42,6 +42,12 @@ public:
         size_t     alloc_size = 0;   // 对齐后的分配大小（GGML_PAD 后）
         Buffer*    buffer     = nullptr;
         int        backend_id = 0;
+        // ---- needs_realloc 接入（2026-08-31，移植 ggml tensor_alloc 语义）----
+        // 持久化"上次预留"记录：size_max=上次分配的 alloc_size（0=外部/view），
+        // buffer_id=-1 表示该张量上次无需 galloc 分配（外部数据/预分配/view）。
+        // 供 needs_realloc() 在跨 graph_compute 时判断布局是否仍有效。
+        int64_t    size_max   = 0;
+        int        buffer_id  = -1;
     };
 
     // 单后端分配器（一个 backend 对应一个 DynTalloc）
@@ -71,9 +77,26 @@ public:
 
     // Phase 2：按峰值分配 buffer 并绑定张量 data_/buffer_/buffer_offs_。
     //   调用前必须已 reserve()。返回 false 表示失败。
+    //   2026-08-31（needs_realloc 接入）：内部先判 has_snapshot_ && !needs_realloc(graph)
+    //   → 走复用路径 alloc_reuse()（不重建 buffer，只重绑 data，对齐 GGML alloc_graph）；
+    //   否则走重建路径 alloc_rebuild()（原 alloc 实现，保留可回退）。
     bool alloc(ComputeGraph* graph,
                const std::function<int(TensorF32*)>& backend_id_of,
                int n_backends);
+
+    // ---- needs_realloc 接入（2026-08-31，移植 ggml_gallocr_needs_realloc 语义）----
+    // 上次 reserve 是否留有有效快照（reserve 成功置 true，release/reset_state 置 false）
+    bool has_snapshot() const { return has_snapshot_; }
+    // 判断当前 graph 是否能复用上次 reserve 的布局（buffer 无需重建）。
+    // 对齐 GGML：n_nodes/n_leafs 变化、或任一节点 dst/src 预留记录失效
+    // （buffer_id<0 但现需分配；或 size_max < 当前所需大小）→ 需要重分配。
+    // 注意：调用时要求 buffer 仍存活（调用方须在 release 前判断）。
+    bool needs_realloc(ComputeGraph* graph);
+    // 统一复用判定：已实际分配过 buffer（allocated_）且布局未变（has_snapshot_ &&
+    // !needs_realloc）。reserve 仅模拟不分配 buffer，首次 alloc 必须走重建路径。
+    bool can_reuse(ComputeGraph* graph) {
+        return allocated_ && has_snapshot_ && !needs_realloc(graph);
+    }
 
     // 设置后端数量（分配 backends_ 槽位）。在设置 buft / 调用 reserve 前调用。
     void set_n_backends(int n) { backends_.resize(n); }
@@ -109,6 +132,41 @@ private:
     void check_live_overlap(BackendAlloc& ba, const NodeInfo* ni);
     void add_live(BackendAlloc& ba, size_t off, size_t size);
     void remove_live(BackendAlloc& ba, size_t off, size_t size);
+
+    // ---- needs_realloc 接入（2026-08-31）----
+    // 单张量预留记录（对标 ggml tensor_alloc）
+    struct TensorAllocSnap {
+        int    buffer_id = -1;   // -1: 外部/预分配/view（无需 galloc 分配）
+        size_t size_max  = 0;    // 上次预留大小（0: 外部/view）
+        size_t offset    = 0;    // 上次分配偏移（buffer 内）
+    };
+    struct NodeAllocSnap {
+        TensorAllocSnap dst;
+        TensorAllocSnap src[GGML_MAX_SRC];
+    };
+    struct LeafAllocSnap {
+        TensorAllocSnap dst;
+    };
+    // 单张量预留记录是否仍有效（对标 ggml_gallocr_node_needs_realloc）
+    bool node_alloc_valid(TensorF32* t, const TensorAllocSnap& a);
+    // 复用路径：布局未变时用快照直接重绑 data（不重建 buffer，对齐 GGML alloc_graph）
+    bool alloc_reuse(ComputeGraph* graph);
+    // 重建路径：原 alloc 完整实现（2026-08-31 移出保留，可回退）
+    bool alloc_rebuild(ComputeGraph* graph,
+                       const std::function<int(TensorF32*)>& backend_id_of,
+                       int n_backends);
+
+    // 上次 reserve 成功后持久化的预留快照（独立于 nodes_/leaves_，
+    // release()/reset_state() 不清除数组，仅 has_snapshot_=false 使其失效）
+    std::vector<NodeAllocSnap> node_allocs_;
+    std::vector<LeafAllocSnap> leaf_allocs_;
+    int  n_nodes_snap_ = -1;
+    int  n_leafs_snap_ = -1;
+    bool has_snapshot_ = false;
+    // 实际分配过 buffer（alloc_rebuild 成功置 true；release/reset_state 置 false）。
+    // reserve 仅模拟（Phase1 不分配 buffer），故首次 alloc 前 buffer 为空，
+    // 必须走重建路径分配；后续同布局 alloc 才允许走复用路径。
+    bool allocated_     = false;
 
     // Phase1（reserve）记录的每个 managed 张量偏移。Phase2 直接复用该偏移，
     // 使两阶段布局完全一致（消除 best-fit 因 buffer 总大小不同导致的分叉）。

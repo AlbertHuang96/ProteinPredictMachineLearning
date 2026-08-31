@@ -1,9 +1,53 @@
 
 # ProteinPredictMachineLearning Project
 PPML project  
-Inspired by RosettaFoldAllAtom  
+Inspired by RosettaFoldAllAtom(RFAA)
 and   
 llama.cpp and GGML  
+
+## 训练基准 (Training Benchmark)
+
+### Small setting CPU training  
+Env: Intel i5-1335U 12 Core / 15 GB RAM / Pure CPU (LD_PRELOAD libstdc++)
+
+小配置纯 CPU 训练 5 epoch (P62891, L=51, MSA_DEPTH=8, N_EXTRA=1, N_MAIN=2, N_REFINE=1, DEV_SE3=1, SE3_TOPO=per_block 开关B)  
+环境: Intel i5-1335U 12 核 / 15 GB RAM / 纯 CPU (LD_PRELOAD 系统 libstdc++)
+
+| Epoch | 耗时 (ms) | forward (ms) | loss | grad_norm |
+|-------|----------|--------------|------|-----------|
+| 1/5   | 34642    | 25576        | 14.16    | 0.11 |
+| 2/5   | 35859    | 25254        | 15.1777  | 0.11 |
+| 3/5   | 43021    | 28667        | 14.7508  | 0.11 |
+| 4/5   | 38636    | 27085        | 14.3692  | 0.11 |
+| 5/5   | 37338    | 25205        | 14.3877  | 0.11 |
+
+- 5 epoch finished with EXIT=0，loss limited (no NaN)，grad_norm stable=0.11
+- 5 epoch 全部完成 EXIT=0，loss 全有限（无 NaN），grad_norm 稳定 0.11
+
+
+### Small setting hybrid training 5 epoch
+Env: Intel i5-1335U 12 Core / 15 GB RAM / NVIDIA GeForce RTX 2050 4GB (compute 8.6)
+
+小配置混合 CUDA 训练 5 epoch (P62891, L=51, MSA_DEPTH=8, N_EXTRA=1, N_MAIN=2, N_REFINE=1, DEV_SE3=1, SE3_TOPO=per_block 开关B)  
+环境: Intel i5-1335U 12 核 / 15 GB RAM / NVIDIA GeForce RTX 2050 4GB (compute 8.6, Tensor Core YES) / 混合调度 (BackendScheduler, GPU scatter 开启, 未设 PPML_CUDA_NO_SCATTER)
+
+| Epoch | 耗时 (ms) | forward (ms) | loss | grad_norm |
+|-------|----------|--------------|------|-----------|
+| 1/5   | 25972    | 24582        | 0.00      | 0.11 |
+| 2/5   | 25712    | 23931        | 2.85e-05  | 0.11 |
+| 3/5   | 25346    | 23699        | 2.85e-05  | 0.11 |
+| 4/5   | 25045    | 23489        | 2.85e-05  | 0.11 |
+| 5/5   | 25942    | 24138        | 2.85e-05  | 0.11 |
+
+GPU stat（nvidia-smi 1s sample，112 sample points）: VRAM peak 3923/4096 MiB (95.8%), usage 99%, avg usage 2.8%, nonzero sample 8.9%
+显存峰值 3923/4096 MiB (95.8%) / 利用率峰值 99% / 平均利用率 2.8% / 非零采样占比 8.9%
+
+- 5 epoch finished EXIT=0，loss limited, grad_norm stable=0.11
+- 5 epoch 全部完成 EXIT=0，loss 全有限（无 NaN/Inf，0.00 与 2.85e-05 为小配置 loss 分量特征），grad_norm 稳定 0.11
+
+- Mixed mode: about 25.7s per epoch; About 1.47x faster than CPU mode
+- 混合 CPU+GPU：每 epoch ~25.7s（CPU 纯跑 ~37.8s，提速约 1.47×）；GPU 平均利用率低（2.8%）因主要负载仍落 CPU（CPU buffer 峰值 4.35GB vs CUDA 1.11GB）
+
 
 dev/training data:
 
@@ -17,7 +61,7 @@ predict the 3D structure of a protein with limited compute resources,
 i.e. personal computer  
 still leave potential to running on a GPU server  
 or multiplatform deploy  
-Theoretically, it could predict structure of all-atom protein.  
+Theoretically, it could predict structure of a protein including side-chain and all-atom in the near future :)
 
 ### Data pipeline
 preprocessing

@@ -479,6 +479,13 @@ bool is_device_pointer(const TensorF32* src, const float* data) {
     if (src->buffer_) return !src->buffer_->is_host();
     float probe = 0.0f;
     cudaError_t err = cudaMemcpy(&probe, data, sizeof(float), cudaMemcpyDeviceToHost);
+    // ⚠️ 2026-08-31 根因修复：对 host 指针做 D2H 探测必然返回 invalid argument（预期结果，
+    //    说明 data 是 host）。但该失败会残留在 CUDA 错误状态，被后续任意 cudaGetLastError
+    //    捕获 → 误报后续 kernel（如 OP_SCATTER_ADD op=108）invalid argument。
+    //    这里必须清掉探测产生的错误，否则污染错误状态（混合训练 [CUDA-ERR] op=108 真凶）。
+    if (err != cudaSuccess) {
+        cudaGetLastError();  // 清掉探测失败的残留错误
+    }
     return (err == cudaSuccess);
 }
 
@@ -517,6 +524,21 @@ bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
         if (dst->buffer_) {
             dst->buffer_->set_tensor(const_cast<TensorF32*>(dst),
                                      src->data(), dst->buffer_offs_, nbytes);
+            // 诊断（GRAPH_DEBUG_CROSSBK）：H2D 拷贝错误检查——scatter 前的 invalid argument
+            //   真凶常在这里（set_tensor 的 cudaMemcpy 不查返回值，错误残留被后续捕获）。
+            if (getenv("GRAPH_DEBUG_CROSSBK")) {
+                cudaError_t he = cudaGetLastError();
+                if (he != cudaSuccess) {
+                    fprintf(stderr,
+                            "[h2d-ERR] src=%p src_data=%p src_numel=%lld cpy_data=%p cpy_offs=%zu "
+                            "cpy_buf=%p buf_size=%zu nbytes=%zu: %s\n",
+                            (const void*)src, (const void*)src->data(), (long long)src->numel(),
+                            (const void*)dst->data(), (size_t)dst->buffer_offs_,
+                            (const void*)dst->buffer_, dst->buffer_ ? dst->buffer_->size() : 0,
+                            nbytes, cudaGetErrorString(he));
+                    cudaGetLastError();  // 清错误
+                }
+            }
         } else {
             std::memcpy(dst->data(), src->data(), nbytes);
         }
@@ -554,6 +576,28 @@ bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
 // 改用 Gallocr 做延迟分配 + 空间复用：每个后端 buffer 只开峰值大小，
 // 张量沿拓扑序"借/还"复用，替代原来的全量常驻 + bump 分配。
 bool BackendScheduler::reserve_graph_memory() {
+    // ---- needs_realloc 接入（2026-08-31，移植 ggml alloc_graph 懒重建语义）----
+    // 上次 reserve 布局仍有效（图结构/张量大小未变）→ 不 release、不清 reserved_buffers_、
+    // 不重建：直接复用现有 gallocr buffer（alloc 内部走 alloc_reuse 只重绑 data）。
+    // 旧逻辑（无条件 release + reserve + alloc）保留在下方 else 分支。
+    // 注意：compute_and_read 的增量 build_forward_expand 每次图在变（n_nodes 增长）
+    //   → needs_realloc 恒 true → 走重建路径，行为与接入前完全一致（无回归）；
+    //   纯训练（同图反复 compute）才走复用路径——正是要优化的跨调用 buffer 存活场景。
+    if (gallocr_.can_reuse(current_graph_)) {
+        // 复用路径：仍重设 buft 注入（防御 buft 指针变化），然后直接 alloc（走复用分支）。
+        for (int b = 0; b < n_backends_; b++) {
+            gallocr_.backends()[b].buft = const_cast<BufferType*>(bufts_[b]);
+        }
+        auto backend_id_of_reuse = [&](TensorF32* t) -> int {
+            return tensor_backend_id(t, n_backends_ - 1);
+        };
+        if (!gallocr_.alloc(current_graph_, backend_id_of_reuse, n_backends_)) {
+            return false;
+        }
+        // 跨后端拷贝节点（步骤7）的持久 buffer 在 reserved_buffers_ 中，布局未变 → 仍存活。
+        return true;
+    }
+
     // 释放上次分配的 buffer
     reserved_buffers_.clear();
     // 必须先 release 上一轮 gallocr buffer：Gallocr::alloc 每次 push 新 buffer 到

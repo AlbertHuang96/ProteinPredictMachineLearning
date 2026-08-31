@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 namespace ppml {
 
@@ -342,6 +343,69 @@ void elementwise_mul_cuda(float * A, float * B, float * C, int N, int block_size
 void elementwise_div_cuda(float * A, float * B, float * C, int N, int block_size) {
     int grid_size = ceil_div(N, block_size);
     elementwise_div_kernel<<<grid_size, block_size>>>(A, B, C, N);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// 广播逐元素 op（模仿 ggml k_bin_bcast，按项目 CPU kernel_elemwise 语义简化）
+//   dst[i] = op(a[i % an], b[i % bn])
+//   - 项目广播语义：src 是 dst 去掉若干"前导最内维"后的尾部对齐后缀，
+//     扁平序下 src 索引 = i % src_numel（对齐 CPU kernel_elemwise CPUKernels.cpp:447）。
+//   - 与 k_bin_bcast 差异：丢弃 fast_div_modulo/fastmod、逐维取模、uint32 溢出防护
+//     ——项目语义只需全局取模，int64 全程无溢出。
+//   - an==n 时 i%an==i，故"全等/广播"两情形统一用取模，无需分支。
+// 使用场景: OP_ADD/SUB/MUL/DIV 的 bias 广播、seq_emb 广播等（图里大量存在）。
+// ============================================================
+struct op_add_f { __device__ __forceinline__ float operator()(float a, float b) const { return a + b; } };
+struct op_sub_f { __device__ __forceinline__ float operator()(float a, float b) const { return a - b; } };
+struct op_mul_f { __device__ __forceinline__ float operator()(float a, float b) const { return a * b; } };
+struct op_div_f { __device__ __forceinline__ float operator()(float a, float b) const { return a / b; } };
+
+template <typename bin_op>
+__global__ void bcast_elemwise_kernel(
+    const float * __restrict__ a, const float * __restrict__ b, float * __restrict__ dst,
+    const int64_t n, const int64_t an, const int64_t bn, bin_op op) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += int64_t(gridDim.x) * blockDim.x) {
+        dst[i] = op(a[i % an], b[i % bn]);
+    }
+}
+
+// eop: 0=add 1=sub 2=mul 3=div
+void bcast_elemwise_cuda(
+    const float * a, const float * b, float * dst,
+    int64_t n, int64_t an, int64_t bn, int eop) {
+    if (n <= 0 || an <= 0 || bn <= 0) return;   // 防御：避免 i%0
+    constexpr int BLOCK = 256;
+    const int64_t grid = (n + BLOCK - 1) / BLOCK;
+    switch (eop) {
+        case 0: bcast_elemwise_kernel<<<(unsigned)grid, BLOCK>>>(a, b, dst, n, an, bn, op_add_f()); break;
+        case 1: bcast_elemwise_kernel<<<(unsigned)grid, BLOCK>>>(a, b, dst, n, an, bn, op_sub_f()); break;
+        case 2: bcast_elemwise_kernel<<<(unsigned)grid, BLOCK>>>(a, b, dst, n, an, bn, op_mul_f()); break;
+        default: bcast_elemwise_kernel<<<(unsigned)grid, BLOCK>>>(a, b, dst, n, an, bn, op_div_f()); break;
+    }
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_ADD1 前向（加标量）：dst[i] = src[i] + b
+// 对齐 CPU kernel_add1 (CPUKernels.cpp:1503)；b 为 src[1] 标量张量（D2H 读取）。
+// 结构：一维 grid-stride。标量天然广播，无需逐维取模。
+// ============================================================
+__global__ void add1_f32_kernel(
+    const float * __restrict__ src, float * __restrict__ dst,
+    const float b, const int64_t n) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += int64_t(gridDim.x) * blockDim.x) {
+        dst[i] = src[i] + b;
+    }
+}
+
+void add1_cuda(const float * src, float * dst, float b, int64_t n) {
+    if (n <= 0) return;
+    constexpr int BLOCK = 256;
+    const int64_t grid = (n + BLOCK - 1) / BLOCK;
+    add1_f32_kernel<<<(unsigned)grid, BLOCK>>>(src, dst, b, n);
     cudaCheck(cudaGetLastError());
 }
 
@@ -835,6 +899,149 @@ void mean_cuda(const float * src, float * dst, long long n) {
 }
 
 // ============================================================
+// OP_MAX_ALL: 全元素归约 max → 标量 [1]（参考 sum/mean 的 reduce 结构）
+// 两级规约：grid-stride + warp shuffle（fmaxf）+ shared 归并 + block 间 float atomicMax。
+// NaN 语义：CPU kernel_max_all 跳 NaN（m 初值 -INF，!isnan(v)&&v>m 才更新）。
+//   CUDA fmaxf 规则 fmaxf(x, NaN)=x → 用 fmaxf(val, src[i]) 累积时 NaN 自动被忽略，
+//   与 CPU 一致；全 NaN → 保持 -INF（对齐 CPU 的 n>0 全 NaN → -INF）。空输入 → 0.0。
+// 使用场景: SE3 edge_softmax 的 max 减稳（避免 exp 溢出）。
+// ============================================================
+
+// float 无原子 max，用 CAS 循环（block 值已 fmaxf 归约，传入 value 非 NaN）
+__device__ float atomic_max_f(float* addr, float value) {
+    int* a = reinterpret_cast<int*>(addr);
+    int old = *a, assumed;
+    do {
+        assumed = old;
+        if (value <= __int_as_float(assumed)) break;   // value 不更大（含相等）则无需更新
+        old = atomicCAS(a, assumed, __float_as_int(value));
+    } while (old != assumed);
+    return __int_as_float(old);
+}
+
+__device__ float max_warp_reduce(float val) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val = fmaxf(val, __shfl_down_sync(0xffffffffu, val, offset));
+    }
+    return val;  // lane 0 持有最终结果
+}
+
+// 每个 block 处理一段元素：grid-stride 累积 max，warp 内规约，shared 归并，block 结果 atomic_max 到 dst
+__global__ void max_reduce_kernel(const float * __restrict__ src, float * __restrict__ dst,
+                                  long long n, int block_size) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    float val = -INFINITY;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        val = fmaxf(val, src[i]);   // fmaxf(x,NaN)=x → NaN 被忽略，对齐 CPU 跳 NaN
+    }
+
+    const int lane = threadIdx.x % 32;
+    const int wid  = threadIdx.x / 32;
+    // 第一级：Warp 内规约
+    val = max_warp_reduce(val);
+
+    __shared__ float warp_results[32];  // block_size<=1024 → 最多 32 warp
+    if (lane == 0) warp_results[wid] = val;
+    __syncthreads();
+
+    // 第二级：Warp 0 归并各 warp 结果
+    const int num_warps = block_size / 32;
+    if (wid == 0) {
+        val = (lane < num_warps) ? warp_results[lane] : -INFINITY;
+        val = max_warp_reduce(val);
+        if (lane == 0) atomic_max_f(dst, val);
+    }
+}
+
+void max_all_cuda(const float * src, float * dst, long long n) {
+    if (n <= 0) {
+        const float zero = 0.0f;   // 对齐 CPU: 空输入 → 0.0
+        cudaMemcpy(dst, &zero, sizeof(float), cudaMemcpyHostToDevice);
+        return;
+    }
+    constexpr int BLOCK = 256;
+    // 每线程至少处理 1 个元素，block 数上限 ~4096 防 launch 超限（同 sum_impl）
+    long long want_blocks = (n + BLOCK - 1) / BLOCK;
+    if (want_blocks > 4096) want_blocks = 4096;
+    // 预置 -INF（不能用 cudaMemset 0，float max 的初始值须是 -INF）
+    const float neg_inf = -INFINITY;
+    cudaMemcpy(dst, &neg_inf, sizeof(float), cudaMemcpyHostToDevice);
+    max_reduce_kernel<<<(int)want_blocks, BLOCK>>>(src, dst, n, BLOCK);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_SUM_ROWS: 沿最内维 dims[0] 归约，保留其余维（输出 {1, dims[1..3]}）
+// 对齐 CPU kernel_sum_rows (CPUKernels.cpp:1536)：每个输出元素 = 一行连续 ne0 个元素的和。
+// 参考 ggml reduce_rows_f32（ncols=ne[0] 最内维、每行一个 block），简化掉：
+//   8 路 unroll（性能优化非必需）、PDL、block 大小启发式（固定 256）。
+// block-per-row：grid = nrows（= ne1*ne2*ne3），block 内线程沿 ncols grid-stride
+// 累加 → warp 归约（sum_warp_reduce 复用 OP_SUM 段）→ shared 归并 → lane0 写 dst[row]。
+// norm=false（sum）；mean 由上层 scale(1/N) 实现。
+// 反向为 repeat(grad, src0) 广播回原形状（ComputeGraph.cpp:471）。
+// ============================================================
+__global__ void sum_rows_kernel(
+    const float * __restrict__ src, float * __restrict__ dst,
+    const int64_t ncols, const int64_t nrows) {
+    const int64_t row = blockIdx.x;   // 每 block 一行（grid = nrows）
+    if (row >= nrows) return;
+    const float * r = src + row * ncols;
+    float val = 0.0f;
+    for (int64_t i = threadIdx.x; i < ncols; i += blockDim.x) {
+        val += r[i];
+    }
+
+    const int lane = threadIdx.x % 32;
+    const int wid  = threadIdx.x / 32;
+    val = sum_warp_reduce(val);
+
+    __shared__ float warp_results[32];  // block_size<=1024 → 最多 32 warp
+    if (lane == 0) warp_results[wid] = val;
+    __syncthreads();
+
+    const int num_warps = blockDim.x / 32;
+    if (wid == 0) {
+        val = (lane < num_warps) ? warp_results[lane] : 0.0f;
+        val = sum_warp_reduce(val);
+        if (lane == 0) dst[row] = val;
+    }
+}
+
+void sum_rows_cuda(const float * src, float * dst, int64_t ncols, int64_t nrows) {
+    if (ncols <= 0 || nrows <= 0) return;
+    constexpr int BLOCK = 256;
+    // gridDim.x 上限 2^31-1；防御性 cap（正常模型不可能达到）
+    const int64_t grid = (nrows > 0x7fffffff) ? 0x7fffffff : nrows;
+    sum_rows_kernel<<<(unsigned)grid, BLOCK>>>(src, dst, ncols, nrows);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_RELU_BACK 反向（relu 的梯度）：dst[i] = (x[i] > 0.0f) ? grad[i] : 0.0f
+// 对齐 CPU kernel_relu_back (CPUKernels.cpp:1616)：
+//   d(relu(x))/dx = step(x)，链式法则 → grad * 1[x>0]。
+//   x<=0（含 x=0 边界）梯度置 0（PyTorch 同约定）。
+// ggml 无专门 relu_back op，用 grad * step(x) 组合；本项目用专用 op。
+// 结构：一维 grid-stride，每线程一个元素。src[0]=grad, src[1]=x。
+// ============================================================
+__global__ void relu_back_f32_kernel(
+    const float * __restrict__ grad, const float * __restrict__ x,
+    float * __restrict__ dst, const int64_t n) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += int64_t(gridDim.x) * blockDim.x) {
+        dst[i] = (x[i] > 0.0f) ? grad[i] : 0.0f;
+    }
+}
+
+void relu_back_cuda(const float * grad, const float * x, float * dst, int64_t n) {
+    if (n <= 0) return;
+    constexpr int BLOCK = 256;
+    const int64_t grid = (n + BLOCK - 1) / BLOCK;
+    relu_back_f32_kernel<<<(unsigned)grid, BLOCK>>>(grad, x, dst, n);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
 // OP_REPEAT_BACK: 归约（repeat 的逆操作，梯度和）
 // 语义（对齐 CPU kernel_repeat_back，仅支持同 ndim，即 src 与 dst 尾部对齐且
 //       src 各维 = dst 各维 × 整数重复因子）:
@@ -905,6 +1112,147 @@ void repeat_back_cuda(
         src, dst,
         ne00, ne01, ne02, ne03,
         ne0,  ne1,  ne2,  ne3);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_REPEAT 前向（简化版）：对齐 CPU kernel_repeat (CPUKernels.cpp:1626)
+//   dst[j] = src[s]，其中对每个维 d: s_d = j_d % ne0_d
+//   （src 缺维/维=1 时取模得 0，天然处理跨 ndim 广播）
+// 结构：一维 grid-stride，每线程一个 dst 元素。
+// 与 ggml k_bin_bcast 的差异：本项目 repeat 的 dst 各维必为 src 各维整数倍，
+// 无需 bcast 分支/标量特判/fastdiv 优化，直接逐元素映射即可（int64 无溢出）。
+// 使用场景: 掩码广播 [1,1,N,1]→[D,L,N,B]、seq_emb 广播、BN gamma/beta 广播等。
+// ============================================================
+template <typename T>
+__global__ void repeat_f32_kernel(
+    const T * __restrict__ src, T * __restrict__ dst,
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+    const int64_t ne0,  const int64_t ne1,  const int64_t ne2,  const int64_t ne3) {
+    const int64_t total = ne0 * ne1 * ne2 * ne3;
+    for (int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total; idx += int64_t(gridDim.x) * blockDim.x) {
+        int64_t t = idx;
+        const int64_t i3 = t % ne3; t /= ne3;
+        const int64_t i2 = t % ne2; t /= ne2;
+        const int64_t i1 = t % ne1; t /= ne1;
+        const int64_t i0 = t;
+        const int64_t s0 = i0 % ne00;
+        const int64_t s1 = i1 % ne01;
+        const int64_t s2 = i2 % ne02;
+        const int64_t s3 = i3 % ne03;
+        dst[idx] = src[((s3 * ne02 + s2) * ne01 + s1) * ne00 + s0];
+    }
+}
+
+void repeat_cuda(
+    const float * src, float * dst,
+    int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+    int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3) {
+    if (ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || ne03 <= 0) return;
+    if (ne0  <= 0 || ne1  <= 0 || ne2  <= 0 || ne3  <= 0) return;
+    const int64_t total = ne0 * ne1 * ne2 * ne3;
+    constexpr int BLOCK = 256;
+    const int64_t grid = (total + BLOCK - 1) / BLOCK;
+    // gridDim.x 上限 2^31-1；防御性 cap（正常模型不可能达到）
+    const int64_t g = (grid > 0x7fffffff) ? 0x7fffffff : grid;
+    repeat_f32_kernel<float><<<(unsigned)g, BLOCK>>>(
+        src, dst,
+        ne00, ne01, ne02, ne03,
+        ne0,  ne1,  ne2,  ne3);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_SET_ROWS 前向（散点覆写，简化版）：对齐 CPU kernel_set_rows (CPUKernels.cpp:1873)
+// 语义: set_rows(a, b, c) → dst = a 全量拷贝（保留未覆盖行），再把 c[k] 覆写到
+//       b[k] 指定行（越界钳制）。a/c/dst 严格 2D(N,M)，b 为 (K,) float 编码索引。
+// 与 ggml k_set_rows 的差异：ggml 是"行重排/收集"（src0 与 dst 同形状 + rows 张量
+// 外层维取模广播 + fast_div_modulo + PDL 异步就绪），本项目为"散点覆写"，只需：
+//   1) 拷贝 kernel: dst[i] = a[i]                        （N*M 全量）
+//   2) 散点 kernel: dst[clamp(b[k])*M + m] = c[k*M + m]   （k,m 网格）
+// 重复索引语义：CPU 版预扫 b 检测重复 → 有重复则跳过散点（仅保留 a 拷贝）。
+// 重复检测放宿主侧（K 小，D2H 代价可忽略），保证与 CPU 完全一致。
+// ============================================================
+__global__ void set_rows_copy_kernel(
+    const float * __restrict__ a, float * __restrict__ dst,
+    const int64_t n) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < n; i += int64_t(gridDim.x) * blockDim.x) {
+        dst[i] = a[i];
+    }
+}
+
+__global__ void set_rows_scatter_kernel(
+    const float * __restrict__ c, const float * __restrict__ b,
+    float * __restrict__ dst,
+    const int64_t K, const int64_t M, const int64_t N) {
+    const int64_t total = K * M;
+    for (int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total; idx += int64_t(gridDim.x) * blockDim.x) {
+        const int64_t k = idx / M;
+        const int64_t m = idx % M;
+        int64_t row = (int64_t)b[k];
+        if (row < 0) row = 0;
+        if (row >= N) row = N - 1;
+        dst[row * M + m] = c[idx];
+    }
+}
+
+// ============================================================
+// OP_SCALE 前向（标量乘）：dst[i] = scale * x[i]
+// 对齐 CPU kernel_scale (CPUKernels.cpp:1482)；s 存 op_params[0] float 位模式。
+// 参考 ggml scale_f32（含 bias 参数 + PDL）；本项目 scale() helper 无 bias
+// （仅标量乘），故省略 bias，PDL 由默认流顺序执行保证（无需）。
+// 结构：一维 grid-stride，每线程多个元素。
+// ============================================================
+__global__ void scale_f32_kernel(
+    const float * __restrict__ x, float * __restrict__ dst,
+    const float scale, const int64_t nelements) {
+    for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < nelements; i += int64_t(gridDim.x) * blockDim.x) {
+        dst[i] = scale * x[i];
+    }
+}
+
+void scale_cuda(const float * x, float * dst, float scale, int64_t nelements) {
+    if (nelements <= 0) return;
+    constexpr int BLOCK = 256;
+    const int64_t grid = (nelements + BLOCK - 1) / BLOCK;
+    // gridDim.x 上限 2^31-1；防御性 cap
+    const int64_t g = (grid > 0x7fffffff) ? 0x7fffffff : grid;
+    scale_f32_kernel<<<(unsigned)g, BLOCK>>>(x, dst, scale, nelements);
+    cudaCheck(cudaGetLastError());
+}
+
+void set_rows_cuda(
+    const float * a, const float * b, const float * c, float * dst,
+    int64_t N, int64_t M, int64_t K) {
+    if (N <= 0 || M <= 0) return;
+    const int64_t n_total = N * M;
+    constexpr int BLOCK = 256;
+    const int64_t g1 = (n_total + BLOCK - 1) / BLOCK;
+    set_rows_copy_kernel<<<(unsigned)g1, BLOCK>>>(a, dst, n_total);
+
+    if (K <= 0) { cudaCheck(cudaGetLastError()); return; }  // 无索引：仅保留 a 拷贝
+
+    // 宿主预扫重复索引（对齐 CPU：越界索引不参与查重）
+    std::vector<float> b_host((size_t)K);
+    cudaMemcpy(b_host.data(), b, K * sizeof(float), cudaMemcpyDeviceToHost);  // 同步
+    std::vector<uint8_t> seen((size_t)N, 0);
+    bool dup = false;
+    for (int64_t k = 0; k < K && !dup; ++k) {
+        const int64_t i1 = (int64_t)b_host[(size_t)k];
+        if (i1 < 0 || i1 >= N) continue;
+        if (seen[(size_t)i1]) dup = true;
+        seen[(size_t)i1] = 1;
+    }
+
+    if (!dup) {
+        const int64_t s_total = K * M;
+        const int64_t g2 = (s_total + BLOCK - 1) / BLOCK;
+        set_rows_scatter_kernel<<<(unsigned)g2, BLOCK>>>(c, b, dst, K, M, N);
+    }
     cudaCheck(cudaGetLastError());
 }
 

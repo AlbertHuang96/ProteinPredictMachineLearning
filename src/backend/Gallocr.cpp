@@ -36,6 +36,9 @@ void Gallocr::reset_state(int n_backends) {
         ba.live.clear();
     }
     recording_phase1_ = false;
+    // needs_realloc 接入：布局重置 → 旧快照失效（数组保留，供下次 reserve 覆盖）
+    has_snapshot_ = false;
+    allocated_ = false;
 }
 
 size_t Gallocr::backend_peak(int b) const {
@@ -442,6 +445,39 @@ bool Gallocr::reserve(
         delete ba.talloc;
         ba.talloc = nullptr;
     }
+
+    // ---- needs_realloc 接入（2026-08-31）：reserve 成功后持久化预留快照 ----
+    // 对标 ggml reserve 的 node_allocs/leaf_allocs。独立于 nodes_/leaves_（后者会被
+    // release/reset_state 清空）；此处按"上次布局"记录每个张量的 buffer_id/offset/size_max，
+    // 供 needs_realloc() 跨 graph_compute 判断复用。数组保留、has_snapshot_ 标记有效。
+    node_allocs_.resize(nodes_.size());
+    for (size_t i = 0; i < nodes_.size(); i++) {
+        const NodeInfo& ni = nodes_[i];
+        NodeAllocSnap& snap = node_allocs_[i];
+        snap.dst.buffer_id = ni.managed ? ni.backend_id : -1;
+        snap.dst.size_max  = ni.managed ? ni.alloc_size : 0;
+        snap.dst.offset    = ni.managed ? phase1_offset_[ni.tensor] : 0;
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            TensorF32* src = ni.tensor ? ni.tensor->src[s] : nullptr;
+            if (!src) { snap.src[s] = TensorAllocSnap(); continue; }
+            auto it = node_map_.find(src);
+            if (it == node_map_.end()) { snap.src[s] = TensorAllocSnap(); continue; }
+            const NodeInfo& sni = *it->second;
+            snap.src[s].buffer_id = sni.managed ? sni.backend_id : -1;
+            snap.src[s].size_max  = sni.managed ? sni.alloc_size : 0;
+            snap.src[s].offset    = sni.managed ? phase1_offset_[sni.tensor] : 0;
+        }
+    }
+    leaf_allocs_.resize(leaves_.size());
+    for (size_t i = 0; i < leaves_.size(); i++) {
+        const NodeInfo& li = leaves_[i];
+        leaf_allocs_[i].dst.buffer_id = li.managed ? li.backend_id : -1;
+        leaf_allocs_[i].dst.size_max  = li.managed ? li.alloc_size : 0;
+        leaf_allocs_[i].dst.offset    = li.managed ? phase1_offset_[li.tensor] : 0;
+    }
+    n_nodes_snap_ = (int)nodes_.size();
+    n_leafs_snap_ = (int)leaves_.size();
+    has_snapshot_ = true;
     return true;
 }
 
@@ -449,6 +485,26 @@ bool Gallocr::reserve(
 // alloc — Phase 2：按峰值分配真实 buffer，重新模拟并绑定 data_
 // ============================================================
 bool Gallocr::alloc(
+    ComputeGraph* graph,
+    const std::function<int(TensorF32*)>& backend_id_of,
+    int n_backends) {
+    // ---- needs_realloc 接入（2026-08-31，移植 ggml alloc_graph 复用语义）----
+    // 已分配过 buffer 且布局未变（can_reuse）→ 复用路径：不重建 buffer，
+    // 用上次快照直接重绑 data（对齐 GGML：alloc_graph 在 needs_realloc==false 时
+    // 只 vbuffer_reset + init_tensor）。要求调用方在 release 前调用本函数。
+    // 首次 alloc（allocated_==false，reserve 只模拟不分配）必须走重建路径。
+    if (can_reuse(graph)) {
+        return alloc_reuse(graph);
+    }
+    // 否则走重建路径（原 alloc 实现，移入 alloc_rebuild 保留可回退）
+    return alloc_rebuild(graph, backend_id_of, n_backends);
+}
+
+// ============================================================
+// alloc_rebuild — 重建路径：原 alloc 完整实现
+//   （2026-08-31 由 alloc 移出，逻辑未改，保留以支持回退/对比）
+// ============================================================
+bool Gallocr::alloc_rebuild(
     ComputeGraph* graph,
     const std::function<int(TensorF32*)>& backend_id_of,
     int n_backends) {
@@ -544,6 +600,93 @@ bool Gallocr::alloc(
         }
     }
 
+    allocated_ = true;   // needs_realloc 接入：重建路径成功 → 已实际分配 buffer，允许后续复用
+    return true;
+}
+
+// ============================================================
+// needs_realloc / node_alloc_valid / alloc_reuse — needs_realloc 接入
+//   （2026-08-31，移植 ggml_gallocr_needs_realloc + alloc_graph 复用路径）
+// ============================================================
+bool Gallocr::node_alloc_valid(TensorF32* t, const TensorAllocSnap& a) {
+    // 该张量当前需要 galloc 分配（无外部 data 且非 view）？
+    if (t && t->data() == nullptr && t->view_src == nullptr) {
+        if (a.buffer_id < 0) return false;                // 上次是外部/view，本次需分配
+        if (a.buffer_id >= (int)backends_.size()) return false;
+        BufferType* buft = backends_[a.buffer_id].buft;
+        if (!buft) return false;
+        // 实时算当前所需（对齐 ggml：size_max >= ggml_backend_buft_get_alloc_size）
+        size_t need = GGML_PAD(buft->get_alloc_size(t), buft->get_alignment());
+        return a.size_max >= need;
+    }
+    return true;   // 外部数据/view：恒有效（对齐 ggml）
+}
+
+bool Gallocr::needs_realloc(ComputeGraph* graph) {
+    // 对齐 ggml_gallocr_needs_realloc：①节点数 ②叶子数 ③逐节点 dst/src 预留记录
+    if (!has_snapshot_) return true;
+    if (n_nodes_snap_ != graph->n_nodes()) return true;
+    if (n_leafs_snap_ != graph->n_leafs()) return true;
+    if ((int)node_allocs_.size() != graph->n_nodes()) return true;
+    if ((int)leaf_allocs_.size() != graph->n_leafs()) return true;
+    for (int i = 0; i < graph->n_nodes(); i++) {
+        TensorF32* node = graph->graph_node(i);
+        if (!node_alloc_valid(node, node_allocs_[i].dst)) return true;
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            TensorF32* src = node->src[s];
+            if (!src) continue;
+            if (!node_alloc_valid(src, node_allocs_[i].src[s])) return true;
+        }
+    }
+    // 叶子也检查（比 GGML 更保守：叶子大小变化同样触发重建）
+    for (int i = 0; i < graph->n_leafs(); i++) {
+        TensorF32* leaf = graph->graph_leaf(i);
+        if (!node_alloc_valid(leaf, leaf_allocs_[i].dst)) return true;
+    }
+    return false;
+}
+
+bool Gallocr::alloc_reuse(ComputeGraph* graph) {
+    if (getenv("GRAPH_DEBUG_GALLOCR")) {
+        fprintf(stderr, "[gallocr] REUSE path hit: n_nodes=%d n_leafs=%d (no realloc)\n",
+                graph->n_nodes(), graph->n_leafs());
+    }
+    // 对齐 GGML ggml_gallocr_alloc_graph 的复用路径：needs_realloc==false →
+    // 不重建 buffer（调用方已保证 buffer 存活、未 release），用快照直接重绑 data。
+    // 不重新模拟（无 compute_refcounts/allocate_node），因此 n_children 等不维护；
+    // 若后续在同一布局上再次 alloc，needs_realloc 仍为 false → 继续复用。
+    nodes_.clear(); leaves_.clear(); node_map_.clear();
+    nodes_.resize(graph->n_nodes());
+    leaves_.resize(graph->n_leafs());
+
+    auto bind_from_snap = [&](NodeInfo& ni, const TensorAllocSnap& snap) {
+        if (snap.buffer_id < 0 || snap.buffer_id >= (int)backends_.size()) {
+            ni.managed   = false;   // 外部/预分配/view：不重绑（data 保持原样）
+            ni.allocated = false;
+            ni.buffer_id = snap.buffer_id;
+            return;
+        }
+        BackendAlloc& ba = backends_[snap.buffer_id];
+        ni.managed     = true;
+        ni.allocated   = true;
+        ni.backend_id  = snap.buffer_id;
+        ni.buffer_id   = snap.buffer_id;
+        ni.offset      = snap.offset;
+        ni.alloc_size  = snap.size_max;
+        ni.buffer      = ba.buffers.empty() ? nullptr : ba.buffers[0];
+        if (ni.buffer) bind_tensor(&ni);
+    };
+
+    for (int i = 0; i < graph->n_leafs(); i++) {
+        leaves_[i].tensor = graph->graph_leaf(i);
+        bind_from_snap(leaves_[i], leaf_allocs_[i].dst);
+        node_map_[leaves_[i].tensor] = &leaves_[i];
+    }
+    for (int i = 0; i < graph->n_nodes(); i++) {
+        nodes_[i].tensor = graph->graph_node(i);
+        bind_from_snap(nodes_[i], node_allocs_[i].dst);
+        node_map_[nodes_[i].tensor] = &nodes_[i];
+    }
     return true;
 }
 
@@ -665,6 +808,9 @@ void Gallocr::release() {
     leaves_.clear();
     phase1_offset_.clear();
     recording_phase1_ = false;
+    // needs_realloc 接入：release 后 buffer 已删 → 快照/已分配失效（数组保留供下次 reserve 覆盖）
+    has_snapshot_ = false;
+    allocated_ = false;
 }
 
 // ============================================================
