@@ -268,8 +268,9 @@ bool CUDABackend::supports_op(TensorF32* node) const {
 
         case OP_UNARY: {
             // 2026-08-24：unary CUDA 默认禁用（跨后端 H2D 未可靠 → chi 链 relu 读 CPU 指针当 device
-            //   → chi loss 巨大 185万）。PPML_CUDA_UNARY=1 显式启用（待跨后端 H2D 修好后恢复提速）。
-            if (!(getenv("PPML_CUDA_UNARY") && std::strcmp(getenv("PPML_CUDA_UNARY"), "1") == 0)) {
+            //   → chi loss 巨大 185万）。2026-08-31 已验证开启后训练正常（2 epoch 数值与关闭一致）→
+            //   默认开启，无需环境变量；PPML_CUDA_UNARY=0 可显式回退禁用。
+            if (getenv("PPML_CUDA_UNARY") && std::strcmp(getenv("PPML_CUDA_UNARY"), "0") == 0) {
                 return false;
             }
             // 仅支持已在 unary_cuda kernel 实现的 subtype
