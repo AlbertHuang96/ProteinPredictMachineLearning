@@ -5,7 +5,6 @@
 
 namespace ppml {
 
-// TODO : memory pool
 // CPU 内存分配
 static void* cpu_alloc(size_t size) {
     void* ptr = nullptr;
@@ -234,7 +233,6 @@ Tensor<T> Tensor<T>::select(int dim, int64_t index) const {
     }
     
     // 正确切片（ggml 布局 dims[0] 最内维）：取 dim 维的 index，深拷贝到独立内存。
-    // ⚠️ 旧实现 `Tensor(new_shape, data_+offset, false)` 是错误 view：offset 与 view 形状不匹配，
     //    导致切片数据读到错误区域（巨大值/垃圾），模板分支 emb_t1d_ 由此产生 1.78e6 溢出（[kern] op=30）。
     //    改为按外层步进深拷贝，得到正确的、独立拥有的切片。
     int64_t outer = 1;   // dim 之前维度乘积

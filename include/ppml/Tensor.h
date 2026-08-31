@@ -290,14 +290,13 @@ public:
         device_ = Device::CPU;
         own_data_ = false;  // Context 管理生命周期
         src.fill(nullptr);  // 显式清空 src，避免残留脏指针
-        // ⚠️ 必须显式初始化 op/flag：Tensor() 默认构造不初始化这两个成员，
         //    而 new_tensor 用 placement new 且 context 缓冲区可能是复用/非全零，
         //    导致 op 读到垃圾值（如 32653）→ dispatch_body 无 case → NOT_SUPPORTED。
         //    （本会话 SE3 测试 `node#92 op=32653` 即此根因：RadialFunc 的 BN 参数
         //     经 new TensorF32 后 op 未初始化。）
         op        = OP_NONE;
         flag      = 0;
-        type      = TENSOR_TYPE_F32;   // ⚠️ 必须显式初始化：placement new + context 缓冲区复用可能非全零，
+        type      = TENSOR_TYPE_F32;
                                        //    否则 type 读到垃圾值（非 F32/F16）→ build_backward_expand 断言失败。
         for (int i = 0; i < GGML_MAX_OP_PARAMS; ++i) op_params[i] = 0;
     }

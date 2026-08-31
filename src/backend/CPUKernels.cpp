@@ -367,7 +367,6 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
                 s2 ? " src2{...}" : "");
     }
 
-    // ⚠️ 判空防护：src[0]/src[1] 为 null（图构建错误/悬垂节点）或 data() 未分配时，
     // 直接解引用会 SIGSEGV。所有线程一致 return（与 kernel_mul_mat 一致，避免 barrier 失步）。
     if (!node->src[0] || !node->src[1] || !node->data()) {
         if (p->ith == 0) {
@@ -509,7 +508,6 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
                     (void*)node->data(), (int)node->flag);
             fprintf(stderr, "[MULMAT-NULL] aborting mul_mat node to avoid SIGSEGV\n");
         }
-        // ⚠️ 所有线程必须一致 return：kernel 内部有 barrier（GPU/CPU 路径各 2 次），若只线程 0
         // return 而 worker 继续走 barrier → barrier 次数不匹配 → 线程失步 → 后续 kernel_elemwise 崩。
         // 所有线程都 return → 每线程跳过的 barrier 次数一致 → 同步不破坏。
         return;

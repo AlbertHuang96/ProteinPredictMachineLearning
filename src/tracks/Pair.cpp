@@ -39,17 +39,14 @@ TensorF32 PairTrack::templ_stack(const TensorF32& in_templ, const TensorF32& rbf
     // tensor copy constructor was deleted i.e. = t1d;
     TensorF32 t1d_reshaped = t1d.view({B*T, L, D_T1D});
 
-    // TODO: LinearLayer 值类型构造已删除，需用 create()
     // LinearLayer* t1d_proj = LinearLayer::create(D_T1D, D_STATE);
     // TensorF32 state_proj = t1d_proj->forward(t1d_reshaped);
     TensorF32 out;
-    // TODO: TemplatePairStack 指针化完成前，此函数暂不可用
     // for (int i = 0; i < 2; i++) {
     //     templ = tps_.forward(templ, rbf_feat, state_proj);
     // }
     
     // d_templ = 64
-    // TODO: LayerNorm 值类型构造已删除，需用 create()
     // LayerNorm* layernorm = LayerNorm::create(64);
     // out = layernorm->forward(templ);
     out = templ;  // placeholder
@@ -67,7 +64,6 @@ void PairTrack::inject_template(const TensorF32& in_templ) {
     auto templ = in_templ.permute({0, 2, 3, 1, 4}).view(Shape{B*L*L, 1, 64});
     CrossAttention cross_attn(D_PAIR, 64, 8);
     auto out = cross_attn.forward(pair, templ);  // (B*L*L, 1, D_PAIR)
-    // ⚠️ 值版：不能用 out = out.view(...)（view 不拥有数据，move 赋值悬垂），
     //    也不能用 add_impl（图版返回图节点 data()=nullptr）。值版逐元素加。
     TensorF32 out_r(Shape{B, L, L, D_PAIR}, out.device());
     out_r.copy_from(out);   // 行优先扁平 reshape 拷贝

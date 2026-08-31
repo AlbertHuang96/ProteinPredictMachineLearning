@@ -42,7 +42,6 @@ namespace ppml {
         return get_rows(weights_, indices);
     }
 
-    // TODO
     // all the forward_exec need to be removed
     // forward
     // backward
@@ -160,7 +159,6 @@ namespace ppml {
         // output: (..., out_features)
         
         int batch = x.shape().numel() / in_features_;
-        // ⚠️ 直接按 (..., out_features) 分配并返回**拥有数据**的张量。
         // 旧实现先分配 (batch,out) 再 return output.view(out_shape)（own_data_=false），
         // 局部 output 析构释放数据 → 返回悬垂指针（use-after-free，值版 forward 崩溃根因）。
         auto out_shape = x.shape();
@@ -348,7 +346,6 @@ namespace ppml {
         const int64_t n = bond_feats.numel();   // 总位置数（B*L*L 或 B*L*L*d_init）
         const int64_t rows = n / static_cast<int64_t>(L * L);  // 位置数（每行一个 bond 类型）
         
-        // ⚠️ 值版修复（2026-08-22）：bond_feats 实际是 3D (B,L,L)，不能直接喂 one_hot_seq（期望 2D）。
         // 扁平化所有位置为 1D，对每个位置做 one-hot (NBYTES)，再 reshape 回 (B,L,L,NBYTES)。
         TensorF32 flat(Shape({rows * L * L}), bond_feats.device());  // 位置扁平
         flat.copy_from(bond_feats);   // 前 n 元素即各位置值（若 4D 输入取前 B*L*L 个）
@@ -429,7 +426,6 @@ namespace ppml {
     //   msa_emb : [d_msa, L, N, B]  (emb_->forward_graph 输出, mul_mat)
     //   seq_emb : [d_msa, B*L]      (emb_q_->forward_graph 输出, get_rows, 一维扁平索引)
     // 广播路径: seq_emb -> view [d_msa, L, 1, B] -> repeat 到 msa_emb 形状 -> add
-    // ⚠️ 依赖: view / repeat / add_impl 图 op。其中 view 图节点当前缺 dispatch kernel，
     //    需先补 view/unsqueeze kernel 才能执行。布局以 PPMLModel 图化后的上游约定为准。
     TensorF32* FullEmbedding::forward_graph(TensorF32* msa, TensorF32* seq, TensorF32* idx) {
         // msa : (B, N, L, d_init) → emb 线性投影

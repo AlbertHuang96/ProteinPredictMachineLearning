@@ -219,7 +219,6 @@ TensorF32* set_rows(TensorF32* a, TensorF32* b, TensorF32* c);
 // edge_gather_rows(node_feat, edge_src_idx) — 按边源节点索引取行（gather）
 //   node_feat: (N, C) 节点特征；edge_src_idx: (E,) 源节点 id（float-encoded int）
 //   dst: (E, C) — dst[e,:] = node_feat[edge_src_idx[e],:]
-//   ⚠️ 与 get_rows 语义一致（get_rows 本身即该操作），但独立 op 便于显式表达
 //      SE3 消息传递阶段，并在 backward 时散点累加回节点梯度（见 scatter_add）。
 TensorF32* edge_gather_rows(TensorF32* node_feat, TensorF32* edge_src_idx);
 
@@ -243,7 +242,6 @@ TensorF32* per_edge_matmul_back_gathered(TensorF32* grad, TensorF32* kernel);
 
 // one_hot_seq 图版：seq 为一维扁平整数索引图节点 → get_rows(eye, seq)
 // 返回 [num_classes, K] 图节点（ggml 布局 dims[0]=最内维）。依赖 get_rows（已实现）。
-// ⚠️ seq 需先扁平为一维 (view/reshape kernel 待补时由调用方保证已扁平)
 TensorF32* one_hot_seq_graph(TensorF32* seq, int num_classes = 21);
 
 // outer_sum 图版：left [D,1,L,B] + right [D,L,1,B] → [D,L,L,B]（ggml 布局 dims[0]=最内维）

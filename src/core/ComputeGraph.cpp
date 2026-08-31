@@ -38,7 +38,6 @@ ComputeGraph * ComputeGraph::new_graph_custom(struct PPMLContext * ctx, size_t s
     ComputeGraph * cgraph = (ComputeGraph *) ((char *) ctx->mem_buffer + obj->offs);
  
     // the size of the hash table is doubled since it needs to hold both nodes and leafs
-    // ⚠️ 修复：hash_size 应为槽位数 size*2（容纳 nodes+leafs）。原用 bitset_size(size*2)
     //   （除以 32）导致哈希表只有 size/16 个槽位，图节点多时 hash_find 返回 HASHSET_FULL(-1)，
     //   visit_parents_graph 的 bitset_get(used, -1) 越界段错误。keys/grads/grad_accs/use_counts/
     //   used 数组均按 hash_size 或 bitset_size(hash_size) 分配，改 hash_size 后自动一致。
@@ -99,7 +98,6 @@ size_t ComputeGraph::visit_parents_graph(TensorF32 * node, bool compute) {
         node->flag |= TENSOR_FLAG_COMPUTE;
     }
 
-    // ⚠️ 诊断（GRAPH_DEBUG_BACKNODE=1）：追踪所有 op>=100 的节点（_BACK op）何时被 visit
     // —— 这是进入 graph->nodes() 的唯一路径。若 back_node(op=108) 从未在此打印，说明
     // compute_backward 创建的 back_node 根本不进 nodes，dispatch 的 op=108 另有来源。
     if (getenv("GRAPH_DEBUG_BACKNODE") && (int)node->op >= 100 && (int)node->op <= 120) {
@@ -146,7 +144,6 @@ size_t ComputeGraph::visit_parents_graph(TensorF32 * node, bool compute) {
         if (src) {
             this->visit_parents_graph(src, compute);
 
-            // TODO: use_counts tracking not yet implemented
         }
     }
     
@@ -186,7 +183,6 @@ void ComputeGraph::build_forward_impl(TensorF32 * tensor, bool expand, bool comp
 }
 
 void ComputeGraph::build_forward_expand(TensorF32 * tensor) {
-    // ⚠️ 保持 compute=true：值版 forward 依赖 build 阶段立即计算并读值（ModelTest.ModelForward）。
     //    若改 false，值版 forward 里 concat_ptr/add_impl 等图 helper 创建的节点 data() 为 null，
     //    直接读会段错误。SE3 图训练的 buffer 悬垂问题由 graph_compute 的 need_alloc 逻辑另行处理。
     build_forward_impl(tensor, true, true);
@@ -310,7 +306,6 @@ void ComputeGraph::build_backward_expand(
         compute_backward(ctx, i, grads_needed);
     }
 
-    // ⚠️ 诊断（GRAPH_DEBUG_BACKNODE=1）：确认多输出反向 op（OP_TRI_MUL_BACK/OUTER_PROD_MEAN_BACK/
     // OUTER_PROD_BACK）是否真的进入了 graph->nodes()。compute_backward 创建 back_node 后仅
     // add_or_set(grad_left/grad_right)（叶子），理论上 back_node 不会进 nodes —— 若打印显示
     // 它们不在 nodes，则 CUDA dispatch 里的 op=108 来自别的路径，需另查。
@@ -388,7 +383,7 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                add_or_set(ctx, cgraph, isrc1, mean(grad)); // TODO: should probably be sum instead of mean
+                add_or_set(ctx, cgraph, isrc1, mean(grad));
             }
         } break;
         case OP_ACC: {
@@ -396,7 +391,6 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                // TODO: extract nb1/nb2/nb3/offset from tensor->op_params and use view_4d + reshape + cont
                 // const size_t nb1    = ((int32_t *) tensor->op_params)[0];
                 // const size_t nb2    = ((int32_t *) tensor->op_params)[1];
                 // const size_t nb3    = ((int32_t *) tensor->op_params)[2];
@@ -525,7 +519,6 @@ void ComputeGraph::compute_backward(
         } break;
         case OP_RMS_NORM: {
             if (src0_needs_grads) {
-                // TODO: needs rms_norm_back graph node and kernel
                 // float eps;
                 // memcpy(&eps, tensor->op_params, sizeof(float));
                 // add_or_set(ctx, cgraph, isrc0, rms_norm_back(grad, src0, eps));
@@ -609,7 +602,6 @@ void ComputeGraph::compute_backward(
             }
         } break;
         case OP_SET: {
-            // TODO: needs op_params for nb1/nb2/nb3/offset, view_4d, and acc_impl
             // const size_t nb1    = ((const int32_t *) tensor->op_params)[0];
             // const size_t nb2    = ((const int32_t *) tensor->op_params)[1];
             // const size_t nb3    = ((const int32_t *) tensor->op_params)[2];
@@ -704,7 +696,6 @@ void ComputeGraph::compute_backward(
                 back_node->src[4]  = grad_right;
                 memcpy(back_node->op_params,     tensor->op_params,     8);  // L + outgoing
 
-                // ⚠️ 关键修复：多输出反向 op 必须显式 expand 进图，否则 back_node 不在
                 //    graph->nodes() 里、kernel 永不执行，grad_left/grad_right 恒 0 → 梯度断链。
                 //    add_or_set 只把输出槽叶子加入 graph，不会把生产者 back_node 加入。
                 //    参考 ggml：ggml_build_backward_expand 对 grad 调 ggml_build_forward_expand 时，
@@ -734,7 +725,6 @@ void ComputeGraph::compute_backward(
                 back_node->src[4]  = grad_right;
                 memcpy(back_node->op_params, tensor->op_params, sizeof(float));  // N
 
-                // ⚠️ 关键修复（同 OP_TRI_MUL）：多输出反向 op 显式 expand 进图，
                 //    否则 back_node 不在 nodes()、kernel 不执行、msa2pair 梯度断链。
                 build_forward_expand(back_node);
 
@@ -773,7 +763,6 @@ void ComputeGraph::compute_backward(
                 back_node->src[3]  = grad_left;
                 back_node->src[4]  = grad_right;
 
-                // ⚠️ 关键修复（同 OP_TRI_MUL / OP_OUTER_PROD_MEAN）：多输出反向 op 显式 expand 进图。
                 build_forward_expand(back_node);
 
                 if (src0_needs_grads && grad_left)
@@ -867,7 +856,6 @@ void ComputeGraph::compute_backward(
         } break;
         case OP_ROPE: {
             if (src0_needs_grads) {
-                // TODO: needs rope_back graph node and kernel
                 // const int n_dims     = ((const int32_t *) tensor->op_params)[1];
                 // const int mode       = ((const int32_t *) tensor->op_params)[2];
                 // const int n_ctx_orig = ((const int32_t *) tensor->op_params)[4];
@@ -904,7 +892,6 @@ void ComputeGraph::compute_backward(
             }
         } break;
         case OP_IM2COL: {
-            // TODO: needs im2col_back graph node and kernel
             // if (src1_needs_grads) {
             //     const int32_t s0 = ((const int32_t *) tensor->op_params)[0];
             //     const int32_t s1 = ((const int32_t *) tensor->op_params)[1];
@@ -917,7 +904,6 @@ void ComputeGraph::compute_backward(
             // }
         } break;
         case OP_POOL_2D: {
-            // TODO: needs pool_2d_back graph node and kernel
             // if (src0_needs_grads) {
             //     const enum ggml_op_pool op = ((const int32_t *) tensor->op_params)[0];
             //     const int32_t k0 = ((const int32_t *) tensor->op_params)[1];
@@ -936,7 +922,6 @@ void ComputeGraph::compute_backward(
                 case UNARY_OP_ABS: {
                     if (src0_needs_grads) {
                         // d(abs(x))/dx = sign(x) * grad
-                        // TODO: needs sgn() graph node; currently using step()-based approach
                         // add_or_set(ctx, cgraph, isrc0, mul(sgn(src0), grad));
                     }
                 } break;
@@ -966,21 +951,16 @@ void ComputeGraph::compute_backward(
                 } break;
                 case UNARY_OP_SILU: {
                     if (src0_needs_grads) {
-                        // TODO: needs silu_back graph node and kernel
                         // add_or_set(ctx, cgraph, isrc0, silu_back(grad, src0));
                     }
                 } break;
                 case UNARY_OP_GELU: {
-                    // TODO: needs gelu_back graph node and kernel
                 } break;
                 case UNARY_OP_GELU_QUICK: {
-                    // TODO: needs gelu_quick_back graph node and kernel
                 } break;
                 case UNARY_OP_TANH: {
-                    // TODO: needs tanh_back graph node and kernel
                 } break;
                 case UNARY_OP_SIGMOID: {
-                    // TODO: needs sigmoid_back graph node and kernel
                     // d(sigmoid(x))/dx = sigmoid(x) * (1 - sigmoid(x)) * grad = tensor * (1 - tensor) * grad
                 } break;
                 default: {
@@ -990,7 +970,6 @@ void ComputeGraph::compute_backward(
         } break;
         case OP_CROSS_ENTROPY_LOSS: {
             if (src0_needs_grads) {
-                // TODO: needs cross_entropy_loss_back graph node and kernel
                 // add_or_set(ctx, cgraph, isrc0, cross_entropy_loss_back(grad, src0, src1));
             }
             // labels (src1) gradient not implemented
@@ -1024,7 +1003,6 @@ void ComputeGraph::compute_backward(
             }
         } break;
         case OP_GLU: {
-            // TODO: needs glu op and glu_back graph nodes and kernels
             // switch (ggml_get_glu_op(tensor)) {
             //     case GGML_GLU_OP_SWIGLU:
             //         if (src0_needs_grads) add_or_set(ctx, cgraph, isrc0, silu_back(mul(grad, src1), src0));
@@ -1087,7 +1065,6 @@ void ComputeGraph::acc_or_set(
     if (cgraph->grads[isrc]) {
         cgraph->grads[isrc] = acc(cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset);
     } else {
-        // FIXME this is going to produce NaN if src contains inf/NaN
         TensorF32 * a_zero = scale(src, 0.0f);
         cgraph->grads[isrc] = acc(a_zero, tensor, nb1, nb2, nb3, offset);
     }

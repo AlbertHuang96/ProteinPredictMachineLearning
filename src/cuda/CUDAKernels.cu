@@ -14,7 +14,6 @@ static inline int ceil_div(int a, int b) {
 
 static inline void cudaCheck(cudaError_t err) {
     if (err != cudaSuccess) {
-        // TODO: proper error handling
     }
 }
 
@@ -809,7 +808,6 @@ __global__ void unary_kernel(
     if (tid >= N) return;
     float x = src[tid];
     float y;
-    // ⚠️ uop 必须与 unary_op 枚举精确对齐（ComputeGraph.h）：
     //    0=ABS, 4=RELU, 5=GELU, 7=SILU, 8=TANH, 10=SIGMOID, 12=HARDSWISH,
     //    13=EXP, 14=LOG, 15=SQRT。之前把 10 当 SQRT（实为 SIGMOID）→ sqrt(负)→NaN。
     switch (uop) {

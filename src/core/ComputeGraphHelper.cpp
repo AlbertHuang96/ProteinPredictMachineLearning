@@ -822,7 +822,6 @@ TensorF32* torsion_angle_loss(TensorF32* pred, TensorF32* gt, TensorF32* chi_mas
     float eps = 1e-8f;
 
     // Step 1: normalize pred to unit circle: pred_n = pred / sqrt(sum(pred², dim=-1))
-    // ⚠️ r 必须加 eps：pred 某通道为 0 时 sqrt(0)=0，div(pred,0)=inf → chi=inf（训练 loss 卡死根因）
     auto sq_sum = sum_rows(sqr(pred));       // [N, 7]
     auto r      = sqrt(add1_impl(sq_sum, make_scalar(eps), false)); // [N, 7] 加 eps 防除零
     auto pred_n = div(pred, r);              // [N, 7, 2] broadcast
@@ -1013,7 +1012,7 @@ TensorF32* total_loss(
     const float w_chi       = 0.5f;
     const float w_distogram = 0.3f;
     const float w_msa       = 2.0f;
-    const float w_conf = 0.01f;  // TODO: 待 L_conf 实现后加入
+    const float w_conf = 0.01f;
 
     auto w_fape_node      = scale(loss_fape,      w_fape);
     auto w_chi_node       = scale(loss_chi,       w_chi);

@@ -654,7 +654,6 @@ void CUDABackend::kernel_out_prod_cuda(TensorF32 * node, ComputeParams * p) {
     const int64_t ne3 = (node->shape().ndim() > 3) ? node->shape().dims[3] : 1;
 
     // GQA: ne2/ne02, ne3/ne03 暂不计算 dps 参数
-    // TODO: 后续实现 GQA 支持
     // const int64_t dps2 = ne2 / ne02;
     // const int64_t dps3 = ne3 / ne03;
 

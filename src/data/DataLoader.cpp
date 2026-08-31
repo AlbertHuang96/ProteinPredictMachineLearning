@@ -301,7 +301,6 @@ const std::vector<std::string>& aa2long(int aa_num) {
         // 这里只列出 ALA 和 ARG 作为示例，完整版本需要所有 20 种氨基酸
     };
     
-    // TODO: 完整实现所有 20 种氨基酸的原子列表
     // 暂时返回 ALA 的定义
     return AA2LONG[aa_num];
 }
@@ -2266,7 +2265,6 @@ ModelInput PPMLDataLoader::load_from_files(
         prepare_ca_mask(input.true_coords, input.ca_mask);
     }
 
-    // read templates (TODO: 需要 FFindexDB 支持)
     // ReadTemplatesResult read_templates_result = read_templates(
     //     sequence.length(), ffdb, hhr_path, atab_fn, max_templates_);
     // TensorF32 xyz_t = std::move(read_templates_result.xyz);
@@ -2316,7 +2314,6 @@ ModelInput PPMLDataLoader::load_from_files(
         input.residx = residx.unsqueeze(0);  // (1, L)
     }
 
-    // TODO: torsions — 需要 xyz_t
     // input.tor_feat = get_torsions(xyz_t, sequence).torsions;
 
     // Step 2: 解析 HHR
@@ -2341,7 +2338,6 @@ ReadTemplatesResult PPMLDataLoader::read_templates(
     const std::string& atab_fn,
     int n_templ
 ) {
-    // TODO: 完整实现需要 FFindexDB 完整类型 + parse_templates 完善
     ReadTemplatesResult result;
     result.xyz = ppml::TensorF32({0, qlen, 3, 3});
     result.f1d = ppml::TensorF32({0, qlen, 3});
@@ -2461,7 +2457,6 @@ ReadTemplatesResult PPMLDataLoader::read_templates(
 std::vector<TemplateHit> PPMLDataLoader::parse_atab(const std::string& atab_fn) {
     // 解析 .atab 文件，提取模板命中信息
     std::vector<TemplateHit> hits;
-    // TODO: 完整实现
     return hits;
 }
 
@@ -2471,7 +2466,6 @@ TemplateDataInternal PPMLDataLoader::parse_templates(
     const std::string& atab_fn,
     int n_templ
 ) {
-    // TODO: FFindexDB 需要完整类型支持（当前仅为前向声明）
     // 完整实现需要: load_ffdb, parse_atab, parse_pdb_lines 等
     TemplateDataInternal result;
     return result;
@@ -2614,7 +2608,6 @@ TensorF32 PPMLDataLoader::a3m_to_msa_features(const std::vector<std::vector<uint
     TensorF32 features({max_seqs, max_length, MSA_FULL_DIM}, Device::CPU);
     features.zero_();
     
-    // TODO: 实际特征提取逻辑
     // 对于每个序列：
     //   - one-hot 编码氨基酸 (20 维)
     //   - 删除概率特征 (1 维)
@@ -2645,7 +2638,6 @@ TemplateData PPMLDataLoader::hhr_extract_template_features(
     result.t2d = zeros<float>({T, max_length, max_length, D_T2D}, Device::CPU);
     result.coords = zeros<float>({T, max_length, 3, 3}, Device::CPU);
     
-    // TODO: 实际特征提取逻辑
     
     return result;
 }
@@ -2692,7 +2684,6 @@ TorsionResult PPMLDataLoader::get_torsions(
     ppml::TensorF32 Rs({B, L, 3, 3});
     ppml::TensorF32 Ts({B, L, 3});
     Rs.zero_(); Ts.zero_();
-    // TODO: 实现完整的 rigid_from_3_points
     
     // Nideal = [-0.5272, 1.3593, 0.000], Cideal = [1.5233, 0.000, 0.000]
     std::array<float, 3> Nideal = {-0.5272f, 1.3593f, 0.0f};
@@ -3588,7 +3579,6 @@ TensorF32 PPMLDataLoader::prepare_coords(const std::string& sequence) {
     TensorF32 coords({B, L, 3, 3}, Device::CPU);
     coords.zero_();
     
-    // TODO: 实际实现
     // 可以使用简单的扩展或从 PDB 加载
     
     return coords;

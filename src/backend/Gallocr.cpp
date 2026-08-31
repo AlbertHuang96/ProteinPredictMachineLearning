@@ -195,7 +195,6 @@ void Gallocr::compute_refcounts(
             }
         }
     }
-    // ⚠️ 关键修复（2026-08-22）：backward 的 grad 节点消费前向节点，但 grad 节点不在
     // graph->nodes() 里（由 build_backward_expand 通过 add_or_set 存入 grads[ihash]）。
     // 若不计数，前向节点（如 msa）在 forward 消费完后 refcount=0 被释放，backward 算梯度时
     // 读已释放/复用的 buffer → 梯度 0/垃圾。开 SE3 时节点多（8165）复用密集 → msa head 梯度

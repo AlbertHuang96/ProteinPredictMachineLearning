@@ -74,7 +74,6 @@ __global__ void kernel_out_prod(
     //   将 dst 的 (i2, i3) 映射回 src0 的对应维度
     //   当 src0 的 head 数 < src1 时，共享 K/V heads
     // ================================================================
-    // TODO: 后续实现 GQA 支持
     // const int64_t i02 = i2 / dps2;
     // const int64_t i03 = i3 / dps3;
     const int64_t i02 = i2;

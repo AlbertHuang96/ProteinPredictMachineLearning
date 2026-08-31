@@ -23,7 +23,6 @@ void StateTrack::init_from_embedding(const TensorF32& seq_tokens) {
 
 // deprecated
 void StateTrack::inject_template(const TensorF32& t1d, const TensorF32& tor_feat) {
-    // TODO: LinearLayer 值类型构造已删除，需迁移到 create() + 指针模式
     // 此函数已内联到 PPMLModel::forward() 中
     /*
     LinearLayer emb_t1d(D_T1D + D_TOR, 64);

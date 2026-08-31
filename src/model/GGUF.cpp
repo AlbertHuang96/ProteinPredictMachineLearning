@@ -417,7 +417,6 @@ void load_gguf(const std::string& path,
 
     // ------ 5. 布局指纹校验 (若文件存有 layout_hash) ------
     if (!saved_layout_hash.empty()) {
-        // 用文件中的 (名字, 形状) 重算指纹；⚠️ 只取前 params.size() 个（模型参数），
         // 优化器状态 (opt.*) 不参与 hash（与保存侧一致，否则含 opt 的新文件会误报 mismatch）
         const size_t hash_n = std::min<size_t>(static_cast<size_t>(tensor_count), params.size());
         std::vector<std::string> file_names;

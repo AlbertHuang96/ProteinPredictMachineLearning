@@ -94,7 +94,6 @@ TensorF32 relu_value(const TensorF32& x) {
     for (int64_t i = 0; i < n; i++) op[i] = xp[i] > 0.0f ? xp[i] : 0.0f;
     return out;
 }
-// 值版 reshape（返回拥有数据的拷贝）。⚠️ 值版禁止 `x = x.view(s)`：view 返回
 // own_data_=false 的共享张量，move 赋值先 deallocate() 释放自身数据再接管悬垂指针 → use-after-free。
 TensorF32 reshape_value(const TensorF32& x, const Shape& s) {
     if (s.numel() != x.shape().numel())
@@ -185,7 +184,6 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
     // 主图 build_forward_expand 会复用这些节点（coords_graph 引用链），split_graph 的
     // node_is_host_producer 检查 base->buffer_->is_host() 时对悬垂 GPU buffer 做虚调用 → SIGSEGV。
     // 值已读回 dst，子图不再需要 buffer；主图最终 compute 由 bind_tensor 无条件 rebind，故直接清零安全。
-    // ⚠️ 只清中间计算结果节点：参数节点（TENSOR_FLAG_PARAM）保有 host data，不可清空，
     //   否则 gallocr 会把它们误判为 managed 需分配 → 大量 WARN 且参数数据丢失。
     for (int i = 0; i < cgraph->n_nodes(); i++) {
         TensorF32* nd = cgraph->graph_node(i);
@@ -294,7 +292,6 @@ void IterBlock::proj_state_add_to_query_row(TensorF32& msa, const TensorF32& pro
     // state -> msa[:,0]
     // msa[:, 0] += proj(state)  (B,L,32) -> (B,L,256)
 
-    // TODO: CUDA optimize
 
     // projected state (B, L, 256)
     // query_row += state_proj
@@ -505,7 +502,6 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
             pair_biased = add_value(pair_biased, rbf_feature);
 
-            // TODO
             // update msa query row with state from SE3 output
             // state → msa[:,0] 已在 Step 1 (msa2msa) 完成，无需重复
 
@@ -642,7 +638,6 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // ---- Step 4b: 序列加权求和 ----
         // encoder_seq: 学习每条序列的权重, shape (N,) → softmax → 加权求和
         // 简化实现: equal-weight mean over N sequences
-        // TODO: replace with learned SequenceWeight
         TensorF32 msa_sum({B, L, D_MSA}, msa_normed.device());
         float* sum_data = msa_sum.data();
         const float* msa_data = msa_normed.data();
@@ -699,9 +694,7 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // l1_feats: (B*L, 3, 3) 作为 degree-1
         SE3Features node_se3;
         node_se3.features.resize(2);
-        // ⚠️ features[0] 是 view（不拥有数据，node_out 存活本作用域，安全）
         node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
-        // ⚠️ features[1] 默认构造 numel=1，直接 copy_from 大张量 shape mismatch。
         //    先按 l1_feats 形状重建再拷贝（同 FullBlock 修复）。
         node_se3.features[1].~TensorF32();
         new (&node_se3.features[1]) TensorF32(l1_feats.shape(), l1_feats.device());
@@ -719,7 +712,6 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
 
         // ---- Step 4j: 提取输出 ----
         // state: degree-0 → (B*L, D_STATE) → (B, L, D_STATE)
-        // ⚠️ 不能 move 赋值 view（悬垂/double-free，同 FullBlock 修复）：深拷贝独立。
         if (state.numel() != static_cast<int64_t>(B * L * D_STATE)) {
             state.~TensorF32();
             new (&state) TensorF32(Shape({B, L, D_STATE}), se3_out.features[0].device());
@@ -775,7 +767,6 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
             }
         }
 
-        // ⚠️ xyz_new_ 成员默认构造 numel=1，直接 copy_from 大张量 shape mismatch。
         //    先按源 shape 重建（同 FullBlock 修复）。
         if (xyz_new_.numel() != xyz_new.numel()) {
             xyz_new_.~TensorF32();
@@ -817,7 +808,6 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
 
     // MSA Row Attention (with bias)
     msa = msa_row_attn_->forward_graph(msa, pair_biased);
-    // TODO: dropout(row_attn_out, 0.15) 图 drop 后续补
     // MSA Column Attention
     msa = msa_col_attn_->forward_graph(msa);
     // FeedForward
@@ -934,7 +924,6 @@ std::vector<TensorF32*> IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pa
     TensorF32 l1 = compute_l1_features(coords);                      // (B*L, 3, 3)
     const int m1     = 3;                                             // 度1 通道数（值版 l1_feats 固定 3）
     const int d_dim1 = 3;                                             // 度1 → 2*1+1
-    // ⚠️ 2026-08-24 布局修复：此前 `(a*d_dim1+c)*N + n`（特征外层、节点内层）与图布局相反。
     //    ggml dims[0]=最内维 → 图节点 [m1*d_dim1, N] 数据序应为 [节点][特征]（节点外层）。
     //    kernel_mul_mat 读 a[i*K+k]（i=节点行, k=特征K）要求 [节点][特征] 序。
     //    原序导致 G1x1SE3 度1 输出错位放大 ~26 倍（l1_feats ~100 → ±2680，值版仅 3.75）。
@@ -1075,7 +1064,6 @@ void IterBlock::apply_coord_update(const TensorF32& offset_value, const TensorF3
             (void*)xyz_data, (void*)off_data, (void*)xyz_out);
         return;
     }
-    // ⚠️ offset scale：SE3 初始权重随机的度1 输出量级可能极大（±1e10+），直接叠加会把
     // 坐标推到 ±3.5e10 → FAPE 的 sqr 溢出 → [FWD-NAN] op=9 → fape/conf(lddt 距离) NaN。
     // 参考 RF2AA 对 translation 输出的约束，这里乘 scale 限制单步位移量级（训练早期尤为关键）。
     // 2026-08-22: 0.1 下 chi head 波动剧烈（grad 经 coords→offset→SE3 链放大，[GRAD-NORM]
@@ -1163,7 +1151,6 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
 
         pair_biased = add_value(pair_biased, rbf_feature);
 
-        // TODO
         // update msa query row with state from SE3 output
         // DONE already update in the msa2msa
 
@@ -1296,9 +1283,7 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         SE3Features node_se3;
         node_se3.features.resize(2);
         // node_out = it was actually msa input
-        // ⚠️ features[0] 是 node_out 的 view（不拥有数据，node_out 存活于本作用域，安全）
         node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
-        // ⚠️ features[1] 默认构造 numel=1，直接 copy_from 大张量 shape mismatch。
         //    先按 l1_feats 形状重建再拷贝（值版 SE3Features 是值类型成员）。
         node_se3.features[1].~TensorF32();
         new (&node_se3.features[1]) TensorF32(l1_feats.shape(), l1_feats.device());
@@ -1314,7 +1299,6 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[FBLK] se3 forward OK (f0=%lld f1=%lld)\n",
             (long long)se3_out.features[0].numel(), (long long)se3_out.features[1].numel());
 
-        // ⚠️ 不能 state = se3_out.features[0].view(...)（move 赋值 + view）：
         //    state 是外部引用，move 赋值释放其旧数据；若旧数据地址恰好被 se3_out
         //    复用或 se3_out 析构释放 view 指向的 data，后续 state 读悬垂/析构 double-free。
         //    用深拷贝（先重建再 copy_from）使 state/offset 独立于 se3_out。
@@ -1366,7 +1350,6 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
             }
         }
 
-        // ⚠️ xyz_new_ 成员默认构造 numel=1，直接 copy_from 大张量 shape mismatch。
         //    先按源 shape 重建（同 IterBlock::forward 的 placement-new 模式）。
         if (xyz_new_.numel() != xyz_new.numel()) {
             xyz_new_.~TensorF32();
@@ -1400,7 +1383,6 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
 
     // MSA Row Attention (with bias)
     msa_full = msa_row_attn_->forward_graph(msa_full, pair_biased);
-    // TODO: dropout(row_attn_out, 0.15) 图 drop 后续补
     // MSA Global Column Attention
     msa_full = msa_global_col_attn_->forward_graph(msa_full);
     // FeedForward
@@ -1603,9 +1585,7 @@ void RefineBlock::forward(TensorF32& msa,
     // 构建 SE3Features 输入
     SE3Features node_se3;
     node_se3.features.resize(2);
-    // ⚠️ features[0] 是 view（不拥有数据，node_out 存活本作用域，安全）
     node_se3.features[0] = node_out.view({B * L, ITER_NODE_3D_OUT, 1});
-    // ⚠️ features[1] 默认构造 numel=1，直接 copy_from 大张量 shape mismatch。
     //    先按 l1_feats 形状重建再拷贝（同 IterBlock/FullBlock 修复）。
     node_se3.features[1].~TensorF32();
     new (&node_se3.features[1]) TensorF32(l1_feats.shape(), l1_feats.device());
@@ -1620,7 +1600,6 @@ void RefineBlock::forward(TensorF32& msa,
 
         // ---- Step 4j: 提取输出 ----
         // state: degree-0 → (B*L, D_STATE) → (B, L, D_STATE)
-        // ⚠️ 不能 move 赋值 view（悬垂/double-free，同 FullBlock 修复）：深拷贝独立。
         if (state.numel() != static_cast<int64_t>(B * L * D_STATE)) {
             state.~TensorF32();
             new (&state) TensorF32(Shape({B, L, D_STATE}), se3_out.features[0].device());
@@ -1676,7 +1655,6 @@ void RefineBlock::forward(TensorF32& msa,
         }
     }
 
-    // ⚠️ xyz_new_ 成员默认构造 numel=1，直接 copy_from 大张量 shape mismatch。
     //    先按源 shape 重建（同 IterBlock/FullBlock 修复）。
     if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[RBLK] before xyz_new_ store: xyz_new_.numel=%lld xyz_new.numel=%lld this=%p\\n",
         (long long)xyz_new_.numel(), (long long)xyz_new.numel(), (void*)&xyz_new_);
@@ -1687,7 +1665,6 @@ void RefineBlock::forward(TensorF32& msa,
     xyz_new_.copy_from(xyz_new);
     if (getenv("PPML_TRACE_VALUE")) fprintf(stderr, "[RBLK] after xyz_new_ store: numel=%lld this=%p\\n",
         (long long)xyz_new_.numel(), (void*)&xyz_new_);
-    // TODO: SE3Transformer 当前 forward 签名为 forward(SE3Features&, positions,
     //       orientations, edge_index, training)。
     //       等接口完善后，此处替换为：
     //
@@ -1710,7 +1687,6 @@ void RefineBlock::forward(TensorF32& msa,
     // Python: state  = shift['0'].reshape(B, L, -1)
     //         offset = shift['1'].reshape(B, L, -1, 3)
     // ================================================================
-    // TODO: 从 se3_out 中提取后激活以下代码:
     //
     // state_new_ = state_vec.view({B, L, D_STATE});        // (B, L, 32)
     // TensorF32 offset = offset_tensor.view({B, L, 3, 3}); // (B, L, 3, 3)
@@ -1834,7 +1810,6 @@ std::vector<TensorF32*> RefineBlock::run_se3_graph_refine(TensorF32*& msa, Tenso
     TensorF32 l1 = compute_l1_features(coords);                        // (B*L, 3, 3)
     const int m1     = 3;                                              // 度1 通道数（值版 l1_feats 固定 3）
     const int d_dim1 = 3;                                              // 度1 → 2*1+1
-    // ⚠️ 2026-08-24 布局修复：此前 `(a*d_dim1+c)*N + n`（特征外层、节点内层）与图布局相反。
     //    ggml dims[0]=最内维 → 图节点 [m1*d_dim1, N] 数据序应为 [节点][特征]（节点外层）。
     //    kernel_mul_mat 读 a[i*K+k]（i=节点行, k=特征K）要求 [节点][特征] 序。
     //    原序导致 G1x1SE3 度1 输出错位放大 ~26 倍（l1_feats ~100 → ±2680，值版仅 3.75）。
@@ -2692,7 +2667,6 @@ ModelOutput PPMLModel::forward(const ModelInput& input) {
             refine->set_seq_info(seq1hot, idx);
         } */
 
-        // ⚠️ RefineBlock::forward 需 residx（内部 get_bonded_neigh/make_graph 用）。
         //    不传则默认构造 TensorI64 shape 未初始化 → get_bonded_neigh 读 dims[0] SEGV。
         block->forward(msa, pair, state, seq1hot, coords,
                        input.bond_feats, input.dist_matrix, input.same_chain, input.residx);
@@ -2886,7 +2860,6 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     //   state 分支: 用全部 T 模板（T 维作 cross-attn key）
     //   pair 分支: 用 t=0 单模板（值版 PairTrack::inject_template 为 T=1 语义；图基础设施 4D 上限
     //              无法在不新增 5D 归约下遍历多模板，故取首模板）。
-    //   TODO(T>1): 完整 pair cross-attn 需把全部 T 模板作 key。当前图 op 缺沿 dims[3] 的归约
     //              (sum/mean 只支持全归约, sum_rows 只沿 dims[1]) 与 5D permute，故暂用 t=0。
     //              后续可：① 新增沿任意维的 reduce op；② 或把 templ_pair [64,L,L,T] 经 permute
     //              重排为 [64,1,1,L*L*T] 作为多模板 kv（T 折叠进 key 长度），query 仍为 B*L*L。
@@ -2909,7 +2882,6 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         // ---- (b) state 分支: template cross-attention (state 为 Q, 模板为 K/V) ----
         // 注: CrossAttention::forward_graph 为单 key (T=1) 设计（merge 时 view 掉 T 维），
         //     故 state 分支也用 t=0 单模板，与 pair 分支一致。多模板 (T>1) 需先扩展
-        //     CrossAttention 支持 T 维（见 README TODO），当前取首模板。
         // concat(t1d_t0, tor_t0) 沿最内维 → [110,L,B]
         TensorF32 tor_t0 = input.tor_feat.select(1, 0);                          // 值 (B,L,30)
         TensorF32* tor_t0_g = wrap_input_as_leaf(tor_t0, {D_TOR, L, B});         // [30,L,B]
@@ -3043,7 +3015,6 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         std::vector<TensorF32*> se3_out = blk->run_se3_structural(
             msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot);
         // 开关A（fixed）：只构图，收集 offset 图节点，block 循环后统一 compute + 读值更新。
-        // ⚠️ FAPE 梯度用的 coords_graph 不在此逐 block 累加（否则 ~7 个 block 的 offset 叠加成
         //   ~2100Å 巨型扰动 → FAPE 发散）。改为循环结束后一次性 build（sum/N，N=block 数），
         //   使图版坐标扰动总量≈单 block 量级，与开关B 一致，FAPE 梯度收敛。
         if (se3_fixed_topo) {
@@ -3199,7 +3170,6 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     // 【设计】开关A 下 drive_block_se3 只构图（用初始 coords 拓扑），不回落 offset。
     // 此处对收集的全部 offset 图节点 build 到**同一个** cgraph，一次 graph_compute 物化全部
     // SE3 offset/state（及其依赖的 msa/pair 子树——SE3 的 node0 依赖主图 msa）。
-    // ⚠️ 必须用**主 backend（cpu_backend_）**而非独立 se3_bk：SE3 图节点（node0/edge_w）依赖主图
     //   msa/pair，若用独立 backend compute，会把主图 msa/pair 子图节点 bind 到 se3_bk buffer 并
     //   置 TENSOR_FLAG_COMPUTE → loss 图 compute 时 msa 子图被跳过/读错位 → msa head 输入全 0
     //   → msa loss 恒 ln(23)=3.13（实测 2026-08-22）。用主 backend 则 msa 子树在主图生命周期内
@@ -3210,7 +3180,6 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         for (TensorF32* onode : se3_fixed_offsets_iter_) cg->build_forward_expand(onode);
         for (TensorF32* onode : se3_fixed_offsets_ref_) cg->build_forward_expand(onode);
         backend->graph_compute(cg);   // 主 backend：物化全部 offset/state + 依赖的 msa/pair 子树
-        // ⚠️ 清除本次 build 置的 TENSOR_FLAG_COMPUTE（nodes + leafs）：此 cgraph 包含 SE3 子树的
         // msa/pair 依赖，若残留 flag，loss 图 build_forward_expand(total) 时
         // visit_parents_graph（ComputeGraph.cpp:112）在"已访问"分支会跳过已带 flag 的 src →
         // msa/pair 子图大量节点/叶子不进 loss 图 nodes[] → 不重算 → msa head 输入全 0 →
@@ -3585,7 +3554,6 @@ void PPMLModel::load_weights(const std::string& path) {
 
     // 2. 从文件加载权重数据到各参数 tensor 的 CPU arena
     //    （此时参数数据仍在 context arena 中，data_ 指向 arena 地址）
-    //    TODO: 实现二进制文件读取逻辑
     //    示例: file.read(linear->weight()->data(), linear->weight()->nbytes());
 
     // 3. 将参数迁移到 backend buffer

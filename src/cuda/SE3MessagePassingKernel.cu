@@ -42,7 +42,6 @@ void edge_gather_rows_cuda(
     int N, int C, int E)
 {
     constexpr int BLOCK = 256;
-    // ⚠️ 2026-08-24: grid 下限 1, 防 E==0 → grid=0 → invalid argument
     int grid = E > 0 ? se3_ceil_div(E, BLOCK) : 0;
     if (grid <= 0) grid = 1;
     edge_gather_rows_kernel<<<grid, BLOCK>>>(node_feat, src_idx, dst, N, C, E);
@@ -79,7 +78,6 @@ void per_edge_matmul_cuda(
     int M, int K, int E)
 {
     constexpr int BLOCK = 256;
-    // ⚠️ 2026-08-24: grid 下限 1, 防 E==0 → grid=0 → invalid argument
     int grid = E > 0 ? se3_ceil_div(E, BLOCK) : 0;
     if (grid <= 0) grid = 1;
     per_edge_matmul_kernel<<<grid, BLOCK>>>(kernel, gathered, dst, M, K, E);
@@ -120,7 +118,6 @@ void scatter_add_cuda(
 {
     constexpr int BLOCK = 256;
 
-    // ⚠️ 2026-08-24 修复：grid 至少为 1。此前 `se3_ceil_div(total, BLOCK)` 在
     //    total=N*M==0 时得 grid=0 → cudaLaunchKernel invalid argument → zero_kernel
     //    未执行 → dst 残留上一轮数据(nan) → CONCAT 读到 nan → 混合 SE3 前向爆炸
     //    (loss 276万)。实测: 反向 scatter_add(grad, idx, N=0) 时 total=0 必现。

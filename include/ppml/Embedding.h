@@ -42,7 +42,6 @@ public:
         // embedding 本质是 get_rows(weight, indices)
         //return get_rows(weights_, indices);
     
-    // TODO
     // all the forward_exec need to be removed
     // forward
     // backward

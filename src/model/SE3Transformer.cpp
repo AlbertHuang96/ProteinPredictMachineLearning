@@ -30,7 +30,6 @@ struct GraphData;
     eijk.resize(batch_size * n_nodes * n_nodes * basis_dim, 0.0f);
     R_ij.resize(batch_size * n_nodes * n_nodes * 9, 0.0f);  // 3x3 旋转矩阵
     
-    // TODO: 实现完整的球谐基计算
     // 1. 计算相对位置向量
     // 2. 计算球谐函数 Y_lm
     // 3. 计算 Clebsch-Gordan 系数
@@ -98,7 +97,6 @@ std::vector<float> null_project(const std::vector<float>& A, int m, int n) {
         result[i * n + i] = 1.0f;
     }
     
-    // TODO: 实现完整的零空间计算
     // 1. 对 A 进行 SVD 分解：A = U * S * V^T
     // 2. 找到 S 中接近 0 的奇异值对应的 V 的列
     // 3. 这些列构成零空间
@@ -122,7 +120,6 @@ std::vector<float> null_project(const std::vector<float>& A, int m, int n) {
         }
     }
     
-    // TODO: 实现完整的 Q_J 矩阵计算
     // 需要计算 Clebsch-Gordan 系数 C_{l1,m1,l2,m2}^{J,M}
     
     return Q_J;
@@ -178,7 +175,6 @@ std::vector<float> null_project(const std::vector<float>& A, int m, int n) {
         }
     }
     
-    // TODO: 实现完整的 Wigner D 矩阵计算
     // D^l_{m,m'}(theta, phi) = e^{-i*m*phi} * d^l_{m,m'}(theta)
     // 其中 d^l 是小 Wigner d 矩阵
     
@@ -424,7 +420,6 @@ GraphData make_graph(const TensorF32& xyz,
     const float*   pair_data = has_pair ? pair.data() : nullptr;  // pair[b, i, j, e]
     const int64_t* idx_data  = idx.data();   // idx[b, i]
 
-    // ⚠️ top_k 不能超过 L-1（dists 排除 i==j 后只有 L-1 个候选），否则
     //    partial_sort(begin+actual_top_k) 与 dists[k] 越界 → heap-buffer-overflow
     //    破坏堆 → 后续 free 报 corrupted double-linked list。这是值版 forward 崩溃根因。
     int actual_top_k = std::min(top_k, L - 1);
@@ -597,7 +592,6 @@ SE3Features::SE3Features(const Fiber& fiber, const TensorF32& prototype, int bat
 
 void SE3Features::zero_() {
     for (auto& feat : features) {
-        // TODO: 实现张量零初始化
         // feat.zero_();
     }
 }
@@ -608,13 +602,11 @@ void SE3Features::add_(const SE3Features& other) {
     }
     
     for (size_t i = 0; i < features.size(); ++i) {
-        // TODO: 实现张量加法
         // features[i] = features[i] + other.features[i];
     }
 }
 
 SE3Features SE3Features::operator+(const SE3Features& other) const {
-    // TODO: SE3Features 禁止拷贝，此操作暂未实现
     SE3Features result;
     return result;
 }
@@ -656,7 +648,6 @@ TensorF32 SE3Basis::q_matrix(int J, int d_in, int d_out) {
     }
 
     // ---------- (d_in=1, d_out=1) ----------
-    // ⚠️ 索引必须用实际 d_o/d_i/d_J 参数化（Q 形状是 {d_o,d_i,d_J}）。
     // 旧实现硬编码 *3/*5 与 mo=3/4，当 d_o 或 d_J < 5（如 d_out=0）时越界写 → ASAN heap-buffer-overflow。
     if (d_in == 1 && d_out == 1) {
         // CG(1,m1, 1,m2, J,M) where M = m1+m2, for J = 0, 1, 2
@@ -718,7 +709,6 @@ TensorF32 SE3Basis::q_matrix(int J, int d_in, int d_out) {
     }
 
     // ---- 高阶度的 fallback: 单位近似 ----
-    // TODO: 实现完整 3j-symbol 计算
     for (int k = 0; k < std::min(d_o, std::min(d_i, d_J)); ++k) {
         q[(k * d_i + k) * d_J + k] = 1.0f;
     }
@@ -975,14 +965,12 @@ SE3Features G1x1SE3::forward(const SE3Features& x) {
         const TensorF32& v = x.features[idx_it->second];  // 输入特征张量 (N, m_in, d_dim)
         LinearLayer* W = w_it->second;                   // 权重矩阵 (m_out × m_in)
 
-        // ⚠️ 不能用 W->forward(v)：LinearLayer::forward 是 2D matmul，会把 (N,m,d_dim) 3D
         //    特征按扁平 (batch=N*d_dim, in=m_in) 处理——Wigner 分量 d_dim 与 multiplicity m
         //    混在一起且 in_features_=m_in 与实际特征维 m_in*d_dim 不符 → batch 计算错 → 越界写。
         //    正确语义（对齐图版块对角）：对每个 Wigner 分量 dd 独立做 out=W@v[...,dd]（只混 m）。
         //    即 out[n, mo, dd] = sum_{mi} W[mo,mi] * v[n, mi, dd]。
         const int64_t N = v.shape().dims[0];
         const int64_t d_dim = v.shape().dims[2];
-        // ⚠️ 权重 shape 是 {in_features, out_features}（Embedding.cpp:98 create 里
         //    w_dims={in,out}）→ dims[0]=in, dims[1]=out。
         //    m_out 必须以输入张量 v 的实际通道数为准（v.shape().dims[1]），
         //    不能假设等于权重 in_features：skip='cat' 时 out_proj_ 输入是 cat 后的
@@ -1159,7 +1147,6 @@ TensorF32* RadialFunc::forward_graph(TensorF32* x) {
     // ---- Layer 3: Linear → reshape (E, num_freq*in*out) → R dims=[num_freq, in, out, E] ----
     TensorF32* y = linear3_->forward_graph(h);          // (E, num_freq*in*out)
     const int64_t E = y->shape().dims[1];
-    // ⚠️ view 形状必须按 ggml 约定 dims[0]=最内维：R 期望 [num_freq, in, out, E]
     //    （dims[0]=num_freq 最内，与 PairwiseConv 的 permute{2,0,1,3} 和
     //    view(R_co, Shape({E,in,nf})) 布局对齐）。原代码 Shape({E,out,in,nf}) 让
     //    dims[0]=E 最内，导致 PairwiseConv 读 R 错位 → kernel 值巨大 → exp 溢出 NaN
@@ -1308,7 +1295,6 @@ TensorF32 PairwiseConv::forward(const TensorF32& feat, const TensorF32& basis) {
     // 实际 Python 中 view 做了: kernel(E,nc_out,nc_in,d_out) → (E, d_out*nc_out, d_in*nc_in)
     // 但这需要假定原 kernel 的 nc_in 维度实际代表 d_in*nc_in
 
-    // TODO: 完整实现需要确认输入特征具体的 reshape 约定
     // 当前简化: 直接将 kernel reshape 为输出形状
     //int64_t out_rows = d_out_ * nc_out_;
     //int64_t out_cols = d_in_ * nc_in_;
@@ -1371,7 +1357,6 @@ TensorF32* PairwiseConv::forward_graph(TensorF32* feat, const TensorF32& basis) 
     // 2) permute R → (out, nf, in, E)：把被切片的输出通道 co 移到最内 dims[0]（get_rows 按 dims[0] 选行），
     //    其余保持 nf,in,E 顺序（nf 最内，便于后续 view 回 [nf,in,E]）。
     //    再 view → 2D (out, E*in*nf)：dims[0]=out（行，供 get_rows 按 co 选），dims[1]=E*in*nf（行内长，nf 最内）。
-    //    ⚠️ 修正：原实现 permute{0,1,3,2}+view[E*in*nf,out] 把可变长 E*in*nf 放 dims[0]（get_rows 当行）、
     //      把待切 co 放 dims[1]（get_rows 当行内长），方向反了；配合本次 get_rows 修复（按 a.dims[0] 选行、
     //      输出 a.dims[1] 长）会切错行并输出错误长度。现改为 co 在 dims[0]、行内长在 dims[1]。
     TensorF32* R_perm = permute(R, std::vector<int>{2, 0, 1, 3});
@@ -1384,7 +1369,6 @@ TensorF32* PairwiseConv::forward_graph(TensorF32* feat, const TensorF32& basis) 
         // R_co = R[:,co,:,:] → (E,in,nf) dims=[nf,in,E]
         TensorF32* co_leaf = constant_scalar(static_cast<float>(co));
         TensorF32* R_co_flat = get_rows(R_2d, co_leaf);          // (1, E*in*nf)
-        // ⚠️ 修正：按 ggml dims[0]=最内维，行内数据布局是 [nf,in,E]（nf 最内、E 在 dims[2]），
         //    per_edge_matmul 读 kernel->dims[2] 作为 E。原 Shape({E,in,nf}) 让 dims[0]=E、
         //    dims[2]=nf，per_edge_matmul 会把 nf 当 E → 索引错乱 → kernel 值巨大 → exp 溢出 NaN。
         TensorF32* R_co = view(R_co_flat, Shape({nf, in, E}));   // dims=[nf,in,E]
@@ -1550,7 +1534,6 @@ TensorF32 GConvSE3Partial::udf_u_mul_e(
         }
     }
 
-    // ⚠️ 诊断（GRAPH_DEBUG_SE3_WEIGHT=1）：值版 GConv 消息量级，与图版 PER_EDGE_MATMUL 输出对比。
     if (getenv("GRAPH_DEBUG_SE3_WEIGHT")) {
         const int64_t mn = E * m_out * d_dim_out;
         float mmin = msg_data[0], mmax = msg_data[0]; double msum2 = 0;
@@ -1725,7 +1708,6 @@ std::vector<TensorF32*> GConvSE3Partial::forward_graph(
             TensorF32* kernel = k_it->second;
             // 按源节点 gather: (E, m_in*d_dim_in) dims=[m_in*d_dim_in, E]
             TensorF32* gathered = edge_gather_rows(h_nodes[i], edge_src_idx);
-            // ⚠️ 诊断（GRAPH_DEBUG_SE3_WEIGHT=1）：打印消息传递输入 gathered（节点特征）值域，
             //    判断爆炸发生在"进入 GConv 前"（h_nodes 已大）还是"GConv 核乘"放大。
             if (getenv("GRAPH_DEBUG_SE3_WEIGHT")) {
                 fprintf(stderr, "[GConv-dbg] d_in=%d(m=%d,dd=%d) d_out=%d(m=%d,dd=%d) h_nodes[%zu] dims=[%lld,%lld] numel=%lld kernel dims=[%lld,%lld,%lld]\n",
@@ -1774,7 +1756,6 @@ std::vector<TensorF32*> G1x1SE3::forward_graph(const std::vector<TensorF32*>& x_
 
         const float* w_data = weights_[d]->weight()->data();  // (m_out, m_in)
         const float* b_data = weights_[d]->bias() ? weights_[d]->bias()->data() : nullptr;
-        // ⚠️ 诊断（GRAPH_DEBUG_SE3_WEIGHT=1）：打印 G1x1SE3 权重/偏置值域，判断是否 Xavier 初始化过大。
         if (getenv("GRAPH_DEBUG_SE3_WEIGHT")) {
             const int64_t wn = (int64_t)weights_[d]->weight()->numel();
             const int64_t bn = b_data ? (int64_t)weights_[d]->bias()->numel() : 0;
@@ -1834,7 +1815,6 @@ TensorF32 GMABSE3::fiber2head(const TensorF32& feat, int m, int d_dim) {
     const auto& shape = feat.shape();
     int64_t X = shape.dims[0];  // N 或 E
 
-    // ⚠️ 不能用 result = result.view(...)（view 不拥有数据，move 赋值悬垂）；
     // 直接按目标 shape 构造并扁平拷贝。
     TensorF32 result({X, n_heads_, m / n_heads_, d_dim}, feat.device());
     result.copy_from(feat);    // 行优先扁平拷贝，reshape 安全
@@ -2227,12 +2207,10 @@ std::vector<TensorF32*> GMABSE3::forward_graph(
         // a_v[c,e] = a[h(c),e]：a 是 [n_heads,E]（mul_mat 输出 dims=[n_heads, E]，
         // dims[0]=n_heads 行, dims[1]=E 行内长——get_rows 恰好需要行在 dims[0]）。
         // 直接 get_rows(a, h_idx)：按 dims[0]=n_heads 取 h_idx(C 个) 头行，行内长 dims[1]=E
-        // → 输出 dims=[E, C]（行内长 E 最内, C 行）。⚠️ 不能先 transpose(a)（会把 E 变成行数、
         // n_heads 变行内长 → 输出 dims=[n_heads, C] numel=C*n_heads ≠ v_nodes 的 C*E → mul 广播越界）。
         // 再 transpose → dims=[C, E]（dims[0]=C 通道, dims[1]=E 边）== v_nodes[i] 布局，逐元素对齐。
         // a_v[c,e] = a[h(c),e]：a 是 [n_heads,E]（mul_mat 输出 dims=[n_heads, E]，
         // dims[0]=n_heads 行, dims[1]=E 行内长）。get_rows 需要行在 dims[0]。
-        // ⚠️ 2026-08-23 方案A修复后采用新版：直接 get_rows(a)（行在 dims[0]=n_heads）→ [E, C]，
         //    再 transpose → [C, E]（shape 正确，无 ELEM-BCAST）。其跨后端
         //    （get_rows 读 GPU 的 a → transpose CPU）已由 Gallocr GPU→CPU is_output 保护修复，
         //    混合训练 loss 13.86 正常（原旧版 13.49，新版略高但 shape 正确且无广播警告）。
@@ -2543,7 +2521,6 @@ std::vector<TensorF32*> GSE3Res::parameters() {
         auto p = k_proj_->parameters();
         params.insert(params.end(), p.begin(), p.end());
     }
-    // TODO: add q_proj_, attn_, out_proj_ parameters
     return params;
 }
 
@@ -2554,7 +2531,6 @@ std::vector<TensorF32*> GSE3Res::parameters() {
 
 GNormSE3::GNormSE3(const Fiber& fiber, float eps)
     : fiber_(fiber), eps_(eps) {
-    // TODO: 初始化缩放和偏置参数
 }
 
 SE3Features GNormSE3::forward(const SE3Features& x) {
@@ -2698,7 +2674,6 @@ std::vector<TensorF32*> GNormBias::forward_graph(
         TensorF32* v3     = view(x, Shape({d_dim, m, N}));      // [d_dim, m, N]（d_dim 最内）
         TensorF32* sum_sq = sum_rows(sqr(v3));                  // [1, m, N]（沿 d_dim 归约）
         TensorF32* norm   = sqrt(sum_sq);                       // [1, m, N]
-        // ⚠️ 诊断（GRAPH_DEBUG_SE3_WEIGHT=1）：打印 GNormBias 输入 x 与 norm 值域。
         //    爆炸链 node=1605 DIV=t/(norm+eps)=13442 且输入 x~l1_feats(~100) 矛盾
         //    → 怀疑 norm 计算或 x 布局错位（跨节点混值）。此诊断确认 x/norm 实际量级。
         if (getenv("GRAPH_DEBUG_SE3_WEIGHT")) {
@@ -2734,7 +2709,6 @@ std::vector<TensorF32*> GNormBias::forward_graph(
         TensorF32* scale_f  = view(scale3d, Shape({m * d_dim, N}));     // [m*d_dim, N]
         out[i] = mul(x, scale_f);                                       // [m*d_dim, N]
 
-        // ⚠️ 图版激活控制（2026-08-24）：GNormBias 数学上保持量级（out≈x），但图版 SE3 消息传递
         //    逐层放大（首层 gathered 已 ±2680，值版仅 3.75）。此控制对输出乘全局衰减 scale
         //    （等变安全：标量缩放），抑制爆炸向后续层传播。env PPML_SE3_GNORM_SCALE 默认 0.1；
         //    =1.0 关闭（保持原行为）。注：这是缓解措施，根因是图版度1 特征构建/传递的布局错位
@@ -2759,7 +2733,6 @@ TFN::TFN(const Fiber& fiber_in,
          bool use_layer_norm)
     : fiber_in_(fiber_in), fiber_out_(fiber_out), 
       J_max_(J_max), use_layer_norm_(use_layer_norm) {
-    // TODO: conv_ = std::make_unique<GConvSE3>(fiber_in, fiber_out, J_max); — GConvSE3 未实现
     if (use_layer_norm) {
         norm_ = std::make_unique<GNormSE3>(fiber_out);
     }
@@ -2769,12 +2742,10 @@ TFN::TFN(const Fiber& fiber_in,
 SE3Features TFN::forward(const SE3Features& x,
                         const SE3Basis& basis,
                         const TensorI64& edge_index) {
-    // TODO: 实现张量场网络前向传播
     // 1. 图卷积
     // 2. 层归一化（可选）
     // 3. 偏置加法
     
-    // TODO: conv_ 未实现，暂时返回空
     // 注意: 不可用 out.features[i].copy_from(...) —— resize 默认构造 1 元素 Tensor。
     // 按源 shape 构造再复制。
     SE3Features out;

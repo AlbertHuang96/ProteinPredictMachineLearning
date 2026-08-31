@@ -34,7 +34,6 @@ TensorF32 PositionalEncoding::forward(const TensorF32& seq,
                                       const TensorF32& bond_feats,
                                       const TensorF32& dist_matrix,
                                       const TensorF32& same_chain) {
-    // TODO:
     // 1. Compute is_atom mask from seq
     // 2. Call getResAtomDist to get res_dist and atom_dist
     // 3. Bucketize distances
@@ -60,7 +59,6 @@ TensorF32 PositionalEncoding::forward(const TensorF32& coords) {
     // Simplified version: compute positional encoding from coordinates only
     // This is used in PPML.cpp line 196
     
-    // TODO: Full implementation
     // For now, return zeros as placeholder
     
     int B = coords.shape().dims[0];
@@ -178,7 +176,6 @@ std::pair<TensorF32, TensorF32> PositionalEncoding::getResAtomDist(
     //   sm_mask: (B, L) - small molecule mask (1 if atom, 0 if residue)
     //   cyclize: (B, L) - cyclization mask (optional, 1 if cyclized)
     
-    // Assume batch = 1 for now (TODO: handle batch > 1)
     int B = idx.shape().dims[0];
     int L = idx.shape().dims[1];
     Device device = idx.device();

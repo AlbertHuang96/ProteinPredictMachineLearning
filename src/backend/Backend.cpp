@@ -304,7 +304,6 @@ static bool alloc_tensor_range(
             if (t->view_src == nullptr) {
                 continue;  // 已独立分配
             }
-            // TODO: view tensor 需要设置 data_/buffer_，但 data_ 是 private
             // else if (t->buffer_ == nullptr) {
             //     t->data_        = t->view_src->data_;
             //     t->buffer_      = t->view_src->buffer_;
@@ -315,7 +314,6 @@ static bool alloc_tensor_range(
 
         if (t->view_src != nullptr) {
             // view tensor：不需要新内存，指向源
-            // TODO: data_ is private, need friend or public setter
             // if (t->buffer_ == nullptr) {
             //     t->data_        = t->view_src->data_;
             //     t->buffer_      = t->view_src->buffer_;
@@ -479,7 +477,6 @@ bool is_device_pointer(const TensorF32* src, const float* data) {
     if (src->buffer_) return !src->buffer_->is_host();
     float probe = 0.0f;
     cudaError_t err = cudaMemcpy(&probe, data, sizeof(float), cudaMemcpyDeviceToHost);
-    // ⚠️ 2026-08-31 根因修复：对 host 指针做 D2H 探测必然返回 invalid argument（预期结果，
     //    说明 data 是 host）。但该失败会残留在 CUDA 错误状态，被后续任意 cudaGetLastError
     //    捕获 → 误报后续 kernel（如 OP_SCATTER_ADD op=108）invalid argument。
     //    这里必须清掉探测产生的错误，否则污染错误状态（混合训练 [CUDA-ERR] op=108 真凶）。
@@ -974,7 +971,6 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
         TensorF32* node = graph->graph_node(i);
         if (is_view_op(node->op)) continue;
 
-        // ⚠️ 2026-08-24 修复：未分配节点默认 CPU（最后后端）而非 GPU。
         //   原 default_id=0(GPU) 会把未分配的反向 op（如 OP_OUTER_PROD_MEAN_BACK，CUDA
         //   supports_op=false）当 GPU → 在 GPU split dispatch → CUDA 无 kernel 却走默认
         //   launch 路径 → buffer_offs 巨大 → invalid argument → 偶发 nan（msa 梯度缺失）。
@@ -1241,7 +1237,6 @@ Status BackendScheduler::graph_compute() {
         Status st = backend->graph_compute(current_graph_);
         backend->set_skip_alloc(false);
 
-        // ⚠️ 2026-08-24 修复异步竞态：GPU split 的 kernel 是异步执行的，
         //   若不等其完成就进入下一个 CPU split 的 Step 1b D2H（get_tensor/cudaMemcpy），
         //   可能读到未完成/垃圾数据 → 偶发 loss 巨大(nan)/segfault（每次运行结果不同）。
         //   在 GPU split 结束后强制同步（CPU split 同步是空操作，无开销）。
@@ -1260,7 +1255,6 @@ Status BackendScheduler::graph_compute() {
         //   → 偶发巨大值（k_cat CONCAT 报 -1.98e6、新版 a_rows 跨后端 NaN）。
         //   生产后立即落地，src 数据刚算完，且 CPU 消费者用 cpy（host）不依赖 src GPU buffer 存活。
         // 主动落地（PPML_EAGER_D2H=1 启用）：生产者 split 后立即拷贝跨后端输出。
-        // ⚠️ 2026-08-24：默认关（试验发现可能触发 op=108 OUTER_PROD_MEAN_BACK 在 GPU launch
         //    invalid argument，且与方案A is_output 叠加后偶发 loss 巨大）。保留开关待进一步调试。
         if (getenv("PPML_EAGER_D2H") && std::strcmp(getenv("PPML_EAGER_D2H"), "1") == 0) {
             for (auto& kv : copy_tensor_map_) {

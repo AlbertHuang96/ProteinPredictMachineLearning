@@ -149,7 +149,6 @@ static float compute_total_grad_norm(const std::vector<TensorF32*>& param_list, 
 }
 
 /// @brief 等比例缩放所有参数梯度
-/// ⚠️ 若梯度含 NaN/Inf，直接 *=scale 会把 NaN 传播进 Adam 更新 → 参数变 NaN → 下一 epoch 前向全 NaN。
 /// 这里把非有限元素置 0（等价"该元素不贡献梯度"），打破"梯度 NaN→参数 NaN→前向 NaN"恶性循环。
 static void scale_param_grads(const std::vector<TensorF32*>& param_list, ComputeGraph* cgraph, float scale) {
     for (auto* param : param_list) {
@@ -193,7 +192,6 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
     auto params = collect_params(cgraph);
     if (params.empty()) return 0.0f;
 
-    // ⚠️ 分离 SE3 参数（TENSOR_FLAG_SE3）单独 clip（2026-08-22 修复）：
     // SE3 梯度尺度（~1e13）远大于主图/head 梯度（~1e5），若与主图一起做全局比例 clip，
     // SE3 主导 scale → msa head 等正常参数被压到极小（1e-9）→ 权重几乎不动 → msa/chi 不学习
     // （实测开 SE3 时 msa=3.13 恒定，关 SE3 时 msa 下降）。

@@ -119,7 +119,6 @@ bool CPUBackend::supports_op(TensorF32* node) const {
 // ===== graph_plan (公有，可外部调用预估算) =====
 ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
     ComputePlan plan;
-    // ⚠️ n_threads 必须恒等于 n_threads_（实际参与线程数 = 主线程 + 全部 worker）。
     // 线程池 submit 设 n_threads_cur = plan.n_threads，barrier 期待该数量的线程参与；
     // 但 worker_loop 会在【全部】n_threads_-1 个 worker 上跑 compute_thread，主线程也参与，
     // 共 n_threads_ 个线程调 barrier。若 plan.n_threads < n_threads_（例如 max_tasks 较小），
@@ -169,7 +168,6 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
         } else {
             // 释放上一图分配的 buffer（上一图消费方已在上次 graph_compute 返回后读取完 data()）。
             gallocr_.release();
-            // ⚠️ need_alloc 必须恒 true：release() 已释放全部 buffer 并复位快照内节点 data()，
             //    但跨图共享节点（SE3 的 compute_and_read 独立 cg 与主图共享 backend gallocr_）
             //    的 data() 可能仍非空且指向已释放 buffer —— 若依赖 data()==nullptr 判定跳过
             //    重新分配，主图 compute 就会读悬垂指针 → SIGSEGV（[ELEM-PTR] 显示 data 非空仍崩）。
@@ -243,7 +241,6 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
 
     ComputePlan plan = graph_plan(cgraph);
 
-    // ⚠️ 不再强制 skip_alloc_ 时 plan.n_threads=1：那会破坏"n_threads 必须等于实际参与线程数
     // n_threads_"的不变量（见 graph_plan）。graph_plan 现在恒返回 n_threads_（全部线程参与），
     // 多线程 barrier 计数一致，正确。
 
@@ -334,7 +331,6 @@ void CPUBackend::compute_thread(ThreadState * state) {
                             (long long)(s1&&s1->shape().ndim()>2?s1->shape().dims[2]:-1),
                             (long long)(s1&&s1->shape().ndim()>3?s1->shape().dims[3]:-1),
                             opname(s1?s1->src[0]:nullptr));
-                    // ⚠️ OP_DIV 专项（GNormBias 的 scale3=t/(norm+eps)）：打印 t(src0=relu) 与
                     //    denom(src1=norm+eps) 统计。若 t≈norm 但 norm 巨大而输入 x 正常 → 布局错位。
                     if ((int)node->op == 8 /*OP_DIV*/ && node->shape().ndim() >= 3) {
                         const float* td = s0 ? s0->data() : nullptr;
@@ -358,7 +354,6 @@ void CPUBackend::compute_thread(ThreadState * state) {
                                     (double)dmin, (double)dmax, (long long)s1->numel());
                         }
                     }
-                    // ⚠️ PER_EDGE_MATMUL 专项：打印 kernel(src0) / gathered(src1) 的统计，
                     //    定位 SE3 核生成爆炸是 kernel 值异常还是 gathered(节点特征) 异常。
                     if ((int)node->op == 107 /*OP_PER_EDGE_MATMUL*/) {
                         const float* kd = s0 ? s0->data() : nullptr;
@@ -514,7 +509,6 @@ size_t CPUBackend::estimate_work_size(TensorF32 * node, int n_threads, int n_tas
             //int n_tasks = get_n_tasks(node, n_threads);
             // 保守估计：attn weights 的中间存储
             cur = sizeof(float) * node->shape().dims[2] * node->shape().dims[3] * n_tasks;
-            // TODO: further need to change to tiled version
 
         } break;
         case OP_FLASH_ATTN_BACK: {

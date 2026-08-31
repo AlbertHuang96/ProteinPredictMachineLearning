@@ -430,7 +430,6 @@ private:
     //bool      has_seq_info_ = false;
 
     // ---- 输出缓存 ----
-    // ⚠️ 不再定义独立的 xyz_new_/state_new_：updated_coords() 是非虚函数，
     //    block->updated_coords()（静态类型 IterBlock*）会调用基类版本返回基类成员。
     //    派生类若再定义同名成员，RefineBlock::forward 更新派生类成员而读取端拿基类
     //    成员 → 永远拿到默认空张量（[COPY-FAIL] src=()）。统一复用基类成员。

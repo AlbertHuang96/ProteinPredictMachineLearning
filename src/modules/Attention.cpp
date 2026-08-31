@@ -43,7 +43,6 @@ TensorF32 value_add_same(const TensorF32& a, const TensorF32& b) {
     for (int64_t i = 0; i < n; ++i) op[i] = ap[i] + bp[i];
     return out;
 }
-// 值版 reshape（返回拥有数据的拷贝）。⚠️ 值版禁止 `x = x.view(s)`：view 返回
 // own_data_=false 的共享张量，move 赋值先 deallocate() 释放自身数据再接管悬垂指针 → use-after-free。
 TensorF32 value_reshape(const TensorF32& x, const Shape& s) {
     if (s.numel() != x.shape().numel())
@@ -766,7 +765,6 @@ TensorF32 PairColAttention::forward(const TensorF32& pair, const TensorF32& str_
     // attn_out: (B*Lr, 8, 32, Lc)
 
     // Merge heads: (B*Lr, 8, 32, Lc) → (B*Lr, Lc, H*D) → (B, Lr, Lc, H*D)
-    // ⚠️ 不能用 attn_out = attn_out.view(...)：view 不拥有数据，move 赋值先释放自身再接管悬垂指针。
     //    view 须与底层拥有者分离声明，同作用域存活。
     TensorF32 merged = attn_out.permute({0, 3, 1, 2});          // (B*Lr, Lc, 8, 32) 拥有数据
     TensorF32 merged_view = merged.view(Shape({B, Lr, Lc, H * D})); // (B, Lr, Lc, H*D) 非拥有 view

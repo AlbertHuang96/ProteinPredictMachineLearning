@@ -172,7 +172,6 @@ size_t total_bytes_of(const std::vector<TensorF32*>& params) {
 // 加载 checkpoint (GGUF): 从文件读权重覆盖模型当前参数。
 //   path: 输入 gguf 文件路径
 //   meta_out (可选): 收集文件中数值型元数据 (epoch/sample_pos 等)，供多样本断点续训。
-//   ⚠️ 当前假设加载的权重与模型内架构/命名/顺序一致（collect_params_with_names 的
 //      顺序 = save_gguf 的写入顺序 = load_gguf 的读取顺序）。load_gguf 内部校验
 //      张量数量与形状，不一致会抛异常（由调用方决定 WARN 继续或退出）。
 // ============================================================================
@@ -303,7 +302,6 @@ std::vector<ProteinSample> discover_training_set(const std::string& root) {
     std::vector<ProteinSample> out;
     if (!std::filesystem::exists(root)) return out;
     // 收集 a3m -> uniprot
-    // ⚠️ 2026-08-24 修复：后缀 "_alignment.a3m" 长 14 字符，此前用 11/12 导致永远匹配不到
     //    a3m → 多样本"未发现任何蛋白样本"。实证: p[-11:]="ignment.a3m"≠"_alignment."
     //    p[-14:]="_alignment.a3m"✓；name[:-12]="O60260_a"✗, name[:-14]="O60260"✓。
     const std::string kA3mSuffix = "_alignment.a3m";  // 14 chars
@@ -360,7 +358,6 @@ double estimate_peak_gb(int L, int N) {
 }
 
 // buffer 感知读写 (复刻 GradientClipper 的内部辅助, 因其未导出)
-// ⚠️ graph_get_grad(param) 对"未参与本图 loss 路径"的参数返回 nullptr（如 SE3 部分参数/未激活分支），
 // 必须判空：read 返回全零（等价该参数本样本梯度为 0），write 跳过（避免写坏 last_cgraph）。
 std::vector<float> ms_read_grad(ComputeGraph* cgraph, TensorF32* param) {
     TensorF32* grad = cgraph->graph_get_grad(param);
@@ -540,7 +537,6 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
     float epoch_loss_sum = 0.0f;
     int trained_samples = 0;
     ComputeGraph* last_cgraph = nullptr; // 保留最近一个样本图用于写回梯度
-    // ⚠️ 多样本 arena 复用（与单样本 main 一致）：
     //   ComputeGraph 分配于 context arena（1GB 固定缓冲），不能 delete（invalid free 崩溃）。
     //   模型参数已全部创建（params() 已收集）→ 记录参数末水位 mark；每样本 step 完成后
     //   reset_objects_to(mark) 回退释放上一样本图节点，保留参数，避免 arena 跨样本单调增长
@@ -788,7 +784,6 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
             // 内存检查点：本样本 compute 完 + 梯度已读出（step 前）的峰值状态
             print_rss("sample-end");
 
-            // ⚠️ 不能 delete：ComputeGraph 分配于 context arena（invalid free 崩溃）。
             // 仅保留引用供 step 写回；arena 释放由 step 完成后的 reset_objects_to 统一回退。
             last_cgraph = cgraph;
 
@@ -903,7 +898,6 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
               << " avg_loss=" << avg_loss << " elapsed=" << elapsed << "s" << std::endl;
 
     // checkpoint
-    // ⚠️ 末次保存必须带 extra_meta（sample_pos/resume_epoch），否则会覆盖掉中途每样本
     //    保存写入的进度，导致续训读不到 sample_pos（实测 strings 无 sample_pos、
     //    resume 退化到 sample_pos=-1）。末次 = 最后一个 epoch 全部完成。
     if (const char* ck = std::getenv("PPML_CKPT")) {
@@ -1677,7 +1671,6 @@ int main(int argc, char* argv[]) {
             for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
                 TensorF32* nd = cgraph->graph_node(gi);
                 if (!nd || !nd->data()) continue;
-                // ⚠️ CUDA 混合模式下 data() 可能是 device 指针/已释放悬垂指针，直接读会 SIGSEGV。
                 //    只扫描 host 数据节点（CPU 模式全通过；scheduler 下 device 节点跳过）。
                 if (nd->buffer_ && !nd->buffer_->is_host()) continue;
                 const int64_t nelt = nd->numel();
@@ -1692,7 +1685,6 @@ int main(int argc, char* argv[]) {
                               << " numel=" << nelt << " bad=" << firstbad << " @flat=" << firstidx
                               << " src0_op=" << (nd->src[0] ? (int)nd->src[0]->op : -1)
                               << " src1_op=" << (nd->src[1] ? (int)nd->src[1]->op : -1);
-                    // ⚠️ GET_ROWS 专项：打印权重表(src0)与索引(src1)统计，区分"表值巨大"vs"索引越界"
                     if (nd->op == 41 /*OP_GET_ROWS*/) {
                         TensorF32* W = nd->src[0];
                         TensorF32* I = nd->src[1];
@@ -1728,7 +1720,6 @@ int main(int argc, char* argv[]) {
         if (go.distogram && go.distogram->numel() > 0) {
             auto dump4 = [&](TensorF32* t, const char* tag) {
                 if (!t || !t->data()) { std::cout << "[dist_logits] " << tag << " data=null\n"; return; }
-                // ⚠️ CUDA 混合模式：data() 可能是 device/悬垂指针，直接读会 SIGSEGV
                 if (t->buffer_ && !t->buffer_->is_host()) { std::cout << "[dist_logits] " << tag << " on-device(skip)\n"; return; }
                 const float* gd = t->data();
                 float mn=1e30f, mx=-1e30f; bool nan=false; long nnan=0;
@@ -1805,7 +1796,6 @@ int main(int argc, char* argv[]) {
                           << " l2=" << ord[q]->l2
                           << " max_abs=" << ord[q]->maxabs << std::endl;
             }
-            // ⚠️ 诊断（PPML_DEBUG_GRAD=1）：扫描全部 PARAM 参数，打印 numel/dims/flag/是否有grad/
             //    是否被图中节点消费。用于区分：
             //    (a) 非 PARAM 或未被任何节点消费（不在前向链）→ NO GRAD 合理；
             //    (b) PARAM 且被消费（参与 loss 链）却 NO GRAD → 反向断链异常。
@@ -1954,7 +1944,6 @@ int main(int argc, char* argv[]) {
         // 当 batch_loss 为 NaN 或 grad_norm 异常时无条件打印（不依赖 env，绕过 env 不生效问题）。
         if (getenv("GRAPH_DEBUG_LOSS") || std::isnan(batch_loss) || std::isnan(grad_norm) || grad_norm > 100000.0f) {
             auto print_loss = [](const char* name, TensorF32* n) {
-                // ⚠️ CUDA 混合：有 buffer_ 判 is_host；无 buffer_ 的裸指针用 D2H 探测兜底。
                 //    漏判 device 指针会在读 data() 时 SIGSEGV（见历史崩溃 main+20152）。
                 if (!n) { std::cout << "  [loss] " << name << " = (null)" << std::endl; return; }
                 if (n->buffer_) {
@@ -2031,7 +2020,6 @@ int main(int argc, char* argv[]) {
                 TensorF32* cur = total_node;
                 for (int depth = 0; cur && depth < 8; depth++) {
                     double s = 0; int64_t cn = cur->numel();
-                    // ⚠️ CUDA 混合：device/悬垂指针跳过，避免读崩
                     if (cur->buffer_ && !cur->buffer_->is_host()) break;
                     if (cur->data() && !is_device_pointer(cur, cur->data()))
                         for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
@@ -2109,7 +2097,6 @@ int main(int argc, char* argv[]) {
                 }
             }
             // loss 节点结构诊断
-            // ⚠️ dims 是 std::vector，scalar 节点 ndim=1 时读 dims[1..3] 越界（heap-buffer-overflow）。
             //    按 ndim 边界打印。
             auto print_loss_node = [&](const char* name, TensorF32* n) {
                 if (!n) { std::cout << "  [lossnode] " << name << " = null" << std::endl; return; }
@@ -2131,7 +2118,6 @@ int main(int argc, char* argv[]) {
                 TensorF32* cur = loss_msa_node;
                 for (int depth = 0; cur && depth < 6; depth++) {
                     double s = 0; int64_t cn = cur->numel();
-                    // ⚠️ CUDA 混合：device/悬垂指针跳过，避免读崩
                     bool cur_dev = (cur->buffer_ && !cur->buffer_->is_host()) ||
                                    (cur->data() && is_device_pointer(cur, cur->data()));
                     if (!cur_dev && cur->data()) for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
