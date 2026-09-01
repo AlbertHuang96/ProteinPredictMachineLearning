@@ -290,6 +290,36 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             kernel_add1_cuda(node, &st);
             break;
 
+        case OP_SQR:
+            // 独立 op（非 unary）：dst = src^2（uop=16）
+            if (!node->src[0] || !node->src[0]->data() || !node->data()) {
+                st = Status::NOT_SUPPORTED;
+                break;
+            }
+            unary_cuda(node->src[0]->data(), node->data(),
+                       (int)node->numel(), 16, 256);
+            break;
+
+        case OP_SQRT:
+            // 独立 op（非 unary）：dst = sqrt(src)（uop=15）
+            if (!node->src[0] || !node->src[0]->data() || !node->data()) {
+                st = Status::NOT_SUPPORTED;
+                break;
+            }
+            unary_cuda(node->src[0]->data(), node->data(),
+                       (int)node->numel(), 15, 256);
+            break;
+
+        case OP_LOG:
+            // 独立 op（非 unary）：dst = log(src)（uop=14）
+            if (!node->src[0] || !node->src[0]->data() || !node->data()) {
+                st = Status::NOT_SUPPORTED;
+                break;
+            }
+            unary_cuda(node->src[0]->data(), node->data(),
+                       (int)node->numel(), 14, 256);
+            break;
+
         case OP_SCALE:
             kernel_scale_cuda(node, &st);
             break;

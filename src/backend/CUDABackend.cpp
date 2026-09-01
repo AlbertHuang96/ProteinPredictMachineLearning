@@ -98,6 +98,14 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_DIV:
             return true;
 
+        case OP_SQR:
+        case OP_SQRT:
+        case OP_LOG:
+            // 2026-09-01: 独立逐元素 op（非 unary）CUDA 接入：dst=src^2 / sqrt / log。
+            //   前置: F32 + src0 存在。
+            if (!src0) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
         case OP_PERMUTE:
         case OP_TRANSPOSE:
             // 2026-09-01: 通用维度重排 CUDA kernel（对齐 CPU kernel_permute，

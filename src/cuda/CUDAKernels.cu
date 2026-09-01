@@ -1097,7 +1097,7 @@ __global__ void unary_kernel(
     float x = src[tid];
     float y;
     //    0=ABS, 4=RELU, 5=GELU, 7=SILU, 8=TANH, 10=SIGMOID, 12=HARDSWISH,
-    //    13=EXP, 14=LOG, 15=SQRT。之前把 10 当 SQRT（实为 SIGMOID）→ sqrt(负)→NaN。
+    //    13=EXP, 14=LOG, 15=SQRT, 16=SQR。之前把 10 当 SQRT（实为 SIGMOID）→ sqrt(负)→NaN。
     switch (uop) {
         case 0:  y = fabsf(x);        break;   // ABS
         case 4:  y = fmaxf(x, 0.0f);  break;   // RELU
@@ -1109,6 +1109,7 @@ __global__ void unary_kernel(
         case 13: y = expf(x);         break;   // EXP
         case 14: y = logf(x);         break;   // LOG
         case 15: y = sqrtf(x);        break;   // SQRT
+        case 16: y = x * x;           break;   // SQR（独立 op OP_SQR 用，非 unary）
         default: y = x;               break;
     }
     dst[tid] = y;
