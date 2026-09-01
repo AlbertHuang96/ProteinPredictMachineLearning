@@ -686,10 +686,63 @@ bool BackendScheduler::reserve_graph_memory() {
 
 
 // ============================================================
+// 图备份/恢复（2026-09-01，回退路径）
+//   backup_graph_nodes: split_graph 前保存每个 node/leaf 的 src 引用与 data/buffer/offs。
+//   restore_graph_nodes: graph_compute 失败回退 CPU 前恢复原图，撤销 build_splits 污染
+//     （node->src 被替换成未分配 cpy、节点被 bind 到 device buffer）。
+//   备份的是指针快照（浅拷贝），node/leaf 对象本身不重建——它们属于 context 生命周期，
+//   build_splits 替换的 src 指向新建的 cpy 节点（context arena），恢复时把 src 指回原对象。
+// ============================================================
+void BackendScheduler::backup_graph_nodes(ComputeGraph * graph) {
+    graph_backup_.clear();
+    const int n = graph->n_nodes() + graph->n_leafs();
+    graph_backup_.reserve((size_t)n);
+    for (int i = 0; i < graph->n_leafs(); i++) {
+        TensorF32* t = graph->graph_leaf(i);
+        GraphNodeBackup b;
+        b.node = t;
+        for (int s = 0; s < GGML_MAX_SRC; s++) b.src[s] = t->src[s];
+        b.data   = t->data();
+        b.buffer = t->buffer_;
+        b.offs   = t->buffer_offs_;
+        graph_backup_.push_back(b);
+    }
+    for (int i = 0; i < graph->n_nodes(); i++) {
+        TensorF32* t = graph->graph_node(i);
+        GraphNodeBackup b;
+        b.node = t;
+        for (int s = 0; s < GGML_MAX_SRC; s++) b.src[s] = t->src[s];
+        b.data   = t->data();
+        b.buffer = t->buffer_;
+        b.offs   = t->buffer_offs_;
+        graph_backup_.push_back(b);
+    }
+    graph_backup_valid_ = true;
+}
+
+void BackendScheduler::restore_graph_nodes() {
+    if (!graph_backup_valid_) return;
+    for (const GraphNodeBackup& b : graph_backup_) {
+        if (!b.node) continue;
+        for (int s = 0; s < GGML_MAX_SRC; s++) {
+            if (b.node->src[s] != b.src[s]) b.node->src[s] = b.src[s];
+        }
+        b.node->bind_data(b.data);
+        b.node->buffer_      = b.buffer;
+        b.node->buffer_offs_ = b.offs;
+    }
+    graph_backup_valid_ = false;
+}
+
+// ============================================================
 // split_graph — 三趟扫描
 // ============================================================
 
 void BackendScheduler::split_graph(ComputeGraph * graph) {
+    // 2026-09-01：切分会污染原图（node->src 替换成 cpy、bind device buffer），
+    // 先备份以便 graph_compute 失败时 restore 后回退 CPU（避免 CPU 也算不出）。
+    backup_graph_nodes(graph);
+
     current_graph_ = graph;  // 保存当前图引用，供 alloc_splits 使用
     n_splits_ = 0;
     splits_.clear();
@@ -1041,7 +1094,20 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
                     src_backend_id = tensor_backend_id(cur, -1);
                 }
             }
-            if (src_backend_id == -1) continue;
+            // ⚠️ 2026-09-01 修复：host 数据被 GPU split 消费时必须建 H2D cpy。
+            //   判据不依赖 backend_map_（host 常量 leaf 可能被 pass_fill 标到 GPU 导致
+            //   src_backend_id==cur_backend_id 误判"同后端兼容"）→ 直接看数据实际位置：
+            //   只要 src 数据在 host（buffer_==null 或 host buffer）而当前是 GPU split，
+            //   一律视为 host 后端，走下方不兼容分支强制建 cpy。
+            //   （混合训练 loss=0 真根因：GPU REPEAT 读 host mask → dispatch NOT_SUPPORTED
+            //     → graph_compute 中断 → loss 链从未执行。）
+            bool src_data_host = (src->buffer_ == nullptr) || src->buffer_->is_host();
+            bool cur_is_gpu    = !backends_[cur_backend_id]->buffer_type()->is_host();
+            if (src_data_host && cur_is_gpu) {
+                src_backend_id = n_backends_ - 1;   // host 数据 == CPU backend
+            } else if (src_backend_id == -1) {
+                continue;
+            }
 
             if (src_backend_id != cur_backend_id &&
                 !tensor_buffer_compatible(src, cur_backend_id)) {
@@ -1111,6 +1177,10 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
 // ============================================================
 Status BackendScheduler::graph_compute() {
     if (!current_graph_ || n_splits_ == 0) return Status::SUCCESS;
+    if (getenv("GRAPH_DEBUG_SCHED")) {
+        fprintf(stderr, "[sched] graph_compute: n_splits_=%d splits_size=%zu\n",
+                n_splits_, splits_.size());
+    }
 
     for (int si = 0; si < n_splits_; si++) {
         SplitInfo& sp = splits_[si];
@@ -1282,7 +1352,14 @@ Status BackendScheduler::graph_compute() {
         host_stage_.clear();
         host_scratch_.clear();
 
-        if (st != Status::SUCCESS) return st;
+        if (st != Status::SUCCESS) {
+            fprintf(stderr, "[sched] split=%d backend=%d i=[%d,%d) FAILED st=%d\n",
+                    si, sp.backend_id, sp.i_start, sp.i_end, (int)st);
+            // 2026-09-01：回退 CPU 前恢复原图（撤销 build_splits 的 src 替换/bind 污染），
+            // 否则 train.cpp 的 CPU 回退全图会读被替换的未分配 cpy 节点 → loss=0。
+            restore_graph_nodes();
+            return st;
+        }
     }
 
     return Status::SUCCESS;

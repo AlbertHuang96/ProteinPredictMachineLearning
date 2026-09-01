@@ -30,6 +30,25 @@ extern void bcast_elemwise_cuda(
 
 // OP_ADD1 前向（实现于 src/cuda/CUDAKernels.cu）：dst[i] = src[i] + b（b 标量，D2H 读取）
 extern void add1_cuda(const float * src, float * dst, float b, int64_t n);
+
+// OP_DUP/OP_CPY/OP_CONT 整块拷贝（实现于 src/cuda/CUDAKernels.cu）：四分支 buffer-aware
+extern void copy_tensor_cuda(const float * src, float * dst, int64_t n,
+                             bool src_dev, bool dst_dev);
+
+// OP_FAPE 前向（实现于 src/cuda/CUDAKernels.cu）：FAPE 结构损失 → 标量 [1]
+extern void fape_cuda(const float* pred, const float* truth,
+                      const float* frame_idx, const float* fmask, const float* pmask,
+                      float* dst, int64_t N_atoms, int64_t N_frames,
+                      float d_clamp, float epsilon, float length_scale);
+
+// OP_PERMUTE/OP_TRANSPOSE 前向（实现于 src/cuda/CUDAKernels.cu）：通用维度重排
+extern void permute_cuda(const float * src, float * dst, int64_t total, int ndim,
+                         int32_t d0, int32_t d1, int32_t d2, int32_t d3,
+                         int64_t s0, int64_t s1, int64_t s2, int64_t s3,
+                         int64_t dd0, int64_t dd1, int64_t dd2, int64_t dd3);
+
+// OP_TRANSPOSE 2D 专用（实现于 src/cuda/CUDAKernels.cu）：tile + XOR swizzle
+extern void transpose_cuda(const float * src, float * dst, int64_t M, int64_t N);
 extern void softmax_cuda(float * input, float * output, int M, int N, int block_size);
 extern void softmax_backward_cuda(
     const float * grad, const float * output, float * dst,
@@ -137,6 +156,30 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
     Status st = Status::SUCCESS;
     switch (node->op) {
         case OP_NONE:   break;
+
+        case OP_DUP:
+            // 整块拷贝 dst=src0（buffer-aware：D2D/H2D/D2H 四分支）
+            kernel_dup_cuda(node);
+            break;
+        case OP_CPY:
+        case OP_CONT:
+            // 整块拷贝（含 OP_VIEW 零拷贝共享 src0）
+            kernel_cpy_cuda(node, &st);
+            break;
+
+        case OP_FAPE:
+            kernel_fape_cuda(node, &st);
+            break;
+
+        case OP_PERMUTE:
+            // 通用维度重排（任意 dims 映射）
+            kernel_permute_cuda(node, &st);
+            break;
+
+        case OP_TRANSPOSE:
+            // 2D 用 tile XOR swizzle 专用 kernel；3D/4D 回落通用 permute
+            kernel_transpose_cuda(node, &st);
+            break;
 
         // ===== 有完整 .cu kernel 的 op =====
         case OP_ADD:
@@ -435,8 +478,50 @@ void CUDABackend::kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p) {
         rows, 1, C, 256);
 }
 
+// 指针类型探测：CUDA 11+ 用 cudaPointerGetAttributes 的 type 字段。
+// 与 Backend.cpp 的 is_device_pointer（cudaMemcpy 探测）相比无副作用（不污染错误状态）。
+// 覆盖三种来源：gallocr 分配的 device buffer、bind_data 的 cudaMalloc 指针、host 常量。
+static bool cuda_ptr_is_device(const float* p) {
+    if (!p) return false;
+    cudaPointerAttributes attr;
+    if (cudaPointerGetAttributes(&attr, p) != cudaSuccess) return false;
+    return attr.type == cudaMemoryTypeDevice;
+}
+
 void CUDABackend::kernel_dup_cuda(TensorF32 * node) {
-    (void)node;
+    // OP_DUP：dst = src0 整块拷贝（对齐 CPU kernel_dup + buffer-aware 安全化）。
+    // 混合调度下 src/dst 可能在 host 或 device，用指针类型探测选拷贝方向。
+    if (!node->src[0] || !node->src[0]->data() || !node->data()) return;
+    const bool src_dev = cuda_ptr_is_device(node->src[0]->data());
+    const bool dst_dev = cuda_ptr_is_device(node->data());
+    copy_tensor_cuda(node->src[0]->data(), node->data(), node->numel(), src_dev, dst_dev);
+}
+
+void CUDABackend::kernel_cpy_cuda(TensorF32 * node, Status* st) {
+    // OP_CPY / OP_CONT：整块拷贝（对齐 CPU kernel_cpy）。OP_VIEW 零拷贝共享 src0。
+    if (!node->src[0]) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    // OP_VIEW：不拷贝，直接共享 src0 的 data/buffer/offs（对齐 CPU kernel_cpy 的 view 分支）
+    if (node->op == OP_VIEW) {
+        TensorF32* src_t = node->src[0];
+        if (src_t && src_t->data()) {
+            node->bind_data(src_t->data());
+            node->buffer_      = src_t->buffer_;
+            node->buffer_offs_ = src_t->buffer_offs_;
+        }
+        if (st) *st = Status::SUCCESS;
+        return;
+    }
+    if (!node->src[0]->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const bool src_dev = cuda_ptr_is_device(node->src[0]->data());
+    const bool dst_dev = cuda_ptr_is_device(node->data());
+    copy_tensor_cuda(node->src[0]->data(), node->data(), node->numel(), src_dev, dst_dev);
+    if (st) *st = Status::SUCCESS;
 }
 
 void CUDABackend::kernel_scale_cuda(TensorF32 * node, Status* st) {
@@ -492,6 +577,79 @@ void CUDABackend::kernel_relu_back_cuda(TensorF32 * node, Status* st) {
     }
     relu_back_cuda(node->src[0]->data(), node->src[1]->data(),
                    node->data(), node->numel());
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_fape_cuda(TensorF32 * node, Status* st) {
+    // OP_FAPE 前向：FAPE 结构损失（对齐 CPU compute_forward_fape）。
+    // src0=pred_coords [3,N_atoms] src1=true_coords [3,N_atoms]
+    // src2=frame_indices [3,N_frames] src3=frames_mask [1,N_frames] src4=positions_mask [1,N_atoms]
+    if (!node->src[0] || !node->src[1] || !node->src[2] ||
+        !node->src[3] || !node->src[4] ||
+        !node->src[0]->data() || !node->src[1]->data() || !node->src[2]->data() ||
+        !node->src[3]->data() || !node->src[4]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int64_t N_atoms  = node->src[0]->shape().dims[1];
+    const int64_t N_frames = node->src[2]->shape().dims[1];
+    const float d_clamp    = reinterpret_cast<const float&>(node->op_params[0]);
+    const float epsilon    = reinterpret_cast<const float&>(node->op_params[2]);
+    const float length_scale = reinterpret_cast<const float&>(node->op_params[4]);
+
+    fape_cuda(node->src[0]->data(), node->src[1]->data(), node->src[2]->data(),
+              node->src[3]->data(), node->src[4]->data(),
+              node->data(), N_atoms, N_frames, d_clamp, epsilon, length_scale);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_transpose_cuda(TensorF32 * node, Status* st) {
+    // OP_TRANSPOSE：2D 用 tile+XOR swizzle 专用 kernel（对齐用户 transposeSharedSwizzling）；
+    //   3D/4D（交换倒数两维）回落通用 permute（用 op_params 映射）。
+    if (!node->src[0] || !node->src[0]->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const TensorF32* a = node->src[0];
+    if (a->shape().ndim() == 2) {
+        // M=行数=dims[1]，N=行长度=dims[0]（dims[0]=最内）
+        const int64_t M = a->shape().dims[1];
+        const int64_t N = a->shape().dims[0];
+        transpose_cuda(a->data(), node->data(), M, N);
+        if (st) *st = Status::SUCCESS;
+    } else {
+        kernel_permute_cuda(node, st);   // 3D/4D 走通用映射
+    }
+}
+
+void CUDABackend::kernel_permute_cuda(TensorF32 * node, Status* st) {
+    // OP_PERMUTE/OP_TRANSPOSE：通用维度重排（对齐 CPU kernel_permute）。
+    // op_params 存 dims 映射（int32）；dst 第 p 维 = src 第 dims[p] 维。
+    if (!node->src[0] || !node->src[0]->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const TensorF32* a = node->src[0];
+    const int ndim = a->shape().ndim();
+    int32_t dims[4] = {0, 1, 2, 3};
+    for (int i = 0; i < ndim && i < 4; i++) dims[i] = node->op_params[i];
+    // 防御：op_params 未初始化（垃圾）会导致 i[dims[p]] 越界 → SIGSEGV
+    for (int i = 0; i < ndim && i < 4; i++) {
+        if (dims[i] < 0 || dims[i] >= ndim) {
+            if (st) *st = Status::NOT_SUPPORTED;
+            return;
+        }
+    }
+    int64_t sd[4] = {1, 1, 1, 1};
+    int64_t dd[4] = {1, 1, 1, 1};
+    for (int i = 0; i < ndim && i < 4; i++) {
+        sd[i] = a->shape().dims[i];
+        dd[i] = node->shape().dims[i];
+    }
+    permute_cuda(a->data(), node->data(), node->numel(), ndim,
+                 dims[0], dims[1], dims[2], dims[3],
+                 sd[0], sd[1], sd[2], sd[3],
+                 dd[0], dd[1], dd[2], dd[3]);
     if (st) *st = Status::SUCCESS;
 }
 

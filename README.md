@@ -10,7 +10,7 @@ llama.cpp and GGML
 ### Small setting CPU training  
 Env: Intel i5-1335U 12 Core / 15 GB RAM / Pure CPU (LD_PRELOAD libstdc++)
 
-小配置纯 CPU 训练 5 epoch (P62891, L=51, MSA_DEPTH=8, N_EXTRA=1, N_MAIN=2, N_REFINE=1, DEV_SE3=1, SE3_TOPO=per_block 开关B)  
+small setting  CPU train 5 epoch (P62891, L=51, MSA_DEPTH=8, N_EXTRA=1, N_MAIN=2, N_REFINE=1, DEV_SE3=1, SE3_TOPO=per_block switch-B)  
 环境: Intel i5-1335U 12 核 / 15 GB RAM / 纯 CPU (LD_PRELOAD 系统 libstdc++)
 
 | Epoch | 耗时 (ms) | forward (ms) | loss | grad_norm |
@@ -28,25 +28,25 @@ Env: Intel i5-1335U 12 Core / 15 GB RAM / Pure CPU (LD_PRELOAD libstdc++)
 ### Small setting hybrid training 5 epoch
 Env: Intel i5-1335U 12 Core / 15 GB RAM / NVIDIA GeForce RTX 2050 4GB (compute 8.6)
 
-小配置混合 CUDA 训练 5 epoch (P62891, L=51, MSA_DEPTH=8, N_EXTRA=1, N_MAIN=2, N_REFINE=1, DEV_SE3=1, SE3_TOPO=per_block 开关B)  
+small setting CUDA train 5 epoch (P62891, L=51, MSA_DEPTH=8, N_EXTRA=1, N_MAIN=2, N_REFINE=1, DEV_SE3=1, SE3_TOPO=per_block 开关B)  
 环境: Intel i5-1335U 12 核 / 15 GB RAM / NVIDIA GeForce RTX 2050 4GB (compute 8.6, Tensor Core YES) / 混合调度 (BackendScheduler, GPU scatter 开启, 未设 PPML_CUDA_NO_SCATTER)
 
 | Epoch | 耗时 (ms) | forward (ms) | loss | grad_norm |
 |-------|----------|--------------|------|-----------|
-| 1/5   | 25972    | 24582        | 0.00      | 0.11 |
-| 2/5   | 25712    | 23931        | 2.85e-05  | 0.11 |
-| 3/5   | 25346    | 23699        | 2.85e-05  | 0.11 |
-| 4/5   | 25045    | 23489        | 2.85e-05  | 0.11 |
-| 5/5   | 25942    | 24138        | 2.85e-05  | 0.11 |
+| 1/5   | 33270    | 23536        | 14.65     | 0.11 |
+| 2/5   | 35583    | 25739        | 17.8698   | 0.11 |
+| 3/5   | 34238    | 24872        | 15.3571   | 0.11 |
+| 4/5   | 33476    | 24337        | 14.5947   | 0.11 |
+| 5/5   | 32181    | 23230        | 14.4642   | 0.11 |
 
-GPU stat（nvidia-smi 1s sample，112 sample points）: VRAM peak 3923/4096 MiB (95.8%), usage peak 99%, avg usage 2.8%, nonzero sample 8.9%
-显存峰值 3923/4096 MiB (95.8%) / 利用率峰值 99% / 平均利用率 2.8% / 非零采样占比 8.9%
+GPU stat（nvidia-smi 1s sample，143 sample points）: VRAM peak 2539/4096 MiB (62.0%), usage peak 53%, avg usage 0.6%, nonzero sample 1.4%
+显存峰值 2539/4096 MiB (62.0%) / 利用率峰值 53% / 平均利用率 0.6% / 非零采样占比 1.4%
 
-- 5 epoch finished EXIT=0，loss limited, grad_norm stable=0.11
-- 5 epoch 全部完成 EXIT=0，loss 全有限（无 NaN/Inf，0.00 与 2.85e-05 为小配置 loss 分量特征），grad_norm 稳定 0.11
+- 5 epoch finished EXIT=0，loss converged（14.46~17.87，was of CPU 14.16-15.18 same level），grad_norm stable=0.11，nan=0
+- 5 epoch 全部完成 EXIT=0，loss 有意义的有限值，grad_norm 稳定 0.11
 
-- Mixed mode: about 25.7s per epoch; About 1.47x faster than CPU mode
-- 混合 CPU+GPU：每 epoch ~25.7s（CPU 纯跑 ~37.8s，提速约 1.47×）；GPU 平均利用率低（2.8%）因主要负载仍落 CPU（CPU buffer 峰值 4.35GB vs CUDA 1.11GB）
+- Mixed mode: about 33.7s per epoch; About 1.12x faster than CPU mode
+- 混合 CPU+GPU：每 epoch ~33.7s（CPU 纯跑 ~37.8s，提速约 1.12×）；GPU 平均利用率低（0.6%）因 loss 链整体仍在 CPU 兜底执行（GPU 显存峰值降至 62% 因复用 gallocr 优化），骨干网络在 GPU
 
 
 dev/training data:

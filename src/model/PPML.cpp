@@ -3529,6 +3529,11 @@ Backend* PPMLModel::active_backend() {
     return cpu_backend_.get();
 }
 
+Backend* PPMLModel::active_cpu_backend() {
+    ensure_backend_ready();
+    return cpu_backend_.get();
+}
+
 BackendScheduler* PPMLModel::scheduler() {
     ensure_backend_ready();
     return scheduler_.get();

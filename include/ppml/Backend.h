@@ -568,6 +568,22 @@ private:
     };
     std::unordered_map<CopyKey, TensorF32*, CopyKeyHash> copy_tensor_map_;
 
+    // ===== 回退路径图恢复（2026-09-01）=====
+    // build_splits 会污染原图（node->src 替换成未分配 cpy 节点、节点被 bind 到 device buffer）。
+    // 若 GPU split 执行失败（dispatch NOT_SUPPORTED），scheduler 回退 CPU 全图前必须先恢复
+    // 原图结构（src 引用 + data/buffer/offs），否则 CPU 也算不出正确结果（混合训练 loss=0）。
+    struct GraphNodeBackup {
+        TensorF32* node   = nullptr;
+        TensorF32* src[GGML_MAX_SRC] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr};
+        float*     data   = nullptr;
+        Buffer*    buffer = nullptr;
+        size_t     offs   = 0;
+    };
+    std::vector<GraphNodeBackup> graph_backup_;
+    bool graph_backup_valid_ = false;
+    void backup_graph_nodes(ComputeGraph* graph);   // split_graph 前调用
+    void restore_graph_nodes();                     // graph_compute 失败时调用
+
     // context
     PPMLContext * ctx_ = nullptr;
 };
@@ -759,6 +775,7 @@ private:
     static void kernel_norm_cuda     (TensorF32 * node, ComputeParams * p);
     static void kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p);
     static void kernel_dup_cuda      (TensorF32 * node);
+    static void kernel_cpy_cuda      (TensorF32 * node, Status* st);
     // 错误上报：CUDA 后端无线程池，统一经 Status* 输出，避免空指针解引用。
     static void kernel_scale_cuda    (TensorF32 * node, Status* st);
     static void kernel_add1_cuda     (TensorF32 * node, Status* st);
@@ -766,6 +783,9 @@ private:
     static void kernel_sum_rows_cuda (TensorF32 * node, Status* st);
     static void kernel_mean_cuda     (TensorF32 * node, Status* st);
     static void kernel_max_all_cuda  (TensorF32 * node, Status* st);
+    static void kernel_fape_cuda     (TensorF32 * node, Status* st);
+    static void kernel_permute_cuda  (TensorF32 * node, Status* st);
+    static void kernel_transpose_cuda(TensorF32 * node, Status* st);
     static void kernel_relu_back_cuda(TensorF32 * node, Status* st);
     static void kernel_concat_cuda   (TensorF32 * node, Status* st);
     static void kernel_repeat_back_cuda(TensorF32 * node, Status* st);

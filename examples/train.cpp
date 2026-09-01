@@ -747,8 +747,11 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                     compute_st = Status::ALLOC_FAILED;
                 }
                 if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED) {
+                    // ⚠️ 2026-09-01：回退必须用真 CPU 后端——active_backend() 在 CUDA 模式
+                    //   返回 CUDABackend，其单后端全图算不出 loss 链（TRANSPOSE 被 skip、
+                    //   host 输入）→ loss 恒 0。改用 active_cpu_backend()。
                     std::cerr << "[WARN] CUDA scheduler compute failed; falling back to CPU." << std::endl;
-                    compute_st = backend->graph_compute(cgraph);
+                    compute_st = model.active_cpu_backend()->graph_compute(cgraph);
                 }
             } else {
                 compute_st = backend->graph_compute(cgraph);
@@ -1614,7 +1617,9 @@ int main(int argc, char* argv[]) {
                 std::cerr << "[WARN] CUDA scheduler compute failed (status="
                           << static_cast<int>(compute_st) << "); "
                           << "falling back to CPU single-backend compute." << std::endl;
-                compute_st = backend->graph_compute(cgraph);
+                // ⚠️ 2026-09-01：回退用真 CPU 后端（active_backend 在 CUDA 模式是 CUDABackend，
+                //   单后端全图算不出 loss 链 → loss 恒 0）。
+                compute_st = model.active_cpu_backend()->graph_compute(cgraph);
             }
         } else {
             compute_st = backend->graph_compute(cgraph); // 执行前向+反向，写入参数梯度
@@ -1642,7 +1647,15 @@ int main(int argc, char* argv[]) {
             if (getenv("PPML_DEBUG_LOSSREAD")) {
                 std::cout << "  [LOSS-READ] tv0=" << (tv.empty() ? -9.9f : tv[0])
                           << " nelt=" << (n ? n->numel() : -1)
-                          << " nbytes=" << (n ? n->nbytes() : -1) << std::endl;
+                          << " nbytes=" << (n ? n->nbytes() : -1);
+                // 旁路：GPU buffer 节点直接用 cudaMemcpy 从 data() 读（不走 buffer_offs_），
+                // 区分"buffer_offs_ 错位（data 直读非 0）"与"GPU 真没算对（data 直读也 0）"。
+                if (n && n->buffer_ && !n->buffer_->is_host() && n->data()) {
+                    float raw = -1.0f;
+                    cudaMemcpy(&raw, n->data(), sizeof(float), cudaMemcpyDeviceToHost);
+                    std::cout << " raw_data0=" << raw;
+                }
+                std::cout << std::endl;
             }
             return tv.empty() ? 0.0f : tv[0];
         };
@@ -1982,7 +1995,12 @@ int main(int argc, char* argv[]) {
                 std::cout << "  [loss] manual_total = " << manual << std::endl;
             }
             // ---- chi 诊断：值侧重算 torsion/norm，检查 chi_mask 与 gt 是否正常 ----
-            if (getenv("GRAPH_DEBUG_LOSS") && go.alpha && go.alpha->numel() > 0) {
+            if (getenv("GRAPH_DEBUG_LOSS") && go.alpha && go.alpha->numel() > 0 &&
+                go.alpha->data() &&
+                !(go.alpha->buffer_ && !go.alpha->buffer_->is_host()) &&
+                !is_device_pointer(go.alpha, go.alpha->data())) {
+                // ⚠️ 2026-09-01：go.alpha 在混合调度下可能为 device buffer（GPU 指针），
+                //    host 循环解引用会 SIGSEGV。device 时跳过 chi_diag（与 msa_logits 段同防护）。
                 const int64_t chN = input.gt_chi.shape().dims[0]*input.gt_chi.shape().dims[1];
                 const float* ap = go.alpha->data();          // (B,L,7,2) row-major, B=1
                 const float* gtp = input.gt_chi.data();       // (B,L,7,2)

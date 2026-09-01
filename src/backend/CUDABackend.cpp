@@ -65,6 +65,8 @@ bool CUDABackend::supports_op(TensorF32* node) const {
     const TensorF32* src0 = node->src[0];
     const TensorF32* src1 = node->src[1];
     const TensorF32* src2 = node->src[2];
+    const TensorF32* src3 = node->src[3];
+    const TensorF32* src4 = node->src[4];
 
     // 诊断二分：PPML_CUDA_DISABLE_OPS 指定要强制回落 CPU 的 op（数字，逗号/空格分隔）。
     // 用于定位哪个 CUDA kernel 有越界/异步崩溃：逐个把可疑 op 禁掉，看崩溃是否消失。
@@ -82,8 +84,7 @@ bool CUDABackend::supports_op(TensorF32* node) const {
     }
 
     // no-op / view ops 始终支持（不需要 kernel）
-    //  OP_PERMUTE/OP_TRANSPOSE 是真数据重排且 CUDA 无 kernel（graph_compute 跳过执行），
-    //    必须强制回落 CPU，否则分到 GPU split 后 dst 数据不重排 → 数值错/下游读空。
+    //  OP_PERMUTE/OP_TRANSPOSE 已有真重排 kernel（2026-09-01），在下方 switch 支持。
     if (node->op == OP_NONE    || node->op == OP_RESHAPE ||
         node->op == OP_VIEW) {
         return true;
@@ -96,6 +97,14 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_MUL:
         case OP_DIV:
             return true;
+
+        case OP_PERMUTE:
+        case OP_TRANSPOSE:
+            // 2026-09-01: 通用维度重排 CUDA kernel（对齐 CPU kernel_permute，
+            //   op_params 存 dims 映射）。此前无 kernel → graph_compute skip 执行 +
+            //   supports_op false 强制回落 CPU（loss 链因此无法全 GPU）。现实现后支持。
+            if (!src0) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
 
         case OP_MUL_MAT:
             if (!src1) return true;
@@ -252,14 +261,25 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             return src0->type == TENSOR_TYPE_F32 && src1->type == TENSOR_TYPE_F32 &&
                    node->type == TENSOR_TYPE_F32;
 
+        case OP_FAPE:
+            // 2026-09-01: OP_FAPE CUDA kernel（FAPE 结构损失）。前置: F32 + 5 输入存在
+            //   （pred/true coords、frame_indices、frames_mask、positions_mask）。
+            if (!src0 || !src1 || !src2 || !src3 || !src4) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
+        case OP_DUP:
+        case OP_CPY:
+        case OP_CONT:
+            // 2026-09-01: OP_DUP/OP_CPY/OP_CONT CUDA kernel（整块拷贝，buffer-aware，
+            //   经 cudaPointerGetAttributes 选 D2D/H2D/D2H）。跨后端 cpy 节点不再回落 CPU。
+            //   前置: F32 + src0 存在。
+            if (!src0) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
         // ===== kernel 为空函数体或 NOT_SUPPORTED，暂不支持 =====
-        // OP_DUP      → kernel_dup_cuda 空函数体，无实现
-        // OP_CPY      → dispatch_node 中无 case
         // UNARY_OP_*  → kernel_relu/gelu/sigmoid/silu/tanh/exp_cuda 均为空函数体
 
         // ===== 未实现的 op =====
-        case OP_DUP:
-        case OP_CPY:
         case OP_FLASH_ATTN_EXT:
         case OP_FLASH_ATTN_BACK:
         case OP_CROSS_ENTROPY_LOSS:
@@ -364,10 +384,9 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
             }
         }
 
-        // 跳过 no-op
+        // 跳过 no-op（OP_PERMUTE/OP_TRANSPOSE 已有真 kernel，2026-09-01 起不再跳过）
         if (node->op == OP_NONE || node->op == OP_VIEW ||
-            node->op == OP_RESHAPE || node->op == OP_PERMUTE ||
-            node->op == OP_TRANSPOSE) {
+            node->op == OP_RESHAPE) {
             continue;
         }
 

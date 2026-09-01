@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <vector>
 
 namespace ppml {
@@ -405,6 +406,293 @@ void add1_cuda(const float * src, float * dst, float b, int64_t n) {
     constexpr int BLOCK = 256;
     const int64_t grid = (n + BLOCK - 1) / BLOCK;
     add1_f32_kernel<<<(unsigned)grid, BLOCK>>>(src, dst, b, n);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_DUP / OP_CPY / OP_CONT 整块拷贝（buffer-aware）
+// 对齐 CPU kernel_cpy (CPUKernels.cpp:1385-1400) 的四分支语义：
+//   src/dst 均 device → D2D；仅 src device → D2H；仅 dst device → H2D；均 host → memcpy。
+// 与 ggml cpy_f32_q 的差异：本项目 Tensor 无 nb[]（连续行主序），无需逐维
+//   nb 跨步解坐标；ggml 的 dequant 分支（cpy_blck_q_f32）本项目不涉及（全 F32）。
+//   D2D 用 cudaMemcpy 同步（驱动最优），默认流顺序执行保证前后 kernel 依赖。
+// ============================================================
+// ============================================================
+// OP_FAPE 前向：FAPE 结构损失（对齐 CPU compute_forward_fape CPUKernels.cpp:2395）
+//   两阶段：
+//     stage1 (fape_tinv_kernel)：每帧一个线程，由 3 个原子做 Gram-Schmidt 建
+//       T_inv_pred/T_inv_true（各 12 floats：R^T 3 列 + 平移），存 tmp[n*24]。
+//       fm==0 的帧保持单位阵（平移 0），对齐 CPU 默认初始化。
+//     stage2 (fape_dist_kernel)：每 (frame,atom) 一个线程，把 pred/true 原子变换到
+//       帧局部系求欧氏距离，clamp 到 d_clamp，×fm×pm，atomicAdd 归约 sum_loss/sum_fm/sum_pm。
+//     stage3 (fape_finalize_kernel)：loss = sum_loss/(sum_fm*sum_pm+eps)/length_scale。
+//   op_params: [0]=d_clamp [2]=epsilon [4]=length_scale（float 位模式，对齐 CPU）。
+//   布局（ggml dims[0]=最内）：pred/true coords [3, N_atoms]；frame_indices [3, N_frames]；
+//   frames_mask [1,N_frames]；positions_mask [1,N_atoms]。输出 dst 标量 [1]。
+//   索引注意：CPU 用 src0->dims[1]=N_atoms 行数、src2->dims[1]=N_frames。
+// ============================================================
+__device__ __forceinline__ void fape_build_tinv(
+    const float* coords, const int a, const int b, const int c, float* T,
+    const float epsilon) {
+    const float pAx = coords[a*3+0], pAy = coords[a*3+1], pAz = coords[a*3+2];
+    const float pBx = coords[b*3+0], pBy = coords[b*3+1], pBz = coords[b*3+2];
+    const float pCx = coords[c*3+0], pCy = coords[c*3+1], pCz = coords[c*3+2];
+    float v1x = pBx-pAx, v1y = pBy-pAy, v1z = pBz-pAz;
+    float v2x = pCx-pAx, v2y = pCy-pAy, v2z = pCz-pAz;
+    float n1 = sqrtf(v1x*v1x + v1y*v1y + v1z*v1z + epsilon);
+    float e1x = v1x/n1, e1y = v1y/n1, e1z = v1z/n1;
+    float dot = v2x*e1x + v2y*e1y + v2z*e1z;
+    float u2x = v2x - dot*e1x, u2y = v2y - dot*e1y, u2z = v2z - dot*e1z;
+    float n2 = sqrtf(u2x*u2x + u2y*u2y + u2z*u2z + epsilon);
+    float e2x = u2x/n2, e2y = u2y/n2, e2z = u2z/n2;
+    float e3x = e1y*e2z - e1z*e2y;
+    float e3y = e1z*e2x - e1x*e2z;
+    float e3z = e1x*e2y - e1y*e2x;
+    T[0]=e1x; T[1]=e1y; T[2]=e1z;
+    T[3]=e2x; T[4]=e2y; T[5]=e2z;
+    T[6]=e3x; T[7]=e3y; T[8]=e3z;
+    T[9] =-(e1x*pAx + e1y*pAy + e1z*pAz);
+    T[10]=-(e2x*pAx + e2y*pAy + e2z*pAz);
+    T[11]=-(e3x*pAx + e3y*pAy + e3z*pAz);
+}
+
+__global__ void fape_tinv_kernel(
+    const float * __restrict__ pred, const float * __restrict__ truth,
+    const float * __restrict__ frame_idx, const float * __restrict__ fmask,
+    float * __restrict__ tmp, const int64_t N_atoms, const int64_t N_frames,
+    const float epsilon) {
+    const int64_t n = blockIdx.x;
+    if (n >= N_frames) return;
+    float* Tp = tmp + n * 24;
+    float* Tt = Tp + 12;
+    // 默认单位阵 + 零平移（CPU 默认初始化）
+    for (int k = 0; k < 12; k++) { Tp[k] = 0.0f; Tt[k] = 0.0f; }
+    Tp[0] = Tp[4] = Tp[8] = 1.0f;
+    Tt[0] = Tt[4] = Tt[8] = 1.0f;
+    if (fmask[n] == 0.0f) return;
+
+    const int ia = (int)frame_idx[n * 3 + 0];
+    const int ib = (int)frame_idx[n * 3 + 1];
+    const int ic = (int)frame_idx[n * 3 + 2];
+    // 越界钳制（防御）
+    const int a = (ia < 0 || ia >= N_atoms) ? (int)(N_atoms - 1) : ia;
+    const int b = (ib < 0 || ib >= N_atoms) ? (int)(N_atoms - 1) : ib;
+    const int c = (ic < 0 || ic >= N_atoms) ? (int)(N_atoms - 1) : ic;
+
+    fape_build_tinv(pred, a, b, c, Tp, epsilon);
+    fape_build_tinv(truth, a, b, c, Tt, epsilon);
+}
+
+__global__ void fape_dist_kernel(
+    const float * __restrict__ pred, const float * __restrict__ truth,
+    const float * __restrict__ fmask, const float * __restrict__ pmask,
+    const float * __restrict__ tmp,
+    float * __restrict__ sum_loss, float * __restrict__ sum_fm, float * __restrict__ sum_pm,
+    const int64_t N_atoms, const int64_t N_frames,
+    const float d_clamp, const float epsilon) {
+    const int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t total = N_frames * N_atoms;
+    if (idx >= total) return;
+    const int64_t n = idx / N_atoms;
+    const int64_t j = idx % N_atoms;
+    const float fm = fmask[n];
+    if (fm == 0.0f) return;
+    const float pm = pmask[j];
+    if (pm == 0.0f) return;
+
+    // ⚠️ 归约语义对齐 CPU：sum_pm 在每 (frame,atom) 有效对累加一次（CPU 内循环每帧累加），
+    //    不能只对 n==0 帧累加（会差 N_valid_frames 倍，loss 错误放大）。
+    if (j == 0) atomicAdd(sum_fm, fm);   // 每帧一次（由 j==0 线程累加，对齐 CPU 每帧累加）
+    atomicAdd(sum_pm, pm);               // 每 (frame,atom) 有效对一次，对齐 CPU 内循环
+
+    const float* Tp = tmp + n * 24;
+    const float* Tt = Tp + 12;
+    const float px = pred[j*3+0], py = pred[j*3+1], pz = pred[j*3+2];
+    const float lpx = Tp[0]*px + Tp[1]*py + Tp[2]*pz + Tp[9];
+    const float lpy = Tp[3]*px + Tp[4]*py + Tp[5]*pz + Tp[10];
+    const float lpz = Tp[6]*px + Tp[7]*py + Tp[8]*pz + Tp[11];
+    const float tx = truth[j*3+0], ty = truth[j*3+1], tz = truth[j*3+2];
+    const float ltx = Tt[0]*tx + Tt[1]*ty + Tt[2]*tz + Tt[9];
+    const float lty = Tt[3]*tx + Tt[4]*ty + Tt[5]*tz + Tt[10];
+    const float ltz = Tt[6]*tx + Tt[7]*ty + Tt[8]*tz + Tt[11];
+    const float dx = lpx-ltx, dy = lpy-lty, dz = lpz-ltz;
+    float dist = sqrtf(dx*dx + dy*dy + dz*dz + epsilon);
+    if (dist > d_clamp) dist = d_clamp;
+    atomicAdd(sum_loss, dist * fm * pm);
+}
+
+__global__ void fape_finalize_kernel(
+    const float * __restrict__ sum_loss, const float * __restrict__ sum_fm,
+    const float * __restrict__ sum_pm, float * __restrict__ dst,
+    const float epsilon, const float length_scale) {
+    const float denom = (*sum_fm) * (*sum_pm) + epsilon;
+    dst[0] = (*sum_loss) / denom / length_scale;
+}
+
+// eop 约定（复用 op_params[0]=d_clamp, [2]=epsilon, [4]=length_scale）
+void fape_cuda(const float* pred, const float* truth,
+               const float* frame_idx, const float* fmask, const float* pmask,
+               float* dst, int64_t N_atoms, int64_t N_frames,
+               float d_clamp, float epsilon, float length_scale) {
+    if (N_atoms <= 0 || N_frames <= 0) return;
+    float *d_tmp = nullptr, *d_sl = nullptr, *d_sf = nullptr, *d_sp = nullptr;
+    const size_t tmp_bytes = (size_t)N_frames * 24 * sizeof(float);
+    if (cudaMalloc(&d_tmp, tmp_bytes) != cudaSuccess) return;
+    if (cudaMalloc(&d_sl, sizeof(float)) != cudaSuccess) { cudaFree(d_tmp); return; }
+    if (cudaMalloc(&d_sf, sizeof(float)) != cudaSuccess) { cudaFree(d_tmp); cudaFree(d_sl); return; }
+    if (cudaMalloc(&d_sp, sizeof(float)) != cudaSuccess) { cudaFree(d_tmp); cudaFree(d_sl); cudaFree(d_sf); return; }
+    cudaMemset(d_sl, 0, sizeof(float));
+    cudaMemset(d_sf, 0, sizeof(float));
+    cudaMemset(d_sp, 0, sizeof(float));
+
+    const int64_t total = N_frames * N_atoms;
+    constexpr int BLOCK = 256;
+    const int64_t g1 = (N_frames + 1 - 1) / 1;
+    const int64_t g2 = (total + BLOCK - 1) / BLOCK;
+    fape_tinv_kernel<<<(unsigned)g1, 32>>>(pred, truth, frame_idx, fmask, d_tmp,
+                                           N_atoms, N_frames, epsilon);
+    fape_dist_kernel<<<(unsigned)g2, BLOCK>>>(pred, truth, fmask, pmask, d_tmp,
+                                              d_sl, d_sf, d_sp, N_atoms, N_frames,
+                                              d_clamp, epsilon);
+    fape_finalize_kernel<<<1, 1>>>(d_sl, d_sf, d_sp, dst, epsilon, length_scale);
+    cudaFree(d_tmp); cudaFree(d_sl); cudaFree(d_sf); cudaFree(d_sp);
+    cudaCheck(cudaGetLastError());
+}
+
+void copy_tensor_cuda(const float * src, float * dst, int64_t n,
+                      bool src_dev, bool dst_dev) {
+    if (n <= 0) return;
+    const size_t bytes = (size_t)n * sizeof(float);
+    if (src_dev && dst_dev) {
+        cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToDevice);
+    } else if (src_dev) {
+        cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost);
+    } else if (dst_dev) {
+        cudaMemcpy(dst, src, bytes, cudaMemcpyHostToDevice);
+    } else {
+        std::memcpy(dst, src, bytes);
+    }
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_PERMUTE / OP_TRANSPOSE 前向：通用维度重排（对齐 CPU kernel_permute）
+//   dst 的第 p 维来自 src 的第 dims[p] 维（op_params 存 int32 映射，行主序 dims[0]=最内）。
+//   对 dst 每个连续元素 idx，反解 dst 坐标(j0..j3) → src 坐标 i_{dims[p]}=j_p
+//   → src 线性偏移（行主序）写入。每线程一个 dst 元素，grid-stride。
+//   参数经值传递（dims/sd/dd 各 4 个标量），避免额外 device 分配。
+//   参考 ggml transposeSharedSwizzling（tile XOR swizzle 优化 2D）；本项目通用 4D
+//   反解映射 + 直写（无 tile），以正确性优先（transpose 是 dims=[1,0,2,3] 特例）。
+// ============================================================
+__global__ void permute_f32_kernel(
+    const float * __restrict__ src, float * __restrict__ dst,
+    const int64_t total,
+    const int ndim,
+    const int32_t d0, const int32_t d1, const int32_t d2, const int32_t d3,
+    const int64_t s0, const int64_t s1, const int64_t s2, const int64_t s3,
+    const int64_t dd0, const int64_t dd1, const int64_t dd2, const int64_t dd3) {
+    for (int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+         idx < total; idx += int64_t(gridDim.x) * blockDim.x) {
+        // 反解 dst 坐标 (j0..j3)，dims[0]=最内
+        int64_t t = idx;
+        const int64_t jv0 = t % dd0; t /= dd0;
+        const int64_t jv1 = t % dd1; t /= dd1;
+        const int64_t jv2 = t % dd2; t /= dd2;
+        const int64_t jv3 = t;
+        // src 坐标: i_{dims[p]} = j_p
+        int64_t i0 = 0, i1 = 0, i2 = 0, i3 = 0;
+        for (int p = 0; p < ndim && p < 4; p++) {
+            const int64_t jv = (p == 0) ? jv0 : (p == 1) ? jv1 : (p == 2) ? jv2 : jv3;
+            switch (p == 0 ? d0 : p == 1 ? d1 : p == 2 ? d2 : d3) {
+                case 0: i0 = jv; break;
+                case 1: i1 = jv; break;
+                case 2: i2 = jv; break;
+                case 3: i3 = jv; break;
+                default: break;
+            }
+        }
+        const int64_t off = ((i3 * s2 + i2) * s1 + i1) * s0 + i0;
+        dst[idx] = src[off];
+    }
+}
+
+// ============================================================
+// OP_TRANSPOSE 2D 专用 kernel — tile + XOR swizzle（参考用户 transposeSharedSwizzling）
+//   A: M×N（M=行数=src.dims[1]，N=行长度=src.dims[0]，dims[0]=最内）
+//   B: N×M 转置输出。
+//   XOR swizzle：shared tile[y][x^y]，读写两阶段均避免 bank conflict。
+//   线程循环覆盖 tile（Bm×Bn），支持任意 block 尺寸/越界。
+//   3D/4D transpose（交换倒数两维）由 kernel_transpose_cuda 回落通用 permute。
+// ============================================================
+template<int Bm, int Bn>
+__global__ void transpose_tile_swizzle_kernel(
+    const float * __restrict__ A, float * __restrict__ B,
+    const int64_t M, const int64_t N) {
+    __shared__ float tile[Bm][Bn];
+
+    /* -------- 读取阶段 -------- */
+    // (r0, c0) 表示 tile 内左上角元素在 matrixA 中的坐标
+    const int64_t r0 = blockIdx.y * (int64_t)Bm;
+    const int64_t c0 = blockIdx.x * (int64_t)Bn;
+
+    // thread y 方向负责：矩阵 A 的行，shared memory 的行
+    // thread x 方向负责：矩阵 A 的列，shared memory 的列
+    // shared memory 中的元素 tile[y][x ^ y] = A[r0 + y, c0 + x]
+#pragma unroll
+    for (int y = threadIdx.y; y < Bm; y += blockDim.y) {  // 在 y 方向，每次跨度为 blockDim.y
+        const int64_t r = r0 + y;
+        if (r >= M) break;
+
+#pragma unroll
+        for (int x = threadIdx.x; x < Bn; x += blockDim.x) {  // 在 x 方向，每次跨度为 blockDim.x
+            const int64_t c = c0 + x;
+            if (c < N) {
+                tile[y][x ^ y] = A[r * N + c];  // 将 A[r0 + y, c0 + x] 写入 tile[y][x ^ y]
+            }
+        }
+    }
+
+    __syncthreads();  // 同步线程块
+
+    /* -------- 写入阶段 -------- */
+    // (c0, r0) 表示 tile 内左上角元素在 matrixB 中的坐标
+    // thread y 方向负责：矩阵 B 的行，shared memory 的列
+    // thread x 方向负责：矩阵 B 的列，shared memory 的行
+    // shared memory 中的元素 tile[x][x ^ y] = B[c0 + y, r0 + x]
+#pragma unroll
+    for (int y = threadIdx.y; y < Bn; y += blockDim.y) {  // 在 y 方向，每次跨度为 blockDim.y
+        const int64_t c = c0 + y;
+        if (c >= N) break;
+
+#pragma unroll
+        for (int x = threadIdx.x; x < Bm; x += blockDim.x) {  // 在 x 方向，每次跨度为 blockDim.x
+            const int64_t r = r0 + x;
+            if (r < M) { B[c * M + r] = tile[x][x ^ y]; }  // 将 tile[x][x ^ y] 写入 B[c0 + y, r0 + x]
+        }
+    }
+}
+
+void transpose_cuda(const float * src, float * dst, int64_t M, int64_t N) {
+    if (M <= 0 || N <= 0) return;
+    constexpr int Bm = 32, Bn = 32;
+    dim3 block(16, 16);
+    dim3 grid((unsigned)((N + Bn - 1) / Bn), (unsigned)((M + Bm - 1) / Bm));
+    transpose_tile_swizzle_kernel<Bm, Bn><<<grid, block>>>(src, dst, M, N);
+    cudaCheck(cudaGetLastError());
+}
+
+void permute_cuda(const float * src, float * dst, int64_t total, int ndim,
+                  int32_t d0, int32_t d1, int32_t d2, int32_t d3,
+                  int64_t s0, int64_t s1, int64_t s2, int64_t s3,
+                  int64_t dd0, int64_t dd1, int64_t dd2, int64_t dd3) {
+    if (total <= 0) return;
+    constexpr int BLOCK = 256;
+    const int64_t grid = (total + BLOCK - 1) / BLOCK;
+    permute_f32_kernel<<<(unsigned)grid, BLOCK>>>(
+        src, dst, total, ndim,
+        d0, d1, d2, d3,
+        s0, s1, s2, s3,
+        dd0, dd1, dd2, dd3);
     cudaCheck(cudaGetLastError());
 }
 

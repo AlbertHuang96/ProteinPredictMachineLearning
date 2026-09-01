@@ -510,6 +510,10 @@ public:
     // 供训练循环调用 backend->graph_compute(cgraph) 执行反向/更新。
     Backend* active_backend();
 
+    // CPU 后端访问器（2026-09-01）：scheduler 失败时的"回退 CPU"必须用真 CPU 后端，
+    // 不能用 active_backend()（CUDA 模式下它返回 CUDABackend，算不出 loss 链）。
+    Backend* active_cpu_backend();
+
     // 调度器访问器：返回后端调度器（CPU+CUDA 注册后按 priority 分配算子）。
     // 供训练循环用 split_graph + alloc_splits + graph_compute 让受支持算子跑 CUDA、
     // 不支持的自动跨后端拷贝回落 CPU。
