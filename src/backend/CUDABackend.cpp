@@ -98,6 +98,10 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_DIV:
             return true;
 
+        case OP_CLAMP:
+            if (!src0) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
         case OP_SQR:
         case OP_SQRT:
         case OP_LOG:

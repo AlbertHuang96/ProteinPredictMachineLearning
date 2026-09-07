@@ -731,8 +731,8 @@ TensorF32* clamp(TensorF32* a, float min_val, float max_val) {
     TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());
     result->op     = OP_CLAMP;
     result->src[0] = a;
-    //result->op_params[0] = reinterpret_cast<int32_t&>(min_val);
-    //result->op_params[1] = reinterpret_cast<int32_t&>(max_val);
+    reinterpret_cast<float&>(result->op_params[0]) = min_val;
+    reinterpret_cast<float&>(result->op_params[1]) = max_val;
     return result;
 }
 

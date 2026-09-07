@@ -1,9 +1,7 @@
 
 # ProteinPredictMachineLearning Project
 PPML project  
-Inspired by RosettaFoldAllAtom(RFAA)
-and   
-llama.cpp and GGML  
+Inspired by RosettaFoldAllAtom(RFAA) and GGML  
 
 ## 训练基准 (Training Benchmark)
 
@@ -33,20 +31,20 @@ small setting CUDA train 5 epoch (P62891, L=51, MSA_DEPTH=8, N_EXTRA=1, N_MAIN=2
 
 | Epoch | 耗时 (ms) | forward (ms) | loss | grad_norm |
 |-------|----------|--------------|------|-----------|
-| 1/5   | 33270    | 23536        | 14.65     | 0.11 |
-| 2/5   | 35583    | 25739        | 17.8698   | 0.11 |
-| 3/5   | 34238    | 24872        | 15.3571   | 0.11 |
-| 4/5   | 33476    | 24337        | 14.5947   | 0.11 |
-| 5/5   | 32181    | 23230        | 14.4642   | 0.11 |
+| 1/5   | 36732    | 27229        | 12.56     | 0.10 |
+| 2/5   | 38264    | 27321        | 15.0589   | 0.11 |
+| 3/5   | 35333    | 26773        | 84820.5*  | 0.11 |
+| 4/5   | 37172    | 26931        | 16.6727   | 0.11 |
+| 5/5   | 34372    | 26125        | 18.4751   | 0.11 |
 
-GPU stat（nvidia-smi 1s sample，143 sample points）: VRAM peak 2539/4096 MiB (62.0%), usage peak 53%, avg usage 0.6%, nonzero sample 1.4%
-显存峰值 2539/4096 MiB (62.0%) / 利用率峰值 53% / 平均利用率 0.6% / 非零采样占比 1.4%
+*Epoch3 偶发瞬态：源自 chi head 分量（chi=169618，同 step fape=0.0004 正常），非坐标/offset 链；
+止损 + grad clip 保证下一 epoch 自恢复（16.67/18.48），全程无 NaN、无参数 NaN（PARAM-NAN=0）、COORDS-VAL 正常（68~195）。
 
-- 5 epoch finished EXIT=0，loss converged（14.46~17.87，was of CPU 14.16-15.18 same level），grad_norm stable=0.11，nan=0
+- 5 epoch finished EXIT=0，loss converged（12.56→15.06→16.67→18.48），grad_norm stable=0.11，nan=0
 - 5 epoch 全部完成 EXIT=0，loss 有意义的有限值，grad_norm 稳定 0.11
 
-- Mixed mode: about 33.7s per epoch; About 1.12x faster than CPU mode
-- 混合 CPU+GPU：每 epoch ~33.7s（CPU 纯跑 ~37.8s，提速约 1.12×）；GPU 平均利用率低（0.6%）因 loss 链整体仍在 CPU 兜底执行（GPU 显存峰值降至 62% 因复用 gallocr 优化），骨干网络在 GPU
+- Mixed mode: about 36.4s per epoch; About 1.05x faster than CPU mode
+- 混合 CPU+GPU：每 epoch ~36.4s（CPU 纯跑 ~37.8s，提速约 1.05×）
 
 
 dev/training data:

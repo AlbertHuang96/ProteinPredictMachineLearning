@@ -639,6 +639,20 @@ bool BackendScheduler::reserve_graph_memory() {
         return tensor_backend_id(t, n_backends_ - 1);
     };
 
+    // 2026-09-06 注入跨后端 producer 保活：build_splits 创建的 OP_DUP cpy 不入图 nodes，
+    //   gallocr 统计不到 producer 的跨后端消费 → refcount 低估 → 算完即 free 被覆盖 →
+    //   graph_compute Step1 D2H 读垃圾（混合 chi loss 3021 根因）。注入 copy_tensor_map_
+    //   全部 src，compute_refcounts 中标 is_output（不释放/不复用）。
+    if (!copy_tensor_map_.empty()) {
+        std::vector<const TensorF32*> xbk_srcs;
+        xbk_srcs.reserve(copy_tensor_map_.size());
+        for (auto& kv : copy_tensor_map_) {
+            const TensorF32* s = kv.first.first;
+            if (s) xbk_srcs.push_back(s);
+        }
+        gallocr_.set_pinned_srcs(xbk_srcs);
+    }
+
     // 5. Phase1：计算各后端峰值
     if (!gallocr_.reserve(current_graph_, backend_id_of, n_backends_)) {
         return false;

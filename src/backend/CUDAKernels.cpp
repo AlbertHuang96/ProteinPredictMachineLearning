@@ -49,6 +49,15 @@ extern void permute_cuda(const float * src, float * dst, int64_t total, int ndim
 
 // OP_TRANSPOSE 2D 专用（实现于 src/cuda/CUDAKernels.cu）：tile + XOR swizzle
 extern void transpose_cuda(const float * src, float * dst, int64_t M, int64_t N);
+
+// Tensor Core / MMA 硬件能力检测（实现于 src/cuda/CUDAKernels.cu）
+//   out_major/out_minor: compute capability。返回 true 表示 sm_80+（TF32/F16 MMA 可用）。
+extern bool cutlass_hw_supported(int* out_major, int* out_minor);
+
+// TF32 tensor-core GEMM 性能测试（实现于 src/cuda/CUDAKernels.cu）
+//   C[M,N] = A[M,K] * B[N,K]ᵀ（B 行主序 [N][K]）。返回 0=成功，ms_out 为平均耗时。
+extern int tf32_gemm_bench_cuda(const float* A, const float* B, float* C,
+                                int M, int K, int N, float* ms_out);
 extern void softmax_cuda(float * input, float * output, int M, int N, int block_size);
 extern void softmax_backward_cuda(
     const float * grad, const float * output, float * dst,
@@ -103,6 +112,9 @@ extern void set_rows_cuda(
 
 // OP_SCALE 前向（实现于 src/cuda/CUDAKernels.cu）：dst[i] = scale * x[i]
 extern void scale_cuda(const float * x, float * dst, float scale, int64_t nelements);
+
+// OP_CLAMP 前向（实现于 src/cuda/CUDAKernels.cu）：dst[i] = clamp(x[i], lo, hi)
+extern void clamp_cuda(const float * x, float * dst, int N, float lo, float hi, int block_size);
 
 // OP_RMS_NORM（实现于 src/cuda/CUDAKernels.cu）：沿 dims[0] 归一化 dst=x/sqrt(mean(x²)+eps)
 // 前置: ncols % 32 == 0，否则 CUDA 侧直接 return，由调度回落 CPU
@@ -265,6 +277,10 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             kernel_unary_cuda(node, uop, p);
             break;
         }
+
+        case OP_CLAMP:
+            kernel_clamp_cuda(node, &st);
+            break;
 
         case OP_SUM:
             kernel_sum_cuda(node, &st);
@@ -569,6 +585,20 @@ void CUDABackend::kernel_scale_cuda(TensorF32 * node, Status* st) {
     if (st) *st = Status::SUCCESS;
 }
 
+void CUDABackend::kernel_clamp_cuda(TensorF32 * node, Status* st) {
+    // OP_CLAMP：dst[i] = clamp(src[i], lo, hi)。lo/hi 以 float 位模式存 op_params[0]/[1]
+    // （由 clamp() 构造器写入，对齐 CPU kernel_clamp）。NaN 透传，与 CPU 语义一致。
+    if (!node->src[0] || !node->src[0]->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const float lo = reinterpret_cast<const float&>(node->op_params[0]);
+    const float hi = reinterpret_cast<const float&>(node->op_params[1]);
+    clamp_cuda(node->src[0]->data(), node->data(),
+               (int)node->numel(), lo, hi, 256);
+    if (st) *st = Status::SUCCESS;
+}
+
 void CUDABackend::kernel_add1_cuda(TensorF32 * node, Status* st) {
     // OP_ADD1：dst = src + b（b 为 src[1] 标量张量，device 指针 → D2H 读 b[0]，
     // 对齐 CPU kernel_add1 的 host 读取语义）。
@@ -781,10 +811,14 @@ void CUDABackend::kernel_repeat_cuda(TensorF32 * node, Status* st) {
     const int64_t ne2 = (dst->shape().ndim() > 2) ? dst->shape().dims[2] : 1;
     const int64_t ne3 = (dst->shape().ndim() > 3) ? dst->shape().dims[3] : 1;
 
-    // 防御性校验：dst 各维须为 src 各维整数倍（repeat 语义保证；否则回落 CPU 避免语义偏差）
+    // 校验（2026-09-06）：CPU kernel_repeat (CPUKernels.cpp:1666-1680) 是逐维取模
+    //   s_d = i_d % ne0[d]（尾部对齐广播），无任何 dst≥src / 整除要求，永不越界。
+    //   CUDA repeat_f32_kernel 与之逐行等价。此前 9/4 的 "dst 每维 ≥ src" 校验仍
+    //   拒绝合法形状（如 src[256,51]→dst[64,51,8]，dst 最内维反而更小，CPU 照算）→
+    //   dispatch NOT_SUPPORTED → GPU split 整体中断回退 CPU。取模天然把坐标钳制在
+    //   src 界内，故删除一切维度大小比较，仅保留基本存在性检查。
     if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0 ||
-        ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || ne03 <= 0 ||
-        ne0 % ne00 != 0 || ne1 % ne01 != 0 || ne2 % ne02 != 0 || ne3 % ne03 != 0) {
+        ne00 <= 0 || ne01 <= 0 || ne02 <= 0 || ne03 <= 0) {
         if (st) *st = Status::NOT_SUPPORTED;
         return;
     }

@@ -194,6 +194,7 @@ Status CPUBackend::dispatch_body(TensorF32* node, ComputeParams* p) {
                     break;
             }
         } break;
+        case OP_CLAMP: kernel_clamp(node, p); break;
         default:
             p->threadpool->ec = Status::NOT_SUPPORTED;
             break;
@@ -1494,6 +1495,26 @@ void CPUBackend::kernel_scale(TensorF32 * node, ComputeParams * p) {
     }
 
     for (int64_t i = start; i < end; i++) dst[i] = src[i] * s;
+}
+
+// ===== clamp (逐元素裁剪): dst = clamp(src0, lo, hi) =====
+// lo/hi 以 float 位模式存于 op_params[0]/[1]（由 clamp() 构造器写入）。
+// NaN 输入透传（与 GPU clamp_kernel 一致）；范围外取 lo/hi。
+void CPUBackend::kernel_clamp(TensorF32 * node, ComputeParams * p) {
+    const float lo = reinterpret_cast<const float&>(node->op_params[0]);
+    const float hi = reinterpret_cast<const float&>(node->op_params[1]);
+    const float * src = node->src[0]->data();
+    float       * dst = node->data();
+
+    const int64_t total = node->numel();
+    const int64_t per   = (total + p->nth - 1) / p->nth;
+    const int64_t start = per * p->ith;
+    const int64_t end   = (start + per < total) ? (start + per) : total;
+
+    for (int64_t i = start; i < end; i++) {
+        float v = src[i];
+        dst[i] = (v <= lo) ? lo : ((v >= hi) ? hi : v);
+    }
 }
 
 // ===== add1 (加标量): dst = src0 + b =====

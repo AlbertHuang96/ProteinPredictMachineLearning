@@ -663,6 +663,7 @@ private:
     static void kernel_relu    (TensorF32 * node);
     static void kernel_dup     (TensorF32 * node);
     static void kernel_scale   (TensorF32 * node, ComputeParams * p);
+    static void kernel_clamp   (TensorF32 * node, ComputeParams * p);
     static void kernel_add1    (TensorF32 * node, ComputeParams * p);
     static void kernel_sum     (TensorF32 * node, ComputeParams * p);
     static void kernel_sum_rows(TensorF32 * node, ComputeParams * p);
@@ -778,6 +779,7 @@ private:
     static void kernel_cpy_cuda      (TensorF32 * node, Status* st);
     // 错误上报：CUDA 后端无线程池，统一经 Status* 输出，避免空指针解引用。
     static void kernel_scale_cuda    (TensorF32 * node, Status* st);
+    static void kernel_clamp_cuda    (TensorF32 * node, Status* st);
     static void kernel_add1_cuda     (TensorF32 * node, Status* st);
     static void kernel_sum_cuda      (TensorF32 * node, Status* st);
     static void kernel_sum_rows_cuda (TensorF32 * node, Status* st);

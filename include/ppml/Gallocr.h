@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <functional>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "Tensor.h"
@@ -101,6 +102,14 @@ public:
     // 设置后端数量（分配 backends_ 槽位）。在设置 buft / 调用 reserve 前调用。
     void set_n_backends(int n) { backends_.resize(n); }
 
+    // 注入"跨后端 producer"保活集合（2026-09-06）：build_splits 把消费者 node->src[j]
+    //   rewired 到 OP_DUP cpy（cpy 不入图 nodes）→ gallocr 统计不到 producer 的跨后端
+    //   消费 → refcount 被低估 → producer 算完即 free、空间被后续节点复用覆盖 →
+    //   graph_compute Step1 D2H 读到垃圾 → 混合 loss 爆炸。注入后这些张量在
+    //   compute_refcounts 中被标 is_output（不释放、不复用）。
+    //   每次 reserve 前由调用方（BackendScheduler::reserve_graph_memory）重新设置。
+    void set_pinned_srcs(const std::vector<const TensorF32*>& srcs);
+
     // 释放所有 backend buffer（与 reserve/alloc 配套）
     void release();
 
@@ -177,6 +186,8 @@ private:
     std::unordered_map<const TensorF32*, NodeInfo*> node_map_;
     std::vector<NodeInfo> nodes_;    // 与 graph->nodes 对应
     std::vector<NodeInfo> leaves_;   // 与 graph->leafs 对应
+    // 外部注入的跨后端 producer（见 set_pinned_srcs 注释），compute_refcounts 末尾应用
+    std::unordered_set<const TensorF32*> pinned_srcs_;
 };
 
 } // namespace ppml

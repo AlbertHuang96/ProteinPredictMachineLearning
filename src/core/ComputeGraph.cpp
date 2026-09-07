@@ -601,6 +601,20 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, scale(grad, s));
             }
         } break;
+        case OP_CLAMP: {
+            // d(clamp(x,lo,hi))/dx = grad * step(x-lo) * step(hi-x)（区间内 1，区间外 0；NaN→0）。
+            // 复用现成 relu_back(g,y)=g*(y>0) 组合：先 (x-lo)>0 透传，再 (hi-x)>0 透传。
+            if (src0_needs_grads) {
+                float lo, hi;
+                memcpy(&lo, tensor->op_params,     sizeof(float));
+                memcpy(&hi, tensor->op_params + 1, sizeof(float));
+                TensorF32* t_lo = sub(src0, constant_scalar(lo));   // x - lo
+                TensorF32* g1   = relu_back(grad, t_lo);            // grad * (x > lo)
+                TensorF32* t_hi = sub(constant_scalar(hi), src0);   // hi - x
+                TensorF32* g2   = relu_back(g1, t_hi);              // * (x < hi)
+                add_or_set(ctx, cgraph, isrc0, g2);
+            }
+        } break;
         case OP_SET: {
             // const size_t nb1    = ((const int32_t *) tensor->op_params)[0];
             // const size_t nb2    = ((const int32_t *) tensor->op_params)[1];

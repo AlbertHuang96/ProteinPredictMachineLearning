@@ -46,6 +46,13 @@ size_t Gallocr::backend_peak(int b) const {
     return backends_[b].peak;
 }
 
+void Gallocr::set_pinned_srcs(const std::vector<const TensorF32*>& srcs) {
+    pinned_srcs_.clear();
+    for (const TensorF32* s : srcs) {
+        if (s) pinned_srcs_.insert(s);
+    }
+}
+
 // ============================================================
 // compute_refcounts — 统计每个张量被多少个计算节点引用（作为 src）
 //   只统计 managed（需复用分配）的张量，以便其最后一个消费者结束后释放。
@@ -193,6 +200,16 @@ void Gallocr::compute_refcounts(
             } else if (sni->managed) {
                 sni->n_children++;
             }
+        }
+    }
+    // 2026-09-06 注入式保活（见 Gallocr.h set_pinned_srcs）：跨后端 producer 的消费者
+    // 被 build_splits rewired 到 OP_DUP cpy（不入图 nodes），此处统计不到其跨后端消费 →
+    // refcount 被低估 → producer 算完即 free、空间被后续节点覆盖 → graph_compute Step1
+    // D2H 读到垃圾（混合 chi loss 3021 根因）。外部注入后直接标 is_output（不释放）。
+    for (auto pit = pinned_srcs_.begin(); pit != pinned_srcs_.end(); ++pit) {
+        auto pit_it = node_map_.find(*pit);
+        if (pit_it != node_map_.end() && pit_it->second->managed) {
+            pit_it->second->is_output = true;
         }
     }
     // graph->nodes() 里（由 build_backward_expand 通过 add_or_set 存入 grads[ihash]）。

@@ -1677,7 +1677,42 @@ int main(int argc, char* argv[]) {
                 if (v > mx) mx = v;
             }
             std::cout << "[PREDS] numel=" << pdN << " has_nan=" << has_nan
-                      << " min=" << mn << " max=" << mx << std::endl;
+                      << " min=" << mn << " max=" << mx;
+            // [2026-09-06] NaN 定位：打印 pred 链底层信息（view_src 链 + op）
+            TensorF32* pb = pred_node;
+            int guard = 0;
+            while (pb->view_src && guard++ < 16) pb = pb->view_src;
+            std::cout << " base_op=" << (int)pb->op
+                      << " base_host=" << (pb->buffer_ ? (int)pb->buffer_->is_host() : -1)
+                      << " base_data=" << (void*)pb->data()
+                      << " src0_op=" << (pb->src[0] ? (int)pb->src[0]->op : -1)
+                      << " src1_op=" << (pb->src[1] ? (int)pb->src[1]->op : -1);
+            if (pb->src[0]) {
+                TensorF32* s0 = pb->src[0];
+                int g2 = 0; while (s0->view_src && g2++ < 16) s0 = s0->view_src;
+                std::cout << " s0base_op=" << (int)s0->op
+                          << " s0host=" << (s0->buffer_ ? (int)s0->buffer_->is_host() : -1)
+                          << " s0numel=" << s0->numel();
+                if (s0->data()) {
+                    float smn = s0->data()[0], smx = s0->data()[0]; bool snan = false;
+                    for (int64_t q = 0; q < s0->numel(); ++q) { float v = s0->data()[q];
+                        if (v != v) { snan = true; break; } if (v < smn) smn = v; if (v > smx) smx = v; }
+                    std::cout << " s0_nan=" << snan << " s0_min=" << smn << " s0_max=" << smx;
+                }
+            }
+            std::cout << std::endl;
+        }
+        // [2026-09-06] 值版 coords 对照（SE3 值更新路径）：区分 SE3 值版 vs 主图坐标链
+        {
+            const TensorF32& cval = go.coords;
+            if (cval.numel() > 0 && cval.data()) {
+                bool cnan = false; long nnan = 0; float cmn = 1e30f, cmx = -1e30f;
+                for (int64_t q = 0; q < cval.numel(); ++q) { float v = cval.data()[q];
+                    if (v != v) { cnan = true; ++nnan; } else { if (v < cmn) cmn = v; if (v > cmx) cmx = v; } }
+                std::cout << "[COORDS-VAL] numel=" << cval.numel() << " nnan=" << nnan
+                          << " min=" << (cnan ? -1.f : cmn) << " max=" << (cnan ? -1.f : cmx)
+                          << " has_cg=" << (go.coords_graph != nullptr) << std::endl;
+            }
         }
         // ---- 开发诊断：forward 图第一个 NaN 节点（在 backward 之前扫描，此时 buffer 未被反向破坏）----
         {
@@ -1952,6 +1987,29 @@ int main(int argc, char* argv[]) {
                       << std::endl;
         }
         optimizer.step(cgraph);                            // 更新权重 (decoupled weight decay)
+
+        // [2026-09-07 Epoch2 NaN 定位] step 后扫描参数 NaN（区分"参数被污染"vs"Epoch2 forward 输入/buffer 问题"）
+        {
+            std::vector<TensorF32*> ps; std::vector<std::string> ns;
+            model.collect_params_with_names(ps, ns);
+            int nnanp = 0;
+            for (size_t pi = 0; pi < ps.size() && pi < ns.size(); ++pi) {
+                TensorF32* pt = ps[pi];
+                if (!pt || !pt->data()) continue;
+                bool nan = false;
+                for (int64_t v = 0; v < pt->numel(); ++v) {
+                    if (pt->data()[v] != pt->data()[v]) { nan = true; break; }
+                }
+                if (nan) {
+                    if (nnanp < 12) {
+                        std::cout << "[PARAM-NAN] " << ns[pi] << " numel=" << pt->numel()
+                                  << " op=" << (int)pt->op << std::endl;
+                    }
+                    ++nnanp;
+                }
+            }
+            if (nnanp) std::cout << "[PARAM-NAN] total=" << nnanp << std::endl;
+        }
 
         // 开发诊断：打印各损失分量（定位 NaN 根因）。
         // 当 batch_loss 为 NaN 或 grad_norm 异常时无条件打印（不依赖 env，绕过 env 不生效问题）。

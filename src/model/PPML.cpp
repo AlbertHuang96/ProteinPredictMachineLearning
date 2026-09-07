@@ -142,7 +142,8 @@ TensorF32* wrap_input_as_leaf(const TensorF32& t, const std::vector<int64_t>& di
 // 存储兼容，直接 memcpy 到目标值张量。
 // CUDA 后端：kernel 异步，node->data() 是 device 指针，须先 synchronize 再经 buffer D2H 读回。
 void compute_and_read(TensorF32* node, TensorF32& dst,
-                      ComputeGraph* cgraph, Backend* backend) {
+                      ComputeGraph* cgraph, Backend* backend,
+                      const std::vector<TensorF32*>* keep_nodes = nullptr) {
     if (!node) return;
     // 崩溃定位（GRAPH_DEBUG_DISPATCH=1）：打印每次值回落的调用点（build 前 / graph_compute 前），
     // 区分崩溃在"图构建"还是"kernel 执行"。numel=1 的是 loss 累加等小量。
@@ -189,6 +190,13 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
         TensorF32* nd = cgraph->graph_node(i);
         if (!nd) continue;
         if (nd->flag & TENSOR_FLAG_PARAM) continue;  // 参数保留 data
+        // 2026-09-07 方案A：keep_nodes（SE3 输入值 leaf）跳过清理——它们是无上游可重算的
+        // 值拷贝常量 leaf，被清 data 后主图 coords_graph 重算 SE3 时数据不可恢复。
+        if (keep_nodes) {
+            bool hit = false;
+            for (const TensorF32* k : *keep_nodes) { if (k == nd) { hit = true; break; } }
+            if (hit) continue;
+        }
         nd->buffer_      = nullptr;
         nd->buffer_offs_ = 0;
         nd->bind_data(nullptr);  // 清 data_（值已拷回 dst）
@@ -1068,28 +1076,43 @@ void IterBlock::apply_coord_update(const TensorF32& offset_value, const TensorF3
     // 参考 RF2AA 对 translation 输出的约束，这里乘 scale 限制单步位移量级（训练早期尤为关键）。
     // 2026-08-22: 0.1 下 chi head 波动剧烈（grad 经 coords→offset→SE3 链放大，[GRAD-NORM]
     // rank=0 SE3 权重 l2=1e13），loss 不收敛；改用 0.03 减小 SE3 对坐标/state 的更新步长。
+    // 2026-09-07 RFAA 式单步位移 clamp：SE3 随机初始化下 offset 偶发 O(1e3~1e8)，per_block
+    //   每 block 用漂移 coords 重构图 → 正反馈放大（coords 巨大/NaN）。RFAA 原版显式
+    //   T=offset/10、R=offset/100 限制步长；此处等价限制"应用后的单步位移"：
+    //     d = clamp(offset * SE3_OFFSET_SCALE, ±kMaxStep)
+    //   使每 block 位移 ≤ kMaxStep Å（默认 3Å），打破 offset→coords→构图→offset 反馈放大。
+    //   env PPML_SE3_MAX_STEP 覆盖；设 ≤0 表示不 clamp（保留原行为）。
     static constexpr float SE3_OFFSET_SCALE = 0.03f;
+    float kMaxStep = 3.0f;
+    if (const char* _s = std::getenv("PPML_SE3_MAX_STEP")) kMaxStep = std::atof(_s);
+    const bool do_clamp = (kMaxStep > 0.0f);
+    // 应用单步位移（offset×scale，可选 clamp）
+    auto step_of = [&](float off) -> float {
+        float d = off * SE3_OFFSET_SCALE;
+        if (do_clamp) { if (d >  kMaxStep) return  kMaxStep; if (d < -kMaxStep) return -kMaxStep; }
+        return d;
+    };
     for (int b = 0; b < B; ++b) {
         for (int l = 0; l < L; ++l) {
             const int base = (b * L + l) * 9;
             const float ca_x0 = xyz_data[base + 3];
             const float ca_y0 = xyz_data[base + 4];
             const float ca_z0 = xyz_data[base + 5];
-            const float dca_x = off_data[base + 3] * SE3_OFFSET_SCALE;
-            const float dca_y = off_data[base + 4] * SE3_OFFSET_SCALE;
-            const float dca_z = off_data[base + 5] * SE3_OFFSET_SCALE;
+            const float dca_x = step_of(off_data[base + 3]);
+            const float dca_y = step_of(off_data[base + 4]);
+            const float dca_z = step_of(off_data[base + 5]);
             const float ca_x_new = ca_x0 + dca_x;
             const float ca_y_new = ca_y0 + dca_y;
             const float ca_z_new = ca_z0 + dca_z;
-            xyz_out[base + 0] = ca_x_new + off_data[base + 0] * SE3_OFFSET_SCALE;
-            xyz_out[base + 1] = ca_y_new + off_data[base + 1] * SE3_OFFSET_SCALE;
-            xyz_out[base + 2] = ca_z_new + off_data[base + 2] * SE3_OFFSET_SCALE;
+            xyz_out[base + 0] = ca_x_new + step_of(off_data[base + 0]);
+            xyz_out[base + 1] = ca_y_new + step_of(off_data[base + 1]);
+            xyz_out[base + 2] = ca_z_new + step_of(off_data[base + 2]);
             xyz_out[base + 3] = ca_x_new;
             xyz_out[base + 4] = ca_y_new;
             xyz_out[base + 5] = ca_z_new;
-            xyz_out[base + 6] = ca_x_new + off_data[base + 6] * SE3_OFFSET_SCALE;
-            xyz_out[base + 7] = ca_y_new + off_data[base + 7] * SE3_OFFSET_SCALE;
-            xyz_out[base + 8] = ca_z_new + off_data[base + 8] * SE3_OFFSET_SCALE;
+            xyz_out[base + 6] = ca_x_new + step_of(off_data[base + 6]);
+            xyz_out[base + 7] = ca_y_new + step_of(off_data[base + 7]);
+            xyz_out[base + 8] = ca_z_new + step_of(off_data[base + 8]);
         }
     }
     // xyz_new_ 是成员，首次调用时为空（numel=0）；copy_from 要求 numel 严格相等，
@@ -3004,6 +3027,73 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     // （即 300Å/block 巨型扰动，FAPE 落退化平台、梯度爆炸）。可用 PPML_SE3_GRAPH_SCALE 覆盖。
     float kSe3OffsetScale = 0.001f;
     if (const char* s = std::getenv("PPML_SE3_GRAPH_SCALE")) kSe3OffsetScale = std::atof(s);
+    // 图版位移 clamp（2026-09-07）：值版 apply_coord_update 已对单步位移 clamp ±3Å；图版
+    // coords_graph 链此前未 clamp → 偶发巨大 offset（1e3~1e8）×scale 直接进入 FAPE/conf 坐标
+    // → Epoch 瞬态 loss 巨大。与值版同用 PPML_SE3_MAX_STEP（≤0 表示不 clamp）。
+    float kMaxStepGraph = 3.0f;
+    if (const char* s = std::getenv("PPML_SE3_MAX_STEP")) kMaxStepGraph = std::atof(s);
+    const bool do_clamp_graph = (kMaxStepGraph > 0.0f);
+
+    // ================================================================
+    // [方案A step1-3] 值版主干 + SE3 输入值 leaf 化（PPML_SE3_VALUE_DRIVE=1 启用，默认关）
+    // 问题：per_block（开关B）下 SE3 每 block 构图需要"该 block 的 msa/pair 值"，当前靠
+    //   compute_and_read 在独立 CPU 子图展开/重算整条 backbone（msa/pair/state 主图链），
+    //   共享节点反复 bind/清空 → 偶发巨大 offset/NaN。
+    // 做法：维护一条"值版主干"——每 block 调用 block 值版 forward（track + SE3 值，打开
+    //   dropout，与图版同算子同权重），产出 msa/pair/state 值；SE3 图版构图输入改用这些值
+    //   的 leaf → compute_and_read 子图只算 SE3 网络自身（不再重算 backbone）→ 确定性。
+    // 局限（2026-09-07）：值版 track 与图版 track 各自 dropout mask 随机不同 → 两链 msa/pair
+    //   有 0.15 随机差；SE3 输入走值版链（自洽）。验证目标是"偶发巨大值消除"。
+    const bool kValDrive = run_se3 && !se3_fixed_topo && getenv("PPML_SE3_VALUE_DRIVE") &&
+                           std::strcmp(getenv("PPML_SE3_VALUE_DRIVE"), "1") == 0;
+    TensorF32 vmsa, vpair, vstate;          // 值版主干 msa/pair/state（值 row-major 布局）
+    TensorF32 vmsa_full;                    // extra(FullBlock) 用 msa_full 值
+    // 值 → 图 leaf（值 dims 逆序即图 ggml dims：值 (B,N,L,D) = 图 [D,L,N,B]）
+    auto val_to_graph_leaf = [&](const TensorF32& v) -> TensorF32* {
+        if (v.numel() == 0 || !v.data()) return nullptr;
+        std::vector<int64_t> gd;
+        const Shape& s = v.shape();
+        for (int i = (int)s.ndim() - 1; i >= 0; --i) gd.push_back(s.dims[i]);
+        return wrap_input_as_leaf(v, gd);
+    };
+    if (kValDrive) {
+        // ---- 初始值：物化主图 msa/pair/state 初始 embedding 图节点（与图版同源同权重）----
+        // 用主 backend(cpu) 独立子图 compute，读值后清 COMPUTE flag + buffer/data（主图后续重算）。
+        auto materialize_val = [&](TensorF32* g, TensorF32& out) {
+            if (!g) return;
+            ComputeGraph* cg = ComputeGraph::new_graph(ctx);
+            cg->build_forward_expand(g);
+            backend->graph_compute(cg);
+            for (int gi = 0; gi < cg->n_nodes(); ++gi) { TensorF32* nd = cg->graph_node(gi); if (nd) nd->flag &= ~TENSOR_FLAG_COMPUTE; }
+            for (int gi = 0; gi < cg->n_leafs(); ++gi) { TensorF32* nd = cg->graph_leaf(gi); if (nd) nd->flag &= ~TENSOR_FLAG_COMPUTE; }
+            if (g->data()) {
+                std::vector<int64_t> vd;
+                for (int i = (int)g->shape().ndim() - 1; i >= 0; --i) vd.push_back(g->shape().dims[i]);
+                out.~TensorF32();
+                new (&out) TensorF32(Shape(vd), Device::CPU);
+                const size_t bytes = static_cast<size_t>(g->numel()) * sizeof(float);
+                if (g->buffer_ && !g->buffer_->is_host()) {
+                    backend->synchronize();
+                    g->buffer_->get_tensor(g, out.data(), g->buffer_offs_, bytes);
+                } else {
+                    std::memcpy(out.data(), g->data(), bytes);
+                }
+            }
+            for (int gi = 0; gi < cg->n_nodes(); ++gi) {
+                TensorF32* nd = cg->graph_node(gi);
+                if (nd && !(nd->flag & TENSOR_FLAG_PARAM)) { nd->buffer_ = nullptr; nd->buffer_offs_ = 0; nd->bind_data(nullptr); }
+            }
+        };
+        materialize_val(msa, vmsa);
+        materialize_val(pair, vpair);
+        materialize_val(state, vstate);
+        if (msa_full != nullptr) materialize_val(msa_full, vmsa_full);
+        if (getenv("GRAPH_DEBUG_COORD")) {
+            std::fprintf(stderr, "[VAL-DRIVE] init vmsa=%lld vpair=%lld vstate=%lld vmsa_full=%lld\n",
+                (long long)vmsa.numel(), (long long)vpair.numel(), (long long)vstate.numel(),
+                (long long)vmsa_full.numel());
+        }
+    }
 
     // 驱动单个 block 的 SE3（在每个 block 前向之后、下一个 block 之前）：
     //   1) 回落当前 pair 值；2) run_se3_structural 追加可微 SE3 图节点并回写 state；
@@ -3012,8 +3102,21 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         if (!run_se3) return;
         // 【阶段1.5 重构】不再回落 pair 值（edge_w 已在 run_se3_graph 内从主图 pair 图化），
         // 拓扑用 host current_coords（开关B：每 block 即时更新；开关A：初始 coords，不更新）。
-        std::vector<TensorF32*> se3_out = blk->run_se3_structural(
-            msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot);
+        std::vector<TensorF32*> se3_out;
+        // [方案A] SE3 输入值 leaf（lambda 级，供 run_se3_structural 与 compute_and_read keep 使用）
+        TensorF32* vleaf_msa = nullptr;
+        TensorF32* vleaf_pair = nullptr;
+        if (kValDrive) {
+            // [方案A] SE3 构图输入改用值 leaf（值版主干 vmsa/vpair）→ 子图不再重算 backbone
+            vleaf_msa  = val_to_graph_leaf(vmsa);
+            vleaf_pair = val_to_graph_leaf(vpair);
+            se3_out = (vleaf_msa && vleaf_pair) ? blk->run_se3_structural(
+                vleaf_msa, vleaf_pair, rbf, state, current_coords, input.residx, seq1hot)
+                                 : std::vector<TensorF32*>();
+        } else {
+            se3_out = blk->run_se3_structural(
+                msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot);
+        }
         // 开关A（fixed）：只构图，收集 offset 图节点，block 循环后统一 compute + 读值更新。
         //   ~2100Å 巨型扰动 → FAPE 发散）。改为循环结束后一次性 build（sum/N，N=block 数），
         //   使图版坐标扰动总量≈单 block 量级，与开关B 一致，FAPE 梯度收敛。
@@ -3036,6 +3139,8 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
             {
                 TensorF32* offset_scaled = mul(mul_mat(T_const, se3_out[1]),
                                                se3_scale_tensor());
+                if (do_clamp_graph)
+                    offset_scaled = clamp(offset_scaled, -kMaxStepGraph, kMaxStepGraph);
                 coords_graph = add_impl(coords_graph, offset_scaled, /*inplace=*/false);
             }
             TensorF32 offset_val;
@@ -3043,8 +3148,11 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
             // release 只释放 se3_backend_ 自己的 buffer，不碰主图 cpu_backend_ 的 msa/pair/state。
             // SE3 子图节点会 bind 到 se3_backend_ buffer（持久存活），主图最终 compute 时由
             // bind_tensor 无条件 rebind 回主 backend（正确覆盖）。
+            // [方案A] kValDrive 时 keep 值 leaf（避免被清 data，主图 coords_graph 需重算 SE3）
             { ComputeGraph* cg = ComputeGraph::new_graph(ctx);
-              compute_and_read(se3_out[1], offset_val, cg, se3_bk); }
+              std::vector<TensorF32*> keep;
+              if (kValDrive && vleaf_msa && vleaf_pair) { keep.push_back(vleaf_msa); keep.push_back(vleaf_pair); }
+              compute_and_read(se3_out[1], offset_val, cg, se3_bk, kValDrive ? &keep : nullptr); }
             blk->apply_coord_update(offset_val, current_coords);
             if (getenv("GRAPH_DEBUG_COORD")) {
                 const TensorF32& uc = blk->updated_coords();
@@ -3084,11 +3192,21 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     if (msa_full != nullptr) {
         for (auto& block : extra_blocks_) {   // FullBlock: global column attention
             block->forward_graph(msa_full, pair, rbf, state, coords_ptr, residx_ptr, seq1hot_ptr);
+            if (kValDrive && vmsa_full.numel() > 0) {
+                // [方案A] 值版主干：track+SE3 值前向，产出 vmsa_full/vpair/vstate（打开 dropout）
+                block->forward(vmsa_full, vpair, vstate, seq1hot, current_coords,
+                               input.bond_feats, input.dist_matrix, input.same_chain, input.residx);
+            }
             drive_block_se3(block.get(), msa_full, pair);
         }
     }
     for (auto& block : main_blocks_) {
         block->forward_graph(msa, pair, rbf, state, coords_ptr, residx_ptr, seq1hot_ptr);
+        if (kValDrive && vmsa.numel() > 0) {
+            // [方案A] 值版主干：track+SE3 值前向（打开 dropout，与图版同算子同权重）
+            block->forward(vmsa, vpair, vstate, seq1hot, current_coords,
+                           input.bond_feats, input.dist_matrix, input.same_chain, input.residx);
+        }
         drive_block_se3(block.get(), msa, pair);
     }
     // RefineBlock 的 SE3 结构更新 pipeline 与 IterBlock 不同（node=309 含 state、边两段式、
@@ -3099,8 +3217,21 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     auto drive_refine_block_se3 = [&](RefineBlock* blk, TensorF32*& msa_ref, TensorF32*& pair_ref) {
         if (!run_se3) return;
         // 【阶段1.5 重构】不再回落 pair 值（edge_w 在 run_se3_graph_refine 内从主图 pair 图化）。
-        std::vector<TensorF32*> se3_out = blk->run_se3_structural_refine(
-            msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot);
+        std::vector<TensorF32*> se3_out;
+        // [方案A] SE3 输入值 leaf（lambda 级，供 run_se3_structural_refine 与 compute_and_read keep）
+        TensorF32* vleaf_msa = nullptr;
+        TensorF32* vleaf_pair = nullptr;
+        if (kValDrive) {
+            // [方案A] SE3 构图输入改用值 leaf（值版主干 vmsa/vpair）→ 子图不再重算 backbone
+            vleaf_msa  = val_to_graph_leaf(vmsa);
+            vleaf_pair = val_to_graph_leaf(vpair);
+            se3_out = (vleaf_msa && vleaf_pair) ? blk->run_se3_structural_refine(
+                vleaf_msa, vleaf_pair, rbf, state, current_coords, input.residx, seq1hot)
+                                 : std::vector<TensorF32*>();
+        } else {
+            se3_out = blk->run_se3_structural_refine(
+                msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot);
+        }
         // 开关A（fixed）：只构图，收集 offset 图节点，block 循环后统一 compute + 读值更新。
         if (se3_fixed_topo) {
             if (se3_out.size() > 1) {
@@ -3119,12 +3250,17 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
             {
                 TensorF32* offset_scaled = mul(mul_mat(T_const, se3_out[1]),
                                                se3_scale_tensor());
+                if (do_clamp_graph)
+                    offset_scaled = clamp(offset_scaled, -kMaxStepGraph, kMaxStepGraph);
                 coords_graph = add_impl(coords_graph, offset_scaled, /*inplace=*/false);
             }
             TensorF32 offset_val;
             // 【阶段1.5】offset 回落用独立 se3_backend_（见 drive_block_se3 注释）。
+            // [方案A] kValDrive 时 keep 值 leaf（避免被清 data，主图 coords_graph 需重算 SE3）
             { ComputeGraph* cg = ComputeGraph::new_graph(ctx);
-              compute_and_read(se3_out[1], offset_val, cg, se3_bk); }
+              std::vector<TensorF32*> keep;
+              if (kValDrive && vleaf_msa && vleaf_pair) { keep.push_back(vleaf_msa); keep.push_back(vleaf_pair); }
+              compute_and_read(se3_out[1], offset_val, cg, se3_bk, kValDrive ? &keep : nullptr); }
             blk->apply_coord_update(offset_val, current_coords);
             if (getenv("GRAPH_DEBUG_COORD")) {
                 const TensorF32& uc = blk->updated_coords();
@@ -3163,6 +3299,11 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     for (auto& block : refine_blocks_) {
         // forward_graph 为 pass-through（不改 msa/pair），SE3 由驱动完成。
         block->forward_graph(msa, pair, rbf, state, coords_ptr, residx_ptr, seq1hot_ptr);
+        if (kValDrive && vmsa.numel() > 0) {
+            // [方案A] 值版主干：refine 值前向（更新 vstate，SE3 输入用值 leaf）
+            block->forward(vmsa, vpair, vstate, seq1hot, current_coords,
+                           input.bond_feats, input.dist_matrix, input.same_chain, input.residx);
+        }
         drive_refine_block_se3(static_cast<RefineBlock*>(block.get()), msa, pair);
     }
 
@@ -3246,6 +3387,7 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
             TensorF32* accum = nullptr;
             auto add_one = [&](TensorF32* o) {
                 TensorF32* os = mul(mul_mat(T_const, o), se3_scale_tensor());
+                if (do_clamp_graph) os = clamp(os, -kMaxStepGraph, kMaxStepGraph);
                 accum = accum ? add_impl(accum, os, false) : os;
             };
             for (TensorF32* o : se3_fixed_offsets_iter_) add_one(o);

@@ -192,6 +192,26 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
     auto params = collect_params(cgraph);
     if (params.empty()) return 0.0f;
 
+    // [2026-09-07 Epoch2 NaN 止损] 显式清零含 NaN 的参数梯度：
+    //   compute_total_grad_norm 跳过 NaN（不计入 norm）→ 若整体 norm 未超 clip 阈值，
+    //   scale_param_grads 不会被调用 → NaN 梯度原样进入 AdamW → 参数 NaN → Epoch2 全链 NaN
+    //   （实测：混合 per_block Epoch1 后 SE3 embed_x/embed_e 权重 NaN，Epoch2 loss=-nan；
+    //    CPU per_block 无此问题 → GPU 反向链个别参数梯度 NaN）。
+    for (auto* param : params) {
+        TensorF32* grad = cgraph->graph_get_grad(param);
+        if (!grad) continue;
+        std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
+        bool has_nan = false;
+        for (const float v : g) { if (v != v) { has_nan = true; break; } }
+        if (has_nan) {
+            for (float& v : g) v = 0.0f;
+            write_tensor_values(grad, g);  // H2D 写回
+            if (getenv("GRAPH_DEBUG_GRAD_NAN")) {
+                fprintf(stderr, "[GRAD-NAN-CLR] param cleared (NaN grad->0)\n");
+            }
+        }
+    }
+
     // SE3 梯度尺度（~1e13）远大于主图/head 梯度（~1e5），若与主图一起做全局比例 clip，
     // SE3 主导 scale → msa head 等正常参数被压到极小（1e-9）→ 权重几乎不动 → msa/chi 不学习
     // （实测开 SE3 时 msa=3.13 恒定，关 SE3 时 msa 下降）。

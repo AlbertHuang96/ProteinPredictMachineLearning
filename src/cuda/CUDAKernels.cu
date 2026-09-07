@@ -19,6 +19,129 @@ static inline void cudaCheck(cudaError_t err) {
 }
 
 // ============================================================
+// Tensor Core / MMA 硬件能力检测
+//   - compute capability >= 8.0 (Ampere+) : mma.sync m16n8k8 支持 TF32 与 F16
+//   - compute capability >= 7.0 (Volta+)   : mma.sync fp16 (sm_70/75)
+//   - CUTLASS tensor-core 路径需要 sm_80+（TF32）或 sm_75+（fp16）
+//   RTX 2050 = sm_86 → TF32 MMA 可用（支持 CUTLASS SM80_16x8x8_*）。
+// ============================================================
+bool cutlass_hw_supported(int* out_major, int* out_minor) {
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    cudaDeviceProp prop;
+    if (cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
+    if (out_major) *out_major = prop.major;
+    if (out_minor) *out_minor = prop.minor;
+    return prop.major >= 8;   // sm_80+：TF32/F16 tensor core MMA
+}
+
+// ============================================================
+// TF32 tensor-core GEMM kernel（自包含，无 CUTLASS 依赖）
+//   C[M,N] = A[M,K] * B[N,K]ᵀ（B 按 N×K 行主序传入，即 B[N][K]）
+//   对应 CUTLASS 模板 SM80_16x8x8_F32TF32TF32F32_TN（fp32 精度 tensor core）。
+//   用户模板的 F16F16F16F16 是 fp16 变体（A/B/C/D 全 fp16，精度低）；
+//   TF32 是「fp32 精度」GEMM 的 tensor core 路径（A/B 输入 fp32 硬件截断
+//   到 19bit tf32，累加 fp32）。RTX 2050 = sm_86 支持。
+//   每 warp 独立算一个 16×8 C 子块 + 沿 K 循环 step 8；grid 覆盖 M×N。
+//   fragment 布局（PTX mma.m16n8k8 tf32 官方表，row.col）：
+//     A(16×8): a0=(g,t) a1=(g,t+4) a2=(g+8,t) a3=(g+8,t+4)，g=lane>>2, t=lane&3
+//     B(8×8) : b0=(t,g) b1=(t+4,g)
+//     C(16×8): c0=(g,2t) c1=(g,2t+1) c2=(g+8,2t) c3=(g+8,2t+1)
+//   tf32 截断：输入 fp32 位掩低 13 bit mantissa（round-toward-zero 近似 tf32）。
+//   C 列 c0..c3 与 A 列错开 → 写回 C 按 c 布局精确落位。
+// ============================================================
+__device__ __forceinline__ float tf32_from_f32(float x) {
+    // 截断到 tf32（19 bit：1 sign + 8 exp + 10 mantissa）→ 保留高 19 bit
+    unsigned u = __float_as_uint(x);
+    u &= 0xffffe000u;               // 清低 13 bit mantissa
+    return __uint_as_float(u);
+}
+
+__global__ void tf32_mma_gemm_kernel(
+    const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
+    const int M, const int K, const int N) {
+    // 每 warp 一个 16×8 C 子块；block = 8 warps(256)，每 warp 负责一行 C 子块组
+    const int warp_id = threadIdx.x >> 5;    // 0..7
+    const int lane    = threadIdx.x & 31;
+    const int g = lane >> 2;                 // groupID 0..7
+    const int t = lane & 3;                  // tid 0..3
+
+    // 每个 warp 的 C 子块：M 方向 block 覆盖 8 warps × 16 = 128 行？——不，
+    // 用 blockIdx.y 覆盖 M，warp_id 沿 N 方向扩展（每 warp 一个独立 16×8）。
+    // 简化：每 block 覆盖 16 行 × (8 warps × 8 列 = 64 列)。
+    const int m_base = blockIdx.y * 16;
+    const int n_base = blockIdx.x * 64 + warp_id * 8;
+    if (m_base + 16 > M || n_base + 8 > N) return;   // 完整 tile 才计算（本验证版不做边界 padding）
+
+    float c0 = 0.f, c1 = 0.f, c2 = 0.f, c3 = 0.f;
+    for (int kk = 0; kk < K; kk += 8) {
+        // A fragment (16×8 at kk): A[row][kk+col]
+        const float a0 = tf32_from_f32(A[(m_base + g)     * K + (kk + t)]);
+        const float a1 = tf32_from_f32(A[(m_base + g)     * K + (kk + t + 4)]);
+        const float a2 = tf32_from_f32(A[(m_base + g + 8) * K + (kk + t)]);
+        const float a3 = tf32_from_f32(A[(m_base + g + 8) * K + (kk + t + 4)]);
+        // B fragment：mma 中 B 是 K×N col-major（row=k, col=n），每线程 2 值同列(g)不同
+        // k 行（t 与 t+4）。内存存 B_row[n][k]（行主序 [N][K]）→ b0/b1 行都 = n_base+g，
+        // 内存列 = kk+t 与 kk+t+4。⚠️ 之前误把 t 当行索引（行列对调）→ 结果错位。
+        const float b0 = tf32_from_f32(B[(n_base + g) * K + (kk + t)]);
+        const float b1 = tf32_from_f32(B[(n_base + g) * K + (kk + t + 4)]);
+        // mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32
+        asm volatile(
+            "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+            "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+            : "+f"(c0), "+f"(c1), "+f"(c2), "+f"(c3)
+            : "r"(__float_as_uint(a0)), "r"(__float_as_uint(a1)),
+              "r"(__float_as_uint(a2)), "r"(__float_as_uint(a3)),
+              "r"(__float_as_uint(b0)), "r"(__float_as_uint(b1)));
+    }
+    // 写回 C（按 C fragment 布局）
+    C[(m_base + g)     * N + (n_base + 2 * t)]     = c0;
+    C[(m_base + g)     * N + (n_base + 2 * t + 1)] = c1;
+    C[(m_base + g + 8) * N + (n_base + 2 * t)]     = c2;
+    C[(m_base + g + 8) * N + (n_base + 2 * t + 1)] = c3;
+}
+
+// 性能测试包装：M×N×K fp32 GEMM（C=A*Bᵀ, B[N][K]），返回毫秒（ms_out），0=成功
+int tf32_gemm_bench_cuda(const float* A, const float* B, float* C,
+                         int M, int K, int N, float* ms_out) {
+    if (!cutlass_hw_supported(nullptr, nullptr)) return 1;   // 非 sm_80+ 不支持
+    const size_t a_sz = (size_t)M * K, b_sz = (size_t)N * K, c_sz = (size_t)M * N;
+    float *dA = nullptr, *dB = nullptr, *dC = nullptr;
+    if (cudaMalloc(&dA, a_sz * sizeof(float)) != cudaSuccess) return 1;
+    if (cudaMalloc(&dB, b_sz * sizeof(float)) != cudaSuccess) return 1;
+    if (cudaMalloc(&dC, c_sz * sizeof(float)) != cudaSuccess) return 1;
+    cudaMemcpy(dA, A, a_sz * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, B, b_sz * sizeof(float), cudaMemcpyHostToDevice);
+
+    // grid: x = N/64（每 block 64 列），y = M/16
+    dim3 block(256);
+    dim3 grid((N + 63) / 64, (M + 15) / 16);
+    auto launch = [&]() { tf32_mma_gemm_kernel<<<grid, block>>>(dA, dB, dC, M, K, N); };
+    launch();
+    cudaError_t err = cudaDeviceSynchronize();
+
+    if (ms_out && err == cudaSuccess) {
+        cudaEvent_t e_s, e_e;
+        cudaEventCreate(&e_s); cudaEventCreate(&e_e);
+        // warmup
+        for (int i = 0; i < 3; i++) launch();
+        cudaDeviceSynchronize();
+        cudaEventRecord(e_s);
+        constexpr int R = 50;
+        for (int i = 0; i < R; i++) launch();
+        cudaEventRecord(e_e);
+        cudaEventSynchronize(e_e);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, e_s, e_e);
+        *ms_out = ms / R;
+        cudaEventDestroy(e_s); cudaEventDestroy(e_e);
+    }
+    cudaMemcpy(C, dC, c_sz * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+    return (err == cudaSuccess) ? 0 : 1;
+}
+
+// ============================================================
 // LayerNorm Forward CUDA Kernel
 // ============================================================
 
@@ -1118,6 +1241,27 @@ __global__ void unary_kernel(
 void unary_cuda(const float * src, float * dst, int N, int uop, int block_size) {
     int grid_size = ceil_div(N, block_size);
     unary_kernel<<<grid_size, block_size>>>(src, dst, N, uop);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// OP_CLAMP: 逐元素值裁剪 dst = clamp(src, lo, hi)
+//   lo/hi 由宿主侧从 op_params[0]/[1]（float 位模式）读出后传入。
+//   NaN 透传（与 CPU kernel_clamp 一致）；范围外取 lo/hi。
+// ============================================================
+__global__ void clamp_kernel(
+    const float * __restrict__ src, float * __restrict__ dst, int N,
+    const float lo, const float hi) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= N) return;
+    float x = src[tid];
+    dst[tid] = (x <= lo) ? lo : ((x >= hi) ? hi : x);
+}
+
+void clamp_cuda(const float * src, float * dst, int N, float lo, float hi, int block_size) {
+    if (N <= 0) return;
+    int grid_size = ceil_div(N, block_size);
+    clamp_kernel<<<grid_size, block_size>>>(src, dst, N, lo, hi);
     cudaCheck(cudaGetLastError());
 }
 
