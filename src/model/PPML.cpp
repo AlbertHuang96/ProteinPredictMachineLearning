@@ -3036,14 +3036,21 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
 
     // ================================================================
     // [方案A step1-3] 值版主干 + SE3 输入值 leaf 化（PPML_SE3_VALUE_DRIVE=1 启用，默认关）
-    // 问题：per_block（开关B）下 SE3 每 block 构图需要"该 block 的 msa/pair 值"，当前靠
-    //   compute_and_read 在独立 CPU 子图展开/重算整条 backbone（msa/pair/state 主图链），
-    //   共享节点反复 bind/清空 → 偶发巨大 offset/NaN。
-    // 做法：维护一条"值版主干"——每 block 调用 block 值版 forward（track + SE3 值，打开
-    //   dropout，与图版同算子同权重），产出 msa/pair/state 值；SE3 图版构图输入改用这些值
-    //   的 leaf → compute_and_read 子图只算 SE3 网络自身（不再重算 backbone）→ 确定性。
-    // 局限（2026-09-07）：值版 track 与图版 track 各自 dropout mask 随机不同 → 两链 msa/pair
-    //   有 0.15 随机差；SE3 输入走值版链（自洽）。验证目标是"偶发巨大值消除"。
+    // 动机：per_block（开关B）下 SE3 每 block 构图需要"该 block 的 msa/pair 值"，当前靠
+    //   compute_and_read 在独立 CPU 子图展开/重算整条 backbone（msa/pair/state 主图链）。
+    //   值版主干可让 SE3 构图输入改用值 leaf → compute_and_read 子图只算 SE3 网络自身
+    //   （不再重算 backbone）→ 简化共享节点 bind/清空复杂度（图更小、更确定）。
+    // 注（2026-09-07 排查更新）：此前注释将"共享节点反复 bind/清空"归因为"偶发巨大
+    //   offset/NaN"的成因——该因果不成立。实际根因另有：
+    //   ① Epoch2 全 NaN = Epoch1 反向个别参数梯度 NaN（clip_grad_norm 跳过 NaN 未触发
+    //      scale_param_grads → NaN 梯度进 AdamW → SE3 embed 参数 NaN），已由 clip 前显式
+    //      清零含 NaN 参数梯度（止损）解决；
+    //   ② SE3 随机初始化下 offset 偶发巨大 O(1e3~1e8) = 度1 输出无约束（正反馈放大），
+    //      已由值版/图版单步位移 clamp ±3Å 解决；
+    //   ③ Epoch3 偶发瞬态 loss 巨大 = chi head 分量异常（fape 同 step 正常），非
+    //      coords/offset 链，止损 + grad clip 保证自恢复。
+    // 局限：值版 track 与图版 track 各自 dropout mask 随机不同 → 两链 msa/pair
+    //   有 0.15 随机差；SE3 输入走值版链（自洽）。混合调度下曾 segfault（默认关）。
     const bool kValDrive = run_se3 && !se3_fixed_topo && getenv("PPML_SE3_VALUE_DRIVE") &&
                            std::strcmp(getenv("PPML_SE3_VALUE_DRIVE"), "1") == 0;
     TensorF32 vmsa, vpair, vstate;          // 值版主干 msa/pair/state（值 row-major 布局）
