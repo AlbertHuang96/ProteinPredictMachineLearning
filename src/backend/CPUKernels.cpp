@@ -8,6 +8,11 @@
 #include <cstdlib>
 #include <vector>
 #include <array>
+#include <algorithm>
+#include "ppml/CpuFeatures.h"   // 运行时 AVX2 检测（cpuid + XCR0）
+#if defined(__x86_64__) || defined(_M_X64)
+#  include <immintrin.h>        // _mm256_loadu_ps / add / storeu
+#endif
 
 //#include <omp.h>
 
@@ -339,6 +344,46 @@ Status CPUBackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
     return st;
 }
 
+// ============================================================
+// AVX2 elementwise add（d = a + b），仅 GCC/Clang x86 启用：
+//   - 运行时先检测 AVX2（cpuid + OS XCR0，见 CpuFeatures.h），不支持回落标量；
+//   - target("avx2") 使本函数单独以 AVX2 编译，不影响整个 TU（其余仍 SSE2 基线），
+//     因此无需给全局开 -mavx2，老机器照常运行（只是不走快路径）。
+//   - 主循环每次 8 个 float：vmovups + vaddps + vmovups；不足 8 个尾部标量，防越界。
+// ============================================================
+namespace {
+
+// AVX2 是否可用（首次调用检测一次并缓存；跨线程安全：C++11 静态局部初始化）
+bool cpu_avx2_available() {
+#if defined(__x86_64__) || defined(_M_X64)
+    static const bool k = ppml::detect_cpu_features().avx2;
+    return k;
+#else
+    return false;
+#endif
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx2")))
+#endif
+void elem_add_avx2_impl(const float* a, const float* b, float* d,
+                        int64_t start, int64_t end) {
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+    int64_t i = start;
+    // 主循环：一次处理 8 个 float（loadu 不要求 32B 对齐）
+    for (; i + 8 <= end; i += 8) {
+        const __m256 va = _mm256_loadu_ps(a + i);
+        const __m256 vb = _mm256_loadu_ps(b + i);
+        _mm256_storeu_ps(d + i, _mm256_add_ps(va, vb));
+    }
+    for (; i < end; ++i) d[i] = a[i] + b[i];   // 尾部（<8）标量
+#else
+    for (int64_t i = start; i < end; ++i) d[i] = a[i] + b[i];
+#endif
+}
+
+} // namespace
+
 // ===== elemwise =====
 void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
     // 混训崩溃定位：elemwise 裸读 src/dst。若 src[0]/src[1] 为 null，或指针指向 device/悬垂，
@@ -444,8 +489,18 @@ void CPUBackend::kernel_elemwise(TensorF32 * node, ComputeParams * p) {
 
     switch (node->op) {
         case OP_ADD:
-            for (int64_t i = p->ith; i < n; i += p->nth)
-                d[i] = a[a_full ? i : i % an] + b[b_full ? i : i % bn];
+            if (a_full && b_full && cpu_avx2_available()) {
+                // 无广播且 CPU 支持 AVX2：每线程一段连续区间（利于 SIMD/缓存），
+                // 主循环 8 路 add + 标量尾部；与原 strided 标量结果逐元素一致。
+                const int64_t nblk  = (n + p->nth - 1) / p->nth;
+                const int64_t begin = p->ith * nblk;
+                const int64_t end   = (begin + nblk < n) ? (begin + nblk) : n;
+                if (begin < end) elem_add_avx2_impl(a, b, d, begin, end);
+            } else {
+                // 广播（src numel 为 dst 的因数，按 a_full/b_full 取模）或非 AVX2：原标量循环
+                for (int64_t i = p->ith; i < n; i += p->nth)
+                    d[i] = a[a_full ? i : i % an] + b[b_full ? i : i % bn];
+            }
             if (getenv("GRAPH_DEBUG_ELEM_NAN") && node->numel() <= 4096) {
                 int cnt = 0;
                 // 统计 a/b 中 NaN 数（判断 node#8 dispatch 时 src 是否已含 NaN）

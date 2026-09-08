@@ -40,6 +40,7 @@ set(CORE_SOURCES
     ../src/core/GradientClipper.cpp
     ../src/core/AdamW.cpp
     ../src/core/DynTalloc.cpp
+    ../src/core/CpuFeatures.cpp
     # GGUF 序列化 (checkpoint 保存/加载)
     ../src/model/GGUF.cpp
     # CUDA kernels

@@ -8,6 +8,7 @@
 #include "ppml/AdamW.h"
 #include "ppml/GGUF.h"
 #include "ppml/LDDT.h"
+#include "ppml/CpuFeatures.h"
 #include <iostream>
 #include <chrono>
 #include <cstring>
@@ -34,6 +35,8 @@ void print_system_info() {
     std::cout << "==== System Info ====" << std::endl;
     long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
     std::cout << "  CPU   : " << ncpu << " logical cores" << std::endl;
+    // 运行时检测 x86 SIMD 特性（SSE/AVX/AVX2/AVX-512/FMA 等，含 OS XCR0 校验）
+    ppml::print_cpu_features(stdout);
 
     // ---- 内存 (Linux sysinfo) ----
     struct sysinfo si;
