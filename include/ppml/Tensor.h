@@ -5,6 +5,7 @@
 #include <array>
 #include <vector>
 #include <cuda_fp16.h>
+#include "ppml/QuantBlocks.h"   // int8 分块量化块结构（Q8_0/Q8_1）
 
 #define GGML_MAX_OP_PARAMS      64
 #define GGML_MAX_SRC            10
@@ -54,6 +55,71 @@ enum tensor_type {
     TENSOR_TYPE_I32,
     TENSOR_TYPE_COUNT,
 };
+
+// ============================================================================
+// int8 分块量化：类型谓词与块尺寸换算（2026-09-10 准备，非 kernel 支持代码）
+//   量化张量的数据按「块」存放（Q8_0: 34B/32元素），因此：
+//     - 必须用 Tensor::nbytes()（按块计量）/ nblocks()，**不要**用 type_size_bytes()（每元素）
+//     - numel 必须是 quant_block_elems(type) 的整数倍
+// ============================================================================
+inline bool is_quantized_type(tensor_type t) {
+    switch (t) {
+        case TENSOR_TYPE_Q4_0: case TENSOR_TYPE_Q4_1:
+        case TENSOR_TYPE_Q5_0: case TENSOR_TYPE_Q5_1:
+        case TENSOR_TYPE_Q8_0: case TENSOR_TYPE_Q8_1:
+        case TENSOR_TYPE_Q2_K: case TENSOR_TYPE_Q3_K: case TENSOR_TYPE_Q4_K:
+        case TENSOR_TYPE_Q5_K: case TENSOR_TYPE_Q6_K: case TENSOR_TYPE_Q8_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// 已实现支持的量化类型（准备阶段：仅 Q8_0/Q8_1；其余枚举存在但无块结构/kernel）
+inline bool is_quantized_type_supported(tensor_type t) {
+    return t == TENSOR_TYPE_Q8_0 || t == TENSOR_TYPE_Q8_1;
+}
+
+// 每块元素数（Q8 家族 = 32；不支持的量化类型返回 0）
+inline int quant_block_elems(tensor_type t) {
+    switch (t) {
+        case TENSOR_TYPE_Q8_0: return QK8_0;
+        case TENSOR_TYPE_Q8_1: return QK8_1;
+        default:               return 0;
+    }
+}
+
+// 每块字节数（含 scale/中间量；不支持的量化类型返回 0）
+inline size_t quant_block_bytes(tensor_type t) {
+    switch (t) {
+        case TENSOR_TYPE_Q8_0: return sizeof(block_q8_0);
+        case TENSOR_TYPE_Q8_1: return sizeof(block_q8_1);
+        default:               return 0;
+    }
+}
+
+// 每元素平均字节数（含块内元数据，用于内存估算：Q8_0 = 34/32 ≈ 1.0625 B/元素）
+inline double quant_bytes_per_elem(tensor_type t) {
+    const int qk = quant_block_elems(t);
+    return qk > 0 ? (double)quant_block_bytes(t) / (double)qk : 0.0;
+}
+
+// 权重量化类型 → 对应的「激活/vec_dot」类型（ggml 约定：src1->type == vec_dot_type(src0->type)）
+//   Q8_0 权重 → 激活量化成 Q8_1（带 sum，供后续带 zero-point 组合修正）
+inline tensor_type quant_vec_dot_type(tensor_type w) {
+    switch (w) {
+        case TENSOR_TYPE_Q8_0: return TENSOR_TYPE_Q8_1;
+        default:               return TENSOR_TYPE_F32;
+    }
+}
+
+// 量化 mul_mat 组合是否受支持（权重 w × 激活 a）：
+//   - 权重：Q8_0（后续可扩 Q4_0 等）
+//   - 激活/右操作数：F32、F16 或 Q8_1/Q8_0（对称组合）
+inline bool quant_mul_mat_combo_supported(tensor_type w, tensor_type a) {
+    if (!is_quantized_type_supported(w)) return false;
+    return a == TENSOR_TYPE_F32 || a == TENSOR_TYPE_F16 || is_quantized_type_supported(a);
+}
 
 
 enum tensor_op {
@@ -214,7 +280,46 @@ public:
     // DType deprecate?
 
     int64_t numel() const { return shape_.numel(); }
-    size_t nbytes() const { return numel() * sizeof(T); }
+    // 每元素字节数按 type 计算（前期 fp16 支持，2026-09-10）：
+    //   图节点统一为 Tensor<float>*，但 type==TENSOR_TYPE_F16 时数据按 16 位 half 存放
+    //   （2 字节/元素）；否则按模板 T 大小（F32=4）。若恒用 sizeof(T)，F16 节点会被
+    //   Gallocr/cpy 按 4 字节分配与搬运 → 内存翻倍且跨后端拷贝错位。
+    size_t type_size_bytes() const {
+        return (type == TENSOR_TYPE_F16) ? 2 : sizeof(T);
+    }
+    // 是否量化（数据按块存放，须用 nbytes()/nblocks()，不能用 type_size_bytes()）
+    bool is_quantized() const { return is_quantized_type(type); }
+    // 量化形状合法性（2026-09-10）：
+    //   ① 最内维（dims[0]）必须是块元素数的整数倍 —— 量化块**不允许跨行**；
+    //   ② numel 也须是块元素数整数倍（① 成立时 ② 自动成立，保留作双保险）。
+    //   ⚠️ 只查 numel 是不够的：如 {31,128} 的 numel=3968 是 32 的倍数，但 dims[0]=31
+    //      会让行内块跨越行边界 → 块索引错位（所以 nbytes() 对非法形状返回 0）。
+    bool quant_shape_valid() const {
+        const int qk = quant_block_elems(type);
+        if (qk <= 0) return false;
+        if (shape_.ndim() < 1 || (shape_.dims[0] % qk) != 0) return false;
+        return (numel() % qk) == 0;
+    }
+    // 块数（量化类型且形状合法：numel/块元素数；否则 0）
+    int64_t nblocks() const {
+        if (!is_quantized_type(type) || !quant_shape_valid()) return 0;
+        return numel() / quant_block_elems(type);
+    }
+    // 量化块指针访问（调用方负责确认 type 匹配、numel 为块元素数整数倍）
+    template<typename B> B*       blocks()       { return reinterpret_cast<B*>(data_); }
+    template<typename B> const B* blocks() const { return reinterpret_cast<const B*>(data_); }
+
+    // 字节数：
+    //   - 量化类型（2026-09-10 int8 准备）：按块计量 = nblocks × 块字节数（Q8_0: 34B/32元素）。
+    //     形状非法（numel 非块元素数整数倍 / 类型无块结构）时返回 0，由调用处校验后拒绝。
+    //   - 非量化：numel × 每元素字节数（F16=2，其余 sizeof(T)）。
+    size_t nbytes() const {
+        if (is_quantized_type(type)) {
+            if (!quant_shape_valid()) return 0;   // 形状非法（最内维非块元素数整数倍等）→ 0，由调用处拒绝
+            return static_cast<size_t>(numel() / quant_block_elems(type)) * quant_block_bytes(type);
+        }
+        return numel() * type_size_bytes();
+    }
     
     // 数据访问
     T* data() { return data_; }

@@ -10,6 +10,7 @@
 #include <array>
 #include <algorithm>
 #include "ppml/CpuFeatures.h"   // 运行时 AVX2 检测（cpuid + XCR0）
+#include "ppml/HalfUtils.h"     // fp16→fp32 位运算转换（mul_mat fp16 输入）
 #if defined(__x86_64__) || defined(_M_X64)
 #  include <immintrin.h>        // _mm256_loadu_ps / add / storeu
 #endif
@@ -363,6 +364,52 @@ bool cpu_avx2_available() {
 #endif
 }
 
+// F16C（+FMA）是否可用：CPU 支持 half→float 硬件转换指令 `vcvtph2ps`
+bool cpu_f16c_available() {
+#if defined(__x86_64__) || defined(_M_X64)
+    static const bool k = [] {
+        const CpuFeatures f = detect_cpu_features();
+        return f.f16c && f.fma;
+    }();
+    return k;
+#else
+    return false;
+#endif
+}
+
+// ---- fp16 行点积：软件位运算转换（F16C 不可用 / 被 PPML_CPU_F16C=0 关闭时用）----
+float dot_half_row_soft(const uint16_t* ar, const uint16_t* br, int K) {
+    float acc = 0.f;
+    for (int k = 0; k < K; ++k) acc += fp16_to_fp32(ar[k]) * fp16_to_fp32(br[k]);
+    return acc;
+}
+
+// ---- fp16 行点积：F16C 硬件转换（`vcvtph2ps` 一次 8 个 half→float）+ FMA ----
+//   target("avx,f16c,fma") 使本函数单独以这些指令集编译，不影响整个 TU 基线。
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((target("avx,f16c,fma")))
+#endif
+float dot_half_row_f16c(const uint16_t* ar, const uint16_t* br, int K) {
+#if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
+    __m256 sum = _mm256_setzero_ps();
+    int k = 0;
+    for (; k + 8 <= K; k += 8) {
+        const __m256 fa = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(ar + k)));
+        const __m256 fb = _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i*>(br + k)));
+        sum = _mm256_fmadd_ps(fa, fb, sum);
+    }
+    // 水平求和（只用 SSE1 指令，避免额外依赖 SSE3 的 hadd）
+    __m128 s = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    s = _mm_add_ps(s, _mm_movehl_ps(s, s));
+    s = _mm_add_ss(s, _mm_shuffle_ps(s, s, 0x1));
+    float acc = _mm_cvtss_f32(s);
+    for (; k < K; ++k) acc += fp16_to_fp32(ar[k]) * fp16_to_fp32(br[k]);   // 尾部（<8）
+    return acc;
+#else
+    return dot_half_row_soft(ar, br, K);
+#endif
+}
+
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((target("avx2")))
 #endif
@@ -545,6 +592,15 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
     const float * a = node->src[0]->data();
     const float * b = node->src[1]->data();
     float * d = node->data();
+    // 防御（int8 量化准备，2026-09-10）：量化输入尚无 kernel（supports_op 已返回 false，
+    //   正常不会到达）；万一被误调度，直接返回避免把块结构当 float 读而越界。
+    //   所有线程走同一分支 → 不破坏 barrier 计数（与下面 NULL 检查同理）。
+    if (is_quantized_type(node->src[0]->type) || is_quantized_type(node->src[1]->type)) {
+        if (p->ith == 0)
+            fprintf(stderr, "[MULMAT-QUANT] quantized input not implemented yet (src0=%d src1=%d), skip\n",
+                    (int)node->src[0]->type, (int)node->src[1]->type);
+        return;
+    }
     // 混训崩溃定位：mul_mat 裸读 src/dst 指针，若参数被搬到 device/悬垂/null，这里解引用即 SIGSEGV。
     // 打印 src 的 data()/buffer_/is_host/flag，区分"参数被 device 化"vs"buffer 复用悬垂"vs"null"。
     if (!a || !b || !d) {
@@ -566,6 +622,37 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
         }
         // return 而 worker 继续走 barrier → barrier 次数不匹配 → 线程失步 → 后续 kernel_elemwise 崩。
         // 所有线程都 return → 每线程跳过的 barrier 次数一致 → 同步不破坏。
+        return;
+    }
+
+    // ===== fp16 输入分支（前期支持，2026-09-10）=====
+    //   A/B 均为 TENSOR_TYPE_F16（数据按 16 位 half 存放，2 字节/元素），输出 D 仍 F32：
+    //   逐元素读 half → 转 fp32 → fp32 累加（精度与 F32 路径一致，仅存储减半）。
+    //   barrier 次数与非 F16 路径严格一致（store+barrier / 循环 / barrier），避免线程失步。
+    const bool f16_in = (node->src[0]->type == TENSOR_TYPE_F16 &&
+                         node->src[1]->type == TENSOR_TYPE_F16);
+    if (f16_in) {
+        const uint16_t* a16 = reinterpret_cast<const uint16_t*>(a);
+        const uint16_t* b16 = reinterpret_cast<const uint16_t*>(b);
+        // F16C 可用时走 `vcvtph2ps`(8×half→8×float)+FMA 的 SIMD 点积；否则软件位运算转换。
+        //   PPML_CPU_F16C=0 强制软件路径（用于性能对比/排障）。
+        bool use_f16c = cpu_f16c_available();
+        if (const char* s = std::getenv("PPML_CPU_F16C")) {
+            if (std::strcmp(s, "0") == 0) use_f16c = false;
+        }
+        if (p->ith == 0) tp->current_chunk.store(0);
+        tp->barrier_wait();
+        while (true) {
+            int i = tp->current_chunk.fetch_add(1);
+            if (i >= M) break;
+            const uint16_t* arow = a16 + static_cast<size_t>(i) * K;
+            for (int j = 0; j < N; j++) {
+                const uint16_t* brow = b16 + static_cast<size_t>(j) * K;
+                d[j + i * N] = use_f16c ? dot_half_row_f16c(arow, brow, K)
+                                        : dot_half_row_soft(arow, brow, K);
+            }
+        }
+        tp->barrier_wait();
         return;
     }
     if (getenv("GRAPH_DEBUG_MULMAT") && (int64_t)M * N * K > 200000000LL && p->ith == 0) {

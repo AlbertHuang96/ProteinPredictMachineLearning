@@ -1,4 +1,5 @@
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>   // __half / __half2float（mul_mat fp16 输入路径）
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -60,6 +61,12 @@ __device__ __forceinline__ float tf32_from_f32(float x) {
 __global__ void tf32_mma_gemm_kernel(
     const float* __restrict__ A, const float* __restrict__ B, float* __restrict__ C,
     const int M, const int K, const int N) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    // ---- 编译期守卫（2026-09-10）：仅 sm_80+ 编译 tf32/m16n8k8 MMA 指令 ----
+    //  否则低架构目标（如 sm_61/sm_75）ptxas 报 "Feature '.tf32' requires .target sm_80
+    //  or higher"、"'mma' requires sm_70"、"'.m16n8k8' requires sm_80"。低架构走下方
+    //  #else 空实现（host pass 与低 arch pass 均安全），运行时由 cutlass_hw_supported()
+    //  拦截（本 kernel 仅 bench 验证用，未接入 mul_mat）。
     // 每 warp 一个 16×8 C 子块；block = 8 warps(256)，每 warp 负责一行 C 子块组
     const int warp_id = threadIdx.x >> 5;    // 0..7
     const int lane    = threadIdx.x & 31;
@@ -99,6 +106,11 @@ __global__ void tf32_mma_gemm_kernel(
     C[(m_base + g)     * N + (n_base + 2 * t + 1)] = c1;
     C[(m_base + g + 8) * N + (n_base + 2 * t)]     = c2;
     C[(m_base + g + 8) * N + (n_base + 2 * t + 1)] = c3;
+#else
+    // 低于 sm_80：PTX 不支持 mma.tf32 / m16n8k8 —— 编译期留空实现，避免 ptxas 报错。
+    // 运行时 cutlass_hw_supported() 返回 false → tf32_gemm_bench_cuda 直接返回 1，不会启动本 kernel。
+    (void)A; (void)B; (void)C; (void)M; (void)K; (void)N;
+#endif
 }
 
 // 性能测试包装：M×N×K fp32 GEMM（C=A*Bᵀ, B[N][K]），返回毫秒（ms_out），0=成功
@@ -1018,11 +1030,16 @@ void softmax_backward_cuda(
 // ============================================================
 // Block-Tiled GEMM CUDA Kernel (OP_MUL_MAT)
 // D[M×N] = A[M×K] × B[K×N]  (B is stored transposed: B[N][K])
+//   TA/TB（2026-09-10 前期 fp16 支持）：输入元素可 float 或 __half；
+//   读入 global 时经 to_float() 转 fp32 存入 smem，累加与输出始终 fp32。
 // ============================================================
 
+__device__ __forceinline__ float to_float(float x)  { return x; }
+__device__ __forceinline__ float to_float(__half x) { return __half2float(x); }
+
 template<int Bm = 128, int Bn = 128, int Bk = 8, int blockSize = 256, int A_BLOCK_X = 8,
-         int B_BLOCK_X = 32, int C_BLOCK_X = 16>
-__global__ void blockTileGEMM(float* A, float* B, float* C, const int M, const int K, const int N) {
+         int B_BLOCK_X = 32, int C_BLOCK_X = 16, typename TA, typename TB>
+__global__ void blockTileGEMM(const TA* A, const TB* B, float* C, const int M, const int K, const int N) {
   __shared__ float As[Bm][Bk];  // tileA
   __shared__ float Bs[Bk][Bn];  // tileB
 
@@ -1060,7 +1077,7 @@ __global__ void blockTileGEMM(float* A, float* B, float* C, const int M, const i
 #pragma unroll
       for (int j = A_THREAD_X; j < Bk; j += A_BLOCK_X) {
         int c = k + j;
-        As[i][j] = (r < M && c < K) ? A[r * K + c] : 0.f;
+        As[i][j] = (r < M && c < K) ? to_float(A[r * K + c]) : 0.f;
       }
     }
 
@@ -1072,7 +1089,7 @@ __global__ void blockTileGEMM(float* A, float* B, float* C, const int M, const i
       for (int j = B_THREAD_X; j < Bn; j += B_BLOCK_X) {
         int c = c0 + j;  // N dimension index
         // B is stored transposed: B[c][r] = B[c * K + r]
-        Bs[i][j] = (r < K && c < N) ? B[c * K + r] : 0.f;
+        Bs[i][j] = (r < K && c < N) ? to_float(B[c * K + r]) : 0.f;
       }
     }
 
@@ -1113,8 +1130,318 @@ void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N) {
     dim3 block(256);
     dim3 grid((N + Bn - 1) / Bn, (M + Bm - 1) / Bm);
 
-    blockTileGEMM<Bm, Bn><<<grid, block>>>(A, B, C, M, K, N);
+    blockTileGEMM<Bm, Bn, 8, 256, 8, 32, 16, float, float><<<grid, block>>>(A, B, C, M, K, N);
     cudaCheck(cudaGetLastError());
+}
+
+// fp16 输入版本（前期支持，2026-09-10）：A/B 按 16 位 __half 存储（2 字节/元素），输出 fp32。
+// 语义与 mul_mat_cuda 完全一致：A=(M,K) 行主序；B 以 (N,K) 转置存储 B[n*K+k]。
+void mul_mat_cuda_f16(const void* A, const void* B, float* C, int M, int K, int N) {
+    constexpr int Bm = 128, Bn = 128;
+    dim3 block(256);
+    dim3 grid((N + Bn - 1) / Bn, (M + Bm - 1) / Bm);
+    blockTileGEMM<Bm, Bn, 8, 256, 8, 32, 16, __half, __half><<<grid, block>>>(
+        reinterpret_cast<const __half*>(A), reinterpret_cast<const __half*>(B), C, M, K, N);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
+// fp16 Tensor-Core GEMM（mma.m16n8k16，**fp32 累加**）—— 2026-09-10
+//   C[M,N] = A[M,K] × B[N,K]ᵀ（B 以 [N][K] 行主序存储，语义与 SIMT 版完全一致）
+//
+//   Fragment 布局（PTX m16n8k16 row.col，g = lane>>2, t = lane&3）：
+//     A(16×16, row):  a0={A[g][2t],A[g][2t+1]}       a1={A[g+8][2t],A[g+8][2t+1]}
+//                     a2={A[g][2t+8],A[g][2t+9]}     a3={A[g+8][2t+8],A[g+8][2t+9]}
+//     B(16×8,  col):  b0={B_l[2t][g],B_l[2t+1][g]}   b1={B_l[2t+8][g],B_l[2t+9][g]}
+//                     （B_l[k][n] = 输入 B 的 B_in[n][k]）
+//     C(16×8,  f32):  c0=C[g][2t]  c1=C[g][2t+1]  c2=C[g+8][2t]  c3=C[g+8][2t+1]
+//   本实现为「简化版」：fragment 直接从 global 按行取 2 个连续 half（不用 ldmatrix/smem）。
+//   可优化（未做）：smem 暂存 + ldmatrix 批量加载、cp.async 双缓冲、每 warp 多 tile、
+//     stmatrix 写回 —— 见函数上方注释的 pipeline 说明。
+//   仅 sm_80+ 编译（低架构空实现）；运行时由 cutlass_hw_supported() 拦截。
+// ============================================================
+
+// 取 (r,c) 与 (r,c+1) 打包为一个 .b32（低 16 位 = 第一个元素）；越界元素置 0
+__device__ __forceinline__ unsigned mma_ld_half2(const __half* __restrict__ base,
+                                                 int r, int c, int rows, int cols) {
+    const __half zero = __float2half(0.0f);
+    const __half h0 = (r < rows && c     >= 0 && c     < cols) ? base[(size_t)r * cols + c]     : zero;
+    const __half h1 = (r < rows && c + 1 >= 0 && c + 1 < cols) ? base[(size_t)r * cols + c + 1] : zero;
+    const __half2 h2 = __halves2half2(h0, h1);   // low = h0（PTX 寄存器低半 = 第一个 half）
+    unsigned u;
+    memcpy(&u, &h2, sizeof(u));
+    return u;
+}
+
+template<int WARPS_PER_BLOCK, int N_TILES>
+__global__ void mul_mat_mma_f16_kernel(const __half* __restrict__ A,
+                                       const __half* __restrict__ B,
+                                       float* __restrict__ C,
+                                       const int M, const int K, const int N) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    const int lane = (int)(threadIdx.x & 31u);
+    const int warp = (int)(threadIdx.x >> 5);
+    const int g = lane >> 2;     // groupID 0..7
+    const int t = lane & 3;      // 0..3
+
+    const int m0 = blockIdx.y * 16;                                       // M 方向 16 行
+    const int cols_per_warp = 8 * N_TILES;
+    const int n_base = blockIdx.x * (WARPS_PER_BLOCK * cols_per_warp) + warp * cols_per_warp;
+    if (m0 >= M || n_base >= N) return;
+
+    // 每 warp N_TILES 个 16×8 tile 的 fp32 累加器
+    float acc[N_TILES][4];
+#pragma unroll
+    for (int j = 0; j < N_TILES; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) acc[j][q] = 0.f;
+
+    for (int k0 = 0; k0 < K; k0 += 16) {
+        // A fragment 每 warp 只载入一次，供 N_TILES 次 mma 复用（提升 mma/访存比）
+        const unsigned a0 = mma_ld_half2(A, m0 + g,     k0 + 2 * t,     M, K);
+        const unsigned a1 = mma_ld_half2(A, m0 + g + 8, k0 + 2 * t,     M, K);
+        const unsigned a2 = mma_ld_half2(A, m0 + g,     k0 + 2 * t + 8, M, K);
+        const unsigned a3 = mma_ld_half2(A, m0 + g + 8, k0 + 2 * t + 8, M, K);
+#pragma unroll
+        for (int j = 0; j < N_TILES; ++j) {
+            const int nj = n_base + j * 8;
+            const unsigned b0 = mma_ld_half2(B, nj + g, k0 + 2 * t,     N, K);
+            const unsigned b1 = mma_ld_half2(B, nj + g, k0 + 2 * t + 8, N, K);
+            // D = A(16×16) × B(16×8) + D，A/B 为 f16、C/D 为 f32（fp32 累加）
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[j][0]), "+f"(acc[j][1]), "+f"(acc[j][2]), "+f"(acc[j][3])
+                : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+        }
+    }
+
+    // 写回（C fragment 布局；边界外跳过）
+    const int r0 = m0 + g, r1 = m0 + g + 8;
+#pragma unroll
+    for (int j = 0; j < N_TILES; ++j) {
+        const int ca = n_base + j * 8 + 2 * t;
+        const int cb = ca + 1;
+        if (r0 < M) { if (ca < N) C[(size_t)r0 * N + ca] = acc[j][0];
+                      if (cb < N) C[(size_t)r0 * N + cb] = acc[j][1]; }
+        if (r1 < M) { if (ca < N) C[(size_t)r1 * N + ca] = acc[j][2];
+                      if (cb < N) C[(size_t)r1 * N + cb] = acc[j][3]; }
+    }
+#else
+    // 低于 sm_80：m16n8k16 mma 不可用 —— 编译期留空（运行时由 cutlass_hw_supported 拦截）
+    (void)A; (void)B; (void)C; (void)M; (void)K; (void)N;
+#endif
+}
+
+// fp16 tensor-core GEMM 入口（fp32 累加）。
+// 返回 0 = 已执行；1 = 硬件不支持（< sm_80）或尺寸非法 → 调用方回落 SIMT 版 mul_mat_cuda_f16。
+int mul_mat_mma_f16(const void* A, const void* B, float* C, int M, int K, int N) {
+    if (!cutlass_hw_supported(nullptr, nullptr)) return 1;   // 运行时判 CC >= 8.0
+    if (M <= 0 || N <= 0 || K <= 0) return 1;
+    constexpr int WARPS   = 4;     // 每 block 4 warps
+    constexpr int N_TILES = 4;     // 每 warp 4 个 16×8 tile（A fragment 复用，提升 mma/访存比）
+    dim3 block(WARPS * 32);
+    dim3 grid((unsigned)((N + WARPS * 8 * N_TILES - 1) / (WARPS * 8 * N_TILES)),
+              (unsigned)((M + 15) / 16));
+    mul_mat_mma_f16_kernel<WARPS, N_TILES><<<grid, block>>>(
+        reinterpret_cast<const __half*>(A), reinterpret_cast<const __half*>(B), C, M, K, N);
+    cudaCheck(cudaGetLastError());
+    return 0;
+}
+
+// ============================================================
+// fp16 Tensor-Core GEMM v2：smem + ldmatrix + cp.async 双缓冲流水（2026-09-10）
+//   C[M,N] = A[M,K] × B[N,K]ᵀ（A[M][K]、B[N][K] 行主序 half；输出 fp32）
+//   分块：BM=64, BN=64, BK=32；block=128 线程(4 warps)；每 warp 32(M)×32(N)
+//   smem：双缓冲 sA[2][64][32] + sB[2][64][32]（16 KB，16B 对齐）
+//   流水：cp.async 预取下一块 → commit → wait_group<1> → __syncthreads → mma → __syncthreads
+//   加载：A → ldmatrix.x4（row-major fragment）；B → ldmatrix.x2（非转置：
+//         smem 行=n、列=k 时，ldmatrix 给出的 {M[g][2t],M[g][2t+1]} 恰为 b0/b1 所需布局）
+//   边界：cp.async 的 src-size 参数做零填充（行/列越界时 src_size=0，不读 global）；
+//         **不做 block 级 early return**（否则 __syncthreads 死锁）→ 越界 fragment 全 0，
+//         epilogue 按 M/N 边界跳过写回。
+//   守卫：仅 sm_80+ 编译（低架构空实现），运行时由 cutlass_hw_supported() 拦截。
+// ============================================================
+#define PPML_G2_BM 64
+#define PPML_G2_BN 64
+#define PPML_G2_BK 32
+#define PPML_G2_STAGES 2
+#define PPML_G2_THREADS 128
+
+// cp.async：从 global 拷贝 16B 到 smem；src_bytes<16 时余下字节填 0（0 则全零且不读 global）
+__device__ __forceinline__ void cp_async_16B(void* smem_dst, const void* gmem_src, unsigned src_bytes) {
+    const unsigned sdst = (unsigned)__cvta_generic_to_shared(smem_dst);
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n"
+                 :: "r"(sdst), "l"(gmem_src), "r"(src_bytes));
+}
+__device__ __forceinline__ void cp_async_commit_group() { asm volatile("cp.async.commit_group;\n"); }
+template<int NWAIT>
+__device__ __forceinline__ void cp_async_wait_group() { asm volatile("cp.async.wait_group %0;\n" :: "n"(NWAIT)); }
+
+// ldmatrix：x4（4 个 8×8 b16 矩阵）/ x2（2 个）
+__device__ __forceinline__ void ldsm_x4_b16(unsigned& d0, unsigned& d1, unsigned& d2, unsigned& d3,
+                                            const void* smem_lane_addr) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(smem_lane_addr);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(d0), "=r"(d1), "=r"(d2), "=r"(d3) : "r"(a));
+}
+__device__ __forceinline__ void ldsm_x2_b16(unsigned& d0, unsigned& d1, const void* smem_lane_addr) {
+    const unsigned a = (unsigned)__cvta_generic_to_shared(smem_lane_addr);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+                 : "=r"(d0), "=r"(d1) : "r"(a));
+}
+// m16n8k16：D = A×B + D（A/B f16，C/D f32 累加）
+__device__ __forceinline__ void mma_f16_f32_acc(float (&c)[4], const unsigned (&a)[4], const unsigned (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__global__ void mul_mat_mma_f16_smem_kernel(const __half* __restrict__ A,
+                                            const __half* __restrict__ B,
+                                            float* __restrict__ C,
+                                            const int M, const int K, const int N) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    constexpr int BM = PPML_G2_BM, BN = PPML_G2_BN, BK = PPML_G2_BK;
+    constexpr int STAGES = PPML_G2_STAGES;
+    constexpr int NTH = PPML_G2_THREADS;
+    constexpr int SEG = BK / 8;                 // 每行 16B 片段数（8 half/片段）
+
+    __shared__ __align__(16) __half sA[STAGES][BM][BK];
+    __shared__ __align__(16) __half sB[STAGES][BN][BK];
+
+    const int tid      = (int)threadIdx.x;
+    const int m_block  = blockIdx.y * BM;
+    const int n_block  = blockIdx.x * BN;
+    const int k_blocks = (K + BK - 1) / BK;
+
+    // ---- 异步加载一块 [k0, k0+BK) 到 stage s（A: BM×BK，B: BN×BK）----
+    // cp.async 的两个硬约束（踩坑记录）：
+    //   ① cp-size=16 时 **src-size 只允许 4/8/16**；尾部 rem*2（如 12 字节）是未定义行为；
+    //   ② **global 源地址必须按 cp-size(16B) 对齐**。当 K 不是 8 的倍数时，行偏移
+    //      row*K*2 字节不再是 16B 的倍数 → 只有 row ≡ 0 (mod 8/gcd) 的行才对齐。
+    // 故：仅当"整片段 + 源 16B 对齐"时才发 cp.async；否则退化为同步手工拷贝 + 补零
+    //      （正确性优先；K 为 8 倍数时（真实模型的常见情形）全部走 cp.async，性能不受影响）。
+    auto load_tile = [&](int k0, int s) {
+        for (int idx = tid; idx < BM * SEG; idx += NTH) {          // A
+            const int row = idx / SEG, seg = idx % SEG;
+            const int m = m_block + row, k = k0 + seg * 8;
+            __half* dst = &sA[s][row][seg * 8];
+            const int rem = (m < M) ? (K - k) : 0;                 // 有效 half 数
+            const __half* src = (rem > 0) ? (A + (size_t)m * K + k) : A;
+            if (rem >= 8 && ((reinterpret_cast<uintptr_t>(src) & 15u) == 0u)) {
+                cp_async_16B(dst, src, 16u);
+            } else {
+                for (int i = 0; i < 8; ++i)
+                    dst[i] = (i < rem) ? src[i] : __float2half(0.0f);
+            }
+        }
+        for (int idx = tid; idx < BN * SEG; idx += NTH) {          // B
+            const int row = idx / SEG, seg = idx % SEG;
+            const int n = n_block + row, k = k0 + seg * 8;
+            __half* dst = &sB[s][row][seg * 8];
+            const int rem = (n < N) ? (K - k) : 0;
+            const __half* src = (rem > 0) ? (B + (size_t)n * K + k) : B;
+            if (rem >= 8 && ((reinterpret_cast<uintptr_t>(src) & 15u) == 0u)) {
+                cp_async_16B(dst, src, 16u);
+            } else {
+                for (int i = 0; i < 8; ++i)
+                    dst[i] = (i < rem) ? src[i] : __float2half(0.0f);
+            }
+        }
+    };
+
+    load_tile(0, 0);
+    cp_async_commit_group();
+
+    float acc[2][4][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][j][q] = 0.f;
+
+    const int lane   = tid & 31;
+    const int warp   = tid >> 5;
+    const int g      = lane >> 2;
+    const int t      = lane & 3;
+    const int warp_m = warp >> 1;                       // 0..1（M 方向 32 行）
+    const int warp_n = warp & 1;                        // 0..1（N 方向 32 列）
+    const int a_mat  = lane >> 3;                       // ldmatrix.x4：矩阵 0..3
+    const int a_lr   = lane & 7;                        // 矩阵内行 0..7
+    const int b_l16  = lane & 15;                       // ldmatrix.x2 仅 lane 0..15 有效
+
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        if (kb + 1 < k_blocks) load_tile((kb + 1) * BK, (kb + 1) % STAGES);
+        cp_async_commit_group();                        // 空组也合法 → 统一 wait 语义
+        cp_async_wait_group<1>();                       // 至多 1 组在途（= 下一块）→ 当前块已就绪
+        __syncthreads();
+
+        const int s = kb % STAGES;
+        const int a_row_base = warp_m * 32;
+        const int b_col_base = warp_n * 32;
+
+#pragma unroll
+        for (int k16 = 0; k16 < BK; k16 += 16) {
+            unsigned a[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {               // A：2 个 16×16 tile
+                const int r  = a_row_base + i * 16 + ((a_mat & 1) ? 8 : 0) + a_lr;
+                const int cc = k16 + ((a_mat & 2) ? 8 : 0);
+                ldsm_x4_b16(a[i][0], a[i][1], a[i][2], a[i][3], &sA[s][r][cc]);
+            }
+            unsigned b[4][2];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {               // B：4 个 8×16 tile
+                const int r  = b_col_base + j * 8 + (b_l16 & 7);
+                const int cc = k16 + ((b_l16 >> 3) ? 8 : 0);
+                ldsm_x2_b16(b[j][0], b[j][1], &sB[s][r][cc]);
+            }
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    mma_f16_f32_acc(acc[i][j], a[i], b[j]);
+        }
+        __syncthreads();                                // 所有 warp 用完本 stage 后才能覆写
+    }
+
+    // ---- epilogue：写回 C（越界跳过）----
+    const int m_base = m_block + warp_m * 32;
+    const int n_base = n_block + warp_n * 32;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int r0 = m_base + i * 16 + g;
+        const int r1 = r0 + 8;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c0 = n_base + j * 8 + 2 * t;
+            const int c1 = c0 + 1;
+            if (r0 < M) { if (c0 < N) C[(size_t)r0 * N + c0] = acc[i][j][0];
+                          if (c1 < N) C[(size_t)r0 * N + c1] = acc[i][j][1]; }
+            if (r1 < M) { if (c0 < N) C[(size_t)r1 * N + c0] = acc[i][j][2];
+                          if (c1 < N) C[(size_t)r1 * N + c1] = acc[i][j][3]; }
+        }
+    }
+#else
+    (void)A; (void)B; (void)C; (void)M; (void)K; (void)N;
+#endif
+}
+
+// 流水版入口：返回 0 = 已执行；1 = 不支持（< sm_80 或尺寸非法）→ 调用方回落
+int mul_mat_mma_f16_smem(const void* A, const void* B, float* C, int M, int K, int N) {
+    if (!cutlass_hw_supported(nullptr, nullptr)) return 1;
+    if (M <= 0 || N <= 0 || K <= 0) return 1;
+    dim3 block(PPML_G2_THREADS);
+    dim3 grid((unsigned)((N + PPML_G2_BN - 1) / PPML_G2_BN),
+              (unsigned)((M + PPML_G2_BM - 1) / PPML_G2_BM));
+    mul_mat_mma_f16_smem_kernel<<<grid, block>>>(
+        reinterpret_cast<const __half*>(A), reinterpret_cast<const __half*>(B), C, M, K, N);
+    cudaCheck(cudaGetLastError());
+    return 0;
 }
 
 // ============================================================

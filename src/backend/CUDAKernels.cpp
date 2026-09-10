@@ -65,6 +65,18 @@ extern void softmax_backward_cuda(
 
 extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
 
+// OP_MUL_MAT fp16 输入（前期支持，2026-09-10）：A/B 按 16 位 half 存储，kernel 内转 fp32
+// 累加，输出仍 fp32。M/K/N 语义与 mul_mat_cuda 完全一致（B 以 [N][K] 转置存储）。
+extern void mul_mat_cuda_f16(const void* A, const void* B, float* C, int M, int K, int N);
+
+// OP_MUL_MAT fp16 tensor-core（mma.m16n8k16, fp32 累加，2026-09-10）
+//   返回 0 = 已执行；1 = 硬件 < sm_80（调用方回落 mul_mat_cuda_f16）。
+extern int mul_mat_mma_f16(const void* A, const void* B, float* C, int M, int K, int N);
+
+// OP_MUL_MAT fp16 tensor-core 流水版（smem + ldmatrix + cp.async 双缓冲，2026-09-10）
+//   返回 0 = 已执行；1 = 不支持（< sm_80 / 尺寸非法）→ 回落简化 MMA 或 SIMT。
+extern int mul_mat_mma_f16_smem(const void* A, const void* B, float* C, int M, int K, int N);
+
 extern void out_prod_cuda(
     const float* src0, const float* src1, float* dst,
     int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
@@ -478,6 +490,36 @@ void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
     float * A = node->src[0]->data();
     float * B = node->src[1]->data();
     float * C = node->data();
+
+    // 防御（int8 量化准备，2026-09-10）：量化输入尚无 kernel（supports_op 已返回 false）；
+    //   万一到达则打印并返回，避免把块结构当 float 读。
+    if (is_quantized_type(node->src[0]->type) || is_quantized_type(node->src[1]->type)) {
+        fprintf(stderr, "[MULMAT-QUANT] quantized input not implemented yet (src0=%d src1=%d), skip\n",
+                (int)node->src[0]->type, (int)node->src[1]->type);
+        return;
+    }
+    // 前期 fp16 支持（2026-09-10）：A/B 同为 F16 → half 输入 kernel（内部转 fp32 累加）。
+    //   data() 返回 float*，但实际指向 16 位 half 数据（type_size_bytes()==2），按 void* 传递。
+    //   优先 tensor-core（m16n8k16, fp32 累加）；硬件 < sm_80 时回落 SIMT half 版。
+    if (node->src[0]->type == TENSOR_TYPE_F16 && node->src[1]->type == TENSOR_TYPE_F16) {
+        const void* A16 = reinterpret_cast<const void*>(A);
+        const void* B16 = reinterpret_cast<const void*>(B);
+        // 优先级：流水版（smem+ldmatrix+cp.async）→ 简化 MMA → SIMT fp16
+        const char* path = "tensor-core-smem-pipeline";
+        int rc = mul_mat_mma_f16_smem(A16, B16, C, M, K, N);
+        if (rc != 0) {
+            path = "tensor-core-mma-simple";
+            rc = mul_mat_mma_f16(A16, B16, C, M, K, N);
+        }
+        if (rc != 0) {
+            path = "fallback-simt-f16";
+            mul_mat_cuda_f16(A16, B16, C, M, K, N);
+        }
+        if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
+            fprintf(stderr, "[MMA] M=%d K=%d N=%d path=%s\n", M, K, N, path);
+        }
+        return;
+    }
 
     mul_mat_cuda(A, B, C, M, K, N);
 }

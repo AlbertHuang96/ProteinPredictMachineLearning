@@ -86,10 +86,28 @@ bool CPUBackend::supports_op(TensorF32* node) const {
         // now only have F32
             return true;
         
-        case OP_MUL_MAT:
-        // ggml src1->type == vec_dot_type(src0->type)
+        case OP_MUL_MAT: {
+            // 前期 fp16 支持（2026-09-10）：A/B 同为 F16（数据 2 字节/元素）也可算，
+            //   kernel 内转 fp32 累加，输出仍 F32。混合类型（一 F16 一 F32）暂不支持。
             if (!src1) return true;
-            return src1->type == TENSOR_TYPE_F32;
+            // int8 分块量化（2026-09-10 准备）：只有 kernel 就绪时才放开调度，
+            //   否则量化输入会被送进 F32/F16 kernel 按 float 读块数据（错误/越界）。
+            if (is_quantized_type(src1->type) || (src0 && is_quantized_type(src0->type))) {
+                // 形状合法性：量化张量的最内维须为块元素数整数倍（量化块不能跨行）
+                const bool shape_ok =
+                    (src0 != nullptr) &&
+                    (!is_quantized_type(src0->type) || src0->quant_shape_valid()) &&
+                    (!is_quantized_type(src1->type) || src1->quant_shape_valid());
+                return QUANT_MUL_MAT_KERNELS_READY && shape_ok &&
+                       quant_mul_mat_combo_supported(src0->type, src1->type) &&
+                       node->type == TENSOR_TYPE_F32;
+            }
+            const bool ok_f32 = (src0 && src0->type == TENSOR_TYPE_F32 &&
+                                 src1->type == TENSOR_TYPE_F32);
+            const bool ok_f16 = (src0 && src0->type == TENSOR_TYPE_F16 &&
+                                 src1->type == TENSOR_TYPE_F16);
+            return ok_f32 || ok_f16;
+        }
 
         case OP_SOFT_MAX_BACK: {
             if (!src0 || !src1) return false;
@@ -490,11 +508,27 @@ size_t CPUBackend::estimate_work_size(TensorF32 * node, int n_threads, int n_tas
         case OP_ADD:
         case OP_ADD1:
         case OP_MUL:
-            // PPML 目前只支持 F32，暂不要反量化缓冲
-            // 如果将来支持 F16/I8，这里需要：
-            // if (is_quantized(node->src[0]->type))
-            //     cur = sizeof(float) * node->src[0]->dims()[0] * n_tasks;
+            // 逐元素 op：F32/F16 都不需要额外缓冲（F16 由 kernel 内逐元素转 fp32）。
+            // int8 量化（Q8_0/Q8_1）尚未支持；若将来支持，需要：
+            //   if (is_quantized_type(node->src[0]->type))
+            //       cur = sizeof(float) * node->src[0]->shape().dims[0] * n_tasks;
             break;
+
+        // ===== 矩阵乘：量化权重/激活的反量化暂存（2026-09-10 int8 准备）=====
+        case OP_MUL_MAT: {
+            // F32/F16 路径不需要额外缓冲（cur 保持 0，行为与之前完全一致）；
+            // 量化路径的 kernel（把块反量化成 f32/f16 再算）需要每线程的反量化缓冲：
+            //   权重按行反量化 K 个元素 → sizeof(float) * K；激活同理（各自独立缓冲）。
+            const TensorF32* s0 = node->src[0];
+            const TensorF32* s1 = node->src[1];
+            const int64_t K = s0 ? s0->shape().dims[0] : 0;
+            if (K > 0) {
+                if (s0 && is_quantized_type(s0->type))
+                    cur += sizeof(float) * static_cast<size_t>(K) * static_cast<size_t>(n_tasks);
+                if (s1 && is_quantized_type(s1->type))
+                    cur += sizeof(float) * static_cast<size_t>(K) * static_cast<size_t>(n_tasks);
+            }
+        } break;
 
         // ===== 拷贝/类型转换 =====
         case OP_CPY:

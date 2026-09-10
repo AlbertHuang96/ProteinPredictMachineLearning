@@ -118,9 +118,28 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             if (!src0) return false;
             return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
 
-        case OP_MUL_MAT:
+        case OP_MUL_MAT: {
+            // 前期 fp16 支持（2026-09-10）：A/B 同为 F16 可调度到 GPU（kernel 内转 fp32 累加），
+            //   输出仍 F32。混合类型或输出非 F32 一律回落 CPU。
             if (!src1) return true;
-            return src1->type == TENSOR_TYPE_F32;
+            // int8 分块量化（2026-09-10 准备）：kernel 未就绪 → 不参与 GPU 调度（回落 CPU，
+            //   而 CPU 侧同样返回 false → 该节点整体不被任何后端支持，需等 kernel 落地）。
+            if (is_quantized_type(src1->type) || (src0 && is_quantized_type(src0->type))) {
+                // 形状合法性：量化张量的最内维须为块元素数整数倍（量化块不能跨行）
+                const bool shape_ok =
+                    (src0 != nullptr) &&
+                    (!is_quantized_type(src0->type) || src0->quant_shape_valid()) &&
+                    (!is_quantized_type(src1->type) || src1->quant_shape_valid());
+                return QUANT_MUL_MAT_KERNELS_READY && shape_ok &&
+                       quant_mul_mat_combo_supported(src0->type, src1->type) &&
+                       node->type == TENSOR_TYPE_F32;
+            }
+            const bool ok_f32 = (src0 && src0->type == TENSOR_TYPE_F32 &&
+                                 src1->type == TENSOR_TYPE_F32);
+            const bool ok_f16 = (src0 && src0->type == TENSOR_TYPE_F16 &&
+                                 src1->type == TENSOR_TYPE_F16);
+            return (ok_f32 || ok_f16) && node->type == TENSOR_TYPE_F32;
+        }
 
         case OP_OUT_PROD:
             if (!src0 || !src1) return false;

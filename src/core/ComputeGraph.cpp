@@ -525,6 +525,12 @@ void ComputeGraph::compute_backward(
             }
         } break;
         case OP_MUL_MAT: {
+            // 前期 fp16 支持（2026-09-10）：A/B 为 F16 时按"常量权重/激活"处理，不回传梯度
+            //   （fp16 反向 kernel 未实现；显式跳过，避免 F32 反向 kernel 误读 16 位数据）。
+            if ((src0 && src0->type == TENSOR_TYPE_F16) ||
+                (src1 && src1->type == TENSOR_TYPE_F16)) {
+                break;
+            }
             // https://cs231n.github.io/optimization-2/#staged
             // # forward pass
             // s0 = np.random.randn(5, 10)
