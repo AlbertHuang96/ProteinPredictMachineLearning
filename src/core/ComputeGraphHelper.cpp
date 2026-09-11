@@ -135,6 +135,30 @@ TensorF32* neg(TensorF32* a) {
 // 修正：result.dims[0] 应为 b 的行数 N=b.dims[1]，而非 b.dims[0](=K)；
 //   原实现写 b.dims[0] 导致非方阵时输出形状错误。
 TensorF32* mul_mat(TensorF32* a, TensorF32* b) {
+    // 形状契约检查（2026-09-11）：收缩维必须一致（a.dims[0] == b.dims[0]）。
+    //   实测 le103 + MSA512 多样本出现畸形节点：a=[51,2097152] × b=[512,256,8,51]（51≠512）
+    //   → dst=[256,2097152]=2GB；它不是立即崩溃，而是把 Gallocr 的 **CPU 峰值推到 150GB**
+    //   （日志 `[gallocr] reserve done: backend=1 peak=161200533280 (150.13 GB)`），
+    //   继而 168.9GB 超大分配 → OOM killer（退出码 137）。
+    //   这里显式报错 + 调用栈（**不 abort**：保持训练可继续，便于在服务器上一轮定位）。
+    if (a->shape().dim(0) != b->shape().dim(0)) {
+        fprintf(stderr,
+                "[MULMAT-SHAPE] 收缩维不一致！a.dims[0]=%lld != b.dims[0]=%lld | "
+                "a ndim=%d dims=[%lld,%lld,%lld,%lld] (op=%d) | "
+                "b ndim=%d dims=[%lld,%lld,%lld,%lld] (op=%d)\n",
+                (long long)a->shape().dim(0), (long long)b->shape().dim(0),
+                a->shape().ndim(), (long long)a->shape().dim(0), (long long)a->shape().dim(1),
+                (long long)a->shape().dim(2), (long long)a->shape().dim(3), (int)a->op,
+                b->shape().ndim(), (long long)b->shape().dim(0), (long long)b->shape().dim(1),
+                (long long)b->shape().dim(2), (long long)b->shape().dim(3), (int)b->op);
+        void* bt[20];
+        int n = backtrace(bt, 20);
+        char** syms = backtrace_symbols(bt, n);
+        for (int i = 0; i < n && i < 10; i++)
+            fprintf(stderr, "[MULMAT-SHAPE]   #%d %s\n", i, syms[i] ? syms[i] : "?");
+        std::free(syms);
+    }
+
     int64_t ne[2] = {b->shape().dims[1], a->shape().dims[1]};
     TensorF32* result = context().new_tensor<float>(2, ne);
 
@@ -147,11 +171,25 @@ TensorF32* mul_mat(TensorF32* a, TensorF32* b) {
 // out_prod(a, b) — 外积 a ⊗ b
 // a: (..., M, K1, K2), b: (..., N, K1, K2) → (..., M, N, K1, K2)
 TensorF32* out_prod(TensorF32* a, TensorF32* b) {
+    // 2026-09-11：dim(i) 安全访问（缺失维=1）。原用 dims[2]/dims[3] 裸读，输入 < 4 维时
+    //   越界读取 std::vector → 垃圾维 → dst numel 爆炸（168.9GB 超大分配来源之一），
+    //   且垃圾 ne2/ne3 会让 CUDA 侧 grid 越限（op=32 OP_OUT_PROD invalid configuration）。
+    // 形状契约检查（2026-09-11）：out_prod 收缩 dims[1]，两侧必须等长。
+    if (a->shape().dim(1) != b->shape().dim(1)) {
+        fprintf(stderr,
+                "[OUTPROD-SHAPE] 收缩维(dims[1])不一致！a=%lld b=%lld | "
+                "a dims=[%lld,%lld,%lld,%lld](op=%d) b dims=[%lld,%lld,%lld,%lld](op=%d)\n",
+                (long long)a->shape().dim(1), (long long)b->shape().dim(1),
+                (long long)a->shape().dim(0), (long long)a->shape().dim(1),
+                (long long)a->shape().dim(2), (long long)a->shape().dim(3), (int)a->op,
+                (long long)b->shape().dim(0), (long long)b->shape().dim(1),
+                (long long)b->shape().dim(2), (long long)b->shape().dim(3), (int)b->op);
+    }
     int64_t ne[4] = {
-        a->shape().dims[0],
-        b->shape().dims[0],
-        std::max(a->shape().dims[2], b->shape().dims[2]), 
-        std::max(a->shape().dims[3], b->shape().dims[3])
+        a->shape().dim(0),
+        b->shape().dim(0),
+        std::max(a->shape().dim(2), b->shape().dim(2)), 
+        std::max(a->shape().dim(3), b->shape().dim(3))
     };
     TensorF32* result = context().new_tensor<float>(4, ne);
 
@@ -176,6 +214,26 @@ TensorF32* transpose(TensorF32* a) {
     for (int i = 0; i < n; i++) result->op_params[i] = i;
     std::swap(result->op_params[n - 1], result->op_params[n - 2]);
     return result;
+}
+
+// mat_transpose(a) — 矩阵转置：交换 dims[0] 与 dims[1]（保留 dims[2]/dims[3] 的 batch/head 维）
+//   【2026-09-11 新增，修 4D 反向 bug】
+//   项目 mul_mat/out_prod 的布局约定是 dims[0]=收缩维(K)、dims[1]=行维(M/N)、dims[2..3]=batch/head，
+//   因此"矩阵转置"= 交换 dims[0]/dims[1]，而 **不是** 交换最后两维。
+//   原反向代码用 transpose()（交换最后两维，只对 2-D 等价）→ 4D 张量上转错维 →
+//   反向算子收缩维不匹配。实测（P62891/MSA=8 冒烟）：
+//     `[MULMAT-SHAPE] 收缩维不一致！a.dims[0]=51 != b.dims[0]=32 |
+//      a dims=[51,32,8,51] (op=39) | b dims=[32,51,8,51] (op=39)` ×240 次，
+//     调用栈 compute_backward ← build_backward_expand。
+//   → 4D 训练里每个 mul_mat/out_prod 反向都在拿错布局的算子做乘法（梯度错位、形状被 repeat_back 硬凑，
+//     也是 le103/MSA512 出现 2GB 畸形节点 → CPU 峰值 150GB 的推手之一）。
+TensorF32* mat_transpose(TensorF32* a) {
+    const int nd = a->shape().ndim();
+    assert(nd >= 2);
+    std::vector<int> perm(nd);
+    for (int i = 0; i < nd; ++i) perm[i] = i;
+    std::swap(perm[0], perm[1]);      // dims[0] <-> dims[1]（矩阵维）
+    return permute(a, perm);
 }
 
 // triangle_mul(left, right, L, outgoing)

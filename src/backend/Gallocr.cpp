@@ -380,8 +380,15 @@ bool Gallocr::reserve(
     // 4. 遍历 nodes（拓扑序）：分配当前节点，释放已无依赖的 src
     //    诊断：跟踪 nbytes 最大的张量（定位异常超大 buffer，如 backward 节点 shape bug）
     long max_node_idx = -1; size_t max_node_bytes = 0; int max_node_op = -1;
+    // 2026-09-11：额外统计"大张量"的数量与总量 —— 用于区分峰值爆炸是
+    //   「单个巨张量」还是「大量 GB 级张量同时存活」（le103/MSA512 实测是后者）。
+    long   n_gt1g   = 0;    // nbytes > 1GB 的节点数
+    size_t sum_gt1g = 0;    // 这些节点的字节总和
     for (auto& ni : nodes_) {
         TensorF32* node = ni.tensor;
+        if (node && node->nbytes() > (1ull << 30)) {
+            ++n_gt1g; sum_gt1g += node->nbytes();
+        }
         if (node && node->nbytes() > max_node_bytes) {
             max_node_bytes = node->nbytes();
             max_node_idx   = &ni - &nodes_[0];
@@ -424,11 +431,22 @@ bool Gallocr::reserve(
     }
 
     // 5. 保留每个后端的峰值，释放 Phase1 虚拟 talloc（Phase2 会重建真实 buffer）
-    if (getenv("GRAPH_DEBUG_GALLOCR")) {
+    //   2026-09-11：单张量 > 32GB 时无条件打印下面这段诊断（超大分配几乎总是 shape bug，
+    //   不能再要求用户先设 GRAPH_DEBUG_GALLOCR 才知道是谁）。
+    //   2026-09-11 追加：任一后端峰值 > 64GB 时也无条件打印（le103/MSA512 实测 CPU 峰值 150GB
+    //   但单张量最大仅 2GB → 属"大量 GB 级张量同时存活"，需看 big-tensor 统计）。
+    bool any_peak_huge = false;
+    for (auto& ba : backends_) {
+        if (ba.peak > (64ull << 30)) any_peak_huge = true;
+    }
+    if (getenv("GRAPH_DEBUG_GALLOCR") || max_node_bytes > (32ull << 30) || any_peak_huge) {
         for (auto& ba : backends_) {
             fprintf(stderr, "[gallocr] reserve done: backend=%d peak=%zu bytes (%.2f GB)\n",
                     (int)(&ba - &backends_[0]), ba.peak, ba.peak / (1024.0 * 1024.0 * 1024.0));
         }
+        // 大张量统计：区分「单个巨张量」vs「大量 GB 级张量同时存活」
+        fprintf(stderr, "[gallocr] big tensors: n(>1GB)=%ld sum=%.2f GB (nodes=%zu)\n",
+                n_gt1g, (double)sum_gt1g / (1024.0 * 1024.0 * 1024.0), nodes_.size());
         // 诊断：打印 nbytes 最大的张量（定位异常超大 buffer 的来源 op）
         fprintf(stderr, "[gallocr] max tensor: node_idx=%ld n_bytes=%zu (%.2f GB) op=%d dims=[",
                 max_node_idx, max_node_bytes, max_node_bytes / (1024.0 * 1024.0 * 1024.0), max_node_op);

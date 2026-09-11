@@ -542,17 +542,21 @@ size_t CPUBackend::estimate_work_size(TensorF32 * node, int n_threads, int n_tas
             // shape: (B, H, L, L) 或类似
             //int n_tasks = get_n_tasks(node, n_threads);
             // 保守估计：attn weights 的中间存储
-            cur = sizeof(float) * node->shape().dims[2] * node->shape().dims[3] * n_tasks;
+            // 2026-09-11：dim() 安全访问（缺失维=1）—— 原裸读 dims[2]/dims[3]，<4D 节点上
+            //   越界读 std::vector 是 UB → work_size 可能爆炸成超大分配。
+            cur = sizeof(float) * static_cast<size_t>(node->shape().dim(2))
+                                * static_cast<size_t>(node->shape().dim(3))
+                                * static_cast<size_t>(n_tasks);
 
         } break;
         case OP_FLASH_ATTN_BACK: {
             // 反向还需要存储 dS
             // D = head dim (如 64 or 128)
             // Q's head dim
-            const int64_t D = node->src[0]->shape().dims[0];
+            const int64_t D = node->src[0]->shape().dim(0);
 
             // Lkv = K 的序列长度，对齐到 UNROLL
-            const int64_t ne11 = align_up(node->src[1]->shape().dims[1], SOFT_MAX_UNROLL);
+            const int64_t ne11 = align_up(node->src[1]->shape().dim(1), SOFT_MAX_UNROLL);
 
             // mxDn: 取 max 是为了用较大的维度兜底，×2 因为 S + SM 两份
             const int64_t mxDn = std::max(D, ne11) * 2;

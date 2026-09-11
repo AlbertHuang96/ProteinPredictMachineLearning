@@ -749,7 +749,11 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                 } else {
                     compute_st = Status::ALLOC_FAILED;
                 }
-                if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED) {
+                // 2026-09-11：ABORTED 一并回退 —— CUDA kernel launch 失败（如 grid 越限的
+                //   "invalid configuration argument"）返回的就是 ABORTED(=3)。此前它不满足
+                //   回退条件 → 图停在半算状态，程序继续读 loss/梯度 → SIGSEGV(139)。
+                if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED ||
+                    compute_st == Status::ABORTED) {
                     // ⚠️ 2026-09-01：回退必须用真 CPU 后端——active_backend() 在 CUDA 模式
                     //   返回 CUDABackend，其单后端全图算不出 loss 链（TRANSPOSE 被 skip、
                     //   host 输入）→ loss 恒 0。改用 active_cpu_backend()。
@@ -1613,7 +1617,8 @@ int main(int argc, char* argv[]) {
             } else {
                 compute_st = Status::ALLOC_FAILED;
             }
-            if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED) {
+            if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED ||
+                compute_st == Status::ABORTED) {   // 2026-09-11：ABORTED 也回退（见前文说明）
                 // 显存不足/分配失败/节点含 host 指针（GPU kernel 无法执行）→
                 // 回退到单后端 CPU 全图计算（保证训练不中断）。CPU kernel 对 device 输入
                 // 有 stage_device_src 兜底（D2H 暂存），不会裸读 device 指针。

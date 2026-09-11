@@ -881,16 +881,28 @@ __global__ void softmax_v1_kernel(float * input, float * output, int M, int N) {
     __syncthreads();
 
     // Pass 3: 归一化写出
-    float inv_sum = 1.0f / sum;
+    // 分母保护（2026-09-11）：与 CPU kernel_softmax 的 1/(sum+1e-9f) 语义对齐
+    //   （原实现直接 1/sum，与 CPU 不一致；sum==0/非规格化时 1/sum=inf → exp*inf=NaN 并沿下游传播）。
+    float inv_sum = 1.0f / (sum + 1e-9f);
     for (int i = tid; i < N; i += blockDim.x) {
         y[i] = expf(x[i] - max_val) * inv_sum;
     }
 }
 
-void softmax_cuda(float * input, float * output, int M, int N, int block_size) {
+// v1 入口（smem 树形规约）保留：参考实现 / 与 v2 对拍 / 回退用。smem = block_size 个 float。
+void softmax_v1_cuda(float * input, float * output, int M, int N, int block_size) {
     int smem_size = block_size * sizeof(float);
     softmax_v1_kernel<<<M, block_size, smem_size>>>(input, output, M, N);
     cudaCheck(cudaGetLastError());
+}
+
+void softmax_v2_cuda(float * input, float * output, int M, int N, int block_size);  // 定义见下方
+
+// 生产入口（OP_SOFT_MAX → CUDABackend::kernel_softmax_cuda）：
+//   2026-09-11 起接入 v2（warp shuffle 两级规约，smem 仅 num_warps 个 float，比 v1 少 8×）；
+//   v1 保留为 softmax_v1_cuda 供对拍/回退。
+void softmax_cuda(float * input, float * output, int M, int N, int block_size) {
+    softmax_v2_cuda(input, output, M, N, block_size);
 }
 
 // ============================================================
@@ -925,10 +937,19 @@ __device__ float blockReduceMaxShuffle(float val, float * smem) {
 
     // 第三步：Warp 0 从共享内存读取所有 warp 结果，再做一次 warp 内规约
     int num_warps = blockDim.x / 32;
-    val = (lane < num_warps) ? smem[lane] : -INFINITY;
-    if (wid == 0) val = warpReduceMax(val);
-
-    return val;
+    if (wid == 0) {
+        float v = (lane < num_warps) ? smem[lane] : -INFINITY;
+        v = warpReduceMax(v);
+        if (lane == 0) smem[0] = v;      // 全块最大值写回 smem[0]
+    }
+    __syncthreads();
+    // 【2026-09-11 修正】原实现最后 `return val;`：只有 warp0/lane0 拿到全块结果，
+    //   其余线程返回的是自己的（未跨 warp 归约的）局部值或 -INFINITY。调用方
+    //   （softmax_v2 前向的 max/sum、softmax_backward 的 dgf_dot）除 tid==0 外全部用错值，
+    //   会静默产生错误结果。现改为经 smem[0] 广播给全块所有线程。
+    float r = smem[0];
+    __syncthreads();                     // 所有线程读完后再进入下一阶段（smem 复用安全）
+    return r;
 }
 
 __device__ float blockReduceSumShuffle(float val, float * smem) {
@@ -945,10 +966,18 @@ __device__ float blockReduceSumShuffle(float val, float * smem) {
 
     // 第三步：Warp 0 从共享内存读取所有 warp 结果，再做一次 warp 内规约
     int num_warps = blockDim.x / 32;
-    val = (lane < num_warps) ? smem[lane] : 0.0f;
-    if (wid == 0) val = warpReduceSum(val);
-
-    return val;
+    if (wid == 0) {
+        float v = (lane < num_warps) ? smem[lane] : 0.0f;
+        v = warpReduceSum(v);
+        if (lane == 0) smem[0] = v;      // 全块总和写回 smem[0]
+    }
+    __syncthreads();
+    // 【2026-09-11 修正】同 blockReduceMaxShuffle：原 `return val;` 只有 warp0/lane0 正确，
+    //   导致 softmax_v2 前向的 sum、softmax_backward 的 Σ(y·g) 在其余线程上取错值。
+    //   现经 smem[0] 广播给全块。
+    float r = smem[0];
+    __syncthreads();                     // 所有线程读完后再进入下一阶段（smem 复用安全）
+    return r;
 }
 
 __global__ void softmax_v2_kernel(float * input, float * output, int M, int N) {
@@ -975,7 +1004,8 @@ __global__ void softmax_v2_kernel(float * input, float * output, int M, int N) {
     sum = blockReduceSumShuffle(sum, smem);
 
     // Pass 3: 归一化写出
-    float inv_sum = 1.0f / sum;
+    // 分母保护（2026-09-11）：与 CPU kernel_softmax 的 1/(sum+1e-9f) 语义对齐（见 v1 注释）。
+    float inv_sum = 1.0f / (sum + 1e-9f);
     for (int i = tid; i < N; i += blockDim.x) {
         y[i] = expf(x[i] - max_val) * inv_sum;
     }

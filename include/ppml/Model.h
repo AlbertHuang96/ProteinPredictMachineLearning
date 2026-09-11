@@ -642,12 +642,12 @@ private:
 
     // --- MSARowAttention (6 LL ×12) ---
     // 旧: LinearLayer* msa_row_Wq_ etc.
-    std::vector<LinearLayer*> msa_row_Wq_;     // D_MSA (256) → N_HEAD*D_MSA (2048)
-    std::vector<LinearLayer*> msa_row_Wk_;     // D_MSA (256) → N_HEAD*D_MSA (2048)
-    std::vector<LinearLayer*> msa_row_Wv_;     // D_MSA (256) → N_HEAD*D_MSA (2048)
+    std::vector<LinearLayer*> msa_row_Wq_;     // D_MSA (256) → D_MSA (256)（逐头 32；2026-09-11 修正）
+    std::vector<LinearLayer*> msa_row_Wk_;     // D_MSA (256) → D_MSA (256)（逐头 32；2026-09-11 修正）
+    std::vector<LinearLayer*> msa_row_Wv_;     // D_MSA (256) → D_MSA (256)（逐头 32；2026-09-11 修正）
     std::vector<LinearLayer*> msa_row_to_b_;   // D_PAIR (128) → N_HEAD (8)
-    std::vector<LinearLayer*> msa_row_to_g_;   // D_MSA (256) → N_HEAD*D_MSA (2048)
-    std::vector<LinearLayer*> msa_row_to_out_; // N_HEAD*D_MSA (2048) → D_MSA (256)
+    std::vector<LinearLayer*> msa_row_to_g_;   // D_MSA (256) → D_MSA (256)（2026-09-11 修正）
+    std::vector<LinearLayer*> msa_row_to_out_; // D_MSA (256) → D_MSA (256)（2026-09-11 修正）
 
     // --- MSAColAttention (6 LL ×12) ---
     std::vector<LinearLayer*> msa_col_Wq_;     // D_MSA (256) → N_HEAD*D_MSA (2048)

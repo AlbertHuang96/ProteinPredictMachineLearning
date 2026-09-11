@@ -2027,21 +2027,30 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
     AttnConfig msa_ac(config.d_msa, config.n_heads);
     AttnConfig pair_ac(config.d_pair, config.n_heads);
 
+    // 【2026-09-11 维度修正】MSA row/col 注意力投影必须是 d_msa -> d_msa（256→256），
+    //   逐头 reshape 成 H 头 × d_k（d_k = D_MSA/N_HEAD = 32），总维度不变。
+    //   原写法 `N_HEAD * D_MSA`（256→2048）= 每个头都拿到完整 256 维 → 单块激活 ×8，
+    //   24 块(12×2 样本)的前向激活 + 反向梯度把 Gallocr CPU 峰值推到 150GB
+    //   （日志：`reserve done: backend=1 peak=... (150.13 GB)` → 168.9GB 分配 → OOM 137）。
+    //   依据：① 参考实现 RoseTTAFold `MultiheadAttention` 为 `nn.Linear(d_model,d_model)`
+    //   + `.view(..., heads, d_k)`（Transformer.py:56-68）；② 本文件 FullBlock 已是正确约定
+    //   （`FMSA_QOUT = 64 = n_msa_head*d_msa_channels`，见下方 push_full_msa_row）；
+    //   ③ `[space]` 估算器（18.9GB）也是按 256 维算的，改后两者一致。
     auto push_msa_row = [&]() {
-        msa_row_Wq_.push_back(    LinearLayer::create(D_MSA, N_HEAD * D_MSA));        // 256→2048
-        msa_row_Wk_.push_back(    LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_row_Wv_.push_back(    LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_row_to_b_.push_back(  LinearLayer::create(D_PAIR, N_HEAD));                // 128→8
-        msa_row_to_g_.push_back(  LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_row_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));        // 2048→256
+        msa_row_Wq_.push_back(    LinearLayer::create(D_MSA, D_MSA));        // 256→256（逐头 32）
+        msa_row_Wk_.push_back(    LinearLayer::create(D_MSA, D_MSA));
+        msa_row_Wv_.push_back(    LinearLayer::create(D_MSA, D_MSA));
+        msa_row_to_b_.push_back(  LinearLayer::create(D_PAIR, N_HEAD));      // 128→8
+        msa_row_to_g_.push_back(  LinearLayer::create(D_MSA, D_MSA));        // 门控 256→256
+        msa_row_to_out_.push_back(LinearLayer::create(D_MSA, D_MSA));        // 256→256
     };
     auto push_msa_col = [&]() {
-        msa_col_Wq_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_col_Wk_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_col_Wv_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_col_Wq_.push_back(   LinearLayer::create(D_MSA, D_MSA));
+        msa_col_Wk_.push_back(   LinearLayer::create(D_MSA, D_MSA));
+        msa_col_Wv_.push_back(   LinearLayer::create(D_MSA, D_MSA));
         msa_col_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));
-        msa_col_to_g_.push_back( LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));
+        msa_col_to_g_.push_back( LinearLayer::create(D_MSA, D_MSA));
+        msa_col_to_out_.push_back(LinearLayer::create(D_MSA, D_MSA));
     };
     auto push_pair_row = [&]() {
         pair_attn_norm_.push_back(LayerNorm::create(D_PAIR));                             // 128 (AF2 PairAxialAttention 投影前 norm)
@@ -2129,14 +2138,14 @@ PPMLModel::PPMLModel(const PPMLConfig& config) : config_(config) {
                  tri_in_gate_, tri_in_out_proj_);
     }
 
-    // n_extra 份 GlobalColAttention 参数
+    // n_extra 份 GlobalColAttention 参数（2026-09-11 同上修正为 d_msa → d_msa）
     for (int i = 0; i < n_extra; ++i) {
-        msa_global_col_Wq_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_global_col_Wk_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_global_col_Wv_.push_back(   LinearLayer::create(D_MSA, N_HEAD * D_MSA));
+        msa_global_col_Wq_.push_back(   LinearLayer::create(D_MSA, D_MSA));
+        msa_global_col_Wk_.push_back(   LinearLayer::create(D_MSA, D_MSA));
+        msa_global_col_Wv_.push_back(   LinearLayer::create(D_MSA, D_MSA));
         msa_global_col_to_b_.push_back( LinearLayer::create(D_PAIR, N_HEAD));
-        msa_global_col_to_g_.push_back( LinearLayer::create(D_MSA, N_HEAD * D_MSA));
-        msa_global_col_to_out_.push_back(LinearLayer::create(N_HEAD * D_MSA, D_MSA));
+        msa_global_col_to_g_.push_back( LinearLayer::create(D_MSA, D_MSA));
+        msa_global_col_to_out_.push_back(LinearLayer::create(D_MSA, D_MSA));
     }
 
     // ===== FullBlock(extra) 专属 64 维 MSA 注意力参数（n_extra 份）=====
@@ -4100,6 +4109,22 @@ void PPMLModel::transfer_params_to_backend() {
     }
 
     if (total_size == 0 || param_tensors.empty()) return;
+
+    // 诊断（2026-09-11）：参数总量异常大时逐项打印 —— 定位"超大分配"是否来自参数搬迁
+    //   buffer（usage=WEIGHTS）：某个 param 的 nbytes 异常 = shape 被污染 /
+    //   把激活型（随 L/E 规模变化）张量当参数注册。
+    if (total_size > (8ull << 30)) {
+        fprintf(stderr, "[params] transfer: total=%.2f GB (n_params=%zu) —— 单参数 >1GB 列表：\n",
+                (double)total_size / (1024.0*1024.0*1024.0), param_tensors.size());
+        for (auto* t : param_tensors) {
+            if (!t || !t->data() || t->nbytes() <= (1ull << 30)) continue;
+            fprintf(stderr, "[params]   nbytes=%.2f GB op=%d ndim=%d dims=[",
+                    (double)t->nbytes() / (1024.0*1024.0*1024.0), (int)t->op, t->shape().ndim());
+            for (int d = 0; d < t->shape().ndim(); ++d)
+                fprintf(stderr, "%s%lld", (d ? "," : ""), (long long)t->shape().dims[d]);
+            fprintf(stderr, "]\n");
+        }
+    }
 
     // ===== Step 3: 分配 buffer 并搬迁数据（对标 ggml_backend_alloc_ctx_tensors + ggml_backend_tensor_set）=====
     Buffer* param_buf = alloc_buffer(const_cast<BufferType*>(cpu_buft), total_size, BufferUsage::WEIGHTS);

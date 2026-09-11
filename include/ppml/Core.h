@@ -66,6 +66,14 @@ struct Shape {
     }
     
     int ndim() const { return static_cast<int>(dims.size()); }
+
+    // 安全访问第 i 维（2026-09-11）：超出 ndim 时返回 1（ggml 语义：缺失维视为 1）。
+    //   背景：dims 是 std::vector，`dims[i]`（i ≥ ndim）越界是 UB —— 读到堆垃圾 → 形状爆炸
+    //   → 曾出现 168.9GB 超大分配 / CUDA grid 越限（invalid configuration argument）。
+    //   约定：所有"可能不足 4 维"的读写一律用 dim(i)，禁止裸 dims[i]。
+    int64_t dim(int i) const {
+        return (i >= 0 && i < static_cast<int>(dims.size())) ? dims[i] : 1;
+    }
 };
 
 // 运行时异常

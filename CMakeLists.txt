@@ -47,6 +47,43 @@ else()
 endif()
 
 # ============================================================
+# ASan / UBSan 构建（2026-09-11）
+#   用途：抓 Shape::dims（std::vector）越界读、堆越界读写等 UB。
+#   用法：cmake -S . -B build/asan -DPPML_SANITIZE=address,undefined
+#   要点：
+#     * C++ 源：直接加 -fsanitize=...（编译 + 链接都加，宿主侧插桩）
+#     * .cu 源：nvcc 不认识 -fsanitize，须用 -Xcompiler= 透传给宿主编译器；
+#       同时把该 flag 放在 CMAKE_CUDA_FLAGS 里，nvcc 的链接行也会带上 → 混合
+#       CXX+CUDA 目标（ppml_core）链接时能找到 ASan 运行时。
+#     * 不设 -fno-sanitize-recover，让 UBSan 报错后继续跑，一次收集尽可能多的问题。
+# ============================================================
+set(PPML_SANITIZE "" CACHE STRING "宿主侧 sanitizer 列表，如 address,undefined（空=关闭）")
+if(PPML_SANITIZE)
+    message(STATUS "[SANITIZE] enabled: ${PPML_SANITIZE}")
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=${PPML_SANITIZE}>
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-omit-frame-pointer>
+        $<$<COMPILE_LANGUAGE:CXX>:-g>
+        # 关键补充：libstdc++ 的 operator[] 越界断言。
+        #   GCC 的 ASan **抓不到** std::vector 的 `v[i]`（i ≥ size 但 < capacity）——
+        #   例如本项目的 `Shape::dims`（vector<int64_t>）在 3 维 shape 上读 dims[3]：
+        #   vector 增长 1→2→4，capacity=4 → 该读落在已分配块内，无红区 → ASan 静默。
+        #   `_GLIBCXX_ASSERTIONS` 让 operator[] 显式检查 i < size() 并 abort（ABI 兼容）。
+        $<$<COMPILE_LANGUAGE:CXX>:-D_GLIBCXX_ASSERTIONS>
+    )
+    add_link_options($<$<LINK_LANGUAGE:CXX>:-fsanitize=${PPML_SANITIZE}>)
+
+    string(REPLACE "," ";" _ppml_san_list "${PPML_SANITIZE}")
+    foreach(_s IN LISTS _ppml_san_list)
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fsanitize=${_s}")
+    endforeach()
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-fno-omit-frame-pointer")
+    # .cu 文件里同样可能读 std::vector（如 kernel 里访问 shape().dims[i]）→ 断言开关一并透传
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -Xcompiler=-D_GLIBCXX_ASSERTIONS")
+    message(STATUS "[SANITIZE] CMAKE_CUDA_FLAGS=${CMAKE_CUDA_FLAGS}")
+endif()
+
+# ============================================================
 # 环境信息打印（构建日志里的 CPU / GPU / 编译器 / 编译类型）
 # ============================================================
 # --- CPU ---

@@ -170,6 +170,10 @@ TensorF32* mul_mat  (TensorF32* a, TensorF32* b);
 TensorF32* out_prod (TensorF32* a, TensorF32* b);
 TensorF32* transpose(TensorF32* a);
 
+// mat_transpose(a) — 矩阵转置：交换 dims[0]/dims[1]（保留 batch/head 维）。
+//   2026-09-11：mul_mat/out_prod 反向必须用它（transpose() 交换的是最后两维，4D 上是错的）。
+TensorF32* mat_transpose(TensorF32* a);
+
 // Triangle Multiplication: left (B,I,K,D) × right (B,J,K,D) → (B,I,J,D)
 // outgoing=true: einsum('bikd,bjkd->bijd'), false: einsum('bkid,bkjd->bijd')
 TensorF32* triangle_mul(TensorF32* left, TensorF32* right, float L, bool outgoing);

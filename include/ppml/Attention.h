@@ -72,11 +72,11 @@ private:
     std::unique_ptr<SelfAttention> self_attn_;
 
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
-    LinearLayer* to_g_  = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
-    LinearLayer* to_out_ = nullptr; // N_HEAD*D_MSA (2048) → D_MSA (256)
-    LinearLayer* Wq_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
-    LinearLayer* Wk_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
-    LinearLayer* Wv_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
+    LinearLayer* to_g_  = nullptr; // D_MSA (256)  → D_MSA (256)（逐头 32；2026-09-11 修正）
+    LinearLayer* to_out_ = nullptr; // D_MSA (256) → D_MSA (256)（2026-09-11 修正）
+    LinearLayer* Wq_    = nullptr; // D_MSA (256)  → D_MSA (256)（逐头 32；2026-09-11 修正）
+    LinearLayer* Wk_    = nullptr; // D_MSA (256)  → D_MSA (256)（逐头 32；2026-09-11 修正）
+    LinearLayer* Wv_    = nullptr; // D_MSA (256)  → D_MSA (256)（逐头 32；2026-09-11 修正）
     AttnConfig config_;
 };
 
@@ -100,11 +100,11 @@ public:
 protected:
     std::unique_ptr<SelfAttention> self_attn_;
     LinearLayer* to_b_  = nullptr; // D_PAIR (128) → N_HEAD (8)
-    LinearLayer* to_g_  = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
-    LinearLayer* to_out_ = nullptr; // N_HEAD*D_MSA (2048) → D_MSA (256)
-    LinearLayer* Wq_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
-    LinearLayer* Wk_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
-    LinearLayer* Wv_    = nullptr; // D_MSA (256)  → N_HEAD*D_MSA (2048)
+    LinearLayer* to_g_  = nullptr; // D_MSA (256)  → D_MSA (256)（2026-09-11 修正）
+    LinearLayer* to_out_ = nullptr; // D_MSA (256) → D_MSA (256)（2026-09-11 修正）
+    LinearLayer* Wq_    = nullptr; // D_MSA (256)  → D_MSA (256)（逐头 32；2026-09-11 修正）
+    LinearLayer* Wk_    = nullptr; // D_MSA (256)  → D_MSA (256)（逐头 32；2026-09-11 修正）
+    LinearLayer* Wv_    = nullptr; // D_MSA (256)  → D_MSA (256)（逐头 32；2026-09-11 修正）
     AttnConfig config_;
 };
 

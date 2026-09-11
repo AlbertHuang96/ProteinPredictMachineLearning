@@ -255,11 +255,15 @@ Buffer* alloc_buffer(BufferType* buft, size_t size, BufferUsage usage) {
     const char* buf_name = buft->get_name();
     const size_t size_gb = size / (1024ull * 1024ull * 1024ull);
     if (getenv("PPML_DEBUG_ALLOC") != nullptr || size >= (1024ull*1024ull*1024ull)) {
-        fprintf(stderr, "[alloc-buffer] %-20s size=%.2f GB (%zu bytes)\n",
-                buf_name, (double)size / (1024.0*1024.0*1024.0), size);
+        // 2026-09-11：附带 usage —— 区分"参数搬迁 buffer（WEIGHTS）"vs"gallocr 峰值/跨后端
+        //   cpy（COMPUTE）"，否则日志里只有 type=CPU，无法判断 168.9GB 出自哪条路径。
+        const char* usage_name = (usage == BufferUsage::WEIGHTS) ? "WEIGHTS" :
+                                 (usage == BufferUsage::COMPUTE) ? "COMPUTE" : "STORAGE";
+        fprintf(stderr, "[alloc-buffer] %-20s usage=%-8s size=%.2f GB (%zu bytes)\n",
+                buf_name, usage_name, (double)size / (1024.0*1024.0*1024.0), size);
         if (size_gb > 40) {
-            fprintf(stderr, "[alloc-buffer] ⚠️ 超大分配(>40GB) type=%s size=%.2f GB\n",
-                    buf_name, (double)size / (1024.0*1024.0*1024.0));
+            fprintf(stderr, "[alloc-buffer] ⚠️ 超大分配(>40GB) type=%s usage=%s size=%.2f GB\n",
+                    buf_name, usage_name, (double)size / (1024.0*1024.0*1024.0));
         }
     }
 

@@ -420,7 +420,10 @@ TensorF32* MSAColAttention::forward_graph(TensorF32* msa) {
     int N = static_cast<int>(Q->shape().dims[2]);   // N_seq
     int L = static_cast<int>(Q->shape().dims[1]);   // L (残基)
     int H = config_.n_head;                          // 8
-    int D = D_MSA;                                   // 256
+    // D = 每头隐藏维 = 特征维/H（2026-09-11 修正：原硬编码 D = D_MSA = 256，
+    //   那是配合错误的 256→2048 投影；投影改回 d_msa→d_msa 后这里必须自适应为 256/8 = 32，
+    //   与 MSARowAttention / MSAGlobalColAttention 的 `dims[0]/H` 写法一致）。
+    int D = (int)Q->shape().dims[0] / H;
 
     // Split heads (沿 N_seq 维做 attention, L 合并进 batch):
     // 值: (B,N,L,H*D) → view({B*L,N,H,D}) → (B*L,N,H,D) → permute({0,2,3,1}) → (B*L,H,D,N)

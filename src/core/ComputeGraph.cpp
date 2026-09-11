@@ -558,7 +558,9 @@ void ComputeGraph::compute_backward(
                 // mul_mat(a,b)=a^T@b 收缩 dims[0]=K。用 mul_mat(grad, transpose(W))：
                 //   grad=(M,N) 作 a(dims[0]=N, dims[1]=M)，transpose(W)=(N,K) 作 b → out=(M,K)→dims=[K,M]==src0。
                 // 项目 out_prod 收缩 dims[1]（CrossAttention 用），不适用于此（会收缩错维），故用 mul_mat+transpose。
-                TensorF32 * tmp = mul_mat(grad, transpose(src1));
+                // 【2026-09-11】transpose() → mat_transpose()：4D 张量必须交换 dims[0]/dims[1]
+                //   （矩阵维），transpose() 交换的是最后两维 → 收缩维不匹配（实测 240 次）。
+                TensorF32 * tmp = mul_mat(grad, mat_transpose(src1));
                 if (!tmp->same_shape(*src0)) {
                     tmp = repeat_back(tmp, src0);
                 }
@@ -571,8 +573,8 @@ void ComputeGraph::compute_backward(
                 //   → out=(N,K)→dims=[K,N]==src1。
                 add_or_set(ctx, cgraph, isrc1,
                         mul_mat(
-                            transpose(grad),
-                            transpose(src0)));
+                            mat_transpose(grad),      // 2026-09-11：同上，4D 需交换 dims[0]/dims[1]
+                            mat_transpose(src0)));
             }
         } break;
         case OP_OUT_PROD: {
@@ -588,13 +590,18 @@ void ComputeGraph::compute_backward(
             //     → mul_mat(transpose(grad), a)：transpose(grad)=(N,M) 作 x(dims[0]=M,dims[1]=N)，
             //       a=(M,K) 作 y(dims[0]=K,dims[1]=M) 收缩 x.dims[0]=M 与 y.dims[1]=M ✓
             //       → out=(K,N)→dims=[N,K]==b
+            // 【2026-09-11 修正】out_prod 收缩的是 dims[1]（不是 mul_mat 的 dims[0]），
+            //   原代码直接拿 mul_mat 拼（且只转一侧）→ 收缩维不匹配 + 结果布局被转置，
+            //   靠 repeat_back 硬凑形状。正确形式用 out_prod 本身表达：
+            //     dL/da[m,k] = Σ_{i1} grad[m,i1]·b[i1,k] → out_prod(grad, matT(b)) → [M,K] == a ✓
+            //     dL/db[n,k] = Σ_{i0} grad[i0,n]·a[i0,k] → out_prod(matT(grad), matT(a)) → [N,K] == b ✓
             if (src0_needs_grads) {
-                TensorF32* tmp = mul_mat(grad, src1);
+                TensorF32* tmp = out_prod(grad, mat_transpose(src1));
                 if (!tmp->same_shape(*src0)) tmp = repeat_back(tmp, src0);
                 add_or_set(ctx, cgraph, isrc0, tmp);
             }
             if (src1_needs_grads) {
-                TensorF32* tmp = mul_mat(transpose(grad), src0);
+                TensorF32* tmp = out_prod(mat_transpose(grad), mat_transpose(src0));
                 if (!tmp->same_shape(*src1)) tmp = repeat_back(tmp, src1);
                 add_or_set(ctx, cgraph, isrc1, tmp);
             }
@@ -856,15 +863,23 @@ void ComputeGraph::compute_backward(
             }
         } break;
         case OP_SOFT_MAX: {
-            // forward: y = softmax(x), 沿最后一维
+            // forward: y = softmax(x)，沿 dims[0]（最内维 = 类/key 轴，与 CPU/CUDA kernel_softmax 一致）
             // backward: dL/dx_i = y_i * (dL/dy_i - sum_j(y_j * dL/dy_j))
             if (src0_needs_grads) {
-                int D    = src0->shape().dims.back();
-                int rows = src0->numel() / D;
+                // 【2026-09-11 修正】两处 bug（4D 注意力 scores 上必现）：
+                //   ① 归一维用 dims.back()（scores [N,N,H,L] 得 D=L=51），而 forward kernel 沿
+                //      dims[0] 归一（D=N）→ 反向的行长/行数全错；
+                //   ② dx 被建成 2D [rows,D] → 反向梯度被压扁成 [N·N·H, L]（实测 [524288,51]），
+                //      传给 out_prod 时收缩维不匹配（a.dims[1]=L vs b.dims[1]=N），产出巨张量
+                //      [524288,32,8,51]≈25.5GB → 总分配 350GB → PPMLError: allocation failed。
+                int D    = static_cast<int>(src0->shape().dims[0]);
+                int rows = static_cast<int>(src0->numel() / D);
 
-                // 构造 OP_SOFT_MAX_BACK 节点
-                int64_t dx_dims[] = {rows, D};
-                TensorF32 * dx = context().new_tensor<float>(2, dx_dims);
+                // 构造 OP_SOFT_MAX_BACK 节点：dx 必须保持 src0（x）的 shape（梯度与输入同 shape）
+                int64_t dx_dims[GGML_MAX_DIMS];
+                for (int dd = 0; dd < src0->shape().ndim(); ++dd)
+                    dx_dims[dd] = src0->shape().dims[dd];
+                TensorF32 * dx = context().new_tensor<float>(src0->shape().ndim(), dx_dims);
                 dx->op     = OP_SOFT_MAX_BACK;
                 dx->src[0] = grad;             // dL/dy (upstream gradient)
                 dx->src[1] = tensor;           // y (forward output = softmax(x))
