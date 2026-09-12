@@ -202,6 +202,72 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
         nd->bind_data(nullptr);  // 清 data_（值已拷回 dst）
     }
 }
+
+// ===== 诊断（2026-09-12）：per-block 拓扑 / 坐标 dump =====
+//   开关 PPML_DUMP_TOPO_DIR=<dir>：把每个 block 边界 make_graph 的拓扑（edge_index/edge_d）
+//   与 apply_coord_update 产出的 coords 落盘 → 离线量化"逐步中间结构 vs 最终结构"的拓扑差
+//   （kNN 成员重合率 / edge_d 差异 / coords 漂移）。默认关闭、零开销。
+//   文件格式（小端）：
+//     topo_<kind>_<seq>.bin : int64[4]={B,L,E,0} + int64[2E] edge_index + float[3E] edge_d
+//                             + float[B*L*9] coords（= 生成该拓扑所用的 coords）
+//     coord_<seq>.bin       : int64[4]={B,L,3,3} + float[B*L*9]（apply_coord_update 输出）
+namespace {
+bool dump_write_file(const char* dir, const char* name,
+                     const std::vector<unsigned char>& buf) {
+    if (!dir || !name) return false;
+    std::string path = std::string(dir) + "/" + name;
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) { std::fprintf(stderr, "[DUMP-ERR] open %s failed\n", path.c_str()); return false; }
+    if (!buf.empty()) std::fwrite(buf.data(), 1, buf.size(), f);
+    std::fclose(f);
+    std::fprintf(stderr, "[DUMP] %s bytes=%zu\n", path.c_str(), buf.size());
+    return true;
+}
+
+void dump_se3_topo(const char* kind, const se3::GraphData& G, const TensorF32& coords) {
+    const char* dir = std::getenv("PPML_DUMP_TOPO_DIR");
+    if (!dir || !coords.data() || coords.shape().ndim() < 2) return;
+    static int s_iter = 0, s_ref = 0;
+    const int seq = (std::strcmp(kind, "iter") == 0) ? s_iter++ : s_ref++;
+    const int64_t B = coords.shape().dims[0];
+    const int64_t L = coords.shape().dims[1];
+    const int64_t E = (G.edge_index.numel() > 0 && G.edge_index.shape().ndim() > 1)
+                          ? G.edge_index.shape().dims[1] : 0;
+    std::vector<unsigned char> buf;
+    const int64_t hdr[4] = {B, L, E, 0};
+    auto put = [&](const void* p, size_t n) {
+        if (!p || !n) return;
+        const unsigned char* q = static_cast<const unsigned char*>(p);
+        buf.insert(buf.end(), q, q + n);
+    };
+    put(hdr, sizeof(hdr));
+    if (E > 0) {
+        put(G.edge_index.data(), sizeof(int64_t) * 2 * E);
+        put(G.edge_d.data(),     sizeof(float)   * 3 * E);
+    }
+    put(coords.data(), sizeof(float) * B * L * 9);
+    char nm[64];
+    std::snprintf(nm, sizeof(nm), "topo_%s_%02d.bin", kind, seq);
+    dump_write_file(dir, nm, buf);
+}
+
+void dump_coords(const TensorF32& xyz) {
+    const char* dir = std::getenv("PPML_DUMP_TOPO_DIR");
+    if (!dir || !xyz.data() || xyz.numel() <= 0 || xyz.shape().ndim() < 4) return;
+    static int s_coord = 0;
+    const int seq = s_coord++;
+    std::vector<unsigned char> buf;
+    const int64_t hdr[4] = {xyz.shape().dims[0], xyz.shape().dims[1],
+                            xyz.shape().dims[2], xyz.shape().dims[3]};
+    buf.insert(buf.end(), reinterpret_cast<const unsigned char*>(hdr),
+               reinterpret_cast<const unsigned char*>(hdr) + sizeof(hdr));
+    const unsigned char* d = reinterpret_cast<const unsigned char*>(xyz.data());
+    buf.insert(buf.end(), d, d + sizeof(float) * xyz.numel());
+    char nm[64];
+    std::snprintf(nm, sizeof(nm), "coord_%02d.bin", seq);
+    dump_write_file(dir, nm, buf);
+}
+} // namespace
 } // namespace
 
 // ===== SE3 offset scale：可学习全局标量参数 =====
@@ -733,6 +799,20 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
         // CA_new = xyz[:,:,1] + offset[:,:,1]
         // N_new  = CA_new + offset[:,:,0]
         // C_new  = CA_new + offset[:,:,2]
+        // 【2026-09-12 修复】与图版 IterBlock::apply_coord_update 统一：单步位移 = clamp(offset×0.03, ±3Å)。
+        //   原因：本处原实现直接加**原始 offset**（无 scale、无 clamp），而随机初始化下 offset 可达
+        //   O(1e3~1e8) ⇒ 每 block 坐标漂移数百~数千 Å（实测 CA 均值 747Å、典型边长 1828Å，正常应 ~19Å，
+        //   见 Experiment.md §5）。后果：值版 Pass1（两遍管线的旧实现）产出的拓扑基准被打爆。
+        //   env PPML_SE3_MAX_STEP 覆盖最大单步（≤0 = 不 clamp，保留旧行为）。
+        static constexpr float SE3_OFFSET_SCALE = 0.03f;
+        float kMaxStep = 3.0f;
+        if (const char* _s = std::getenv("PPML_SE3_MAX_STEP")) kMaxStep = std::atof(_s);
+        const bool do_clamp = (kMaxStep > 0.0f);
+        auto step_of = [&](float off) -> float {
+            float d = off * SE3_OFFSET_SCALE;
+            if (do_clamp) { if (d >  kMaxStep) return  kMaxStep; if (d < -kMaxStep) return -kMaxStep; }
+            return d;
+        };
         const float* xyz_data = coords.data();
         const float* off_data = offset.data();
 
@@ -748,10 +828,10 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
                 float ca_y0 = xyz_data[base + 4];
                 float ca_z0 = xyz_data[base + 5];
 
-                // δCA (绝对偏移)
-                float dca_x = off_data[base + 3];
-                float dca_y = off_data[base + 4];
-                float dca_z = off_data[base + 5];
+                // δCA (单步位移：scale + clamp)
+                float dca_x = step_of(off_data[base + 3]);
+                float dca_y = step_of(off_data[base + 4]);
+                float dca_z = step_of(off_data[base + 5]);
 
                 // 更新后 CA
                 float ca_x_new = ca_x0 + dca_x;
@@ -759,9 +839,9 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
                 float ca_z_new = ca_z0 + dca_z;
 
                 // N = CA_new + δN
-                xyz_out[base + 0] = ca_x_new + off_data[base + 0];
-                xyz_out[base + 1] = ca_y_new + off_data[base + 1];
-                xyz_out[base + 2] = ca_z_new + off_data[base + 2];
+                xyz_out[base + 0] = ca_x_new + step_of(off_data[base + 0]);
+                xyz_out[base + 1] = ca_y_new + step_of(off_data[base + 1]);
+                xyz_out[base + 2] = ca_z_new + step_of(off_data[base + 2]);
 
                 // CA = CA_new
                 xyz_out[base + 3] = ca_x_new;
@@ -769,9 +849,9 @@ void IterBlock::forward(TensorF32& msa, TensorF32& pair,
                 xyz_out[base + 5] = ca_z_new;
 
                 // C = CA_new + δC
-                xyz_out[base + 6] = ca_x_new + off_data[base + 6];
-                xyz_out[base + 7] = ca_y_new + off_data[base + 7];
-                xyz_out[base + 8] = ca_z_new + off_data[base + 8];
+                xyz_out[base + 6] = ca_x_new + step_of(off_data[base + 6]);
+                xyz_out[base + 7] = ca_y_new + step_of(off_data[base + 7]);
+                xyz_out[base + 8] = ca_z_new + step_of(off_data[base + 8]);
             }
         }
 
@@ -1025,6 +1105,8 @@ std::vector<TensorF32*> IterBlock::run_se3_structural(TensorF32*& msa, TensorF32
         }
         return {};
     }
+    // [诊断 2026-09-12] dump 本 block 实际使用的拓扑（edge_index/edge_d + 生成它的 coords）
+    dump_se3_topo("iter", G, coords);
 
     // ---- Phase B: run_se3_graph（可微图块，edge_w 图化，state 回写）----
     // 返回 se3_out：se3_out[1]（offset 图节点）由训练入口 graph_compute 后调用 apply_coord_update。
@@ -1122,6 +1204,8 @@ void IterBlock::apply_coord_update(const TensorF32& offset_value, const TensorF3
         new (&xyz_new_) TensorF32(xyz_new.shape(), xyz_new.device());
     }
     xyz_new_.copy_from(xyz_new);
+    // [诊断 2026-09-12] dump 更新后的 coords（供 per-block 拓扑/结构漂移量化）
+    dump_coords(xyz_new_);
 }
 
 void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state, 
@@ -1333,6 +1417,17 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         TensorF32 offset = se3_out.features[1].view({B, L, 3, 3});
 
         // Coordinate update (same as IterBlock)
+        // 【2026-09-12 修复】同 IterBlock 值版：单步位移统一为 clamp(offset×0.03, ±3Å)
+        //   （原实现直接加原始 offset → 每 block 数百~数千 Å 漂移，见 Experiment.md §5）。
+        static constexpr float SE3_OFFSET_SCALE = 0.03f;
+        float kMaxStep = 3.0f;
+        if (const char* _s = std::getenv("PPML_SE3_MAX_STEP")) kMaxStep = std::atof(_s);
+        const bool do_clamp = (kMaxStep > 0.0f);
+        auto step_of = [&](float off) -> float {
+            float d = off * SE3_OFFSET_SCALE;
+            if (do_clamp) { if (d >  kMaxStep) return  kMaxStep; if (d < -kMaxStep) return -kMaxStep; }
+            return d;
+        };
         const float* xyz_data = coords.data();
         const float* off_data = offset.data();
 
@@ -1341,15 +1436,15 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
         for (int b = 0; b < B; ++b) {
             for (int l = 0; l < L; ++l) {
                 int base = (b * L + l) * 9;
-                
+
                 float ca_x0 = xyz_data[base + 3];
                 float ca_y0 = xyz_data[base + 4];
                 float ca_z0 = xyz_data[base + 5];
 
-                // δCA (绝对偏移)
-                float dca_x = off_data[base + 3];
-                float dca_y = off_data[base + 4];
-                float dca_z = off_data[base + 5];
+                // δCA (单步位移：scale + clamp)
+                float dca_x = step_of(off_data[base + 3]);
+                float dca_y = step_of(off_data[base + 4]);
+                float dca_z = step_of(off_data[base + 5]);
 
                 // 更新后 CA
                 float ca_x_new = ca_x0 + dca_x;
@@ -1357,9 +1452,9 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
                 float ca_z_new = ca_z0 + dca_z;
 
                 // N = CA_new + δN
-                xyz_out[base + 0] = ca_x_new + off_data[base + 0];
-                xyz_out[base + 1] = ca_y_new + off_data[base + 1];
-                xyz_out[base + 2] = ca_z_new + off_data[base + 2];
+                xyz_out[base + 0] = ca_x_new + step_of(off_data[base + 0]);
+                xyz_out[base + 1] = ca_y_new + step_of(off_data[base + 1]);
+                xyz_out[base + 2] = ca_z_new + step_of(off_data[base + 2]);
 
                 // CA = CA_new
                 xyz_out[base + 3] = ca_x_new;
@@ -1367,9 +1462,9 @@ void FullBlock::forward(TensorF32& msa_full, TensorF32& pair, TensorF32& state,
                 xyz_out[base + 5] = ca_z_new;
 
                 // C = CA_new + δC
-                xyz_out[base + 6] = ca_x_new + off_data[base + 6];
-                xyz_out[base + 7] = ca_y_new + off_data[base + 7];
-                xyz_out[base + 8] = ca_z_new + off_data[base + 8];
+                xyz_out[base + 6] = ca_x_new + step_of(off_data[base + 6]);
+                xyz_out[base + 7] = ca_y_new + step_of(off_data[base + 7]);
+                xyz_out[base + 8] = ca_z_new + step_of(off_data[base + 8]);
             }
         }
 
@@ -1637,6 +1732,17 @@ void RefineBlock::forward(TensorF32& msa,
         // CA_new = xyz[:,:,1] + offset[:,:,1]
         // N_new  = CA_new + offset[:,:,0]
         // C_new  = CA_new + offset[:,:,2]
+        // 【2026-09-12 修复】同 IterBlock/FullBlock 值版：单步位移统一为 clamp(offset×0.03, ±3Å)
+        //   （原实现直接加原始 offset → 每 block 数百~数千 Å 漂移，见 Experiment.md §5）。
+        static constexpr float SE3_OFFSET_SCALE = 0.03f;
+        float kMaxStep = 3.0f;
+        if (const char* _s = std::getenv("PPML_SE3_MAX_STEP")) kMaxStep = std::atof(_s);
+        const bool do_clamp = (kMaxStep > 0.0f);
+        auto step_of = [&](float off) -> float {
+            float d = off * SE3_OFFSET_SCALE;
+            if (do_clamp) { if (d >  kMaxStep) return  kMaxStep; if (d < -kMaxStep) return -kMaxStep; }
+            return d;
+        };
     const float* xyz_data = coords.data();
     const float* off_data = offset.data();
 
@@ -1646,15 +1752,15 @@ void RefineBlock::forward(TensorF32& msa,
     for (int b = 0; b < B; ++b) {
         for (int l = 0; l < L; ++l) {
             int base = (b * L + l) * 9;
-                
+
             float ca_x0 = xyz_data[base + 3];
             float ca_y0 = xyz_data[base + 4];
             float ca_z0 = xyz_data[base + 5];
 
-                // δCA (绝对偏移)
-            float dca_x = off_data[base + 3];
-            float dca_y = off_data[base + 4];
-            float dca_z = off_data[base + 5];
+                // δCA (单步位移：scale + clamp)
+            float dca_x = step_of(off_data[base + 3]);
+            float dca_y = step_of(off_data[base + 4]);
+            float dca_z = step_of(off_data[base + 5]);
 
                 // 更新后 CA
             float ca_x_new = ca_x0 + dca_x;
@@ -1662,9 +1768,9 @@ void RefineBlock::forward(TensorF32& msa,
             float ca_z_new = ca_z0 + dca_z;
 
                 // N = CA_new + δN
-            xyz_out[base + 0] = ca_x_new + off_data[base + 0];
-            xyz_out[base + 1] = ca_y_new + off_data[base + 1];
-            xyz_out[base + 2] = ca_z_new + off_data[base + 2];
+            xyz_out[base + 0] = ca_x_new + step_of(off_data[base + 0]);
+            xyz_out[base + 1] = ca_y_new + step_of(off_data[base + 1]);
+            xyz_out[base + 2] = ca_z_new + step_of(off_data[base + 2]);
 
                 // CA = CA_new
             xyz_out[base + 3] = ca_x_new;
@@ -1672,9 +1778,9 @@ void RefineBlock::forward(TensorF32& msa,
             xyz_out[base + 5] = ca_z_new;
 
                 // C = CA_new + δC
-            xyz_out[base + 6] = ca_x_new + off_data[base + 6];
-            xyz_out[base + 7] = ca_y_new + off_data[base + 7];
-            xyz_out[base + 8] = ca_z_new + off_data[base + 8];
+            xyz_out[base + 6] = ca_x_new + step_of(off_data[base + 6]);
+            xyz_out[base + 7] = ca_y_new + step_of(off_data[base + 7]);
+            xyz_out[base + 8] = ca_z_new + step_of(off_data[base + 8]);
         }
     }
 
@@ -1923,6 +2029,8 @@ std::vector<TensorF32*> RefineBlock::run_se3_structural_refine(TensorF32*& msa, 
         }
         return {};
     }
+    // [诊断 2026-09-12] dump 本 refine block 实际使用的拓扑
+    dump_se3_topo("ref", G, coords);
 
     // ---- Phase B: run_se3_graph_refine（可微图块，edge_w 图化，state 回写）----
     return run_se3_graph_refine(msa, pair, rbf, state, G, basis, coords, seq1hot);

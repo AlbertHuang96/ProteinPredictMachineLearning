@@ -11,6 +11,7 @@ set(CORE_SOURCES
     ../src/model/Embedding.cpp
     ../src/model/IterBlock.cpp
     ../src/model/PPML.cpp
+    ../src/model/PPMLTopoPass.cpp
     ../src/tracks/MSA.cpp
     ../src/tracks/Pair.cpp
     ../src/tracks/State.cpp

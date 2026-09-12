@@ -1266,21 +1266,43 @@ int main(int argc, char* argv[]) {
         // 开启条件：PPML_SE3_TOPO=pass1（值版 forward 尚未完全跑通，需调试）。
         const char* se3_topo = getenv("PPML_SE3_TOPO");
         const bool se3_pass1 = se3_topo && std::strcmp(se3_topo, "pass1") == 0;
-        TensorF32 pass1_coords;   // Pass1 值版 forward 的输出 coords
+        // 【轻量版 Pass1（2026-09-12）】PPML_TOPO_PASS=graph：Pass1 改用图版拓扑 pass
+        // （PPMLModel::topo_pass，实现于 src/model/PPMLTopoPass.cpp）取代值版 model.forward：
+        // 同一套图版算子/权重，无 340 行重复实现、无值版/图版 dropout mask 不一致。默认仍走值版。
+        const bool topo_pass_graph =
+            std::getenv("PPML_TOPO_PASS") && std::strcmp(std::getenv("PPML_TOPO_PASS"), "graph") == 0;
+        TensorF32 pass1_coords;   // Pass1 输出的 coords（拓扑基准）
         const TensorF32* topo_coords_ptr = nullptr;
         if (se3_pass1) {
             auto p1_start = std::chrono::high_resolution_clock::now();
-            ModelOutput out1 = model.forward(input);   // 值版（逐 block SE3 更新 coords）
+            TensorF32 coords_v;                      // Pass1 产出（值，own-memory）
+            const char* mode_tag = "value-forward";
+            if (topo_pass_graph) {
+                mode_tag = "graph-topo-pass";
+                TensorF32 tp = model.topo_pass(input);   // 图版 Pass1（新）
+                if (tp.numel() > 0 && tp.data()) {
+                    coords_v.~TensorF32();
+                    new (&coords_v) TensorF32(tp.shape(), Device::CPU);
+                    coords_v.copy_from(tp);
+                }
+            } else {
+                ModelOutput out1 = model.forward(input);  // 值版（逐 block SE3 更新 coords）
+                if (out1.coords.numel() > 0) {
+                    coords_v.~TensorF32();
+                    new (&coords_v) TensorF32(out1.coords.shape(), Device::CPU);
+                    coords_v.copy_from(out1.coords);
+                }
+            }
             auto p1_end = std::chrono::high_resolution_clock::now();
             auto p1_ms = std::chrono::duration_cast<std::chrono::milliseconds>(p1_end - p1_start).count();
-            if (out1.coords.numel() > 0) {
+            if (coords_v.numel() > 0) {
                 pass1_coords.~TensorF32();
-                new (&pass1_coords) TensorF32(out1.coords.shape(), Device::CPU);
-                pass1_coords.copy_from(out1.coords);
+                new (&pass1_coords) TensorF32(coords_v.shape(), Device::CPU);
+                pass1_coords.copy_from(coords_v);
                 topo_coords_ptr = &pass1_coords;
             }
-            std::cout << "[PASS1] value-forward " << p1_ms << "ms, coords numel="
-                      << out1.coords.numel() << (out1.coords.numel()>0 ? " OK":" EMPTY") << "\n";
+            std::cout << "[PASS1] " << mode_tag << " " << p1_ms << "ms, coords numel="
+                      << coords_v.numel() << (coords_v.numel()>0 ? " OK":" EMPTY") << "\n";
         }
         
         // 前向传播（图模式：返回可微图节点，供 loss 组装计算图）

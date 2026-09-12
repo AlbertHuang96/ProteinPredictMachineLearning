@@ -2571,7 +2571,7 @@ GNormBias::GNormBias(const Fiber& fiber)
         // 不训练），std=1 在输入 norm 较小时主导输出 → SE3 state 偶发巨大（chi 爆炸 680）→ 全链不稳定。
         // 减小到 std=0.1：bias 只做 norm 微调，不主导输出，SE3 state 量级受输入控制（更稳）。
         std::random_device rd;
-        std::mt19937 gen(rd());
+        std::mt19937 gen(ppml_rng_seed(4));
         std::normal_distribution<float> dist(0.0f, 0.1f);
         for (int c = 0; c < m; ++c) {
             b_data[c] = dist(gen);

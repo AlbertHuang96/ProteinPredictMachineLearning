@@ -25,7 +25,7 @@ namespace ppml {
 
         // Xavier init
         std::random_device rd;
-        std::mt19937 gen(rd());
+        std::mt19937 gen(ppml_rng_seed(1));
         float scale = sqrtf(2.0f / (num_embeddings + embedding_dim));
         std::normal_distribution<float> dist(0.0f, scale);
         for (int i = 0; i < num_embeddings * embedding_dim; ++i)
@@ -202,7 +202,7 @@ namespace ppml {
 
     void LinearLayer::init_weights() {
         std::random_device rd;
-        std::mt19937 gen(rd());
+        std::mt19937 gen(ppml_rng_seed(2));
         float scale = sqrtf(2.0f / in_features_);
         std::normal_distribution<float> dist(0.0f, scale);
         
@@ -237,7 +237,7 @@ namespace ppml {
     void LinearLayer::lora_init() {
         // 标准 LoRA 初始化：A ~ N(0, 0.02)，B = 0 → 初始 B@A=0，前向=原 W0，不破坏预训练
         std::random_device rd;
-        std::mt19937 gen(rd());
+        std::mt19937 gen(ppml_rng_seed(3));
         std::normal_distribution<float> dist(0.0f, 0.02f);
         for (int64_t i = 0; i < lora_A_->numel(); ++i)
             lora_A_->data()[i] = dist(gen);

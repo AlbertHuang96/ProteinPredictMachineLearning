@@ -51,6 +51,35 @@ dev/training data:
 
 data/training_batch_data/P62891_alignment.a3m data/P62891.fasta  
 
+## 实验记录 (Experiments)
+
+**EN** — [Dump the per-block coordinates under `per_block`, measure the kNN-membership overlap between
+adjacent blocks plus the `edge_d` difference → quantify the "intermediate structure vs final structure"
+topology gap](Experiment.md).
+TL;DR: for L≤65, `actual_top_k = min(top_k, L-1)` turns `make_graph` into a **complete graph** so the
+topology cannot change (Jaccard ≡ 1 is an *identity*); for L=103 (true kNN) the first block already differs
+from the final structure by **~30% of directed edges** (100% of residues affected) while the common-edge
+geometry differs by only 0.29Å and coordinates drift by ~1Å RMSD ⇒ the churn comes from **near-tied
+64th/65th neighbours**. The same document reports the **lightweight graph-version Pass 1**
+(`src/model/PPMLTopoPass.cpp`): **1.5× faster Pass 1**, **1.76× faster epoch than `per_block`**, identical
+loss level vs the old value-version Pass 1 — and it fixes the latter's *blown-up* coordinate basis.
+
+> **TODO**
+> **EN** — the topology churn is driven by **near-ties at the 64th/65th neighbour boundary**; whether those
+> swapped neighbours are functionally equivalent (i.e. whether a frozen-topology two-pass pipeline loses
+> accuracy) **needs further study** (suggested: same-seed `fixed` vs `per_block` loss/fape/chi comparison,
+> and a sweep of `PPML_SE3_MAX_STEP`).
+> **中文** — 变化来自「**第 64/65 名近邻近似并列**」的边界翻转，其功能影响（冻结拓扑是否掉精度）
+> **需要进一步研究**（建议：同种子 `fixed` vs `per_block` 的 loss/fape/chi 对比，并扫 `PPML_SE3_MAX_STEP`）。
+
+**中文** — [per_block 下 dump 每个 block 的 coords，统计相邻 block 的 kNN 成员重合率 + edge_d 差异 →
+直接把"中间结构 vs 最终结构"的拓扑差量化出来](Experiment.md)。
+结论速览：L≤65 时 `min(top_k, L-1)` 使 `make_graph` 退化为完全图 → 拓扑恒不变（是**恒等式**）；
+L=103 真实 kNN 下首块与最终结构 **30% 有向边不同**、100% 残基 kNN 集合变化，但公共边几何仅差 0.29Å、
+结构漂移仅 ~1Å RMSD ⇒ 差异来自"第 64/65 名近邻近似并列"的边界翻转。同一文档还给出**图版轻量 Pass1**
+（`src/model/PPMLTopoPass.cpp`）：**Pass1 阶段快 1.5×**、整 epoch 比 `per_block` **快 1.76×**、
+loss 与旧值版 Pass1 同级，并修掉了后者**坐标基准被打爆**的问题。
+
 ## Project Structure
 
 Main goal:  

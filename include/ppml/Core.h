@@ -5,8 +5,22 @@
 #include <memory>
 #include <string>
 #include <stdexcept>
+#include <cstdlib>   // std::getenv / std::strtoul（ppml_rng_seed）
+#include <random>    // std::random_device（ppml_rng_seed）
 
 namespace ppml {
+
+// ===== 可复现随机种子（诊断/对比实验用，2026-09-12）=====
+//   PPML_SEED=<uint> 已设置 → 返回 PPML_SEED + salt（同一 salt 每次运行相同 ⇒ 权重初始化与
+//     dropout 掩码可复现）；未设置 → std::random_device{}()（与既有行为完全一致：每次运行不同）。
+// 动机：train.cpp 不加载权重（每次运行随机初始化），跨 run 对比不同管线/模式时，随机初始化噪声
+//   （loss ±2 量级）会淹没被测差异（如 Pass1 实现方式对 loss 的影响）。固定种子后可做有意义的对比。
+inline uint32_t ppml_rng_seed(uint32_t salt = 0) {
+    const char* s = std::getenv("PPML_SEED");
+    if (s == nullptr) return std::random_device{}();
+    static const uint32_t base = static_cast<uint32_t>(std::strtoul(s, nullptr, 10));
+    return base + salt;
+}
 
 // 维度常量 (与 PPML 对齐)
 constexpr int NAATOKENS = 80;           // 统一 token 空间

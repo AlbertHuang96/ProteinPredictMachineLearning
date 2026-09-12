@@ -463,6 +463,17 @@ public:
     GraphOutput forward_graph(const ModelInput& input, bool enable_se3 = true,
                               const TensorF32* topo_coords = nullptr);
 
+    // ===== 图版拓扑 pass（两遍管线轻量版 Pass1，2026-09-12；实现于 src/model/PPMLTopoPass.cpp）=====
+    // 取代「值版 forward 充当 Pass1」：用**图版** forward_graph 跑一遍（fixed 拓扑 → 内部统一物化
+    //   SE3 offset → apply_coord_update 链式更新 coords），返回 SE3 更新后的 coords 值，
+    //   供 Pass2（PPML_SE3_TOPO=pass1 + 该 coords 作 topo_coords）当拓扑基准。
+    // 优点：与 Pass2 共用同一套图版算子/权重（无 340 行值版重复实现、无值版/图版 dropout mask 不一致）。
+    // 代价：本 pass 用**冻结（初始）拓扑**推进 coords（不做 per-block 拓扑更新）——已知近似；
+    //   实测逐块拓扑漂移：L=51(完全图) 为 0；L=103 首块约 30% 边、稳态 2~3%/块（见 Experiment.md）。
+    // 迭代：PPML_TOPO_PASS_ITERS=n（默认 1）；>1 时用上一轮 coords 作 topo_coords 再跑，
+    //   使拓扑逐步逼近收敛结构（每轮 ≈ 1 遍图版构图 + SE3 统一 compute）。
+    TensorF32 topo_pass(const ModelInput& input);
+
     TensorF32 get_templ_emb(const TensorF32& t1d, const TensorF32& t2d);
     
     // 加载/保存权重

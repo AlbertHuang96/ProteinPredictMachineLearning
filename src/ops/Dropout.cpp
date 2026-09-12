@@ -10,7 +10,7 @@ Dropout::Dropout(int broadcast_dim, float p_drop)
     : broadcast_dim_(broadcast_dim)
     , p_drop_(p_drop)
     , training_(true)
-    , rng_(std::random_device{}())
+    , rng_(ppml_rng_seed(100u + static_cast<uint32_t>(p_drop * 100.0f) * 10u + static_cast<uint32_t>(broadcast_dim)))
     , dist_(1.0 - p_drop)  // Bernoulli with success probability (1 - p_drop)
 {
     if (p_drop_ < 0.0f || p_drop_ >= 1.0f) {
