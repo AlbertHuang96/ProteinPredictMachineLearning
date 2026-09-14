@@ -244,6 +244,15 @@ bool BackendScheduler::alloc_splits() {
 
 
 // ============================================================
+// BufferType::new_buffer — 默认工厂（DefaultBuffer），远端 buffer 类型可覆盖
+// 2026-09-13：把"建 buffer"收敛到单一钩子，alloc_buffer() 与 Gallocr arena 都走它，
+//   新增后端（如 RemoteBufferType）无需改动 Gallocr/调度器。
+// ============================================================
+Buffer* BufferType::new_buffer(size_t size, BufferUsage usage) {
+    return new DefaultBuffer(this, size, usage);
+}
+
+// ============================================================
 // alloc_buffer — 对标 ggml_backend_buft_alloc_buffer
 // ============================================================
 Buffer* alloc_buffer(BufferType* buft, size_t size, BufferUsage usage) {
@@ -269,10 +278,10 @@ Buffer* alloc_buffer(BufferType* buft, size_t size, BufferUsage usage) {
 
     // 零大小：返回空 buffer（对标 ggml 的 dummy buffer）
     if (size == 0) {
-        return new DefaultBuffer(buft, 0, usage);
+        return buft->new_buffer(0, usage);
     }
 
-    return new DefaultBuffer(buft, size, usage);
+    return buft->new_buffer(size, usage);
 }
 
 // ============================================================
@@ -1324,6 +1333,47 @@ Status BackendScheduler::graph_compute() {
         backend->set_skip_alloc(true);
         Status st = backend->graph_compute(current_graph_);
         backend->set_skip_alloc(false);
+
+        // 指纹对拍（PPML_HASH_SOFTMAX=1，诊断用：远端执行 vs 本地执行的数值透明度）
+        //   位置选在"每个 split 刚算完"——此时前向激活尚未被 backward 覆盖。
+        //   读值走 buffer_->get_tensor ⇒ 远端 split 会自动 fetch，因此打印的是"客户端真正拿到的值"。
+        if (getenv("PPML_HASH_SOFTMAX")) {
+            // 统一的"读张量字节 + FNV-1a"（view 沿 view_src 回溯；有 buffer 走 get_tensor——
+            //   远端 split 会自动 fetch，因此打印的就是客户端真正拿到/送出的字节）
+            auto hash_tensor = [](TensorF32* t, uint64_t* out_h, size_t* out_nb) -> bool {
+                TensorF32* real = t;
+                int guard = 0;
+                while (real && !real->buffer_ && !real->data() && real->view_src && guard++ < 64) {
+                    real = real->view_src;
+                }
+                if (!real || real->nbytes() <= 0) return false;
+                std::vector<uint8_t> b((size_t)real->nbytes());
+                if (real->buffer_) {
+                    real->buffer_->get_tensor(real, b.data(), real->buffer_offs_, b.size());
+                } else if (real->data()) {
+                    std::memcpy(b.data(), real->data(), b.size());
+                } else {
+                    return false;
+                }
+                uint64_t h = 1469598103934665603ull;
+                for (uint8_t x : b) { h ^= x; h *= 1099511628211ull; }
+                *out_h = h; *out_nb = b.size();
+                return true;
+            };
+            for (int i = sp.i_start; i < sp.i_end; i++) {
+                TensorF32* nd = current_graph_->graph_node(i);
+                if (!nd || nd->op != OP_SOFT_MAX) continue;
+                uint64_t h = 0, hi = 0; size_t nb = 0, nbi = 0;
+                if (nd->src[0] && hash_tensor(nd->src[0], &hi, &nbi)) {
+                    fprintf(stderr, "[HASH-IN] nid=%d backend=%d nb=%zu fnv=%016llx\n",
+                            i, sp.backend_id, nbi, (unsigned long long)hi);
+                }
+                if (hash_tensor(nd, &h, &nb)) {
+                    fprintf(stderr, "[HASH] split=%d backend=%d nid=%d nb=%zu fnv=%016llx\n",
+                            si, sp.backend_id, i, nb, (unsigned long long)h);
+                }
+            }
+        }
 
         //   若不等其完成就进入下一个 CPU split 的 Step 1b D2H（get_tensor/cudaMemcpy），
         //   可能读到未完成/垃圾数据 → 偶发 loss 巨大(nan)/segfault（每次运行结果不同）。

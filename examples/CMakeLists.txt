@@ -10,6 +10,12 @@ target_link_libraries(ppml_infer PRIVATE ppml_core ppml_python)
 add_executable(ppml_measure measure_graph.cpp)
 target_link_libraries(ppml_measure PRIVATE ppml_core ppml_python)
 
+# 双机验证探针：RemoteBuffer 往返 / Allreduce / 远端执行子图（2026-09-13）
+#   服务端: ./ppml_remote_probe server --port 2244 --dp 10,20,30
+#   客户端: ./ppml_remote_probe client --host <peer> --port 2244
+add_executable(ppml_remote_probe remote_probe.cpp)
+target_link_libraries(ppml_remote_probe PRIVATE ppml_core)
+
 # 多样本加载测试：不训练，仅加载数据集前几个样本打印维度
 add_executable(ppml_test_dataloader test_dataloader.cpp)
 target_link_libraries(ppml_test_dataloader PRIVATE ppml_core)

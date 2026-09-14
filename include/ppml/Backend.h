@@ -132,6 +132,11 @@ public:
 
     virtual bool is_host() const { return false; }
     virtual ~BufferType() = default;
+
+    // 工厂钩子（2026-09-13）：默认走 DefaultBuffer（malloc/显存）；远端等特殊 buffer 类型
+    // 覆盖它即可让 alloc_buffer()/Gallocr 的 arena 用上自定义 Buffer（如 RemoteBuffer）。
+    // 定义在 src/backend/Backend.cpp（需要 DefaultBuffer 完整类型）。
+    virtual class Buffer* new_buffer(size_t size, BufferUsage usage = BufferUsage::COMPUTE);
 };
 
 // ggml_backend_buffer

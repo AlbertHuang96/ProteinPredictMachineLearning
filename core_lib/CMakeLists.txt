@@ -34,6 +34,9 @@ set(CORE_SOURCES
     ../src/backend/Backend.cpp
     ../src/backend/CPUBackend.cpp
     ../src/backend/CUDABackend.cpp
+    # 双机（远端后端）：协议 + RemoteBackend（2026-09-13）
+    ../src/net/RemoteProtocol.cpp
+    ../src/backend/RemoteBackend.cpp
     ../src/backend/Gallocr.cpp
     ../src/backend/CUDAKernels.cpp
     ../src/backend/CPUKernels.cpp

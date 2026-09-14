@@ -2,6 +2,7 @@
 #include "ppml/DataLoader.h"
 #include "ppml/ComputeGraph.h"
 #include "ppml/Context.h"
+#include "ppml/RemoteBackend.h"   // 数据并行：remote_dp_client_if_enabled / remote_dp_allreduce_grads
 #include "ppml/PythonBridge.h"
 #include "ppml/ONNXExporter.h"
 #include "ppml/GradientClipper.h"
@@ -601,6 +602,10 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                 continue;
             }
 
+            // ---- 迭代边界（远端后端）：丢弃上一轮对端结果，只保留参数/常量；未启用时零开销 ----
+            //   必须放在 forward 之前：与"forward+backward 才用完一批结果"的生命周期对齐。
+            remote_iteration_begin();
+
             // ---- 构建图 + 前向 ----
             auto* cgraph = ComputeGraph::new_graph(&context());
 
@@ -739,9 +744,15 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
             }
             // ---- 反向计算 (含 CUDA scheduler 回落 CPU 逻辑, 与单样本一致) ----
             Status compute_st = Status::SUCCESS;
+            // 设了 PPML_REMOTE_HOST 也自动启用 scheduler（远端后端只能经 scheduler 分到节点）
             static const bool sched_flag =
-                (std::getenv("PPML_CUDA_SCHED") != nullptr) && (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0);
-            const bool use_sched = (model.device() == Device::CUDA && scheduler && sched_flag);
+                ((std::getenv("PPML_CUDA_SCHED") != nullptr) &&
+                 (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0)) ||
+                (std::getenv("PPML_REMOTE_HOST") != nullptr);
+            // 注：PPML_REMOTE_HOST 时也走 scheduler —— 否则纯 CPU 运行下"远端后端"永远轮不到分配节点
+            //     （scheduler 是唯一会调用各后端 supports_op 做分配的地方）。
+            const bool use_sched = ((model.device() == Device::CUDA || getenv("PPML_REMOTE_HOST")) &&
+                                    scheduler && sched_flag);
             if (use_sched) {
                 scheduler->split_graph(cgraph);
                 if (scheduler->alloc_splits()) {
@@ -830,9 +841,20 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                 for (size_t pi = 0; pi < params.size(); ++pi) {
                     ms_write_grad(last_cgraph, params[pi], acc[pi]);
                 }
+                // 2b) 数据并行（可选，PPML_DP=1）：梯度 Allreduce 平均。
+                //     位置必须在 clip **之前** —— 这样两端裁剪后的 grad_norm 才一致。
+                if (RemoteClient* dp = remote_dp_client_if_enabled()) {
+                    const int n_dp = remote_dp_allreduce_grads(last_cgraph, dp);
+                    if (n_dp > 0) {
+                        std::cout << "  [DP] allreduce 完成: tensors=" << n_dp
+                                  << " world=" << dp->world_size() << std::endl;
+                    }
+                }
                 // 3) 全局梯度裁剪 + 参数更新
                 float gnorm = clip_grad_norm(last_cgraph, clip_norm);
                 optimizer.step(last_cgraph);
+                // 权重已更新：作废远端副本 ⇒ 下一轮 compute 自动重传（未启用时零开销）
+                remote_after_optimizer_step(last_cgraph);
                 // 4) 清零累加器
                 for (size_t pi = 0; pi < params.size(); ++pi)
                     std::fill(acc[pi].begin(), acc[pi].end(), 0.0f);
@@ -1217,6 +1239,9 @@ int main(int argc, char* argv[]) {
     for (int epoch = 0; epoch < num_epochs; ++epoch) {
         // 释放上一 epoch 的图节点（首轮 mark 为参数末水位，等同无操作），保留参数
         if (se3_arena_mark) context().reset_objects_to(se3_arena_mark);
+
+        // ---- 迭代边界（远端后端）：丢弃上一轮对端结果，只保留参数/常量；未启用时零开销 ----
+        remote_iteration_begin();
 
         // ===== 计时代码: epoch 级 + 前向/损失阶段子计时 =====
         auto epoch_start = std::chrono::high_resolution_clock::now();
@@ -1629,9 +1654,14 @@ int main(int argc, char* argv[]) {
         // 仅在显式 PPML_CUDA_SCHED=1 时用 scheduler 分配算子（实验性）。
         // 注意：scheduler 会把参数/梯度放 device，clip_grad_norm/AdamW 当前仍读 host
         //      grad->data()，故全 CUDA 图训练须先补齐 device→host 梯度读回（见说明）。
+        // 另：设了 PPML_REMOTE_HOST 时也自动启用（远端后端只能经 scheduler 分到节点）。
         static const bool sched_flag =
-            (std::getenv("PPML_CUDA_SCHED") != nullptr) && (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0);
-        const bool use_sched = (model.device() == Device::CUDA && sched && sched_flag);
+            ((std::getenv("PPML_CUDA_SCHED") != nullptr) &&
+             (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0)) ||
+            (std::getenv("PPML_REMOTE_HOST") != nullptr);
+        // 同多样本路径：PPML_REMOTE_HOST 时也启用 scheduler（让远端后端能分到节点）。
+        const bool use_sched = ((model.device() == Device::CUDA || getenv("PPML_REMOTE_HOST")) &&
+                                sched && sched_flag);
         if (use_sched) {
             sched->split_graph(cgraph);
             if (sched->alloc_splits()) {
@@ -1979,6 +2009,11 @@ int main(int argc, char* argv[]) {
             std::cout << "[nanop] total_bad_nodes_shown=" << hit_cnt << std::endl;
         }
 
+        // 数据并行（可选，PPML_DP=1）：梯度 Allreduce 平均；必须在 clip **之前**。
+        if (RemoteClient* dp = remote_dp_client_if_enabled()) {
+            remote_dp_allreduce_grads(cgraph, dp);
+        }
+
         // 全局梯度裁剪阈值：默认 0.1（AF2 惯例），可用环境变量 PPML_CLIP_NORM 覆盖。
         float grad_norm = 0.0f;
         {
@@ -2017,6 +2052,7 @@ int main(int argc, char* argv[]) {
                       << std::endl;
         }
         optimizer.step(cgraph);                            // 更新权重 (decoupled weight decay)
+        remote_after_optimizer_step(cgraph);               // 远端副本作废（下轮 compute 重传新权重）
 
         // [2026-09-07 Epoch2 NaN 定位] step 后扫描参数 NaN（区分"参数被污染"vs"Epoch2 forward 输入/buffer 问题"）
         {

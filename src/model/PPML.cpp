@@ -8,6 +8,7 @@
 
 #include "ppml/Dropout.h"
 #include "ppml/Context.h"
+#include "ppml/RemoteBackend.h"   // 双机：远端后端注册（PPML_REMOTE_HOST 时启用，2026-09-14）
 #include <cuda_runtime.h>   // cudaGetDeviceCount / cudaMemGetInfo 用于 GPU/显存探测
 
 namespace ppml {
@@ -3773,6 +3774,30 @@ void PPMLModel::ensure_backend_ready() {
                     cuda_backend_ = std::make_unique<CUDABackend>(0);  // device 0
                     scheduler_->add_backend(cuda_backend_.get());
                 }
+            }
+        }
+
+        // 4. 可选：把"另一台机器"注册为第 N 个后端（仅当 PPML_REMOTE_HOST 设置时启用）。
+        //    节点被分配到远端的条件（两个都要满足）：
+        //      ① supports_op 命中 PPML_REMOTE_OPS 列表（形如 "32" 或 "30,32" 或 "all"）
+        //      ② 该后端 priority 高于 CPU/CUDA（由 remote_make_backend_from_env 按 env 决定）
+        //    未设环境变量时本块不执行 ⇒ 单机行为零影响。RemoteBackend 由
+        //    remote_make_backend_from_env() 内部静态持有，生命周期覆盖本模型。
+        // ⚠️ 2026-09-14 晚 修正：必须**同时**有非空的 PPML_REMOTE_OPS 才注册远端后端。
+        //   只设 PPML_REMOTE_HOST（ops 为空）时 priority=-1 = 最低 ⇒ 排在 backends_ 末尾，
+        //   而调度器把"未分配节点（view/reshape 等）"默认交给 n_backends_-1 = **它** ✗
+        //   ⇒ 实测 74 个单节点子图被发到对端（数值虽透明，但白搬数据 + 对端上下文耗尽 abort）。
+        const char* remote_ops = getenv("PPML_REMOTE_OPS");
+        if (getenv("PPML_REMOTE_HOST") != nullptr && remote_ops && *remote_ops) {
+            if (RemoteBackend* rb = remote_make_backend_from_env()) {
+                scheduler_->add_backend(rb);
+                std::cerr << "[REMOTE] 远端后端已注册: ops="
+                          << (getenv("PPML_REMOTE_OPS") ? getenv("PPML_REMOTE_OPS") : "(none)")
+                          << " priority=" << rb->priority()
+                          << " slim=" << (int)rb->buffer_type_mut().slim() << std::endl;
+            } else {
+                std::cerr << "[REMOTE] PPML_REMOTE_HOST 已设置但连接对端失败 —— 忽略远端后端"
+                          << std::endl;
             }
         }
     }
