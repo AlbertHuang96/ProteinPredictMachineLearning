@@ -14,12 +14,16 @@ FetchContent_MakeAvailable(googletest)
 add_executable(ppml_tests
     test_tensor.cpp
     test_attention.cpp
+    test_softmax_back.cpp
     test_model.cpp
     test_lora.cpp
     test_outer_product_mean.cpp
     test_dyntalloc.cpp
     test_gallocr.cpp
     test_cuda.cpp
+    test_scan.cpp
+    test_mul_mat_f16.cpp
+    test_quant_prep.cpp
     test_se3_equivariance.cpp
     test_se3_graph_backward.cpp
     test_se3_forward_graph.cpp
