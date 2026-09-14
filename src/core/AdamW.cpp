@@ -20,16 +20,23 @@ AdamW::AdamW(float lr, float weight_decay, float beta1, float beta2,
 
 void AdamW::init_from_graph(ComputeGraph* cgraph) {
     states_.clear();
+    n_owned_ = 0;
     // 参数 (TENSOR_FLAG_PARAM) 在 build_forward_impl 中被归类为 node 而非 leaf
     // (ComputeGraph.cpp:137: OP_NONE && !PARAM 才作 leaf)，故遍历 n_nodes()。
+    // 分片（阶段 A）：idx = 参数全局序号（含被跳过的），owner = idx % world ⇒ 两端一致。
+    int idx = 0;
     for (int i = 0; i < cgraph->n_nodes(); i++) {
         TensorF32* node = cgraph->graph_node(i);
         if (!(node->flag & TENSOR_FLAG_PARAM)) continue;          // 非参数，跳过
         TensorF32* grad = cgraph->graph_get_grad(node);
         if (!grad) continue;                                      // 无梯度（未参与 loss），跳过
+        const int owner = (world_ > 1) ? (idx % world_) : 0;
+        ++idx;
+        if (world_ > 1 && owner != my_rank_) continue;            // 非本 rank owner：不建状态（省 m/v）
         const int64_t n = grad->numel();
         ParamState s;
         s.param            = node;
+        s.owner_rank       = owner;
         s.no_weight_decay  = (node->flag & TENSOR_FLAG_NO_WEIGHT_DECAY) != 0;
         // SE3 等变参数：梯度尺度与主图不匹配（offset→坐标→FAPE 链放大），用分层小 lr。
         // 2026-08-24: 0.1→0.01（新版 a_rows 正确 shape 后 SE3 权重梯度 l2~1e25，

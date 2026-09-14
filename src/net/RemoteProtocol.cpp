@@ -64,10 +64,16 @@ void RSocket::close() {
 }
 
 void RSocket::set_timeout_ms(int ms) {
-    if (fd_ < 0 || ms <= 0) return;
+    if (fd_ < 0) return;
     struct timeval tv{};
-    tv.tv_sec  = ms / 1000;
-    tv.tv_usec = (ms % 1000) * 1000;
+    if (ms > 0) {
+        tv.tv_sec  = ms / 1000;
+        tv.tv_usec = (ms % 1000) * 1000;
+    }
+    // 【修复 2026-09-14 深夜】原实现在 ms<=0 时直接 return ⇒ connect 阶段设的超时**永久保留**，
+    //   后续长等待（DP allreduce：等对端算完一个 forward，可达数十秒）被 EAGAIN 打断 ⇒
+    //   allreduce_sum 返回 false 但 UP 已发出 ⇒ 请求/回包**流错位一格** ⇒ 静默错值 + 崩溃。
+    //   现在：ms<=0 → tv 全 0 = 不限时（真正的阻塞），与调用处语义一致。
     ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
@@ -137,7 +143,9 @@ bool RSocket::connect_to(const std::string& host, int port, int timeout_ms) {
         return false;
     }
     set_tcp_nodelay(fd_);
-    set_timeout_ms(0);   // 后续阻塞等待不限时（由上层控制）
+    // 后续等待改为**耐心但有界**（10 分钟）：DP allreduce 要等对端算完一个 forward（数十秒），
+    // 原 `set_timeout_ms(0)` 既没生效（未清超时）又会让真正的死连接永久挂住。
+    set_timeout_ms(600000);
     return true;
 }
 

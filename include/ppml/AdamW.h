@@ -56,6 +56,16 @@ public:
                          const std::vector<std::string>& param_names,
                          const std::map<std::string, std::vector<float>>& raw_tensors);
 
+    // ---- 数据并行参数分片（阶段 A，ZeRO-1 式）----
+    //   只为本 rank 拥有的参数建 m/v 状态 ⇒ 优化器状态内存按 world 分摊。
+    //   owner 规则（**两端必须完全一致**）：按参数在图中出现顺序的全局序号 idx，owner = idx % world。
+    //   使用要求：必须真的连上对端（world>1）才启用；否则会漏更新一半参数（train.cpp 里做门闩）。
+    void set_shard(int my_rank, int world) { my_rank_ = my_rank; world_ = world; }
+    bool shard_enabled() const { return world_ > 1; }
+    int  my_rank() const       { return my_rank_; }
+    int  world() const         { return world_; }
+    int  n_owned() const       { return n_owned_; }
+
     float lr() const            { return lr_; }
     void  set_lr(float lr)      { lr_ = lr; }
     size_t param_count() const  { return states_.size(); }
@@ -65,6 +75,7 @@ public:
 private:
     struct ParamState {
         TensorF32*         param;
+        int                owner_rank     = 0;    // 该参数归属的 rank（分片时用；未分片恒 0）
         bool               no_weight_decay;
         float              se3_lr_scale  = 1.0f;  // SE3 参数分层 lr 缩放（TENSOR_FLAG_SE3 时 0.01）
         float              lora_lr_scale = 1.0f;  // LoRA 参数分层 lr 缩放（TENSOR_FLAG_LORA 时放大）
@@ -81,6 +92,9 @@ private:
     bool  bias_correction_;
     float lora_lr_scale_ = 10.0f;   // LoRA 参数 lr 放大倍率（默认 10.0）
     int   step_count_ = 0;
+    int   my_rank_    = 0;          // 参数分片：本 rank
+    int   world_      = 1;          // 参数分片：world（<=1 ⇒ 不分片）
+    int   n_owned_    = 0;          // 本 rank 拥有的参数个数（init_from_graph 统计）
 };
 
 } // namespace ppml

@@ -401,13 +401,28 @@ bool RemoteClient::allreduce_sum(float* buf, size_t n) {
     if (!sock_.send_data((uint32_t)rnet::RKind::ALLREDUCE_UP, 0, rnet::RDtype::F32,
                          1, nullptr, buf, bytes)) return false;
     rnet::RHeader h;
-    if (!sock_.recv_header(h)) return false;
-    if (h.kind != (uint32_t)rnet::RKind::ALLREDUCE_DOWN || h.nbytes != bytes) {
-        std::fprintf(stderr, "[REMOTE] allreduce: 意外回包 %s nbytes=%llu（期望 %zu）\n",
-                     rnet::kind_name(h.kind), (unsigned long long)h.nbytes, bytes);
+    // 【2026-09-14 深夜】失败必须**响亮**：UP 已发出而回包读失败时，流已经错位，
+    //   继续跑会让下一次 allreduce 读到上一次的回包 ⇒ 静默错值（本轮实测：loss 爆到 818779 + 崩溃）。
+    //   ⇒ 这里明确报错并标记"本轮 DP 已不可信"，调用方不得把 0 当成"没参数"继续训练。
+    if (!sock_.recv_header(h)) {
+        std::fprintf(stderr,
+                     "[REMOTE-DP] FATAL: allreduce 回包读取失败（流已错位，本次 DP 同步不可信；"
+                     "请检查对端是否在等我方贡献/是否已死锁）\n");
+        dp_broken_ = true;
         return false;
     }
-    return sock_.recv_all(buf, bytes);
+    if (h.kind != (uint32_t)rnet::RKind::ALLREDUCE_DOWN || h.nbytes != bytes) {
+        std::fprintf(stderr, "[REMOTE-DP] FATAL: allreduce 意外回包 %s nbytes=%llu（期望 %zu）⇒ 流已错位\n",
+                     rnet::kind_name(h.kind), (unsigned long long)h.nbytes, bytes);
+        dp_broken_ = true;
+        return false;
+    }
+    if (!sock_.recv_all(buf, bytes)) {
+        dp_broken_ = true;
+        std::fprintf(stderr, "[REMOTE-DP] FATAL: allreduce 回包体读取失败 ⇒ 流已错位\n");
+        return false;
+    }
+    return true;
 }
 
 // ============================================================
@@ -620,14 +635,30 @@ bool RemoteServer::handle_results_clear(rnet::RSocket& s, rnet::RHeader& h) {
 }
 
 bool RemoteServer::handle_allreduce(rnet::RSocket& s, rnet::RHeader& h, int world_size) {
-    // 星型 root：收 worker 的缓冲 → 加上本端 dp_local_ → 广播
+    // 星型 root：收 worker 的缓冲 → 加上本端贡献 → 广播
     const size_t n = h.nbytes / sizeof(float);
     std::vector<float> buf(n);
     if (!s.recv_all(buf.data(), h.nbytes)) return false;
-    for (size_t i = 0; i < n; ++i) {
-        buf[i] += (i < dp_local_.size() ? dp_local_[i] : 0.0f);
+    // 阶段 A：优先取"按调用次序登记的贡献"（peer 双端训练时本端也有真实梯度/权重）；
+    //   未启用队列（旧路径：独立张量服务 + set_dp_buffer）⇒ 退回平铺 dp_local_ 语义（兼容 ✓）。
+    std::vector<float> local;
+    if (dp_queue_enabled()) {
+        if (!pop_dp_contribution(local)) {
+            std::fprintf(stderr, "[REMOTE-SRV] allreduce 贡献超时（队列为空）⇒ 本次按 0 贡献\n");
+            local.assign(n, 0.0f);
+        }
+        if (local.size() != n) {
+            std::fprintf(stderr, "[REMOTE-SRV] allreduce 贡献尺寸不匹配：local=%zu 收到=%zu ⇒ 按 0 贡献\n",
+                         local.size(), n);
+            local.assign(n, 0.0f);
+        }
+    } else {
+        local.assign(n, 0.0f);
+        for (size_t i = 0; i < n && i < dp_local_.size(); ++i) local[i] = dp_local_[i];
     }
+    for (size_t i = 0; i < n; ++i) buf[i] += local[i];
     dp_local_ = buf;   // 本端也拿到求和结果
+    if (dp_queue_enabled()) publish_dp_result(buf);   // rank0 训练线程 wait_dp_result 取回
     for (int r = 1; r < world_size; ++r) {
         if (!s.send_data((uint32_t)rnet::RKind::ALLREDUCE_DOWN, 0, rnet::RDtype::F32,
                          1, nullptr, buf.data(), h.nbytes)) return false;
@@ -889,14 +920,34 @@ bool RemoteServer::handle_graph_compute(rnet::RSocket& s, rnet::RHeader& h) {
     return s.send_header(ok);
 }
 
-bool RemoteServer::serve_forever(int world_size, int max_messages) {
-    rnet::RSocket conn;
-    if (!listener_.accept_one(conn)) return false;
-    std::fprintf(stderr, "[REMOTE-SRV] 客户端已连接（world=%d）\n", world_size);
+// 启动屏障标记：服务线程 accept 到连接后置 true；训练线程（root）据此等待对端就位（bool 写实际原子 ✓）。
+//   注意：必须定义在 serve_forever 之前（它在文件中更靠前）✗。
+static volatile bool g_dp_peer_seen = false;
 
-    for (int msg = 0; msg < max_messages; ++msg) {
-        rnet::RHeader h;
-        if (!conn.recv_header(h)) return false;
+bool RemoteServer::serve_forever(int world_size, int max_messages) {
+    // 【修复 2026-09-15】accept 循环：原实现只服务**一条**连接，recv 失败即 `return` ✗
+    //   ⇒ 多 epoch 场景下 epoch1 的 DP 一结束、客户端断开，rank0 的服务就消失
+    //   （对端随即看到 `Connection reset by peer` / `Broken pipe`）⇒ epoch2 的 DP 全部失败 ✗。
+    //   现在：连接断开后**继续 accept 下一个连接**（listener 常驻），直到 BYE 或 listener 坏掉。
+    int accept_fail = 0;
+    for (;;) {
+        rnet::RSocket conn;
+        if (!listener_.accept_one(conn)) {
+            if (++accept_fail > 1000) return false;      // 连续失败过多（listener 已坏）才退出
+            struct timespec ts{0, 50 * 1000 * 1000};     // 50ms，避免忙等
+            nanosleep(&ts, nullptr);
+            continue;
+        }
+        accept_fail = 0;
+        g_dp_peer_seen = true;   // 启动屏障：通知 root 训练线程"对端已连接"
+        std::fprintf(stderr, "[REMOTE-SRV] 客户端已连接（world=%d）\n", world_size);
+        for (int msg = 0; msg < max_messages; ++msg) {
+            rnet::RHeader h;
+            if (!conn.recv_header(h)) {
+                // 对端断开（正常结束一个 epoch 的 DP、或崩溃）⇒ 回到外层继续 accept，不结束服务
+                std::fprintf(stderr, "[REMOTE-SRV] 连接断开，继续等待下一个连接（多 epoch 需要）\n");
+                break;
+            }
         switch ((rnet::RKind)h.kind) {
             case rnet::RKind::HELLO: {
                 rnet::RHeader ack;
@@ -932,11 +983,14 @@ bool RemoteServer::serve_forever(int world_size, int max_messages) {
                              arena_.size(), (double)arena_bytes_ / (1024.0 * 1024.0));
                 return true;
             default:
-                std::fprintf(stderr, "[REMOTE-SRV] 未知消息 %s（%u）\n",
+                // 未知消息：只记录并跳过（原实现直接 return false ⇒ 杀掉常驻服务 ✗，多 epoch 不可接受）
+                std::fprintf(stderr, "[REMOTE-SRV] 未知消息 %s（%u）⇒ 跳过\n",
                              rnet::kind_name(h.kind), h.kind);
-                return false;
-        }
-    }
+                break;
+            }
+        }   // msg 循环
+        // 本连接结束（recv 失败 / 达到 max_messages）⇒ 回到外层 accept 继续服务（多 epoch 必需）
+    }       // accept 循环（无限，直到 BYE 或 listener 坏）
     return true;
 }
 
@@ -957,9 +1011,22 @@ std::shared_ptr<RemoteClient> remote_make_client_from_env() {
 RemoteBackend* remote_make_backend_from_env() {
     static std::shared_ptr<RemoteClient> cli;
     static std::unique_ptr<RemoteBackend> be;
+    // 【修复 2026-09-15】失败也要**记忆**：原实现 `!be` 时每次调用都重试 connect ✗，
+    //   而 `remote_iteration_begin()/remote_after_optimizer_step()` 每轮迭代都会调本函数
+    //   ⇒ 只设了 PPML_REMOTE_HOST 而对端不存在时，会持续发起半开（EINPROGRESS）连接 ✗
+    //   ⇒ 实测：单进程 + `PPML_REMOTE_HOST` + 2 epoch **必崩**（与 DP/分片无关，是既存 bug）。
+    //   这里改为"一次失败即本进程内不再重试"（与 remote_dp_client_if_enabled 的 static tried 语义一致）。
+    static bool tried_fail = false;
     if (!be) {
+        if (tried_fail) return nullptr;
         cli = remote_make_client_from_env();
-        if (!cli) return nullptr;
+        if (!cli) {
+            tried_fail = true;
+            std::fprintf(stderr,
+                         "[REMOTE] 远端建连失败 ⇒ 本进程内**不再重试**（避免每轮迭代发起半开连接；"
+                         "如需远端能力请确认 PPML_REMOTE_HOST/PORT 与对端已就绪）\n");
+            return nullptr;
+        }
         const bool slim = std::getenv("PPML_REMOTE_SLIM") &&
                           std::atoi(std::getenv("PPML_REMOTE_SLIM")) != 0;
 
@@ -989,17 +1056,23 @@ RemoteClient* remote_dp_client_if_enabled() {
     const char* dp = std::getenv("PPML_DP");
     if (!dp || std::atoi(dp) == 0) return nullptr;
     static std::shared_ptr<RemoteClient> dp_cli;
-    static bool tried = false;
-    if (!tried) {
-        tried = true;
+    // 【修复 2026-09-15】去掉"失败即锁死"（static tried）：对端（acceptor）可能晚于本端启动，
+    //   首次 connect 失败（EINPROGRESS/refused）后就再也不重试 ⇒ 本端整场跳过 allreduce ✗
+    //   （实测：按 rank 分片时 rank1 在训练开头就 connect，而 rank0 要等第一次 optimizer init 才 listen ✗）。
+    //   改为：尚未连上就**每次调用重试**（connect 到未监听端口是廉价快速失败，不会挂）。
+    if (!dp_cli || !dp_cli->connected()) {
         dp_cli = remote_make_client_from_env();   // 与 PP 共用 PPML_REMOTE_HOST/PORT
         if (dp_cli) {
             std::fprintf(stderr, "[REMOTE-DP] 数据并行已启用（world=%d rank=%d）；"
                                  "Allreduce 位置在 clip 之前\n",
                          dp_cli->world_size(), dp_cli->rank());
         } else {
-            std::fprintf(stderr, "[REMOTE-DP] PPML_DP=1 但连不上对端"
-                                 "（需设 PPML_REMOTE_HOST/PORT）—— 跳过 Allreduce\n");
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr, "[REMOTE-DP] PPML_DP=1 但暂未连上对端"
+                                     "（将随调用重试；需设 PPML_REMOTE_HOST/PORT）\n");
+            }
         }
     }
     return dp_cli.get();
@@ -1008,10 +1081,225 @@ RemoteClient* remote_dp_client_if_enabled() {
 // ============================================================
 // 数据并行：对 PARAM 梯度做 Allreduce 平均（在 optimizer.step() 之前调用一次）
 // ============================================================
+// ============================================================
+// 阶段 A：rank0（acceptor / star root）侧的 DP 同步
+//   背景（硬约束，见 PLAN_SHARDING.md §5.5）：`RemoteServer::handle_allreduce` 按"第 k 次调用"配对
+//   本端贡献 ⇒ 两端必须对同一参数各调用一次、顺序一致；rank0 不走客户端 UP 路径（它是被连的一方），
+//   而是：push_dp_contribution(本端值) → 服务线程收到对端 UP 后求和并回放 → 本端 wait_dp_result 取回。
+//   两端遍历顺序都是"参数全局序号"（与 AdamW::init_from_graph 同规则）⇒ 配对天然一致 ✓。
+// ============================================================
+static RemoteServer* g_dp_root_srv = nullptr;
+
+void remote_dp_register_root_server(RemoteServer* srv) { g_dp_root_srv = srv; }
+bool remote_dp_root_mode() { return g_dp_root_srv != nullptr; }
+
+// ---- RemoteServer 的贡献/结果队列（定义在 .cpp，头文件只持 shared_ptr 前向声明）----
+struct RemoteServer::DpQueue {
+    std::mutex mu;
+    std::condition_variable cv_contrib;   // 训练线程 push → 服务线程 pop
+    std::condition_variable cv_result;    // 服务线程 publish → 训练线程 wait
+    std::deque<std::vector<float>> contrib;
+    std::deque<std::vector<float>> done;
+    bool on = false;
+};
+void RemoteServer::enable_dp_queue() {
+    if (!dpq_) dpq_ = std::make_shared<DpQueue>();
+    std::lock_guard<std::mutex> lk(dpq_->mu);
+    dpq_->on = true;
+}
+bool RemoteServer::dp_queue_enabled() const {
+    if (!dpq_) return false;
+    std::lock_guard<std::mutex> lk(dpq_->mu);
+    return dpq_->on;
+}
+void RemoteServer::push_dp_contribution(const float* p, size_t n) {
+    if (!dpq_) return;
+    std::vector<float> v(p, p + n);
+    std::lock_guard<std::mutex> lk(dpq_->mu);
+    dpq_->contrib.push_back(std::move(v));
+    dpq_->cv_contrib.notify_one();
+}
+bool RemoteServer::pop_dp_contribution(std::vector<float>& out) {
+    if (!dpq_) return false;
+    std::unique_lock<std::mutex> lk(dpq_->mu);
+    // 有界等待：对端 UP 可能先到、本端贡献随后到（同一轮，间隔很小）；旧路径不会进这里
+    if (!dpq_->cv_contrib.wait_for(lk, std::chrono::seconds(60),
+                                   [&] { return !dpq_->contrib.empty(); })) {
+        return false;
+    }
+    out = std::move(dpq_->contrib.front());
+    dpq_->contrib.pop_front();
+    return true;
+}
+void RemoteServer::publish_dp_result(const std::vector<float>& r) {
+    if (!dpq_) return;
+    std::lock_guard<std::mutex> lk(dpq_->mu);
+    dpq_->done.push_back(r);
+    dpq_->cv_result.notify_one();
+}
+bool RemoteServer::wait_dp_result(float* out, size_t n, int timeout_sec) {
+    if (!dpq_) return false;
+    std::unique_lock<std::mutex> lk(dpq_->mu);
+    if (!dpq_->cv_result.wait_for(lk, std::chrono::seconds(timeout_sec),
+                                  [&] { return !dpq_->done.empty(); })) {
+        return false;
+    }
+    std::vector<float>& r = dpq_->done.front();
+    if (r.size() != n) { dpq_->done.pop_front(); return false; }
+    std::memcpy(out, r.data(), n * sizeof(float));
+    dpq_->done.pop_front();
+    return true;
+}
+
+// 读/写一个张量的宿主副本（兼容 backend buffer / 裸 CPU）
+static bool dp_read_tensor(TensorF32* t, std::vector<float>& host) {
+    const int64_t n = t->numel();
+    if (n <= 0) return false;
+    host.resize((size_t)n);
+    if (t->buffer_) {
+        t->buffer_->get_tensor(t, host.data(), t->buffer_offs_, (size_t)n * sizeof(float));
+    } else if (t->data()) {
+        std::memcpy(host.data(), t->data(), (size_t)n * sizeof(float));
+    } else {
+        return false;
+    }
+    return true;
+}
+static void dp_write_tensor(TensorF32* t, const std::vector<float>& host) {
+    // 诊断开关：跳过写回（用于判定"写回是否写进已释放/上一代的存储"这类 epoch 边界崩溃）
+    if (std::getenv("PPML_DP_NO_WRITEBACK")) return;
+    const size_t bytes = host.size() * sizeof(float);
+    // 同代校验（最小版）：目标必须有可用存储；否则**不写**并响亮报错（避免写进已释放内存造成延迟崩溃）
+    if (!t->buffer_ && !t->data()) {
+        std::fprintf(stderr, "[DP-SHARD] FATAL: 写回目标无存储（numel=%lld）⇒ 跳过写回（疑似跨代/已释放）\n",
+                     (long long)t->numel());
+        return;
+    }
+    if (t->buffer_) {
+        t->buffer_->set_tensor(t, host.data(), t->buffer_offs_, bytes);
+    } else {
+        std::memcpy(t->data(), host.data(), bytes);
+    }
+}
+
+// 阶段 A：**相位显式握手**（2026-09-14 深夜，教训：靠两侧各自推理太脆弱）。
+//   每个相位开始时交换 [phase_id, 本侧参数个数] 并求和校验：
+//     ① 两侧都必须执行且仅执行一次 ⇒ 即使某一侧该相位"为空"也能保持配对（不会再吃掉下一个相位的 UP）；
+//     ② 求和结果应为 [2*phase_id, 2*count] ⇒ 不一致立刻响亮报错并停止同步（不静默错值）。
+static bool dp_phase_begin(ComputeGraph* cgraph, RemoteClient* cli, bool is_root, int phase_id,
+                           int world, int my_rank) {
+    if (!cgraph || world <= 1) return true;
+    int local_count = 0;
+    for (int i = 0; i < cgraph->n_nodes(); ++i) {
+        TensorF32* n = cgraph->graph_node(i);
+        if (!n || !(n->flag & TENSOR_FLAG_PARAM)) continue;
+        if (!cgraph->graph_get_grad(n)) continue;   // 与同步循环同口径（PARAM 且有 grad）
+        ++local_count;
+    }
+    float buf[2] = {(float)phase_id, (float)local_count};
+    bool ok = false;
+    if (is_root) {
+        if (!g_dp_root_srv) return true;
+        g_dp_root_srv->push_dp_contribution(buf, 2);
+        ok = g_dp_root_srv->wait_dp_result(buf, 2);
+    } else if (cli && cli->connected()) {
+        ok = cli->allreduce_sum(buf, 2);
+    } else {
+        return true;
+    }
+    if (!ok) {
+        std::fprintf(stderr, "[DP-SHARD] FATAL: 相位%d 握手失败（对端无响应/流错位）\n", phase_id);
+        return false;
+    }
+    const float expect_id = 2.0f * (float)phase_id;
+    const float expect_cnt = 2.0f * (float)local_count;
+    if (std::getenv("GRAPH_DEBUG_REMOTE")) {
+        // 成功也打印（此前成功是静默的 ⇒ 看不到两端调用序列，无法定位"谁多推了一次"）
+        static int s_ok_no = 0;
+        std::fprintf(stderr, "[DP-SHARD] phase#%d OK: phase=%d count=%d rank=%d world=%d sum=[%g,%g]\n",
+                     ++s_ok_no, phase_id, local_count, my_rank, world, (double)buf[0], (double)buf[1]);
+    }
+    if (std::fabs(buf[0] - expect_id) > 0.5f || std::fabs(buf[1] - expect_cnt) > 0.5f) {
+        std::fprintf(stderr,
+                     "[DP-SHARD] FATAL: 相位%d 两侧不一致（本侧 count=%d；求和 id=%g cnt=%g，期望 %g/%g）"
+                     "⇒ 相位错配，停止本次同步（rank=%d world=%d）\n",
+                     phase_id, local_count, (double)buf[0], (double)buf[1],
+                     (double)expect_id, (double)expect_cnt, my_rank, world);
+        return false;
+    }
+    return true;
+}
+
+// 内部：root 侧一轮遍历（is_grad=true 同步梯度平均；false 同步 owner 新权重）
+static int dp_roundtrip_root(ComputeGraph* cgraph, bool is_grad, int world, int my_rank) {
+    if (!cgraph || !g_dp_root_srv || world <= 1) return 0;
+    // 启动屏障：等对端连接后才进入第一轮 allreduce（否则首轮 wait_dp_result 在对端未就位前超时 ⇒ 弃轮 ✗）
+    if (!g_dp_peer_seen) {
+        std::fprintf(stderr, "[REMOTE-DP] root 等待对端连接（启动屏障）...\n");
+        for (int i = 0; i < 6000 && !g_dp_peer_seen; ++i) {
+            struct timespec ts{0, 100 * 1000 * 1000};   // 100ms
+            nanosleep(&ts, nullptr);
+        }
+        if (!g_dp_peer_seen) {
+            std::fprintf(stderr, "[REMOTE-DP] root 等对端连接 600s 超时 ⇒ 放弃本轮同步\n");
+            return 0;
+        }
+        std::fprintf(stderr, "[REMOTE-DP] root 已检测到对端连接，继续同步\n");
+    }
+    if (!dp_phase_begin(cgraph, nullptr, /*is_root=*/true, is_grad ? 1 : 2, world, my_rank)) return 0;
+    int n_done = 0, idx = 0;
+    for (int i = 0; i < cgraph->n_nodes(); ++i) {
+        TensorF32* node = cgraph->graph_node(i);
+        if (!node || !(node->flag & TENSOR_FLAG_PARAM)) continue;
+        TensorF32* g = cgraph->graph_get_grad(node);
+        if (!g) continue;
+        const int owner = idx % world;
+        ++idx;
+        TensorF32* src = is_grad ? g : node;
+        std::vector<float> host;
+        // ★不可读也必须占位（补 0 到 numel）：本端少发一轮 ⇒ 与对端**流错位一格** ✗
+        //   （2026-09-14 深夜实测：相位握手报 "sum id=3"=1+2，即两侧相位错开一轮的根因）
+        if (!dp_read_tensor(src, host)) host.assign((size_t)std::max<int64_t>(src->numel(), 0), 0.0f);
+        if (host.empty()) continue;   // numel==0：两侧同口径（对端也发不出数据）
+        // 权重同步：非 owner 提交全 0（占位保持配对，最终结果 = 唯一 owner 的新值）；梯度：双方全量参与
+        if (!is_grad && owner != my_rank) std::fill(host.begin(), host.end(), 0.0f);
+        g_dp_root_srv->push_dp_contribution(host.data(), host.size());
+        if (!g_dp_root_srv->wait_dp_result(host.data(), host.size())) {
+            std::fprintf(stderr, "[REMOTE-DP] root wait_dp_result 超时（param idx=%d）\n", idx - 1);
+            return n_done;
+        }
+        if (is_grad) {
+            const float inv = 1.0f / (float)world;
+            for (float& v : host) v *= inv;
+        }
+        dp_write_tensor(src, host);
+        ++n_done;
+    }
+    if (std::getenv("GRAPH_DEBUG_REMOTE")) {
+        std::fprintf(stderr, "[REMOTE-DP] root 同步完成：%s=%d world=%d rank=%d\n",
+                     is_grad ? "grads" : "params", n_done, world, my_rank);
+    }
+    return n_done;
+}
+
+int remote_dp_grads_root(ComputeGraph* cgraph, int world, int my_rank) {
+    if (std::getenv("GRAPH_DEBUG_REMOTE")) {
+        std::fprintf(stderr, "[DP-SHARD] >>> grads_root 进入（rank=%d world=%d）\n", my_rank, world);
+    }
+    return dp_roundtrip_root(cgraph, /*is_grad=*/true, world, my_rank);
+}
+int remote_dp_params_root(ComputeGraph* cgraph, int world, int my_rank) {
+    if (std::getenv("GRAPH_DEBUG_REMOTE")) {
+        std::fprintf(stderr, "[DP-SHARD] >>> params_root 进入（rank=%d world=%d）\n", my_rank, world);
+    }
+    return dp_roundtrip_root(cgraph, /*is_grad=*/false, world, my_rank);
+}
+
 int remote_dp_allreduce_grads(ComputeGraph* cgraph, RemoteClient* cli) {
     if (!cgraph || !cli || !cli->connected()) return 0;
     const int world = cli->world_size();
     if (world <= 1) return 0;
+    if (!dp_phase_begin(cgraph, cli, /*is_root=*/false, 1, world, cli->rank())) return 0;   // 相位1=梯度
 
     int n_done = 0;
     for (int i = 0; i < cgraph->n_nodes(); ++i) {
@@ -1028,7 +1316,8 @@ int remote_dp_allreduce_grads(ComputeGraph* cgraph, RemoteClient* cli) {
         } else if (g->data()) {
             std::memcpy(host.data(), g->data(), (size_t)n * sizeof(float));
         } else {
-            continue;
+            // 不可读也要参与（补 0 占位）：跳过一轮会与对端流错位 ✗
+            std::fill(host.begin(), host.end(), 0.0f);
         }
 
         if (!cli->allreduce_sum(host.data(), (size_t)n)) return n_done;
@@ -1044,6 +1333,83 @@ int remote_dp_allreduce_grads(ComputeGraph* cgraph, RemoteClient* cli) {
     }
     if (std::getenv("GRAPH_DEBUG_REMOTE")) {
         std::fprintf(stderr, "[REMOTE-DP] allreduce 完成：params=%d world=%d\n", n_done, world);
+    }
+    return n_done;
+}
+
+// ============================================================
+// 数据并行（阶段 A：参数分片）——optimizer.step() 之后同步"owner 的新值"
+//   设计要点：复用已有的 allreduce_sum 原语（星型/两机对换），无需新协议：
+//     ① 参数全局序号 idx 与 AdamW::init_from_graph 的计数规则**完全一致**（PARAM 且有 grad 才 +1）；
+//     ② 非 owner 侧把自己那份（旧值）置 0，只有 owner 提交新值 ⇒ sum == owner 的新值；
+//     ③ 因此**不做 /world**，两端写回同一个值 ⇒ 逐位一致 ⇒ 下一轮 forward 相同。
+//   若跳过本步：非 owner 侧会带着旧权重继续训练 ⇒ 两端发散（阶段 A 的核心风险，见 PLAN_SHARDING.md:44）。
+// ============================================================
+int remote_dp_broadcast_owned_params(ComputeGraph* cgraph, RemoteClient* cli) {
+    if (!cgraph) return 0;
+    if (!cli || !cli->connected()) {
+        // 阶段 A：rank0/acceptor 的 root 模式（cli 为空）⇒ 走贡献队列（与对端同名动作配对）
+        if (g_dp_root_srv) {
+            const int world = std::getenv("PPML_REMOTE_WORLD") ? std::atoi(std::getenv("PPML_REMOTE_WORLD")) : 2;
+            const int rank  = std::getenv("PPML_REMOTE_RANK")  ? std::atoi(std::getenv("PPML_REMOTE_RANK"))  : 0;
+            if (std::getenv("GRAPH_DEBUG_REMOTE")) {
+                std::fprintf(stderr, "[DP-SHARD] params: 走 ROOT 队列（cli 空，root=%p）\n", (void*)g_dp_root_srv);
+            }
+            return dp_roundtrip_root(cgraph, /*is_grad=*/false, world, rank);
+        }
+        if (std::getenv("GRAPH_DEBUG_REMOTE")) {
+            std::fprintf(stderr, "[DP-SHARD] params: cli=%p 未连接 且无 root ⇒ 返回 0（本次不同步）\n",
+                         (void*)cli);
+        }
+        return 0;
+    }
+    if (std::getenv("GRAPH_DEBUG_REMOTE")) {
+        std::fprintf(stderr, "[DP-SHARD] params: 走 WORKER 路径（rank=%d world=%d）\n",
+                     cli->rank(), cli->world_size());
+    }
+    // 相位2=参数（此处 world/my_rank 的局部声明还没引入 ⇒ 直接从 cli 取；world<=1 由握手内部处理）
+    if (!dp_phase_begin(cgraph, cli, /*is_root=*/false, 2, cli->world_size(), cli->rank())) return 0;
+    const int world = cli->world_size();
+    if (world <= 1) return 0;
+    const int my_rank = cli->rank();
+
+    int n_done = 0, idx = 0;
+    for (int i = 0; i < cgraph->n_nodes(); ++i) {
+        TensorF32* node = cgraph->graph_node(i);
+        if (!node || !(node->flag & TENSOR_FLAG_PARAM)) continue;
+        TensorF32* g = cgraph->graph_get_grad(node);
+        if (!g) continue;                       // 与 AdamW 一致：无 grad 的参数不计序号、不同步
+        const int owner = idx % world;
+        ++idx;
+
+        const int64_t n = node->numel();
+        if (n <= 0) continue;
+        std::vector<float> host((size_t)n);
+        if (node->buffer_) {
+            node->buffer_->get_tensor(node, host.data(), node->buffer_offs_, (size_t)n * sizeof(float));
+        } else if (node->data()) {
+            std::memcpy(host.data(), node->data(), (size_t)n * sizeof(float));
+        } else {
+            // 不可读也要参与（补 0 占位）：跳过一轮会与对端流错位 ✗（见 dp_phase_begin 注释）
+            std::fill(host.begin(), host.end(), 0.0f);
+        }
+        // ★配对要求（阶段 A 关键）：**两端必须对同一个参数各调用一次 allreduce**（顺序也一致），
+        //   否则服务端 handle_allreduce 是按"第 k 次调用"配对贡献的 ⇒ 会把参数 k 的贡献加到参数 m 上 ✗。
+        //   非 owner 侧提交全 0（不贡献值，但占位保持配对）。
+        if (owner != my_rank) {
+            std::fill(host.begin(), host.end(), 0.0f);
+        }
+        if (!cli->allreduce_sum(host.data(), (size_t)n)) return n_done;
+        if (node->buffer_) {
+            node->buffer_->set_tensor(node, host.data(), node->buffer_offs_, (size_t)n * sizeof(float));
+        } else if (node->data()) {
+            std::memcpy(node->data(), host.data(), (size_t)n * sizeof(float));
+        }
+        ++n_done;
+    }
+    if (std::getenv("GRAPH_DEBUG_REMOTE")) {
+        std::fprintf(stderr, "[DP-SHARD] params: 循环结束 synced=%d / 扫过参数 idx=%d（world=%d rank=%d）\n",
+                     n_done, idx, world, my_rank);
     }
     return n_done;
 }

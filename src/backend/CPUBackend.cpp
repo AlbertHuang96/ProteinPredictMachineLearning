@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <functional>
+#include <unordered_map>
 
 namespace ppml {
 
@@ -213,6 +215,21 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
         }   // else（重建路径）闭合
     }
 
+    // ---- 产出/使用前 leaf 指纹（PPML_HASH_NODES=1）：参数/常量 leaf 若与激活互相覆盖，
+    //      会表现为"两次运行（布局不同）在同一节点开始分歧"。leaf 不在 n_nodes 里，单独打。----
+    if (getenv("PPML_HASH_NODES")) {
+        for (int i = 0; i < cgraph->n_leafs(); ++i) {
+            TensorF32* lf = cgraph->graph_leaf(i);
+            if (!lf || !lf->data() || lf->nbytes() <= 0) continue;
+            const uint8_t* q = reinterpret_cast<const uint8_t*>(lf->data());
+            uint64_t h = 1469598103934665603ull;
+            const size_t nb = (size_t)lf->nbytes();
+            for (size_t k = 0; k < nb; ++k) { h ^= q[k]; h *= 1099511628211ull; }
+            std::fprintf(stderr, "[NHL] leaf=%d op=%d flag=0x%x nb=%zu fnv=%016llx\n",
+                         i, (int)lf->op, (unsigned)lf->flag, nb, (unsigned long long)h);
+        }
+    }
+
     // ---- 提交前单线程解析所有 view src ----
     // view（view_src 共享源数据）作为别的 op 的 src 时 data() 为 null（kernel_cpy 只在 view 自身
     // 被 dispatch 时解析）。若在 dispatch_node 里多线程解析，会写共享 src->data()/buffer_ 造成竞态
@@ -296,12 +313,195 @@ void CPUBackend::compute_thread(ThreadState * state) {
     params.wdata      = cplan->work_data;
     params.threadpool = tp;
 
+    // 产出时刻指纹（见下方调用点注释）：只由 ith==0 打印，读值发生在 barrier 之后
+    static const bool hash_nodes = (std::getenv("PPML_HASH_NODES") != nullptr);
+    (void)0;
+    static const int watch_op = [] {
+        const char* w = std::getenv("PPML_HASH_WATCH");
+        return w ? std::atoi(w) : -1;
+    }();
+    // 按"执行序号"watch 单个节点（0 基；序号 = 本 run 第几个被执行的节点，两次布局可对齐同一逻辑节点）
+    static const long long watch_idx = [] {
+        const char* w = std::getenv("PPML_HASH_WATCH_IDX");
+        return w ? std::atoll(w) : -1;
+    }();
+    // 限定 watch 的张量字节数（避免 op 级 watch 打出上万个实例；0 = 不限）
+    static const size_t watch_nb = [] {
+        const char* w = std::getenv("PPML_HASH_WATCH_NB");
+        return w ? (size_t)std::strtoull(w, nullptr, 0) : (size_t)0;
+    }();
+    static long long nh_seq = 0;   // 每个被执行节点的序号（只有 ith==0 递增 ⇒ 无竞争）
+
+    // 结构身份 sid：hash(op, type, dims, nbytes, op_params[0..1], 各 src 的 sid)（递归、记忆化）。
+    //   为什么需要：指纹只有 (op, nb, dims) 时，**无法区分"同形状但不同逻辑张量"**
+    //   （例如两个 op=38 nb=6528 的 view）⇒ "读时内容 != 产出时内容" 的判定会有假阳性。
+    //   sid 跨 run 可比（只依赖图结构）⇒ 同 sid 才允许比对数值。
+    std::unordered_map<const TensorF32*, uint64_t> sid_map;
+    std::function<uint64_t(TensorF32*)> sid_of = [&](TensorF32* t) -> uint64_t {
+        if (!t) return 0;
+        auto it = sid_map.find(t);
+        if (it != sid_map.end()) return it->second;
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+        mix((uint64_t)(int)t->op);
+        mix((uint64_t)(int)t->type);
+        const int nd = t->shape().ndim();
+        mix((uint64_t)nd);
+        for (int i = 0; i < 4; ++i) mix((uint64_t)(i < nd ? t->shape().dims[i] : 1));
+        mix((uint64_t)t->nbytes());
+        mix((uint64_t)(uint32_t)t->op_params[0]);
+        mix((uint64_t)(uint32_t)t->op_params[1]);
+        if (t->buffer_ == nullptr && t->view_src == nullptr && t->data() != nullptr) {
+            // 叶子：用 PARAM/CONST 标志参与（**不要**用 data 指针做盐——那会让所有下游 sid 跨 run 不可比，
+            //   sid 的用途正是跨 run 对齐同一逻辑节点；同形状不同权重撞车由 fnv 值差异暴露）。
+            mix((uint64_t)(t->flag & (TENSOR_FLAG_PARAM | TENSOR_FLAG_CONST)));
+        }
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            if (!t->src[s]) break;
+            mix(sid_of(t->src[s]));
+        }
+        sid_map[t] = h;
+        return h;
+    };
+    auto nh = [&](TensorF32* nd, long long seq) {
+        if (!nd || nd->op == OP_NONE) return;
+        const size_t nb = (size_t)nd->nbytes();
+        if (nb == 0) return;
+        const int ndim = nd->shape().ndim();
+        const int64_t d0 = ndim > 0 ? nd->shape().dims[0] : 0;
+        const int64_t d1 = ndim > 1 ? nd->shape().dims[1] : 1;
+        const int64_t d2 = ndim > 2 ? nd->shape().dims[2] : 1;
+        const int64_t d3 = ndim > 3 ? nd->shape().dims[3] : 1;
+        TensorF32* real = nd;
+        int g = 0;
+        while (real && !real->data() && real->view_src && g++ < 64) real = real->view_src;
+        if (!real || !real->data()) {
+            std::fprintf(stderr, "[NH] op=%d nb=%zu dims=[%lld,%lld,%lld,%lld] NO_DATA\n",
+                         (int)nd->op, nb, (long long)d0, (long long)d1, (long long)d2, (long long)d3);
+            return;
+        }
+        const uint8_t* p = reinterpret_cast<const uint8_t*>(real->data());
+        uint64_t h = 1469598103934665603ull;
+        for (size_t i = 0; i < nb; ++i) { h ^= p[i]; h *= 1099511628211ull; }
+        std::fprintf(stderr, "[NH] seq=%lld sid=%016llx op=%d nb=%zu dims=[%lld,%lld,%lld,%lld] ptr=%p fnv=%016llx\n",
+                     seq, (unsigned long long)sid_of(nd), (int)nd->op, nb,
+                     (long long)d0, (long long)d1, (long long)d2, (long long)d3,
+                     (const void*)p, (unsigned long long)h);
+        const bool watch_now = ((watch_op >= 0 && (int)nd->op == watch_op) ||
+                                (watch_idx >= 0 && seq == watch_idx + 1)) &&
+                               (watch_nb == 0 || nb == watch_nb);
+
+        // watch 模式（PPML_HASH_WATCH=<op>）：该 op 每次执行时，把它各 src **此刻** 的哈希打出来。
+        // 用途：若某 src 的"此刻哈希" != 它在产出时刻记录的 [NH] 哈希 ⇒ 该张量的 buffer 被提前复用/覆盖了
+        //   （= 跨张量别名 bug），这正是"输出因布局不同而不同"的机制。
+        if (watch_now) {
+            // 先打指针/重叠（关键判据：dst 与某 src 的地址区间重叠 ⇒ kernel 一边写一边读 ⇒ 结果依布局/线程划分）
+            const uintptr_t self_p = (uintptr_t)real->data();
+            const size_t self_nb = (size_t)nd->nbytes();
+            {
+                const float* df = reinterpret_cast<const float*>(real->data());
+                const int64_t nfl = (int64_t)(self_nb / sizeof(float));
+                std::fprintf(stderr, "[NHW] ptr self=%p nb=%zu head=[%g,%g,%g] tail=[%g,%g,%g]\n",
+                             (const void*)self_p, self_nb,
+                             nfl > 0 ? df[0] : 0.0f, nfl > 1 ? df[1] : 0.0f, nfl > 2 ? df[2] : 0.0f,
+                             nfl > 2 ? df[nfl - 3] : 0.0f, nfl > 1 ? df[nfl - 2] : 0.0f,
+                             nfl > 0 ? df[nfl - 1] : 0.0f);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                TensorF32* sc = nd->src[s];
+                if (!sc) continue;
+                TensorF32* rsc = sc;
+                int g2 = 0;
+                while (rsc && !rsc->data() && rsc->view_src && g2++ < 64) rsc = rsc->view_src;
+                uint64_t hs = 0;
+                bool ok = false;
+                if (rsc && rsc->data() && sc->nbytes() > 0) {
+                    const uint8_t* q = reinterpret_cast<const uint8_t*>(rsc->data());
+                    hs = 1469598103934665603ull;
+                    for (size_t i = 0; i < (size_t)sc->nbytes(); ++i) { hs ^= q[i]; hs *= 1099511628211ull; }
+                    ok = true;
+                }
+                const uintptr_t sp = rsc ? (uintptr_t)rsc->data() : 0;
+                const size_t snb = sc ? (size_t)sc->nbytes() : 0;
+                const bool ov = sp && self_p &&
+                                (self_p < sp + snb) && (sp < self_p + self_nb);
+                std::fprintf(stderr,
+                             "[NHW] self_op=%d src%d: op=%d nb=%zu ptr=%p sid=%016llx OVERLAP=%d\n",
+                             (int)nd->op, s, (int)sc->op, snb, (const void*)sp,
+                             (unsigned long long)sid_of(sc), (int)ov);
+                if (ok) {
+                    std::fprintf(stderr, "[NHW]   self_op=%d src%d op=%d fnv=%016llx\n",
+                                 (int)nd->op, s, (int)sc->op, (unsigned long long)hs);
+                }
+            }
+        }
+    };
+
     for (int node_n = 0;
          node_n < cgraph->n_nodes() &&
          tp->abort.load(std::memory_order_relaxed) != node_n;
          node_n++) {
 
         TensorF32 * node = cgraph->graph_node(node_n);
+
+        // watch 模式的**执行前**读值：此刻上一节点的 barrier 已过、本节点还没开始写
+        //   ⇒ src 的字节就是 kernel 将读到的字节（不受"之后被复用"污染）。
+        //   与执行后（[NHW]）以及另一 run 的 [NHP] 三者对比，才能判定差异到底在哪一侧。
+        if (ith == 0) ++nh_seq;   // 节点执行序号（1 基；两次布局可用同一序号对齐同一逻辑节点）
+        if (ith == 0 &&
+            ((watch_op >= 0 && (int)node->op == watch_op) ||
+             (watch_idx >= 0 && nh_seq == watch_idx + 1)) &&
+            (watch_nb == 0 || (size_t)node->nbytes() == watch_nb)) {
+            {
+                // 自身信息（含 view 链）：用于定位"这个节点是哪个张量、落在哪段 buffer"
+                TensorF32* vs = node->view_src;
+                int nsrc = 0;
+                for (int s = 0; s < GGML_MAX_SRC; ++s) if (node->src[s]) ++nsrc;
+                const int ndv = node->shape().ndim();
+                std::fprintf(stderr,
+                             "[NHI] seq=%lld op=%d nb=%zu ndim=%d dims=[%lld,%lld,%lld,%lld] "
+                             "ptr=%p view_src=%p(vs_op=%d vs_nb=%zu vs_ptr=%p) n_src=%d\n",
+                             nh_seq, (int)node->op, (size_t)node->nbytes(), ndv,
+                             (long long)(ndv > 0 ? node->shape().dims[0] : 0),
+                             (long long)(ndv > 1 ? node->shape().dims[1] : 1),
+                             (long long)(ndv > 2 ? node->shape().dims[2] : 1),
+                             (long long)(ndv > 3 ? node->shape().dims[3] : 1),
+                             (const void*)node->data(), (const void*)vs,
+                             vs ? (int)vs->op : -1, vs ? (size_t)vs->nbytes() : 0,
+                             vs ? (const void*)vs->data() : nullptr, nsrc);
+            }
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                TensorF32* sc = node->src[s];
+                if (!sc) continue;
+                TensorF32* rsc = sc;
+                int g3 = 0;
+                while (rsc && !rsc->data() && rsc->view_src && g3++ < 64) rsc = rsc->view_src;
+                if (!rsc || !rsc->data() || sc->nbytes() <= 0) {
+                    std::fprintf(stderr, "[NHP] self_op=%d src%d op=%d nb=%zu NO_DATA\n",
+                                 (int)node->op, s, (int)sc->op, (size_t)sc->nbytes());
+                    continue;
+                }
+                const uint8_t* q = reinterpret_cast<const uint8_t*>(rsc->data());
+                uint64_t hs = 1469598103934665603ull;
+                for (size_t i = 0; i < (size_t)sc->nbytes(); ++i) { hs ^= q[i]; hs *= 1099511628211ull; }
+                const float* qf = reinterpret_cast<const float*>(q);
+                const int64_t nfl = (int64_t)(sc->nbytes() / sizeof(float));
+                const int ndv = sc->shape().ndim();
+                std::fprintf(stderr,
+                             "[NHP] self_op=%d src%d sid=%016llx op=%d nb=%zu dims=[%lld,%lld,%lld,%lld] view=%d "
+                             "ptr=%p fnv=%016llx head=[%g,%g,%g] tail=[%g,%g,%g] nth=%d\n",
+                             (int)node->op, s, (unsigned long long)sid_of(sc), (int)sc->op, (size_t)sc->nbytes(),
+                             (long long)(ndv > 0 ? sc->shape().dims[0] : 0),
+                             (long long)(ndv > 1 ? sc->shape().dims[1] : 1),
+                             (long long)(ndv > 2 ? sc->shape().dims[2] : 1),
+                             (long long)(ndv > 3 ? sc->shape().dims[3] : 1),
+                             (int)(sc->view_src != nullptr),
+                             (const void*)q, (unsigned long long)hs,
+                             nfl > 0 ? qf[0] : 0.0f, nfl > 1 ? qf[1] : 0.0f, nfl > 2 ? qf[2] : 0.0f,
+                             nfl > 2 ? qf[nfl - 3] : 0.0f, nfl > 1 ? qf[nfl - 2] : 0.0f, nfl > 0 ? qf[nfl - 1] : 0.0f,
+                             (int)params.nth);
+            }
+        }
 
         dispatch_node(node, &params);
 
@@ -313,6 +513,12 @@ void CPUBackend::compute_thread(ThreadState * state) {
         if (node_n + 1 < cgraph->n_nodes()) {
             tp->barrier_wait();
         }
+
+        // ---- 产出时刻指纹（PPML_HASH_NODES=1，2026-09-14 加）----
+        //   为什么必须在这里：任何"split 结束后再读"的指纹都可能读到已被 gallocr 复用的 buffer；
+        //   此处紧跟 barrier（含最后一个节点见循环后同款代码）⇒ 读到的就是"刚算完、未被复用"的真值。
+        //   用途：把两次运行（不同布局）的 [NH] 序列逐行 diff ⇒ 第一个 fnv 不同的节点 = 分歧起点。
+        if (ith == 0 && hash_nodes && node_n + 1 < cgraph->n_nodes()) nh(node, nh_seq);
 
         // ---- 开发诊断：找第一个输出含巨大值(爆炸源)的节点（GRAPH_DEBUG_NAN=1）----
         // 在 NaN 之前抓真正的爆炸起点：max|v| > EXPLODE_THRESH 即报（不放过已是 NaN 的）。
@@ -448,6 +654,10 @@ void CPUBackend::compute_thread(ThreadState * state) {
     }
 
     tp->barrier_wait();
+    // 最后一个节点没有"下一轮 barrier"，在这里补一次（此时全体线程已 barrier，读值是安全/新鲜的）
+    if (ith == 0 && hash_nodes && cgraph->n_nodes() > 0) {
+        nh(cgraph->graph_node(cgraph->n_nodes() - 1), nh_seq);
+    }
 }
 
 int CPUBackend::get_n_tasks(TensorF32 * node, int n_threads) {

@@ -183,19 +183,24 @@ void Gallocr::compute_refcounts(
                 sni->is_output = true;
             }
             if (src->view_src) {
-                // src 是 view：消费者依赖 view 及 view 的底层数据
+                // src 是 view：消费者依赖 **整条 view 链**（view → view → ... → 根），不只是上一层。
+                // 2026-09-14 修复：原实现只向上传播一层（`under = src->src[0]`）⇒ 链深 ≥2 时，
+                //   根存储的活跃期被算短了：根在"孙代 view"被消费前就被回收/复用 ⇒ 孙代 view 读到
+                //   被覆盖的值（B 侧 chi 链实测：root op=30@26936 产出 aea2a231…，地址随即被 26941+
+                //   的 op=20 等复用，而 view@27124 才执行 ⇒ 读到 dd39f619…）。
+                //   证据与时间线见 experiments/dist/REMOTE_BACKEND_SCOPE.md §7.4。
                 sni->n_children++;  // view 本身（非 managed，仅跟踪释放时序）
-                TensorF32* under = src->src[0];
-                if (under) {
-                    auto uit = node_map_.find(under);
-                    if (uit != node_map_.end() && uit->second->managed) {
-                        uit->second->n_children++;  // 底层在 view 的消费者间存活
-                        // 跨后端消费底层同样保护（同 node 循环条件）
-                        if (uit->second->backend_id >= 0 && node_bk >= 0 &&
-                            uit->second->backend_id != node_bk) {
-                            uit->second->is_output = true;
-                        }
+                TensorF32* lay = src->src[0];
+                for (int g = 0; lay && g < 64; ++g) {
+                    auto uit = node_map_.find(lay);
+                    if (uit == node_map_.end()) break;
+                    uit->second->n_children++;  // 每一层都在本消费者的生命周期内存活
+                    // 跨后端消费底层同样保护（同 node 循环条件）
+                    if (kGuard && uit->second->managed && uit->second->backend_id >= 0 &&
+                        node_bk >= 0 && uit->second->backend_id != node_bk) {
+                        uit->second->is_output = true;
                     }
+                    lay = lay->src[0];
                 }
             } else if (sni->managed) {
                 sni->n_children++;
@@ -237,17 +242,18 @@ void Gallocr::compute_refcounts(
                     sni->is_output = true;
                 }
                 if (src->view_src) {
+                    // 与 node 循环一致：整条 view 链逐层计数（2026-09-14 修复，见上方注释）
                     sni->n_children++;
-                    TensorF32* under = src->src[0];
-                    if (under) {
-                        auto uit = node_map_.find(under);
-                        if (uit != node_map_.end() && uit->second->managed) {
-                            uit->second->n_children++;
-                            if (kGuard && uit->second->backend_id >= 0 && gnode_bk >= 0 &&
-                                uit->second->backend_id != gnode_bk) {
-                                uit->second->is_output = true;
-                            }
+                    TensorF32* lay = src->src[0];
+                    for (int g = 0; lay && g < 64; ++g) {
+                        auto uit = node_map_.find(lay);
+                        if (uit == node_map_.end()) break;
+                        uit->second->n_children++;
+                        if (kGuard && uit->second->managed && uit->second->backend_id >= 0 &&
+                            gnode_bk >= 0 && uit->second->backend_id != gnode_bk) {
+                            uit->second->is_output = true;
                         }
+                        lay = lay->src[0];
                     }
                 } else if (sni->managed) {
                     sni->n_children++;
@@ -412,17 +418,16 @@ bool Gallocr::reserve(
             if (it == node_map_.end()) continue;
             NodeInfo* sni = it->second;
             if (src->view_src) {
-                // src 是 view：view 被消费，view 引用减一；到底层也减一（底层随 view 消费者释放）
+                // src 是 view：与上面的计数**对称**——整条链逐层减一（2026-09-14 修复，见计数处注释）
                 if (--sni->n_children <= 0) {
                     free_node(sni);  // view 非 managed，free_node 应跳过实际释放
-                    TensorF32* under = src->src[0];
-                    if (under) {
-                        auto uit = node_map_.find(under);
-                        if (uit != node_map_.end() && uit->second->managed &&
-                            --uit->second->n_children <= 0) {
-                            free_node(uit->second);
-                        }
-                    }
+                }
+                TensorF32* lay = src->src[0];
+                for (int g = 0; lay && g < 64; ++g) {
+                    auto uit = node_map_.find(lay);
+                    if (uit == node_map_.end()) break;
+                    if (--uit->second->n_children <= 0) free_node(uit->second);  // 非 managed 层为 no-op
+                    lay = lay->src[0];
                 }
             } else if (sni->managed && --sni->n_children <= 0) {
                 free_node(sni);

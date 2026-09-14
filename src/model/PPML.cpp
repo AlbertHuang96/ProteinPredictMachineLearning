@@ -4290,9 +4290,66 @@ void PPMLModel::transfer_params_to_backend() {
 }
 
 void PPMLModel::save_weights(const std::string& path) const {
-    std::cout << "Saving weights to: " << path << std::endl;
-    // 实现权重保存...
-    // 如果有 backend buffer，需要通过 buffer->get_tensor 读取
+    // ============================================================================
+    // 权重落盘（**保留为工具**，2026-09-15 实现）—— 供"权重逐字节对比"判据使用。
+    //   ⚠️ 但它产出的 `*.bin` 是**开发期临时产物**：判据完成后应删除，不要当长期权重格式 ✗
+    //     （正式检查点：分片 manifest + 优化器状态 + 断点续训，见 PLAN_SHARDING §2.2 S6）。
+    //   目的：让"权重逐字节对比"这条端到端判据可用（单机 vs 远端执行 vs 数据并行分片两端）。
+    //   背景：此前本函数是空壳 ⇒ `experiments/dist/probe_weight_diff.sh` 之类的判据无法执行。
+    //   格式（自描述、便于跨进程/机器比较，固定顺序来自 collect_params_with_names）：
+    //     magic "PPW1" | u32 n | [ u32 name_len | name | u64 numel | f32 data[numel] ] × n
+    //   * peer 模式（PPML_ROLE=peer）自动追加 `.rank<N>` 后缀 ⇒ 两端各存一份、互不覆盖 ✓
+    //   * 只存参数（不含优化器状态）；**分片下的合并**由"两端权重逐位一致"来判定 ⇒ 无需 manifest 合并器 ✓
+    //   ⚠️ 正式方案（分片 manifest + 优化器状态 + 断点续训）见 PLAN_SHARDING §2.2 S6；
+    //      **判据完成后请删除本实现与产出的 *.bin**（不要把它当长期权重格式 ✗）。
+    // ============================================================================
+    std::string out = path;
+    const char* role = std::getenv("PPML_ROLE");
+    if (role && std::strcmp(role, "peer") == 0) {
+        const int rk = std::getenv("PPML_REMOTE_RANK") ? std::atoi(std::getenv("PPML_REMOTE_RANK")) : 0;
+        out += ".rank" + std::to_string(rk);
+    }
+    std::cout << "Saving weights to: " << out << " (DEV-ONLY 判据设施)" << std::endl;
+
+    std::vector<TensorF32*> ps;
+    std::vector<std::string> ns;
+    const_cast<PPMLModel*>(this)->collect_params_with_names(ps, ns);   // dev 设施：只读收集
+    std::FILE* f = std::fopen(out.c_str(), "wb");
+    if (!f) {
+        std::cerr << "  [save_weights] 打开失败: " << out << std::endl;
+        return;
+    }
+    auto wr = [&](const void* p, size_t n) { if (n) std::fwrite(p, 1, n, f); };
+    wr("PPW1", 4);
+    const uint32_t n_t = (uint32_t)ps.size();
+    wr(&n_t, sizeof(n_t));
+    size_t total_bytes = 0;
+    for (size_t i = 0; i < ps.size(); ++i) {
+        TensorF32* t = ps[i];
+        const std::string& nm = (i < ns.size()) ? ns[i] : std::string("<unnamed>");
+        const uint32_t nl = (uint32_t)nm.size();
+        wr(&nl, sizeof(nl));
+        wr(nm.data(), nl);
+        const uint64_t n_el = (uint64_t)(t ? t->numel() : 0);
+        wr(&n_el, sizeof(n_el));
+        if (!t || n_el == 0) continue;
+        std::vector<float> buf((size_t)n_el);
+        const size_t bytes = (size_t)n_el * sizeof(float);
+        if (t->buffer_) {
+            t->buffer_->get_tensor(t, buf.data(), t->buffer_offs_, bytes);
+        } else if (t->data()) {
+            std::memcpy(buf.data(), t->data(), bytes);
+        } else {
+            std::cerr << "  [save_weights] 参数无数据: " << nm << " ⇒ 写 0" << std::endl;
+            std::fill(buf.begin(), buf.end(), 0.0f);
+        }
+        wr(buf.data(), bytes);
+        total_bytes += bytes;
+    }
+    std::fflush(f);
+    std::fclose(f);
+    std::cout << "  [save_weights] tensors=" << ps.size() << " payload=" << (total_bytes / (1024 * 1024))
+              << " MB" << std::endl;
 }
 
 } // namespace ppml

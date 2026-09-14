@@ -154,6 +154,7 @@ private:
     std::unordered_map<const TensorF32*, uint64_t> remote_ids_;  // "数据在对端"的张量
     std::unordered_set<uint64_t> persistent_ids_;   // 参数/常量 id（跨迭代保留）
     std::vector<uint64_t>        persistent_list_;  // 同上，稳定顺序（发 keep 列表用）
+    bool     dp_broken_ = false;   // 阶段 A：allreduce 流已错位 ⇒ 后续 DP 同步一律快速失败（不静默错值）
     uint64_t bytes_sent_ = 0, bytes_recv_ = 0;
     size_t n_uploads_ = 0, n_graphs_ = 0;
 };
@@ -208,6 +209,17 @@ public:
     bool   use_cuda() const { return use_cuda_; }
     void   set_use_cuda(bool v) { use_cuda_ = v; }
 
+    // ---- 阶段 A（peer 双端训练）：按调用次序登记的"本端贡献" + 求和结果回放 ----
+    //   pair（左右两栏都跑训练）时，本端也有真实梯度/权重 ⇒ 必须与对端**同一参数各调用一次**、
+    //   顺序一致（handle_allreduce 按第 k 次调用配对）。启用后 handle_allreduce 走队列；
+    //   未启用 ⇒ 退回旧 dp_local_ 平铺语义（独立张量服务路径不受影响）。
+    void enable_dp_queue();
+    bool dp_queue_enabled() const;
+    void push_dp_contribution(const float* p, size_t n);
+    bool pop_dp_contribution(std::vector<float>& out);          // 阻塞（有界），服务线程用
+    void publish_dp_result(const std::vector<float>& r);        // 服务线程回放给训练线程
+    bool wait_dp_result(float* out, size_t n, int timeout_sec = 60);  // 训练线程取回第 k 次结果
+
     // 数据并行：本端作为 rank0 时"自己那份"待求和缓冲（star allreduce 的 root 贡献）
     void set_dp_buffer(const float* p, size_t n) {
         dp_local_.assign(p, p ? p + n : p);
@@ -234,7 +246,10 @@ private:
     size_t keep_splits_ = 4096;                      // K，可用 PPML_REMOTE_KEEP_SPLITS 覆盖
     size_t keep_bytes_  = 2ull * 1024 * 1024 * 1024; // 结果内存上限，PPML_REMOTE_KEEP_MB 覆盖
     size_t results_bytes_ = 0;
-    std::vector<float> dp_local_;          // rank0 自己那份（数据并行 star allreduce）
+    std::vector<float> dp_local_;          // rank0 自己那份（数据并行 star allreduce，旧路径）
+    // 阶段 A：贡献/结果队列（定义在 .cpp，避免头文件引入 <mutex>/<condition_variable>）
+    struct DpQueue;
+    std::shared_ptr<DpQueue> dpq_;
     size_t arena_bytes_ = 0;
     bool use_cuda_ = false;
 };
@@ -254,6 +269,22 @@ RemoteClient* remote_dp_client_if_enabled();
 // 数据并行辅助：对图里所有 PARAM 的梯度做 Allreduce 平均（在 optimizer.step() 之前调用）
 //   返回处理过的参数个数（0 = 未启用/无梯度）。
 int remote_dp_allreduce_grads(ComputeGraph* cgraph, RemoteClient* cli);
+
+// 数据并行（阶段 A：参数分片 / ZeRO-1 式）：optimizer.step() **之后**调用。
+//   每个 rank 只更新 owner 的参数；本函数把"owner 的新值"广播给对端：
+//   非 owner 侧该参数置 0 后 allreduce ⇒ sum 恒等于唯一 owner 的新值 ⇒ 两端逐位一致（无需 /world）。
+//   owner 规则与 AdamW 分片一致：参数全局序号 idx % world（world/rank 取自 cli，未连接返回 0）。
+int remote_dp_broadcast_owned_params(ComputeGraph* cgraph, RemoteClient* cli);
+
+// ---- 阶段 A：rank0（acceptor / star root）侧的 DP 同步（见 PLAN_SHARDING.md §5.5）----
+//   rank0 是被连的一方，不走客户端 UP；它 push 本端贡献 → 服务线程收到对端 UP 后求和回放
+//   → 训练线程 wait_dp_result 取回结果。两函数与 worker 侧的同名动作**位置/顺序一一对应**：
+//     remote_dp_grads_root  ←→ remote_dp_allreduce_grads（clip 之前）
+//     remote_dp_params_root ←→ remote_dp_broadcast_owned_params（step 之后）
+void remote_dp_register_root_server(RemoteServer* srv);
+bool remote_dp_root_mode();
+int  remote_dp_grads_root(ComputeGraph* cgraph, int world, int my_rank);   // clip 之前
+int  remote_dp_params_root(ComputeGraph* cgraph, int world, int my_rank);  // optimizer.step() 之后
 
 // ---- 迭代边界 hook（train.cpp 调用；未启用远端时零开销）----
 // 每个样本 forward **之前**调用一次：

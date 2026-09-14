@@ -21,12 +21,158 @@
 #include <sstream>
 #include <iomanip>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <thread>          // 阶段 A：peer 模式后台服务线程（rank0 既训练又服务对端）
 #include <unistd.h>        // sysconf 用于页大小/物理页数 (内存)
 #include <sys/sysinfo.h>   // sysinfo 用于总/可用内存
 #include <sys/resource.h>  // getrusage 用于 RSS 峰值
 #include <cuda_runtime.h>  // cudaGetDeviceProperties 用于 GPU 信息
 
+// 远端后端是否**真的**可用：必须同时有 `PPML_REMOTE_HOST` 且 `PPML_REMOTE_OPS` 非空。
+//   与 `PPML.cpp` 里"注册远端后端"的条件**严格一致**（R3 只改了注册、漏改了 train.cpp 的 sched 开关 ✗）。
+//   不一致的后果（2026-09-15 实测）：只设 `PPML_REMOTE_HOST`（ops 空）时远端后端**不注册**，
+//   但训练仍被切进 **BackendScheduler 路径** ⇒ **2 个 epoch 必崩** ✗（单 epoch 看不出来）。
+static bool remote_backend_enabled() {
+    const char* h = std::getenv("PPML_REMOTE_HOST");
+    const char* o = std::getenv("PPML_REMOTE_OPS");
+    return h && *h && o && *o;
+}
+
+// ============================================================================
+// 按 rank 分片数据（PLAN_SHARDING §3）
+//   DP 与 PP 对数据切分的要求**相反**：DP 要各 rank 样本**不同**（否则等价重复计算 ✗），PP 要**相同**（边界激活对齐）。
+//   ⇒ 用互斥开关 `PPML_RANK_SAMPLE_SHARD=1` 显式开启；`PPML_REMOTE_OPS` 非空（切图/PP）时**强制关闭** ✗。
+//   rank/world 解析：① DP 连接（remote_dp_client_if_enabled）② env PPML_REMOTE_RANK/WORLD
+//     —— ② 让**没有真实远端环境**时也能在本地起一个进程模拟某 rank 的数据切分 ✓（便于验证 ✓）。
+//   返回 true 时写出 rank/world。**注意**：两端必须配套开启，否则单边分片 = 只训了一半数据 ✗。
+// ============================================================================
+static bool rank_sample_shard_params(int* out_rank, int* out_world) {
+    const char* en = std::getenv("PPML_RANK_SAMPLE_SHARD");
+    if (!en || std::atoi(en) == 0) return false;
+    if (const char* ops = std::getenv("PPML_REMOTE_OPS")) {
+        if (*ops) {
+            std::cerr << "[shard] PPML_REMOTE_OPS 非空（切图/PP 模式）⇒ PP 要求各 rank 样本相同，"
+                         "**强制关闭**按 rank 分片数据 ✗" << std::endl;
+            return false;
+        }
+    }
+    int rk = 0, wd = 2;
+    if (ppml::RemoteClient* dp = ppml::remote_dp_client_if_enabled()) {
+        rk = dp->rank();
+        wd = dp->world_size();
+    } else {
+        if (const char* r = std::getenv("PPML_REMOTE_RANK"))  rk = std::atoi(r);
+        if (const char* w = std::getenv("PPML_REMOTE_WORLD")) wd = std::atoi(w);
+        std::cout << "[shard] 未检测到 DP 连接 ⇒ 按 env 解析 rank/world=" << rk << "/" << wd
+                  << "（本地模拟模式；两端务必配套开启 ✗）" << std::endl;
+    }
+    if (wd <= 1) {
+        std::cout << "[shard] PPML_RANK_SAMPLE_SHARD=1 但 world<=1 ⇒ 不分片" << std::endl;
+        return false;
+    }
+    *out_rank = rk;
+    *out_world = wd;
+    std::cout << "[shard] 按 rank 分片数据已启用：rank=" << rk << "/" << wd
+              << "（每 epoch 只跑本 rank 子集；需与对端配套 ✗）" << std::endl;
+    return true;
+}
+
 using namespace ppml;
+
+#include <cstdio>
+
+// 诊断基础设置：**让 stdout 行缓冲**。
+//   本项目日志混用 std::cout(stdout) 与 fprintf(stderr)：重定向到文件时 stdout 被块缓冲 ⇒
+//   两路日志的交错顺序是**伪造的** ⇒ 不能用行序推断因果 ✗（2026-09-14 深夜据此误判过一次，已撤回结论）。
+namespace {
+struct StdoutLineBuffered {
+    StdoutLineBuffered() { std::setvbuf(stdout, nullptr, _IOLBF, 0); }
+} g_stdout_line_buffered;
+}   // namespace
+
+// ============================================================================
+// 阶段 A（数据并行参数分片）门闩：本 rank 只更新 owner 的参数，AdamW 只建 1/world 的 m/v。
+//   只在 PPML_ROLE=peer **且确实连上对端（world>1）**时启用 —— 否则绝不分片：连不上还分片会
+//   漏更新一半参数（静默错值）。owner 规则两端一致：参数全局序号 idx % world（见 AdamW::init_from_graph）。
+// ============================================================================
+// 阶段 A：peer 引导（rank0 建服务端 + 注册 root + 后台服务线程）。**幂等**，可多处调用。
+//   ★必须在**首轮梯度同步之前**完成：否则首轮 root 模式为假 ⇒ 首轮缺一次梯度同步 ⇒ 与对端相位差一轮 ✗
+//   （2026-09-14 深夜实测：rank0 首轮只有参数同步、梯度同步直到 epoch2 才出现，就是这个原因）。
+static void bootstrap_dp_peer(int rank, int world, int port) {
+    if (rank != 0) return;                      // rank>0 走 client 路径，无需服务端
+    static RemoteServer* srv = nullptr;
+    if (srv) return;                            // 幂等
+    RemoteServer* s = new RemoteServer();
+    s->enable_dp_queue();
+    if (!s->listen(port)) {
+        std::cout << "  [DP-SHARD] peer(rank0) listen(" << port << ") 失败 ⇒ **不分片/不同步**" << std::endl;
+        delete s;
+        return;
+    }
+    remote_dp_register_root_server(s);
+    std::thread([world, s] { s->serve_forever(world, 100000000); }).detach();
+    srv = s;
+    std::cout << "  [DP-SHARD] peer(rank0) 已启动后台服务线程 port=" << port
+              << " world=" << world << std::endl;
+}
+
+static void setup_dp_param_shard(AdamW& opt) {
+    const char* role = std::getenv("PPML_ROLE");
+    if (!role || std::strcmp(role, "peer") != 0) return;
+    const int rank  = std::getenv("PPML_REMOTE_RANK")  ? std::atoi(std::getenv("PPML_REMOTE_RANK"))  : 0;
+    const int world = std::getenv("PPML_REMOTE_WORLD") ? std::atoi(std::getenv("PPML_REMOTE_WORLD")) : 2;
+    const int port  = std::getenv("PPML_REMOTE_PORT")  ? std::atoi(std::getenv("PPML_REMOTE_PORT"))  : 2244;
+
+    if (rank == 0) {
+        // acceptor / star root：本进程既训练又服务对端（后台线程收 ALLREDUCE_UP 并回 DOWN）。
+        //   本端贡献走 push_dp_contribution（与对端调用次序一一对应，见 PLAN_SHARDING.md §5.5）。
+        bootstrap_dp_peer(rank, world, port);
+        if (remote_dp_root_mode() && world > 1) {
+            opt.set_shard(rank, world);
+            std::cout << "  [DP-SHARD] 启用参数分片（root）：rank=0/" << world
+                      << "（owner = 参数全局序号 % world）" << std::endl;
+        }
+        return;
+    }
+
+    RemoteClient* dp = remote_dp_client_if_enabled();
+    if (!dp || !dp->connected() || dp->world_size() <= 1) {
+        std::cout << "  [DP-SHARD] PPML_ROLE=peer 但未连上对端(world>1) ⇒ **不分片**，全参数更新" << std::endl;
+        return;
+    }
+    opt.set_shard(dp->rank(), dp->world_size());
+    std::cout << "  [DP-SHARD] 启用参数分片：rank=" << dp->rank() << "/" << dp->world_size()
+              << "（owner = 参数全局序号 % world）" << std::endl;
+}
+
+// 阶段 A：梯度同步调度 —— worker(rank>0) 走 client 的 UP/DOWN；rank0/acceptor 走 root 贡献队列。
+//   两者位置一致（都在 clip 之前），两端配对关系见 PLAN_SHARDING.md §5.5。
+static int dp_allreduce_grads_dispatch(ComputeGraph* g) {
+    // ★首轮保护：`setup_dp_param_shard` 只在 optimizer 首次 init 时调用（在首轮 grads 站点**之后** ✗）
+    //   ⇒ 这里补一次 peer 引导，保证首轮就有 root 模式（否则首轮缺一次梯度同步 ⇒ 相位差一轮 ✗）。
+    if (const char* role = std::getenv("PPML_ROLE")) {
+        if (std::strcmp(role, "peer") == 0) {
+            const int brank  = std::getenv("PPML_REMOTE_RANK")  ? std::atoi(std::getenv("PPML_REMOTE_RANK"))  : 0;
+            const int bworld = std::getenv("PPML_REMOTE_WORLD") ? std::atoi(std::getenv("PPML_REMOTE_WORLD")) : 2;
+            const int bport  = std::getenv("PPML_REMOTE_PORT")  ? std::atoi(std::getenv("PPML_REMOTE_PORT"))  : 2244;
+            bootstrap_dp_peer(brank, bworld, bport);
+        }
+    }
+    if (RemoteClient* dp = remote_dp_client_if_enabled()) {
+        const int n = remote_dp_allreduce_grads(g, dp);
+        if (n > 0) {
+            std::cout << "  [DP] allreduce 完成: tensors=" << n << " world=" << dp->world_size() << std::endl;
+        }
+        return n;
+    }
+    if (remote_dp_root_mode()) {
+        const int world = std::getenv("PPML_REMOTE_WORLD") ? std::atoi(std::getenv("PPML_REMOTE_WORLD")) : 2;
+        const int rank  = std::getenv("PPML_REMOTE_RANK")  ? std::atoi(std::getenv("PPML_REMOTE_RANK"))  : 0;
+        return remote_dp_grads_root(g, world, rank);
+    }
+    return 0;
+}
 
 // ============================================================================
 // 打印 CPU / 内存 / GPU 信息（训练开始前的环境概览）
@@ -580,8 +726,35 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
             std::cout << "  [resume] 跳过前 " << si_start << " 个样本" << std::endl;
         }
 
-        for (size_t si_idx = si_start; si_idx < order.size(); ++si_idx) {
+        // ---- 按 rank 分片数据（PLAN_SHARDING §3）：交错切片 + **step 对齐** ----
+        //   step 对齐是最硬约束 ✗：两端每 epoch 的样本数必须**严格相同**，否则 allreduce 按"第 k 次调用"
+        //   配对会被破坏 ⇒ 全线错位（此前踩过同类坑）。做法：跳过尾部余数样本（两端一致 ✓）。
+        int shard_rank = 0, shard_world = 1;
+        bool shard_on = rank_sample_shard_params(&shard_rank, &shard_world);
+        if (shard_on && si_start != 0) {
+            std::cerr << "[shard] 与断点续训（si_start=" << si_start
+                      << "）同时使用会导致两端 step 数可能不一致 ⇒ 本次**不做分片** ✗" << std::endl;
+            shard_on = false;
+        }
+        size_t si_limit = order.size();
+        if (shard_on) {
+            const size_t rem = order.size() % (size_t)shard_world;
+            if (rem != 0) {
+                si_limit = order.size() - rem;
+                std::cerr << "[shard] 样本数 " << order.size() << " 不能被 world=" << shard_world
+                          << " 整除 ⇒ 跳过尾部 " << rem << " 个样本以保证两端 step 数一致 ✗" << std::endl;
+            }
+        }
+
+        for (size_t si_idx = si_start + (shard_on ? (size_t)shard_rank : 0);
+             si_idx < si_limit;
+             si_idx += (shard_on ? (size_t)shard_world : (size_t)1)) {
             auto& s = order[si_idx];
+            if (shard_on) {
+                std::cout << "  [shard] rank=" << shard_rank << "/" << shard_world
+                          << " 本 rank 第 " << ((si_idx - si_start) / (size_t)shard_world)
+                          << " 个样本: " << s.uniprot << std::endl;
+            }
             std::string sequence;
             try { sequence = read_a3m_query_sequence(s.a3m); }
             catch (const std::exception& e) {
@@ -748,10 +921,10 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
             static const bool sched_flag =
                 ((std::getenv("PPML_CUDA_SCHED") != nullptr) &&
                  (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0)) ||
-                (std::getenv("PPML_REMOTE_HOST") != nullptr);
-            // 注：PPML_REMOTE_HOST 时也走 scheduler —— 否则纯 CPU 运行下"远端后端"永远轮不到分配节点
+                remote_backend_enabled();          // 对齐注册条件（见该函数注释）
+            // 注：远端后端就绪时也走 scheduler —— 否则纯 CPU 运行下"远端后端"永远轮不到分配节点
             //     （scheduler 是唯一会调用各后端 supports_op 做分配的地方）。
-            const bool use_sched = ((model.device() == Device::CUDA || getenv("PPML_REMOTE_HOST")) &&
+            const bool use_sched = ((model.device() == Device::CUDA || remote_backend_enabled()) &&
                                     scheduler && sched_flag);
             if (use_sched) {
                 scheduler->split_graph(cgraph);
@@ -810,6 +983,7 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
 
             // 首个样本图建好后初始化 optimizer (AdamW 需遍历图节点找参数)
             if (optimizer.param_count() == 0) {
+                setup_dp_param_shard(optimizer);          // 阶段 A：分片门闩（必须在 init 之前）
                 optimizer.init_from_graph(cgraph);
                 // 断点续训: 恢复 AdamW m/v 动量 + 偏差校正 step 计数
                 // (须在 init_from_graph 之后；缺失/尺寸不符 → 保持 0 初始化)
@@ -849,10 +1023,17 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                         std::cout << "  [DP] allreduce 完成: tensors=" << n_dp
                                   << " world=" << dp->world_size() << std::endl;
                     }
+                } else {
+                    dp_allreduce_grads_dispatch(last_cgraph);   // 阶段 A：rank0/acceptor 走 root 队列
                 }
                 // 3) 全局梯度裁剪 + 参数更新
                 float gnorm = clip_grad_norm(last_cgraph, clip_norm);
                 optimizer.step(last_cgraph);
+                // 阶段 A：把本 rank owner 的新权重同步给对端（未分片/未连接时零开销）
+                if (optimizer.shard_enabled()) {
+                    const int n_psync = remote_dp_broadcast_owned_params(last_cgraph, remote_dp_client_if_enabled());
+                    std::cout << "  [DP-SHARD] 参数同步: tensors=" << n_psync << std::endl;
+                }
                 // 权重已更新：作废远端副本 ⇒ 下一轮 compute 自动重传（未启用时零开销）
                 remote_after_optimizer_step(last_cgraph);
                 // 4) 清零累加器
@@ -1610,11 +1791,69 @@ int main(int argc, char* argv[]) {
                 }
             }
         }
+        // ===== 开发诊断（PPML_DEBUG_BWDORDER=1）=====
+        // 动机：带 backward 时 chi 链的前向取值与非 backward 不同，而两配置的前向图**本应相同**
+        //   （PPML_NO_BACKWARD 只跳过 build_backward_expand）⇒ 怀疑反向构建改写了 cgraph->nodes。
+        // 判据：① 前 n0 个节点指针前缀是否原样保留；② 旧节点是否仍在 / 是否被丢弃 / 是否重复；
+        //       ③ **拓扑合法性**：每个节点的 src 必须出现在它**之前**（违反 ⇒ 消费者跑在未写缓冲上 ⇒ 读到垃圾）。
+        const bool dbg_bwdorder = (std::getenv("PPML_DEBUG_BWDORDER") != nullptr);
+        auto bwd_snapshot = [&]() {
+            std::vector<TensorF32*> v;
+            v.reserve((size_t)cgraph->n_nodes());
+            for (int i = 0; i < cgraph->n_nodes(); ++i) v.push_back(cgraph->graph_node(i));
+            return v;
+        };
+        auto bwd_topo_check = [&](const char* tag) {
+            std::unordered_map<const TensorF32*, int> idx;
+            int dup = 0;
+            for (int i = 0; i < cgraph->n_nodes(); ++i) {
+                TensorF32* nd = cgraph->graph_node(i);
+                if (idx.count(nd)) ++dup; else idx[nd] = i;
+            }
+            int viol = 0, shown = 0;
+            for (int i = 0; i < cgraph->n_nodes(); ++i) {
+                TensorF32* nd = cgraph->graph_node(i);
+                for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                    TensorF32* sc = nd->src[s];
+                    if (!sc) continue;
+                    auto it = idx.find(sc);
+                    if (it == idx.end() || it->second < i) continue;
+                    ++viol;
+                    if (shown++ < 6) {
+                        std::cout << "  [bwdorder] " << tag << " 拓扑违反: node[" << i << "] op=" << nd->op
+                                  << " src[" << s << "] op=" << sc->op
+                                  << " 位于 node[" << it->second << "]" << std::endl;
+                    }
+                }
+            }
+            std::cout << "  [bwdorder] " << tag << ": n_nodes=" << cgraph->n_nodes()
+                      << " 重复指针=" << dup << " 拓扑违反=" << viol << std::endl;
+        };
+        std::vector<TensorF32*> bwd_before;
+
         // 开发开关：PPML_NO_BACKWARD=1 跳过反向，仅看前向 loss（隔离 forward/backward nan 来源）
         static const bool no_backward =
             (std::getenv("PPML_NO_BACKWARD") != nullptr) && (std::atoi(std::getenv("PPML_NO_BACKWARD")) != 0);
         if (!no_backward) {
+            if (dbg_bwdorder) {
+                bwd_before = bwd_snapshot();
+                bwd_topo_check("before");
+            }
             cgraph->build_backward_expand(ctx, nullptr);
+            if (dbg_bwdorder) {
+                bwd_topo_check("after");
+                int first_diff = -1;
+                for (size_t i = 0; i < bwd_before.size() && i < (size_t)cgraph->n_nodes(); ++i) {
+                    if (cgraph->graph_node((int)i) != bwd_before[i]) { first_diff = (int)i; break; }
+                }
+                std::unordered_set<const TensorF32*> after_set;
+                for (int i = 0; i < cgraph->n_nodes(); ++i) after_set.insert(cgraph->graph_node(i));
+                size_t alive = 0;
+                for (TensorF32* p : bwd_before) if (after_set.count(p)) ++alive;
+                std::cout << "  [bwdorder] 前向节点 " << bwd_before.size() << " 个 / 反向之后仍在 "
+                          << alive << "（新增 " << (cgraph->n_nodes() - (int)alive) << "）"
+                          << "；前向前缀首个不同位置=" << first_diff << std::endl;
+            }
 
             // 关键：为 loss 节点梯度种子 = 1.0（dL/dL=1）。
             // build_backward_expand 只创建 loss 的梯度累加器（初值 0），不置 1；
@@ -1658,9 +1897,9 @@ int main(int argc, char* argv[]) {
         static const bool sched_flag =
             ((std::getenv("PPML_CUDA_SCHED") != nullptr) &&
              (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0)) ||
-            (std::getenv("PPML_REMOTE_HOST") != nullptr);
-        // 同多样本路径：PPML_REMOTE_HOST 时也启用 scheduler（让远端后端能分到节点）。
-        const bool use_sched = ((model.device() == Device::CUDA || getenv("PPML_REMOTE_HOST")) &&
+            remote_backend_enabled();      // 对齐注册条件（见该函数注释）
+        // 同多样本路径：远端后端就绪时也启用 scheduler（让远端后端能分到节点）。
+        const bool use_sched = ((model.device() == Device::CUDA || remote_backend_enabled()) &&
                                 sched && sched_flag);
         if (use_sched) {
             sched->split_graph(cgraph);
@@ -2012,6 +2251,8 @@ int main(int argc, char* argv[]) {
         // 数据并行（可选，PPML_DP=1）：梯度 Allreduce 平均；必须在 clip **之前**。
         if (RemoteClient* dp = remote_dp_client_if_enabled()) {
             remote_dp_allreduce_grads(cgraph, dp);
+        } else {
+            dp_allreduce_grads_dispatch(cgraph);   // 阶段 A：rank0/acceptor 走 root 队列
         }
 
         // 全局梯度裁剪阈值：默认 0.1（AF2 惯例），可用环境变量 PPML_CLIP_NORM 覆盖。
@@ -2034,6 +2275,7 @@ int main(int argc, char* argv[]) {
         }
 
         if (!optimizer_inited) {
+            setup_dp_param_shard(optimizer);               // 阶段 A：分片门闩（必须在 init 之前）
             optimizer.init_from_graph(cgraph);             // 首次收集参数并分配 m/v
             // 断点续训: 恢复 AdamW m/v 动量 + 偏差校正 step 计数
             // (须在 init_from_graph 之后；缺失/尺寸不符 → 保持 0 初始化)
@@ -2052,6 +2294,11 @@ int main(int argc, char* argv[]) {
                       << std::endl;
         }
         optimizer.step(cgraph);                            // 更新权重 (decoupled weight decay)
+        // 阶段 A：把本 rank owner 的新权重同步给对端（未分片/未连接时零开销）
+        if (optimizer.shard_enabled()) {
+            const int n_psync = remote_dp_broadcast_owned_params(cgraph, remote_dp_client_if_enabled());
+            std::cout << "  [DP-SHARD] 参数同步: tensors=" << n_psync << std::endl;
+        }
         remote_after_optimizer_step(cgraph);               // 远端副本作废（下轮 compute 重传新权重）
 
         // [2026-09-07 Epoch2 NaN 定位] step 后扫描参数 NaN（区分"参数被污染"vs"Epoch2 forward 输入/buffer 问题"）

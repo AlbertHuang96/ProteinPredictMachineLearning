@@ -981,7 +981,12 @@ void CPUBackend::kernel_outer_prod_mean(TensorF32 * node, ComputeParams * p) {
         int64_t tmp = idx;
         int64_t b   = tmp % B; tmp /= B;
         int64_t j   = tmp % L; tmp /= L;
-        int64_t i   = tmp % L;
+        // 【2026-09-14 修复】原实现少了这一行 `tmp /= L`：导致 d2/d1 用"仍含 i 项"的 tmp 解码
+        //   ⇒ (d1,d2) 全错，且 d1 最大可到 ~815（D=16）⇒ 越界读到 src 之外 ~41k 元素处，
+        //   读到的是**邻居张量的内存** ⇒ 结果随内存布局变化（同输入不同输出）。
+        //   实测：msa2pair 输出表头正确、表尾错（A:-1.89 / B:98.47，理论 4.39），
+        //   并造成 OPS=47 远端 vs 单机 loss 差 0.08（chi 分量 11.01 vs 11.19）。
+        int64_t i   = tmp % L; tmp /= L;
         int64_t d2  = tmp % D; tmp /= D;
         int64_t d1  = tmp / D;
 
@@ -1109,7 +1114,8 @@ void CPUBackend::kernel_outer_prod(TensorF32 * node, ComputeParams * p) {
         int64_t tmp = idx;
         int64_t b   = tmp % B; tmp /= B;
         int64_t j   = tmp % L; tmp /= L;
-        int64_t i   = tmp % L;
+        // 【2026-09-14 修复】同 kernel_outer_prod_mean：原实现漏 `tmp /= L` ⇒ d1 越界（读 src 之外的内存）。
+        int64_t i   = tmp % L; tmp /= L;
         int64_t d2  = tmp % D; tmp /= D;
         int64_t d1  = tmp / D;
 
@@ -1988,7 +1994,13 @@ void CPUBackend::kernel_concat(TensorF32 * node, ComputeParams * p) {
         const int64_t a2 = (dim == 2) ? local : i2;
         const int64_t a3 = (dim == 3) ? local : i3;
 
-        if (a0 >= s0 || a1 >= s1 || a2 >= s2 || a3 >= s3) continue;
+        // 【2026-09-14 修复】越界元素必须**显式写 0**：原先 `continue` 跳过写 ⇒ 该输出元素保留
+        //   buffer 里上一个占有者的旧内容（且随内存布局变化）⇒ 同输入不同输出（实测：远端 vs 单机
+        //   / 有无 backward 两种布局在该节点开始分歧）。零填充与本项目其它"缺项补零"约定一致。
+        if (a0 >= s0 || a1 >= s1 || a2 >= s2 || a3 >= s3) {
+            d[idx] = 0.0f;
+            continue;
+        }
 
         d[idx] = src->data()[((a3 * s2 + a2) * s1 + a1) * s0 + a0];
     }
