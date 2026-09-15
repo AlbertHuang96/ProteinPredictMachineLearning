@@ -3,6 +3,38 @@
 PPML project  
 Inspired by RosettaFoldAllAtom(RFAA) and GGML  
 
+## Quick Start (command line)
+
+Run a small-sample training job using the bundled tiny sample (P62891, L=51). This uses the
+dev/small config so it fits in a few GB of CPU RAM:
+
+```bash
+# 1) Build (either your local build tree, or the remote-server build script)
+bash build_remote.sh ppml_train        # see also: build_remote.sh (server build, auto-detects python/CUDA)
+
+# 2) Run the small-sample training (pure CPU, dev config)
+LD_PRELOAD=$(gcc -print-file-name=libstdc++.so.6) \
+  build/remote/examples/ppml_train \
+  data/training_batch_data/P62891_alignment.a3m \
+  data/P62891.fasta \
+  data/training_batch_data/4ug0_P62891_mapping.csv \
+  ""
+```
+
+Optional dev env (small/fast: L=51, MSA depth 8, few blocks):
+
+```bash
+PPML_SEED=1 PPML_USE_CUDA=0 PPML_DEV_SE3=1 PPML_MSA_DEPTH=8 \
+PPML_NUM_EPOCHS=2 PPML_N_EXTRA=1 PPML_N_MAIN=2 PPML_N_REFINE=1 PPML_SE3_TOPO=per_block \
+LD_PRELOAD=$(gcc -print-file-name=libstdc++.so.6) \
+  build/remote/examples/ppml_train \
+  data/training_batch_data/P62891_alignment.a3m data/P62891.fasta \
+  data/training_batch_data/4ug0_P62891_mapping.csv ""
+```
+
+> For the full-size remote training (FULL_TRAIN, single sample P04637 + multi-sample L<=103),
+> see the scripts **`build_remote.sh`** (build) and **`remote_fulltrain.sh`** (two-stage training).
+
 ## 训练基准 (Training Benchmark)
 
 ### Small setting CPU training  
