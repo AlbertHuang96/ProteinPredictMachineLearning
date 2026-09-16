@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -143,9 +144,24 @@ bool RSocket::connect_to(const std::string& host, int port, int timeout_ms) {
         return false;
     }
     set_tcp_nodelay(fd_);
-    // 后续等待改为**耐心但有界**（10 分钟）：DP allreduce 要等对端算完一个 forward（数十秒），
+    // TCP keepalive（T1 2026-09-16）：让内核在链路静默死亡时能发现（默认 2h ✗ 太久 ⇒ 缩到 60s 探测）
+    {
+        int one = 1;
+        ::setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+        int idle = 60, intvl = 15, cnt = 4;
+        ::setsockopt(fd_, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+        ::setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        ::setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+    }
+    // 后续等待改为**耐心但有界**：DP allreduce 要等对端算完一个 forward（数十秒），
     // 原 `set_timeout_ms(0)` 既没生效（未清超时）又会让真正的死连接永久挂住。
-    set_timeout_ms(600000);
+    // T1：改成可配置（PPML_REMOTE_TIMEOUT_MS，默认 600000 = 10 分钟）
+    int to_ms = 600000;
+    if (const char* s = std::getenv("PPML_REMOTE_TIMEOUT_MS")) {
+        const int v = std::atoi(s);
+        if (v > 0) to_ms = v;
+    }
+    set_timeout_ms(to_ms);
     return true;
 }
 

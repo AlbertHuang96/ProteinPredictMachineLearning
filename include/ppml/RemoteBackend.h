@@ -104,6 +104,19 @@ public:
     int  rank() const { return rank_; }
     int  world_size() const { return world_size_; }
 
+    // ---- T1（2026-09-16）：端点记忆 / 断线重连 / 心跳 ----
+    //   语义（诚实版，别误解）：
+    //     * **迭代边界**（remote_iteration_begin）会先 ping、必要时重连 ⇒ 抖一次网络后**下一轮自动恢复** ✓
+    //       （旧行为：连接一断就**永久**失效 ✗，后面所有远端 split 全部失败/回落）
+    //     * **迭代中途**断线不做透明重试：那时已上传的输入无法重建（slim 模式下客户端不持有数据 ✗），
+    //       所以只标记 io_failed_ 并让本 split 失败（STRICT 时 abort）；连接会重建，下一轮可继续 ✓
+    bool ensure_connected();            // 不可用则重连（含退避重试），返回最终是否可用
+    bool reconnect();                   // 强制重建连接（内部用）
+    bool ping(int timeout_ms = 3000);   // 心跳：PING → PONG（失败即标记连接不可信）
+    void set_endpoint(const std::string& host, int port) { host_ = host; port_ = port; }
+    uint64_t n_reconnects() const { return n_reconnects_; }
+    bool io_failed() const { return io_failed_; }
+
     // tensor → 稳定 id（同一指针复用同一 id；重新分配后指针变化会得到新 id）
     uint64_t id_for(const TensorF32* t);
 
@@ -155,6 +168,11 @@ private:
     std::unordered_set<uint64_t> persistent_ids_;   // 参数/常量 id（跨迭代保留）
     std::vector<uint64_t>        persistent_list_;  // 同上，稳定顺序（发 keep 列表用）
     bool     dp_broken_ = false;   // 阶段 A：allreduce 流已错位 ⇒ 后续 DP 同步一律快速失败（不静默错值）
+    // T1（2026-09-16）：端点记忆 + 重连状态
+    std::string host_;             // 记住端点 ⇒ 断线可重连（accept_from 侧为空 ⇒ 不重连）
+    int      port_ = 0;
+    bool     io_failed_ = false;   // 最近一次 I/O 失败 ⇒ 连接不可信（ensure_connected 会重连）
+    uint64_t n_reconnects_ = 0;
     uint64_t bytes_sent_ = 0, bytes_recv_ = 0;
     size_t n_uploads_ = 0, n_graphs_ = 0;
 };

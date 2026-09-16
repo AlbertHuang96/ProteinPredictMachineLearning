@@ -24,6 +24,33 @@ static bool rtrace() {
     static const bool on = (std::getenv("PPML_REMOTE_TRACE") != nullptr);
     return on;
 }
+
+// 【加固 2026-09-16】RSS（/proc/self/statm 第 2 字段 = resident pages；x86_64 页 4KB）
+//   用途：服务端每条消息打一行，出问题时能直接看出"是内存爆了还是别的原因"。
+static double cur_rss_mb() {
+    FILE* f = std::fopen("/proc/self/statm", "r");
+    if (!f) return -1.0;
+    long total = 0, resident = -1;
+    if (std::fscanf(f, "%ld %ld", &total, &resident) != 2) resident = -1;
+    std::fclose(f);
+    if (resident < 0) return -1.0;
+    return (double)resident * 4096.0 / 1048576.0;
+}
+
+// 【加固 2026-09-16】严格模式（PPML_REMOTE_STRICT=1）：远端失败**立即终止**，不再静默回落本地。
+//   为什么需要：默认行为下"对端死了"仍会继续跑（调度器回落 CPU 单后端），跑完 loss 与单机一致 ⇒
+//   极易误判"远端等价已验证" ✗。验收远端时务必开它。
+static bool rstrict() {
+    static const bool on = (std::getenv("PPML_REMOTE_STRICT") != nullptr &&
+                            std::atoi(std::getenv("PPML_REMOTE_STRICT")) != 0);
+    return on;
+}
+
+static void rstrict_fail(const char* what) {
+    std::fprintf(stderr, "\n[REMOTE] FATAL: %s（PPML_REMOTE_STRICT=1 ⇒ 立即终止，避免误判为远端已生效）\n", what);
+    std::fflush(stderr);
+    std::abort();
+}
 static void rt_dims(const TensorF32* t, char* out, size_t n) {
     if (!t) { std::snprintf(out, n, "-"); return; }
     int w = 0;
@@ -186,9 +213,93 @@ void RemoteClient::close() {
     }
 }
 
+// ============================================================
+// T1（2026-09-16）：重连 / 心跳
+// ============================================================
+static bool rreconnect_enabled() {
+    static const bool on = [] {
+        const char* s = std::getenv("PPML_REMOTE_RECONNECT");
+        return !(s && std::atoi(s) == 0);            // 默认开
+    }();
+    return on;
+}
+static int rconnect_retry() {
+    static const int n = [] {
+        const char* s = std::getenv("PPML_REMOTE_CONNECT_RETRY");
+        int v = s ? std::atoi(s) : 5;
+        return v < 1 ? 1 : v;                        // 默认 5 次（0.5s→5s 退避）
+    }();
+    return n;
+}
+static int rtimeout_ms() {
+    static const int v = [] {
+        const char* s = std::getenv("PPML_REMOTE_TIMEOUT_MS");
+        const int t = s ? std::atoi(s) : 0;
+        return t > 0 ? t : 600000;
+    }();
+    return v;
+}
+
+bool RemoteClient::reconnect() {
+    if (host_.empty() || port_ <= 0) {
+        std::fprintf(stderr, "[REMOTE] 重连失败：本端没有记住端点（accept 侧不需要重连）\n");
+        return false;
+    }
+    const int retry = rconnect_retry();
+    for (int i = 1; i <= retry; ++i) {
+        std::fprintf(stderr, "[REMOTE] 重连尝试 %d/%d → %s:%d …\n", i, retry, host_.c_str(), port_);
+        sock_.close();
+        if (connect(host_, port_, world_size_, rank_)) {
+            ++n_reconnects_;
+            // 新连接 = 对端状态全新：清掉"数据在对端"记账 + 全部标脏（下次用到时重传）
+            remote_ids_.clear();
+            invalidate_all();
+            std::fprintf(stderr, "[REMOTE] 重连成功（第 %llu 次）：已清空远端记账并标记全部待重传 ✓\n",
+                         (unsigned long long)n_reconnects_);
+            return true;
+        }
+        int ms = 500 << (i - 1);                     // 0.5s, 1s, 2s, 4s … 上限 5s
+        if (ms > 5000) ms = 5000;
+        struct timespec ts{ms / 1000, (long)(ms % 1000) * 1000000L};
+        nanosleep(&ts, nullptr);
+    }
+    std::fprintf(stderr, "[REMOTE] 重连失败（%d 次）✗ ⇒ 本轮远端不可用\n", retry);
+    return false;
+}
+
+bool RemoteClient::ensure_connected() {
+    if (sock_.valid() && !io_failed_) return true;
+    if (!rreconnect_enabled()) return false;
+    if (std::getenv("GRAPH_DEBUG_REMOTE") || rtrace()) {
+        std::fprintf(stderr, "[REMOTE] ensure_connected: 连接不可用（valid=%d io_failed=%d）⇒ 重连\n",
+                     (int)sock_.valid(), (int)io_failed_);
+    }
+    return reconnect();
+}
+
+bool RemoteClient::ping(int timeout_ms) {
+    if (!ensure_connected()) return false;
+    sock_.set_timeout_ms(timeout_ms);                // 心跳只等一小会儿（别用 10 分钟的主超时）
+    rnet::RHeader h;
+    h.kind = (uint32_t)rnet::RKind::PING;
+    bool ok = sock_.send_header(h);
+    if (ok) {
+        rnet::RHeader rh;
+        ok = sock_.recv_header(rh) && rh.kind == (uint32_t)rnet::RKind::PONG;
+    }
+    sock_.set_timeout_ms(rtimeout_ms());             // 恢复主超时
+    if (!ok) {
+        io_failed_ = true;
+        std::fprintf(stderr, "[REMOTE] ping 失败 ⇒ 标记连接不可信（本轮结束会重连）\n");
+    }
+    return ok;
+}
+
 bool RemoteClient::connect(const std::string& host, int port, int world_size, int rank) {
     world_size_ = world_size;
     rank_ = rank;
+    host_ = host;                       // T1：记住端点 ⇒ 断线可重连
+    port_ = port;
     if (!sock_.connect_to(host, port)) return false;
     rnet::RHeader h;
     h.kind = (uint32_t)rnet::RKind::HELLO;
@@ -203,6 +314,7 @@ bool RemoteClient::connect(const std::string& host, int port, int world_size, in
     }
     std::fprintf(stderr, "[REMOTE] 已连接 %s:%d（world=%d rank=%d，对端 rank=%d）\n",
                  host.c_str(), port, world_size, rank, (int)ack.aux1);
+    io_failed_ = false;                 // T1：新连接视为健康
     return true;
 }
 
@@ -261,12 +373,24 @@ uint64_t RemoteClient::upload_tensor(const TensorF32* t, const void* data, size_
     if (t) {
         for (int i = 0; i < ndim && i < 4; ++i) dims[i] = t->shape().dim(i);
     }
+    if (rtrace()) {
+        // 【加固 2026-09-16】"发送前"先打一行：失败时最后一行的 nb/op 就是现场（原来只在成功后打）
+        std::fprintf(stderr, "[RT] SET id=%llu nb=%.2f MB op=%d ptr=%p\n",
+                     (unsigned long long)id, (double)nbytes / 1048576.0, t ? (int)t->op : -1, (const void*)t);
+    }
     if (!sock_.send_data((uint32_t)rnet::RKind::TENSOR_SET, id, dt, ndim, dims, data, nbytes)) {
+        io_failed_ = true;   // T1：连接不可信 ⇒ 迭代边界会重连
+        std::fprintf(stderr, "[REMOTE] TENSOR_SET 发送失败 (id=%llu, %.2f MB)\n",
+                     (unsigned long long)id, (double)nbytes / 1048576.0);
+        if (rstrict()) rstrict_fail("TENSOR_SET 发送失败（对端已断）");
         return 0;
     }
     rnet::RHeader ack;
     if (!sock_.recv_header(ack) || ack.kind != (uint32_t)rnet::RKind::TENSOR_SET_ACK) {
-        std::fprintf(stderr, "[REMOTE] TENSOR_SET 未收到 ACK (id=%llu)\n", (unsigned long long)id);
+        io_failed_ = true;   // T1
+        std::fprintf(stderr, "[REMOTE] TENSOR_SET 未收到 ACK (id=%llu, %.2f MB, op=%d)\n",
+                     (unsigned long long)id, (double)nbytes / 1048576.0, t ? (int)t->op : -1);
+        if (rstrict()) rstrict_fail("TENSOR_SET 未收到 ACK（对端可能已死）");
         return 0;
     }
     dirty_[id] = false;
@@ -331,16 +455,17 @@ bool RemoteClient::fetch_tensor(uint64_t id, void* dst, size_t nbytes) {
     h.kind      = (uint32_t)rnet::RKind::TENSOR_GET;
     h.tensor_id = id;
     h.nbytes    = nbytes;
-    if (!sock_.send_header(h)) return false;
+    if (!sock_.send_header(h)) { io_failed_ = true; return false; }
     rnet::RHeader rh;
-    if (!sock_.recv_header(rh)) return false;
+    if (!sock_.recv_header(rh)) { io_failed_ = true; return false; }
     if (rh.kind != (uint32_t)rnet::RKind::TENSOR_DATA || rh.tensor_id != id || rh.nbytes != nbytes) {
+        io_failed_ = true;
         std::fprintf(stderr, "[REMOTE] TENSOR_GET 失败：%s id=%llu nbytes=%llu (期望 %llu)\n",
                      rnet::kind_name(rh.kind), (unsigned long long)rh.tensor_id,
                      (unsigned long long)rh.nbytes, (unsigned long long)nbytes);
         return false;
     }
-    if (!sock_.recv_all(dst, nbytes)) return false;
+    if (!sock_.recv_all(dst, nbytes)) { io_failed_ = true; return false; }
     bytes_recv_ += nbytes;
     if (rtrace()) {
         // 指纹：远端算出来的张量逐字节 FNV-1a ⇒ 可与单机跑同一张量的哈希直接对比
@@ -373,13 +498,13 @@ bool RemoteClient::compute_graph(const std::vector<rnet::RNodeDesc>& nodes,
     h.aux0   = (uint64_t)nodes.size();
     h.aux1   = (uint64_t)outs.size();
     h.nbytes = nodes.size() * sizeof(rnet::RNodeDesc) + outs.size() * sizeof(uint64_t);
-    if (!sock_.send_header(h)) return false;
+    if (!sock_.send_header(h)) { io_failed_ = true; return false; }
     if (!nodes.empty() &&
-        !sock_.send_all(nodes.data(), nodes.size() * sizeof(rnet::RNodeDesc))) return false;
+        !sock_.send_all(nodes.data(), nodes.size() * sizeof(rnet::RNodeDesc))) { io_failed_ = true; return false; }
     if (!outs.empty() &&
-        !sock_.send_all(outs.data(), outs.size() * sizeof(uint64_t))) return false;
+        !sock_.send_all(outs.data(), outs.size() * sizeof(uint64_t))) { io_failed_ = true; return false; }
     rnet::RHeader rh;
-    if (!sock_.recv_header(rh)) return false;
+    if (!sock_.recv_header(rh)) { io_failed_ = true; return false; }
     if (rh.kind == (uint32_t)rnet::RKind::ERROR_MSG) {
         std::fprintf(stderr, "[REMOTE] 对端执行报错（aux0=%llu）\n", (unsigned long long)rh.aux0);
         return false;
@@ -447,6 +572,7 @@ Status RemoteBackend::graph_compute(ComputeGraph* cg) {
     if (!cg || cg->n_nodes() <= 0) return Status::SUCCESS;
     if (!cli_ || !cli_->connected()) {
         std::fprintf(stderr, "[REMOTE] graph_compute: 未连接对端\n");
+        if (rstrict()) rstrict_fail("远端后端被分到节点，但连接不可用");
         return Status::ABORTED;
     }
 
@@ -534,7 +660,12 @@ Status RemoteBackend::graph_compute(ComputeGraph* cg) {
         if (n) outs.push_back(ids[n]);
     }
 
-    if (!cli_->compute_graph(descs, outs)) return Status::ABORTED;
+    if (!cli_->compute_graph(descs, outs)) {
+        std::fprintf(stderr, "[REMOTE] graph_compute 失败：对端未回结果（nodes=%d）⇒ 调度器大概率回落本地\n",
+                     cg->n_nodes());
+        if (rstrict()) rstrict_fail("远端 graph_compute 失败");
+        return Status::ABORTED;
+    }
 
     // 本 split 的所有节点数据此后都在对端：get_tensor 会走 TENSOR_GET（按需拉取边界张量）
     for (int i = 0; i < cg->n_nodes(); ++i) {
@@ -569,7 +700,22 @@ bool RemoteServer::listen(int port) {
 }
 
 bool RemoteServer::handle_tensor_set(rnet::RSocket& s, rnet::RHeader& h) {
-    std::vector<uint8_t> body(h.nbytes);
+    // 【加固 2026-09-16】原实现 `std::vector<uint8_t> body(h.nbytes)` 未捕获异常 ⇒ 大张量/内存不足时
+    //   std::bad_alloc ⇒ std::terminate ⇒ 进程直接消失（客户端只看到 "peer closed"，对端零线索 ✗）。
+    //   现在：捕获 + 回 ERROR_MSG(405) 告知调用方，服务继续存活。
+    std::vector<uint8_t> body;
+    try {
+        body.resize((size_t)h.nbytes);
+    } catch (const std::exception& e) {
+        std::fprintf(stderr,
+                     "[REMOTE-SRV] !!! 分配 %.1f MB 失败（id=%llu，RSS=%.0f MB）：%s ⇒ 回 ERROR_MSG(405)\n",
+                     (double)h.nbytes / 1048576.0, (unsigned long long)h.tensor_id, cur_rss_mb(), e.what());
+        rnet::RHeader err;
+        err.kind      = (uint32_t)rnet::RKind::ERROR_MSG;
+        err.tensor_id = h.tensor_id;
+        err.aux0      = 405;
+        return s.send_header(err);
+    }
     if (h.nbytes && !s.recv_all(body.data(), h.nbytes)) return false;
     arena_[h.tensor_id] = std::move(body);
     arena_bytes_ += h.nbytes;
@@ -930,6 +1076,7 @@ bool RemoteServer::serve_forever(int world_size, int max_messages) {
     //   （对端随即看到 `Connection reset by peer` / `Broken pipe`）⇒ epoch2 的 DP 全部失败 ✗。
     //   现在：连接断开后**继续 accept 下一个连接**（listener 常驻），直到 BYE 或 listener 坏掉。
     int accept_fail = 0;
+    bool first_conn = true;    // 【T1】用于"客户端重连后清空上一轮 results"
     for (;;) {
         rnet::RSocket conn;
         if (!listener_.accept_one(conn)) {
@@ -940,6 +1087,16 @@ bool RemoteServer::serve_forever(int world_size, int max_messages) {
         }
         accept_fail = 0;
         g_dp_peer_seen = true;   // 启动屏障：通知 root 训练线程"对端已连接"
+        if (!first_conn) {
+            // 【T1 2026-09-16】客户端重连：上一轮的 results_ 已无意义（id 不会再被引用；客户端已 invalidate_all）
+            //   ⇒ 必须立刻丢掉，否则新连接的第一次取回可能命中**旧结果**（静默错值 ✗）
+            std::fprintf(stderr, "[REMOTE-SRV] 客户端重连：清空上一轮 results（%zu 条 / %.1f MB）\n",
+                         results_.size(), (double)results_bytes_ / 1048576.0);
+            results_.clear();
+            recent_ids_.clear();
+            results_bytes_ = 0;
+        }
+        first_conn = false;
         std::fprintf(stderr, "[REMOTE-SRV] 客户端已连接（world=%d）\n", world_size);
         for (int msg = 0; msg < max_messages; ++msg) {
             rnet::RHeader h;
@@ -948,35 +1105,44 @@ bool RemoteServer::serve_forever(int world_size, int max_messages) {
                 std::fprintf(stderr, "[REMOTE-SRV] 连接断开，继续等待下一个连接（多 epoch 需要）\n");
                 break;
             }
+            // 【加固 2026-09-16】每条消息一行（PPML_REMOTE_TRACE=1）：出问题时最后一行就是死因现场
+            if (rtrace()) {
+                std::fprintf(stderr, "[RT-SRV] msg=%s id=%llu nb=%.2f MB rss=%.0f MB arena=%.1f MB results=%zu\n",
+                             rnet::kind_name(h.kind), (unsigned long long)h.tensor_id,
+                             (double)h.nbytes / 1048576.0, cur_rss_mb(),
+                             (double)arena_bytes_ / 1048576.0, results_.size());
+            }
+        bool conn_broken = false;
+        try {
         switch ((rnet::RKind)h.kind) {
             case rnet::RKind::HELLO: {
                 rnet::RHeader ack;
                 ack.kind = (uint32_t)rnet::RKind::HELLO_ACK;
                 ack.aux0 = (uint64_t)world_size;
                 ack.aux1 = 0;
-                if (!conn.send_header(ack)) return false;
+                if (!conn.send_header(ack)) conn_broken = true;
                 break;
             }
             case rnet::RKind::PING: {
                 rnet::RHeader pong;
                 pong.kind = (uint32_t)rnet::RKind::PONG;
-                if (!conn.send_header(pong)) return false;
+                if (!conn.send_header(pong)) conn_broken = true;
                 break;
             }
             case rnet::RKind::TENSOR_SET:
-                if (!handle_tensor_set(conn, h)) return false;
+                if (!handle_tensor_set(conn, h)) conn_broken = true;
                 break;
             case rnet::RKind::TENSOR_GET:
-                if (!handle_tensor_get(conn, h)) return false;
+                if (!handle_tensor_get(conn, h)) conn_broken = true;
                 break;
             case rnet::RKind::GRAPH_COMPUTE:
-                if (!handle_graph_compute(conn, h)) return false;
+                if (!handle_graph_compute(conn, h)) conn_broken = true;
                 break;
             case rnet::RKind::ALLREDUCE_UP:
-                if (!handle_allreduce(conn, h, world_size)) return false;
+                if (!handle_allreduce(conn, h, world_size)) conn_broken = true;
                 break;
             case rnet::RKind::RESULTS_CLEAR:
-                if (!handle_results_clear(conn, h)) return false;
+                if (!handle_results_clear(conn, h)) conn_broken = true;
                 break;
             case rnet::RKind::BYE:
                 std::fprintf(stderr, "[REMOTE-SRV] BYE（tensors=%zu, arena=%.2f MB）\n",
@@ -987,7 +1153,25 @@ bool RemoteServer::serve_forever(int world_size, int max_messages) {
                 std::fprintf(stderr, "[REMOTE-SRV] 未知消息 %s（%u）⇒ 跳过\n",
                              rnet::kind_name(h.kind), h.kind);
                 break;
-            }
+        }
+        } catch (const std::exception& e) {
+            // 【加固 2026-09-16】异常**不许杀掉常驻服务**（原实现会 std::terminate ⇒ 客户端只见 peer closed ✗）
+            std::fprintf(stderr,
+                         "[REMOTE-SRV] !!! 处理 %s（id=%llu nb=%.2f MB）抛异常：%s\n",
+                         rnet::kind_name(h.kind), (unsigned long long)h.tensor_id,
+                         (double)h.nbytes / 1048576.0, e.what());
+            conn_broken = true;
+        } catch (...) {
+            std::fprintf(stderr, "[REMOTE-SRV] !!! 处理 %s 抛未知异常 ⇒ 断开本连接\n",
+                         rnet::kind_name(h.kind));
+            conn_broken = true;
+        }
+        if (conn_broken) {
+            // 只断这一条连接，服务继续 accept（多 epoch / 客户端重启用）
+            std::fprintf(stderr, "[REMOTE-SRV] 本连接终止 ⇒ 继续等待下一个连接（RSS=%.0f MB）\n", cur_rss_mb());
+            conn.close();
+            break;
+        }
         }   // msg 循环
         // 本连接结束（recv 失败 / 达到 max_messages）⇒ 回到外层 accept 继续服务（多 epoch 必需）
     }       // accept 循环（无限，直到 BYE 或 listener 坏）
@@ -1004,7 +1188,11 @@ std::shared_ptr<RemoteClient> remote_make_client_from_env() {
     const int rank = std::getenv("PPML_REMOTE_RANK") ? std::atoi(std::getenv("PPML_REMOTE_RANK")) : 1;
     const int world = std::getenv("PPML_REMOTE_WORLD") ? std::atoi(std::getenv("PPML_REMOTE_WORLD")) : 2;
     auto cli = std::make_shared<RemoteClient>();
-    if (!cli->connect(host, port, world, rank)) return nullptr;
+    if (!cli->connect(host, port, world, rank)) {
+        // 【T1 2026-09-16】STRICT 下"连不上"必须响亮失败：否则整轮其实在本地跑，却以为远端生效了 ✗
+        if (rstrict()) rstrict_fail("远端后端初始化失败：connect 不上对端");
+        return nullptr;
+    }
     return cli;
 }
 
@@ -1424,8 +1612,20 @@ int remote_dp_broadcast_owned_params(ComputeGraph* cgraph, RemoteClient* cli) {
 // ============================================================
 bool remote_iteration_begin() {
     RemoteBackend* be = remote_make_backend_from_env();
-    if (!be || !be->client() || !be->client()->connected()) return false;
+    if (!be || !be->client()) return false;
     RemoteClient* cli = be->client();
+    // 【T1 2026-09-16】迭代边界是**唯一安全的重连点**：此刻两端之间没有"半成品状态"需要保留
+    //   （本端下面马上 invalidate_transient() + RESULTS_CLEAR 把对端清空重来 ✓）。
+    //   旧行为：连接断了就永久失效 ⇒ 后面所有远端 split 全部失败/回落 ✗（网络抖一下的代价）。
+    if (!cli->connected() || cli->io_failed()) {
+        if (!cli->ensure_connected()) {
+            std::fprintf(stderr, "[REMOTE] 迭代边界重连失败 ⇒ 本轮远端不可用（调度器将回落本地）\n");
+            return false;
+        }
+    } else if (!cli->ping()) {
+        std::fprintf(stderr, "[REMOTE] 迭代边界心跳失败 ⇒ 尝试重连 …\n");
+        if (!cli->ensure_connected()) return false;
+    }
     cli->invalidate_transient();   // 激活/输入：作废重传；参数/常量保留（step 后单独作废）
     uint64_t dr = 0, da = 0;
     const bool ok = cli->clear_results(&dr, &da);
