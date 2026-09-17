@@ -16,7 +16,7 @@ Inspired by RosettaFoldAllAtom(RFAA) and GGML
 | Python | **3.11.5** (Anaconda) **with development headers** (`Python.h` / `python3-dev`) |
 
 **Notes (EN)**
-- **Windows is not fully supported yet.** Build/run is verified on **Linux only (WSL2 + Ubuntu 22.04)**.
+- **Updated 09-17: Win support on main branch; Windows is not fully supported yet.** Build/run is verified on **Linux only (WSL2 + Ubuntu 22.04)**.
   Windows PowerShell cannot drive the existing CMake cache — use WSL or a Linux host.
   
   Server build: `build_remote.sh [target]` (also auto-detects python/CUDA).
