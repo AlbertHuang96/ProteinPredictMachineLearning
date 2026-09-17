@@ -5,6 +5,27 @@ Inspired by RosettaFoldAllAtom(RFAA) and GGML
 
 ## Quick Start (command line)
 
+### Build environment (tested)
+
+| Item | Version / note |
+|---|---|
+| OS | **Ubuntu 22.04.5 LTS on WSL2** — kernel `5.15.167.4-microsoft-standard-WSL2` |
+| CMake | **3.22.1** (project minimum: 3.18) |
+| Compiler | **GCC 11.4.0** (C++17) |
+| CUDA | **11.5.119** — tested on GeForce RTX 2050 (compute 8.6). The CUDA toolkit is required at configure time (`project(... LANGUAGES CXX CUDA)` + `find_package(CUDAToolkit REQUIRED)`), even for CPU-only runs. |
+| Python | **3.11.5** (Anaconda) **with development headers** (`Python.h` / `python3-dev`) |
+
+**Notes (EN)**
+- **Windows is not fully supported yet.** Build/run is verified on **Linux only (WSL2 + Ubuntu 22.04)**.
+  Windows PowerShell cannot drive the existing CMake cache — use WSL or a Linux host.
+  
+  Server build: `build_remote.sh [target]` (also auto-detects python/CUDA).
+- **The Python requirement is mainly for future development convenience** (the `python_bridge`
+  pybind11 module). Training / inference are pure C++ and do **not** need Python at runtime; a
+  Python without development headers is not enough to *configure* the project.
+- Anaconda ships an older `libstdc++`: if you hit `GLIBCXX_3.4.30 not found`, prefix commands with
+  `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6`.
+
 Run a small-sample training job using the bundled tiny sample (P62891, L=51). This uses the
 dev/small config so it fits in a few GB of CPU RAM:
 
@@ -229,10 +250,12 @@ RFAA-Cpp
 
 ## Build Requirements
 
+See **Quick Start → Build environment (tested)** for the verified toolchain. Summary:
+
 - CMake >= 3.18
-- CUDA >= 11.7
-- Python >= 3.8 (with development headers)
-- ONNX Runtime >= 1.15
+- CUDA Toolkit (required at configure time; tested 11.5.119)
+- Python >= 3.8 **with development headers** — needed for `python_bridge` / future development only
+- Linux (**WSL2 + Ubuntu 22.04** tested); **Windows is not fully supported yet**
 
 ## Build Commands
 
