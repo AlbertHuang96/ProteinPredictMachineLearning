@@ -77,11 +77,11 @@ void compute_distance_onehot(
 void compute_omega_onehot(
     const TensorF32& coords,
     const float* seq_mask,
-    float* Ω_onehot)
+    float* omega_onehot)
 {
     const int N = static_cast<int>(coords.shape().dims[0]);
 
-    std::memset(Ω_onehot, 0, N * N * OMEGA_N_BINS * sizeof(float));
+    std::memset(omega_onehot, 0, N * N * OMEGA_N_BINS * sizeof(float));
 
     const float* cdata = coords.data();
 
@@ -127,7 +127,7 @@ void compute_omega_onehot(
 
             int bin = dihedral_to_bin(angle);
             int base = l * N * OMEGA_N_BINS + lp * OMEGA_N_BINS;
-            Ω_onehot[base + bin] = 1.0f;
+            omega_onehot[base + bin] = 1.0f;
         }
     }
 }
@@ -139,11 +139,11 @@ void compute_omega_onehot(
 void compute_theta_onehot(
     const TensorF32& coords,
     const float* seq_mask,
-    float* Θ_onehot)
+    float* theta_onehot)
 {
     const int N = static_cast<int>(coords.shape().dims[0]);
 
-    std::memset(Θ_onehot, 0, N * N * THETA_N_BINS * sizeof(float));
+    std::memset(theta_onehot, 0, N * N * THETA_N_BINS * sizeof(float));
 
     const float* cdata = coords.data();
 
@@ -192,7 +192,7 @@ void compute_theta_onehot(
 
             int bin = dihedral_to_bin(angle);
             int base = l * N * THETA_N_BINS + lp * THETA_N_BINS;
-            Θ_onehot[base + bin] = 1.0f;
+            theta_onehot[base + bin] = 1.0f;
         }
     }
 }
@@ -204,11 +204,11 @@ void compute_theta_onehot(
 void compute_phi_onehot(
     const TensorF32& coords,
     const float* seq_mask,
-    float* Φ_onehot)
+    float* phi_onehot)
 {
     const int N = static_cast<int>(coords.shape().dims[0]);
 
-    std::memset(Φ_onehot, 0, N * N * PHI_N_BINS * sizeof(float));
+    std::memset(phi_onehot, 0, N * N * PHI_N_BINS * sizeof(float));
 
     const float* cdata = coords.data();
 
@@ -253,7 +253,7 @@ void compute_phi_onehot(
 
             int bin = planar_to_bin(angle);
             int base = l * N * PHI_N_BINS + lp * PHI_N_BINS;
-            Φ_onehot[base + bin] = 1.0f;
+            phi_onehot[base + bin] = 1.0f;
         }
     }
 }
@@ -266,14 +266,14 @@ void compute_all_distogram_onehots(
     const TensorF32& coords,
     const float* seq_mask,
     float* D_onehot,
-    float* Ω_onehot,
-    float* Θ_onehot,
-    float* Φ_onehot)
+    float* omega_onehot,
+    float* theta_onehot,
+    float* phi_onehot)
 {
     compute_distance_onehot(coords, seq_mask, D_onehot);
-    compute_omega_onehot(coords, seq_mask, Ω_onehot);
-    compute_theta_onehot(coords, seq_mask, Θ_onehot);
-    compute_phi_onehot(coords, seq_mask, Φ_onehot);
+    compute_omega_onehot(coords, seq_mask, omega_onehot);
+    compute_theta_onehot(coords, seq_mask, theta_onehot);
+    compute_phi_onehot(coords, seq_mask, phi_onehot);
 }
 
 } // namespace ppml

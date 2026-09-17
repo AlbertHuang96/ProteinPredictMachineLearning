@@ -1,7 +1,14 @@
 #pragma once
 
 #include "Model.h"
+#if defined(_WIN32) && defined(_DEBUG)
+#pragma push_macro("_DEBUG")
+#undef _DEBUG
 #include <Python.h>
+#pragma pop_macro("_DEBUG")
+#else
+#include <Python.h>
+#endif
 #include <string>
 #include <functional>
 
