@@ -8,7 +8,8 @@
 //   compute   : 远端执行子图（c = mul_mat(a,b)）→ 按需 fetch → 与本地参考比对
 //
 // 用法：
-//   服务端: ./ppml_remote_probe server --port 2244 [--dp 10,20,30]
+//   服务端: ./ppml_remote_probe server --port 2244 [--dp 10,20,30] [--loop]
+//           --loop = 客户端 BYE 后不退出，继续等下一个客户端（2026-09-17 加；连跑多次训练必需 ✓）
 //   客户端: ./ppml_remote_probe client --host 127.0.0.1 --port 2244 [--test all|buffer|allreduce|compute]
 // ============================================================
 #include "ppml/Backend.h"
@@ -45,7 +46,7 @@ static std::vector<std::string> split(const std::string& s, char sep) {
 }
 
 // ---------------- 服务端 ----------------
-static int run_server(int port, const std::string& dp_list) {
+static int run_server(int port, const std::string& dp_list, bool loop) {
     RemoteServer srv;
     if (!srv.listen(port)) {
         std::fprintf(stderr, "[probe] 服务端监听 %d 失败\n", port);
@@ -60,7 +61,15 @@ static int run_server(int port, const std::string& dp_list) {
         for (float v : dp) std::fprintf(stderr, "%.1f ", v);
         std::fprintf(stderr, "}\n");
     }
-    bool ok = srv.serve_forever(/*world_size=*/2);
+    // 【2026-09-17】--loop：客户端正常结束会发 BYE ⇒ serve_forever 返回 ⇒ 原实现**直接退出** ✗
+    //   ⇒ 想连跑两次训练就必须手动重启对端（否则第二次"连不上"✗）。--loop 让它收完 BYE 继续 accept ✓
+    bool ok = true;
+    for (;;) {
+        ok = srv.serve_forever(/*world_size=*/2);
+        if (!ok) break;          // 真出错才退出
+        if (!loop) break;        // 非 loop：收工（保持原行为 ✓）
+        std::fprintf(stderr, "[probe] 本轮结束（BYE）⇒ --loop 开启，继续等待下一个客户端…\n");
+    }
     std::fprintf(stderr, "[probe] 服务端结束：ok=%d tensors=%zu arena=%.2f MB dp_result={",
                  (int)ok, srv.n_tensors(), (double)srv.arena_bytes() / (1024.0 * 1024.0));
     for (float v : srv.dp_buffer()) std::fprintf(stderr, "%.0f ", v);
@@ -193,7 +202,8 @@ static int test_compute(std::shared_ptr<RemoteClient> cli) {
 static void usage() {
     std::fprintf(stderr,
         "用法:\n"
-        "  ppml_remote_probe server --port 2244 [--dp 10,20,30]\n"
+        "  ppml_remote_probe server --port 2244 [--dp 10,20,30] [--loop]\n"
+        "    --loop: 客户端收工（BYE）后不退出，继续等下一个客户端（连跑多次训练用 ✓）\n"
         "  ppml_remote_probe client --host 127.0.0.1 --port 2244 [--test all|buffer|allreduce|compute]\n");
 }
 
@@ -204,14 +214,16 @@ int main(int argc, char** argv) {
     std::string host = "127.0.0.1";
     std::string test = "all";
     std::string dp;
+    bool loop = false;
     for (int i = 2; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--port") && i + 1 < argc) port = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--host") && i + 1 < argc) host = argv[++i];
         else if (!std::strcmp(argv[i], "--test") && i + 1 < argc) test = argv[++i];
         else if (!std::strcmp(argv[i], "--dp") && i + 1 < argc) dp = argv[++i];
+        else if (!std::strcmp(argv[i], "--loop")) loop = true;
     }
 
-    if (mode == "server") return run_server(port, dp);
+    if (mode == "server") return run_server(port, dp, loop);
     if (mode != "client") { usage(); return 1; }
 
     auto cli = std::make_shared<RemoteClient>();

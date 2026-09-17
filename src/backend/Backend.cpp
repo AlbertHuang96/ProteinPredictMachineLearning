@@ -82,16 +82,18 @@ bool BackendScheduler::node_is_host_producer(TensorF32* node) const {
     return false;
 }
 
-void BackendScheduler::set_backend_if_supported(TensorF32* node, int backend_id) {
+void BackendScheduler::set_backend_if_supported(TensorF32* node, int backend_id, int idx) {
     // host 生产者（OP_NONE 参数/常量）不得放 GPU：数据在 host，dispatch 跳过它，
     // 也不会建 cpy（与消费者同后端），GPU kernel 会读 host 指针。
     if (node_is_host_producer(node)) return;
 
     Backend * backend = backends_[backend_id];
+    backend->set_sched_index(idx);   // ★ 供后端做"按图节点区间"选择（远端 PPML_REMOTE_NODES ✓）
     if (!backend->supports_op(node)) return;
 
     // GPU 后端：受显存预算约束——预算不足时拒绝，留待回落 CPU。
-    if (backend->priority() > 0) {
+    //   注：远端后端 vram_budgeted()==false ⇒ 不受此限（它不占显存 ✓）
+    if (backend->vram_budgeted()) {
         if (gpu_assign_if_affordable(node, backend_id)) {
             backend_map_[node] = backend_id;
         }
@@ -771,6 +773,11 @@ void BackendScheduler::split_graph(ComputeGraph * graph) {
     backup_graph_nodes(graph);
 
     current_graph_ = graph;  // 保存当前图引用，供 alloc_splits 使用
+    // 【2026-09-17】通知各后端"新图开始"：远端用它在切图前**自动计算**节点区间
+    //   （PPML_REMOTE_NODES=auto ⇒ 不用手填节点号 ✓）；其他后端默认无操作 ✓
+    for (int b = 0; b < n_backends_; ++b) {
+        if (backends_[b]) backends_[b]->on_graph_begin(graph);
+    }
     n_splits_ = 0;
     splits_.clear();
     n_graph_inputs_ = 0;
@@ -783,7 +790,7 @@ void BackendScheduler::split_graph(ComputeGraph * graph) {
         // 仅当存在非 CPU 后端（CUDA）时启用预算
         bool has_gpu = false;
         for (int b = 0; b < n_backends_; b++) {
-            if (backends_[b]->priority() > 0) { has_gpu = true; break; }
+            if (backends_[b]->vram_budgeted()) { has_gpu = true; break; }   // 远端点不算 GPU ✓
         }
         // 可被环境变量覆盖（测试/调参用）：PPML_GPU_BUDGET_MB=0 表示不限。
         const char* budget_mb = std::getenv("PPML_GPU_BUDGET_MB");
@@ -831,10 +838,16 @@ void BackendScheduler::pass_assign_leafs(ComputeGraph * graph) {
         // 否则 GPU 节点消费它时 src_backend==GPU 不会触发 H2D 拷贝，kernel 会把 host 指针当 device 读。
         for (int b = 0; b < n_backends_; b++) {
             if (!backends_[b]->supports_buffer_type(backends_[b]->buffer_type())) continue;
-            if (backends_[b]->priority() > 0) {
-                // GPU 后端：host 数据叶子不放 GPU；GPU 内存叶子（buffer_ 已设 device）可放。
-                bool host_data = (leaf->buffer_ == nullptr) || leaf->buffer_->is_host();
-                if (host_data) continue;
+            // 【2026-09-17 关键修复（DUP 机制正解）】host 数据叶子（参数/常量/输入，
+            //   buffer_==null 或 host buffer）**只能放 host 后端（CPU）** ✗：
+            //   非 host 后端（GPU / remote）不能直接持有 host 叶子——否则 remote 在 slim=1 下
+            //   本地 staging 从不写 ⇒ get_tensor 取不回 ⇒ 刷 `数据不可得 … op=0 is_remote=0` 卡死 ✗。
+            //   正确做法：host 叶子留 CPU（数据本就 host），build_splits 为非 host 消费者
+            //   **建 DUP cpy**（remote 侧上传 / GPU 侧 H2D）✓ —— 这才是"省内存"的正解。
+            //   原代码只对 vram_budgeted()（GPU）做 host_data 检查，remote(vram_budgeted=false) 漏了 ✗。
+            const bool host_data = (leaf->buffer_ == nullptr) || leaf->buffer_->is_host();
+            if (host_data && !backends_[b]->buffer_type()->is_host()) continue;
+            if (backends_[b]->vram_budgeted()) {
                 if (!gpu_assign_if_affordable(leaf, b)) continue;
             }
             backend_map_[leaf] = b;
@@ -863,7 +876,7 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
                 }
             } else if (cur_backend_id != -1) {
                 // 当前在 GPU 段中，尝试把相邻节点也分配到同一后端
-                set_backend_if_supported(node, cur_backend_id);
+                set_backend_if_supported(node, cur_backend_id, i);
             }
         }
     }
@@ -884,7 +897,7 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
                     cur_backend_id = node_id;
                 }
             } else if (cur_backend_id != -1) {
-                set_backend_if_supported(node, cur_backend_id);
+                set_backend_if_supported(node, cur_backend_id, i);
             }
         }
     }
@@ -934,13 +947,15 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                             (void*)backends_[b],
                             backends_[b] ? *(void**)backends_[b] : nullptr);
                 }
+                backends_[b]->set_sched_index(i);   // ★ 区间选择（远端 PPML_REMOTE_NODES ✓）
                 if (backends_[b]->supports_op(node)) {
                     best_backend = b;  // backends_ 已按 priority 降序 → 第一个即最高
                     break;
                 }
             }
             // 若选中的是 GPU 且显存预算不足 → 回落 CPU（最后后端）。
-            if (backends_[best_backend]->priority() > 0 &&
+            //   远端后端 vram_budgeted()==false ⇒ 不参与（否则大批区间节点会被预算逐出 ✗）
+            if (backends_[best_backend]->vram_budgeted() &&
                 !gpu_assign_if_affordable(node, best_backend)) {
                 best_backend = n_backends_ - 1;  // CPU
             }
@@ -952,7 +967,9 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
             // 仅广播 op 强制回落 CPU：CUDA elemwise kernel 用扁平 idx<n 索引，
             // 不支持广播（src numel != dst numel 越界）。host 源不再整节点禁用 GPU，
             // 改由 build_splits 插入 H2D 拷贝 + graph_compute 兜底处理。
-            if (backends_[best_backend]->priority() > 0) {
+            //   注：远端后端 vram_budgeted()==false ⇒ 跳过本护栏 ✓（服务端是 CPU 执行器，
+            //   广播语义正确 ✓；否则区间会被广播 op 切碎成很多小 split ✗）
+            if (backends_[best_backend]->vram_budgeted()) {
                 // (1) 广播检测：任意 op 只要存在 src numel != dst numel，
                 //     CUDA kernel 假设扁平等长索引 -> 越界读/写 -> 段错误。强制 CPU。
                 bool broadcast = false;

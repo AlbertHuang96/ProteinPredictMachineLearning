@@ -194,9 +194,13 @@ public:
     void   synchronize() override {}   // 同步协议：请求-响应式，无需额外同步
 
     bool supports_op(TensorF32* node) const override;
+    // 「按 block 切」区间解析/自动计算：每次切图前由调度器调用（见 Backend::on_graph_begin ✓）
+    void on_graph_begin(ComputeGraph* g) override;
     const BufferType* buffer_type() const override { return &buft_; }
     bool supports_buffer_type(const BufferType* t) const override { return t == &buft_; }
     int  priority() const override { return priority_; }
+    // ★ 远端不吃显存预算、也不受 CUDA 广播护栏限制（服务端是 CPU 执行器 ⇒ 广播语义正确 ✓）
+    bool vram_budgeted() const override { return false; }
     Gallocr& gallocr() override { return gallocr_; }
 
     RemoteClient* client() const { return cli_.get(); }
@@ -208,6 +212,12 @@ private:
     RemoteBufferType buft_;
     Gallocr gallocr_;
     int priority_ = -1;
+    mutable bool nrange_logged_ = false;   // 区间模式（PPML_REMOTE_NODES）只打印一次
+    mutable bool nrange_warned_ = false;   // 解析失败只警告一次
+    // 生效的节点区间（手动 lo:hi ∪ 自动 auto/auto:K/auto:f1-f2）；每次 on_graph_begin 重算 ✓
+    std::vector<std::pair<int,int>> node_ranges_;
+    bool ranges_ready_ = false;
+    bool range_skip_views_ = true;   // 区间内是否排除 OP_VIEW/OP_RESHAPE（默认排除 ✓，见 .cpp 说明）
 };
 
 // ============================================================
