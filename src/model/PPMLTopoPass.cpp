@@ -41,6 +41,22 @@
 
 namespace ppml {
 
+static void set_topo_environment(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value ? value : "");
+#else
+    setenv(name, value ? value : "", 1);
+#endif
+}
+
+static void unset_topo_environment(const char* name) {
+#if defined(_WIN32)
+    _putenv_s(name, "");
+#else
+    unsetenv(name);
+#endif
+}
+
 TensorF32 PPMLModel::topo_pass(const ModelInput& input) {
     // ---- 保存/恢复 PPML_SE3_TOPO：本 pass 需要 fixed/pass1 分支（走统一 compute + coords 链）----
     const char* saved = std::getenv("PPML_SE3_TOPO");
@@ -59,7 +75,7 @@ TensorF32 PPMLModel::topo_pass(const ModelInput& input) {
     for (int it = 0; it < iters; ++it) {
         // 第 1 轮：fixed（无外部拓扑坐标）；后续轮：pass1 + 上一轮 coords（冻结拓扑再推进一轮）
         const char* mode = (it == 0) ? "fixed" : "pass1";
-        setenv("PPML_SE3_TOPO", mode, 1);
+        set_topo_environment("PPML_SE3_TOPO", mode);
 
         const auto t0 = std::chrono::high_resolution_clock::now();
         GraphOutput g = forward_graph(input, /*enable_se3=*/true, topo_ptr);
@@ -90,8 +106,8 @@ TensorF32 PPMLModel::topo_pass(const ModelInput& input) {
     }
 
     // 恢复环境变量，避免污染后续 Pass2 的模式判定（Pass2 由 train.cpp 显式设为 pass1）
-    if (saved_s.empty()) unsetenv("PPML_SE3_TOPO");
-    else                 setenv("PPML_SE3_TOPO", saved_s.c_str(), 1);
+    if (saved_s.empty()) unset_topo_environment("PPML_SE3_TOPO");
+    else                 set_topo_environment("PPML_SE3_TOPO", saved_s.c_str());
     return coords_out;
 }
 

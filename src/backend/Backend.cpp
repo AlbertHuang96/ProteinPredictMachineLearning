@@ -67,7 +67,11 @@ bool BackendScheduler::node_is_host_producer(TensorF32* node) const {
         fprintf(stderr, "[nhip] node=%p op=%d view_src=%p buffer_=%p data=%p CALLER=%p\n",
                 (void*)node, (int)node->op, (void*)node->view_src,
                 (void*)node->buffer_, (void*)node->data(),
+#if defined(_MSC_VER)
+                nullptr);
+#else
                 __builtin_return_address(0));
+#endif
     }
     while (base->view_src && guard++ < 64) base = base->view_src;
     if (getenv("GRAPH_DEBUG_SCHED") && base != node) {
