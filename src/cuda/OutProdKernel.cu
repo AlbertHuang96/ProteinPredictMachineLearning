@@ -12,10 +12,41 @@ static inline int ceil_div(int a, int b) {
 }
 
 // ============================================================
-// out_prod CUDA Kernel
+// out_prod CUDA Kernel —— **线程重映射 + 按平面局部化 block**（2026-09-18）
 //
 // 数学: dst[i0,i1,i2,i3] = sum_{k} src0[i0,k,i2,i3] * src1[i1,k,i2,i3]
 //
+// ── 为什么改（ncu 定量根因，见 .codebuddy/memory/2026-09-14.md）────────────────
+//   旧映射把**批维**放进了 threadIdx：`i3 = blockIdx.x*blockDim.x + threadIdx.x`、
+//   `i2 = blockIdx.y*blockDim.y + threadIdx.y`，而 i3/i2 在 src0/src1 里的步长是
+//   `ne00*ne01*ne02` / `ne10*ne11*ne12`（**最外层**）✗
+//   ⇒ 同一 warp 的 32 个线程落在 32 条互不相邻的 cache line 上 ⇒ 非合并访问。
+//   实测（真实 shape ne0=ne1=51/K=51/planes=1024）：L1 命中 0.84%、Compute 0.74%、
+//   流量 2.19 GB 而有用数据仅 ~32 MB（**~68× 浪费**）、ncu OPT 判"87% 冗余 sectors"。
+//
+// ── 新映射（谁放进 threadIdx，取决于**谁是 stride=1**）────────────────────────
+//   threadIdx.x  → **i0**   ★ i0 在 src0 与 dst 中 **stride=1**（最内维）
+//                            ⇒ 同 warp 连续线程访问**连续地址**（每次迭代 32×4B = 128B
+//                              = 4 个 sector 全用满）✓
+//   threadIdx.y  → **i1**   ★ i1 在 src1 中 **stride=1**；且同一 warp 内 i1 相同
+//                            ⇒ src1 的读是**广播**（全 warp 同一地址 ⇒ 1 次事务）✓
+//   blockIdx.z   → 平面 (i2,i3)  ★ 按平面局部化：一个 block 只碰一个平面的数据，
+//                                  且带 grid-stride ⇒ 平面数超 gridDim.z(65535) 也不丢 ✓
+//   blockIdx.x/y → i0/i1 的 tile 序号（同样带 grid-stride ⇒ 任何 shape 都不丢数据 ✓）
+//   K 维         在每线程内**串行**：步长只决定"每次迭代跳多远"，而**每次迭代内**
+//                warp 访问的仍是连续的 32 个 i0 ⇒ 依旧满利用 ✓
+//
+// ── 数值一致性 ──────────────────────────────────────────────────────────────
+//   每个输出元素的累加顺序与旧实现**完全一致**（k = 0..ne01-1 依次累加）⇒ 结果逐位相同 ✓
+//   （所以这次优化不会改变 loss；改完可直接用 loss 做回归判据 ✓）
+//
+// ── 历史（新实现同样保留）────────────────────────────────────────────────────
+//   CUDA 硬限制 gridDim.y/z ≤ 65535（旧版曾因 ne0*ne1 折叠进 z 而"invalid configuration
+//   argument"）⇒ 新实现的三个方向**都**做 grid-stride + host 侧 clamp，不丢数据 ✓
+// ============================================================
+#if 0  /* ===== 旧实现（原映射，2026-09-18 起停用；原样保留作对照，不参与编译）===== */
+
+// ---------- 以下为被替换的旧注释（保留以便对照） ----------
 // Grid 映射方案 (高维张量 → CUDA grid):
 //   - dim_{n-1}, dim_n → 2D grid (blockIdx.y, blockIdx.x)
 //   - dim1 ... dim_{n-2} → 折叠入 blockIdx.z 线性编码
@@ -122,6 +153,57 @@ __global__ void kernel_out_prod(
     } // for i2
     } // for z_idx
 }
+#endif  /* ===== 旧实现结束（其后为 2026-09-18 重映射版）===== */
+
+// ============================================================
+// 重映射版 kernel：threadIdx.x→i0、threadIdx.y→i1、blockIdx.z→平面(i2,i3)
+//   · i0 在 src0/dst 中 stride=1 ⇒ 同 warp 连续线程 = 连续地址 ✓
+//   · i1 在 src1 中 stride=1，且 warp 内 i1 相同 ⇒ src1 广播 ✓
+//   · 平面局部化到 blockIdx.z ⇒ 一个 block 只在一个平面内工作 ✓
+//   · 三个方向都带 grid-stride ⇒ 任何 shape 都不丢数据、不受 gridDim.y/z ≤ 65535 限制 ✓
+// ============================================================
+__global__ void kernel_out_prod_remapped(
+    const float* __restrict__ src0,
+    const float* __restrict__ src1,
+    float* __restrict__ dst,
+    // ---- src0 shape (ne00=inner dim, ne01=contraction dim) ----
+    const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
+    // ---- src1 shape (ne10=inner dim, ne11=contraction dim, == ne01) ----
+    const int64_t ne10, const int64_t ne11, const int64_t ne12, const int64_t ne13,
+    // ---- dst shape (ne0==ne00, ne1==ne10, ne2, ne3) ----
+    const int64_t ne0,  const int64_t ne1,  const int64_t ne2,  const int64_t ne3)
+{
+    const int64_t n_planes  = ne2 * ne3;
+    const int64_t x_stride  = static_cast<int64_t>(gridDim.x) * blockDim.x;   // i0 方向
+    const int64_t y_stride  = static_cast<int64_t>(gridDim.y) * blockDim.y;   // i1 方向
+    const int64_t i1_base   = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
+    const int64_t i0_base   = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+
+    // ---- 平面循环（blockIdx.z + grid-stride）：按平面局部化 ✓ ----
+    for (int64_t plane = blockIdx.z; plane < n_planes; plane += gridDim.z) {
+        const int64_t i2 = plane % ne2;
+        const int64_t i3 = plane / ne2;
+
+        // 平面基址（把 i0/i1 之外的部分预先算好，循环内只做加法）
+        const int64_t s0_plane = i2 * ne00 * ne01 + i3 * ne00 * ne01 * ne02;
+        const int64_t s1_plane = i2 * ne10 * ne11 + i3 * ne10 * ne11 * ne12;
+        const int64_t d_plane  = i2 * ne0 * ne1 + i3 * ne0 * ne1 * ne2;
+
+        for (int64_t i1 = i1_base; i1 < ne1; i1 += y_stride) {
+            // ★ warp 内所有线程 i1 相同（threadIdx.y 不随 lane 变）⇒ 下面每次读都是**广播**
+            const float* __restrict__ b_col = src1 + s1_plane + i1;
+            for (int64_t i0 = i0_base; i0 < ne0; i0 += x_stride) {
+                // ★ warp 内 lane 0..31 ↔ i0, i0+1, ... ⇒ src0 侧**连续地址**
+                const float* __restrict__ a_row = src0 + s0_plane + i0;
+                float sum = 0.0f;
+                for (int64_t k = 0; k < ne01; ++k) {          // 累加顺序与旧实现一致 ⇒ 逐位相同 ✓
+                    sum += a_row[k * ne00] * b_col[k * ne10];
+                }
+                dst[d_plane + i1 * ne0 + i0] = sum;           // warp 内连续 i0 ⇒ 写回也合并 ✓
+            }
+        }
+    }
+}
 
 // ============================================================
 // Host wrapper — 计算 grid/block 维度并启动 kernel
@@ -132,10 +214,12 @@ void out_prod_cuda(
     int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
     int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3)
 {
-    // BLOCK_X → dim_n (ne3),  BLOCK_Y → dim_{n-1} (ne2)
-    constexpr int BLOCK_X = 16;
-    constexpr int BLOCK_Y = 16;
-    constexpr int64_t MAX_GRID_XY_Z = 65535;   // CUDA: gridDim.y / gridDim.z 上限
+    // 【2026-09-18 重映射】block 形状按"谁是 stride=1"选：
+    //   BLOCK_X → i0（src0/dst 的 stride=1 维；取 32 = warp 宽 ⇒ 一个 warp 恰好覆盖一行连续 i0 ✓）
+    //   BLOCK_Y → i1（src1 的 stride=1 维；warp 内 i1 相同 ⇒ src1 广播 ✓）
+    constexpr int BLOCK_X = 32;   // i0（合并维）
+    constexpr int BLOCK_Y = 8;    // i1（广播维）
+    constexpr int64_t MAX_GRID_XY_Z = 65535;   // CUDA: gridDim.y / gridDim.z 上限（x 上限 2^31-1）
 
     if (ne0 <= 0 || ne1 <= 0 || ne2 <= 0 || ne3 <= 0) {
         fprintf(stderr,
@@ -147,17 +231,19 @@ void out_prod_cuda(
         return;
     }
 
-    const int64_t n01 = ne0 * ne1;                        // (i0,i1) 组合数 → blockIdx.z
-    int64_t gx = ceil_div(static_cast<int64_t>(ne3), BLOCK_X);
-    int64_t gy = ceil_div(static_cast<int64_t>(ne2), BLOCK_Y);
-    int64_t gz = n01;
+    // 【2026-09-18 重映射】grid：x/y = i0/i1 的 tile 数，z = **平面数**(ne2*ne3)
+    //   （旧版把 (i0,i1) 折叠进 blockIdx.z、把批维放 threadIdx ⇒ 非合并访问 ✗）
+    const int64_t n_planes = ne2 * ne3;
+    int64_t gx = (ne0 + BLOCK_X - 1) / BLOCK_X;
+    int64_t gy = (ne1 + BLOCK_Y - 1) / BLOCK_Y;
+    int64_t gz = n_planes;
 
-    // 2026-09-11：clamp 到 CUDA 硬限制（kernel 内已改成 grid-stride，clamp 不丢数据）
-    if (gz > MAX_GRID_XY_Z || gy > MAX_GRID_XY_Z) {
+    // clamp 到 CUDA 硬限制（kernel 内三个方向都是 grid-stride ⇒ clamp 不丢数据 ✓）
+    if (gy > MAX_GRID_XY_Z || gz > MAX_GRID_XY_Z) {
         fprintf(stderr,
-                "[OUTPROD-CLAMP] grid 越限已 clamp: ne0*ne1=%lld (z=%lld) ne2=%lld (y=%lld) "
-                "dst=[%lld,%lld,%lld,%lld]\n",
-                (long long)n01, (long long)gz, (long long)ne2, (long long)gy,
+                "[OUTPROD-CLAMP] grid 越限已 clamp（kernel 内 grid-stride 覆盖全部）: "
+                "ne1=%lld (gy=%lld) ne2*ne3=%lld (gz=%lld) dst=[%lld,%lld,%lld,%lld]\n",
+                (long long)ne1, (long long)gy, (long long)n_planes, (long long)gz,
                 (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3);
     }
     if (gz > MAX_GRID_XY_Z) gz = MAX_GRID_XY_Z;
@@ -166,7 +252,7 @@ void out_prod_cuda(
     dim3 block(BLOCK_X, BLOCK_Y);
     dim3 grid (static_cast<unsigned>(gx), static_cast<unsigned>(gy), static_cast<unsigned>(gz));
 
-    kernel_out_prod<<<grid, block>>>(
+    kernel_out_prod_remapped<<<grid, block>>>(
         src0, src1, dst,
         ne00, ne01, ne02, ne03,
         ne10, ne11, ne12, ne13,
