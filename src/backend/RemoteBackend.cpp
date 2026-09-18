@@ -41,6 +41,12 @@ static bool rtrace() {
     return on;
 }
 
+// 【2026-09-17 v1】服务端执行统计：CUDA / CPU 各执行了多少个 split。
+//   用途：**不开 TRACE 也能**在 BYE（本轮结束）时看到"GPU 到底吃下了多少、有没有静默回落"✓
+//   （原来只在"执行后端变化"时打印一行 ⇒ 全程 CUDA 时看不出总量 ✗）
+static long g_srv_splits_cuda = 0;
+static long g_srv_splits_cpu  = 0;
+
 // 【加固 2026-09-16】RSS（/proc/self/statm 第 2 字段 = resident pages；x86_64 页 4KB）
 //   用途：服务端每条消息打一行，出问题时能直接看出"是内存爆了还是别的原因"。
 static double cur_rss_mb() {
@@ -183,14 +189,23 @@ void RemoteBuffer::get_tensor(const TensorF32* tensor, void* dst, size_t offset,
         std::abort();
     }
 
-    // 2) 本地 staging（仅用于"本地已有一份正确拷贝"的张量，如上传后的 cpy 原件）
-    if (ptr_ && offset + size <= size_) {
+    // 2) 本地 staging（仅"本地确实有一份正确拷贝"时；slim 模式从不写本地 ⇒ 读它就是未初始化内存 ✗）
+    //   【2026-09-17 关键修复】原实现漏了 `!slim()` 和 `dst` 判空：
+    //     slim=1 时 set_tensor 不写 ptr_（见 set_tensor 的 !slim() 门控）⇒ 此处读的全是未初始化内存；
+    //     且 dst（跨后端 cpy 节点的 data()）可能未分配/已释放 ⇒ memmove 写坏指针 ⇒ 段错误 ✗
+    //     （实测 bt：__memmove_avx_unaligned ← backend_tensor_copy:563 ← get_tensor 的这条 memcpy ✗）
+    if (!rbt->slim() && ptr_ && dst && offset + size <= size_) {
         std::memcpy(dst, ptr_ + offset, size);
         return;
     }
-    std::fprintf(stderr, "[REMOTE] get_tensor: 既非远端张量也无本地 staging"
-                         "（tensor=%p offset=%zu tensor_offs=%zu size=%zu slim=%d）\n",
-                 (const void*)tensor, offset, t_offs, size, (int)(rbt ? rbt->slim() : 0));
+    std::fprintf(stderr,
+                 "[REMOTE] get_tensor: 数据不可得（既非远端张量也无本地 staging）"
+                 "（tensor=%p op=%d offset=%zu tensor_offs=%zu size=%zu slim=%d is_remote=%d data=%p buf=%p）\n",
+                 (const void*)tensor, tensor ? (int)tensor->op : -1, offset, t_offs, size,
+                 (int)(rbt ? rbt->slim() : 0),
+                 (int)(cli && tensor ? cli->is_remote(tensor) : 0),
+                 (const void*)(tensor ? tensor->data() : nullptr),
+                 (const void*)(tensor ? tensor->buffer_ : nullptr));
 }
 
 void RemoteBuffer::memset_tensor(TensorF32* tensor, uint8_t value, size_t offset, size_t size) {
@@ -252,6 +267,19 @@ static int rtimeout_ms() {
         const char* s = std::getenv("PPML_REMOTE_TIMEOUT_MS");
         const int t = s ? std::atoi(s) : 0;
         return t > 0 ? t : 600000;
+    }();
+    return v;
+}
+// 【2026-09-17】上传张量后"等 ACK"的**独立**超时（默认 180 s）：
+//   动机（实测现场）：客户端卡在 `upload_tensor` 等 TENSOR_SET_ACK ✗，而对端日志显示它已处理完
+//   收到的全部消息、正阻塞在 `recv_header` 等**下一个**消息 ✗ ⇒ **两边互等**（数据在链路上停住 ✗）。
+//   此时既没有 EOF（连接没断 ✓）也没有明确报错（主超时 600s 没能把它变成错误 ✗）⇒ 静默挂 40 分钟 ✗。
+//   现在：等 ACK 用更短的独立超时 ⇒ 超时立刻走失败路径 ⇒ io_failed_ ⇒ 迭代边界触发 T1 重连 ✓。
+static int rack_timeout_ms() {
+    static const int v = [] {
+        const char* s = std::getenv("PPML_REMOTE_ACK_TIMEOUT_MS");
+        const int t = s ? std::atoi(s) : 0;
+        return t > 0 ? t : 180000;                   // 默认 3 分钟（正常 ACK 是 ms 级）
     }();
     return v;
 }
@@ -402,7 +430,19 @@ uint64_t RemoteClient::upload_tensor(const TensorF32* t, const void* data, size_
         return 0;
     }
     rnet::RHeader ack;
-    if (!sock_.recv_header(ack) || ack.kind != (uint32_t)rnet::RKind::TENSOR_SET_ACK) {
+    // 【2026-09-17】等 ACK 前也打一行：原来只有"发送前"一行 ⇒ 一旦卡在等 ACK，
+    //   日志最后一行停在 `[RT] SET id=N ...`，看不出"到底在等谁" ✗（实测排查花了很久 ✗）。
+    //   有了这行，卡死现场的末行 = `[RT] WAIT-ACK id=N`，含义明确 ✓。
+    const int ack_to = rack_timeout_ms();
+    if (rtrace()) {
+        std::fprintf(stderr, "[RT] WAIT-ACK id=%llu nb=%zu op=%d（等对端 ACK；ACK 超时=%d ms）\n",
+                     (unsigned long long)id, nbytes, t ? (int)t->op : -1, ack_to);
+    }
+    sock_.set_timeout_ms(ack_to);                 // 等 ACK：独立（较短）超时 ✓
+    const bool ack_ok = sock_.recv_header(ack) &&
+                        ack.kind == (uint32_t)rnet::RKind::TENSOR_SET_ACK;
+    sock_.set_timeout_ms(rtimeout_ms());          // 恢复主超时（其余等待仍用 600s ✓）
+    if (!ack_ok) {
         io_failed_ = true;   // T1
         std::fprintf(stderr, "[REMOTE] TENSOR_SET 未收到 ACK (id=%llu, %.2f MB, op=%d)\n",
                      (unsigned long long)id, (double)nbytes / 1048576.0, t ? (int)t->op : -1);
@@ -569,8 +609,120 @@ bool RemoteClient::allreduce_sum(float* buf, size_t n) {
 // ============================================================
 // RemoteBackend
 // ============================================================
+// ============================================================
+// 「按 block 切」的区间准备：每次切图前由 BackendScheduler 调用（Backend::on_graph_begin ✓）
+//   PPML_REMOTE_NODES 语法（逗号可混写多段）：
+//     * **auto**       ⇒ 图的后半段 [50%,100%) —— 默认推荐：**不用手填节点号** ✓✓
+//     * auto:K         ⇒ 最后 1/K 段（K≥2；auto:2 ≡ auto ✓）
+//     * auto:f1-f2     ⇒ 比例区间，如 auto:0.3-0.7 ✓
+//     * lo:hi          ⇒ 手动精确区间（调试用 ⚠️ 容易填错）
+//   生效区间与覆盖率会打印出来（不用自己数 ✓）
+// ============================================================
+void RemoteBackend::on_graph_begin(ComputeGraph* g) {
+    node_ranges_.clear();
+    ranges_ready_ = false;
+    const char* r = std::getenv("PPML_REMOTE_NODES");
+    if (!r || !*r) return;
+    const int n = (g ? g->n_nodes() : 0);
+    if (n <= 0) return;
+
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "%s", r);
+    char* save = nullptr;
+    for (char* tok = ::strtok_r(buf, ",", &save); tok; tok = ::strtok_r(nullptr, ",", &save)) {
+        while (*tok == ' ' || *tok == '\t') ++tok;
+        int lo = -1, hi = -1;
+        if (std::strncmp(tok, "auto", 4) == 0) {
+            double f1 = 0.5, f2 = 1.0;                       // auto ⇒ 后半段
+            const char* a = tok + 4;
+            if (*a == ':') {
+                ++a;
+                int K = 0;
+                double g1 = -1.0, g2 = -1.0;
+                if (std::sscanf(a, "%d", &K) == 1 && K >= 2) {          // auto:K
+                    f1 = 1.0 - 1.0 / (double)K;
+                    f2 = 1.0;
+                } else if (std::sscanf(a, "%lf-%lf", &g1, &g2) == 2 && g2 > g1) {  // auto:f1-f2
+                    f1 = g1 < 0.0 ? 0.0 : (g1 > 1.0 ? 1.0 : g1);
+                    f2 = g2 < 0.0 ? 0.0 : (g2 > 1.0 ? 1.0 : g2);
+                }
+            }
+            lo = (int)(f1 * (double)n);
+            hi = (int)(f2 * (double)n);
+            if (hi > n) hi = n;
+        } else if (std::sscanf(tok, "%d:%d", &lo, &hi) != 2 || lo < 0 || hi <= lo) {
+            lo = hi = -1;                                    // 手动区间
+        }
+        if (hi > lo) {
+            node_ranges_.emplace_back(lo, hi);
+        } else if (!nrange_warned_) {
+            nrange_warned_ = true;
+            std::fprintf(stderr,
+                         "[REMOTE] PPML_REMOTE_NODES 片段 '%s' 无法解析"
+                         "（支持 lo:hi / auto / auto:K / auto:f1-f2）⇒ 跳过\n", tok);
+        }
+    }
+    ranges_ready_ = true;
+
+    // 【2026-09-17】区间内是否把 **view/reshape** 也发给远端？
+    //   默认 **否**（更安全 ✓）：view 是零拷贝节点，其数据来自 view_src ✗；
+    //   实测（auto / auto:8 两次）崩溃点都在"op=32 输出 + 深度 2 的 view 链 + 本地消费者"处，
+    //   而对照可用的"只按 OPS=32,47"配置里 view 是**本地**的 ⇒ 先把 view 排除在区间外验证 ✓。
+    //   代价：区间被 view 切成更多小段 ✗（想要"一整段大 split"可设 PPML_REMOTE_NODES_VIEWS=1 ✓）。
+    {
+        const char* v = std::getenv("PPML_REMOTE_NODES_VIEWS");
+        range_skip_views_ = !(v && std::atoi(v) != 0);
+    }
+
+    int covered = 0;
+    for (const auto& rg : node_ranges_) covered += (rg.second - rg.first);
+    if (!node_ranges_.empty() && !nrange_logged_) {
+        nrange_logged_ = true;
+        std::fprintf(stderr, "[REMOTE] 区间模式生效：PPML_REMOTE_NODES=%s ⇒ ", r);
+        for (const auto& rg : node_ranges_) std::fprintf(stderr, "[%d,%d) ", rg.first, rg.second);
+        std::fprintf(stderr, "（共 %d/%d 节点 = %.1f%%；view 节点：%s；与 PPML_REMOTE_OPS 并集）\n",
+                     covered, n, 100.0 * (double)covered / (double)n,
+                     range_skip_views_ ? "留本地 ✓(默认)" : "也发远端 ⚠️");
+    }
+}
+
 bool RemoteBackend::supports_op(TensorF32* node) const {
     if (!node) return false;
+
+    // ============================================================
+    // 模式 A（2026-09-17 新增）：**按图节点区间选择 = 「按 block 切」**
+    //   PPML_REMOTE_NODES=lo:hi（半开区间；下标 = 调度器遍历图的序号，
+    //   就是你日志里 `[sched] ... i=[lo,hi)` 的那个 i ✓）
+    //   效果：区间内**所有**节点（含 view / 广播 op）都归远端 ⇒ 调度器把连续节点合成
+    //         **一个**大 split ✓（对照：只按 op 选 ⇒ 散落的单节点 split，一次 forward 几百个 ✗，
+    //         每个 split 都要一次往返 + 重传边界 ✗）
+    //   与模式 B（PPML_REMOTE_OPS）是**并集** ⇒ 原有 op 选法照旧生效 ✓（保留原机制 ✓）
+    //   怎么选区间（推荐第 ① 种 ✓，不用手填节点号）：
+    //     ① `auto`：代码按整图规模自动取后半段；变体 `auto:K` = 最后 1/K 段、
+    //        `auto:f1-f2` = 比例区间（如 auto:0.3-0.7）✓
+    //     ② 多段混写（并集）：`auto,1000:1200` ✓
+    //     ③ 手动 `lo:hi`（调试用 ⚠️ 易错）：先跑一次看 `[sched] COMPUTE split=<bk> i=[a,b)`
+    //        的段边界，或 GRAPH_DEBUG_SCHED=1 看逐节点归属 ✓
+    // ============================================================
+    //   区间来源已由 on_graph_begin() 解析/自动算好（node_ranges_ ✓）：
+    //     * 手动 `lo:hi`（不推荐手填 ✗ 容易错）
+    //     * **自动** `auto`（后半段）/ `auto:K`（最后 1/K 段）/ `auto:f1-f2`（比例区间）✓✓
+    if (ranges_ready_) {
+        const int idx = sched_index();
+        if (idx >= 0) {
+            for (const auto& rg : node_ranges_) {
+                if (idx >= rg.first && idx < rg.second) {
+                    // view/reshape 默认留在本地（零拷贝节点，见 on_graph_begin 里的说明 ✓）
+                    if (range_skip_views_ &&
+                        (node->op == OP_VIEW || node->op == OP_RESHAPE)) {
+                        return false;
+                    }
+                    return true;
+                }
+            }
+        }
+    }
+
     const char* list = std::getenv("PPML_REMOTE_OPS");
     if (!list || !*list) return false;   // 默认不分配任何节点（安全：需要显式开启）
     if (std::strcmp(list, "all") == 0) return true;
@@ -631,9 +783,16 @@ Status RemoteBackend::graph_compute(ComputeGraph* cg) {
                 marked = true;
             } else if (s->data() && s->nbytes() > 0) {
                 up_ret = cli_->upload_tensor(s, s->data(), (size_t)s->nbytes());
-                // 参数/常量叶子：对端那份要活过迭代边界（激活/输入则每轮作废重传）
-                if (s->flag & (TENSOR_FLAG_PARAM | TENSOR_FLAG_CONST)) {
-                    cli_->mark_persistent(sid);
+                // 【2026-09-17 关键修复】叶子（参数/常量/输入）上传后**必须标 remote** ✗：
+                //   原实现只 upload 不 mark_remote ⇒ is_remote=0 ⇒ 后续 get_tensor 走不到 fetch，
+                //   落进本地 staging（slim=1 下是未初始化内存）⇒ 取不回数据 ⇒ 下游卡死/垃圾 ✗
+                //   （实测：崩点修复后暴露本 bug，日志刷 `get_tensor: 数据不可得 … op=0 is_remote=0` ✓）
+                if (up_ret != 0) {
+                    cli_->mark_remote(s, sid);
+                    // 参数/常量叶子：对端那份要活过迭代边界（激活/输入则每轮作废重传）
+                    if (s->flag & (TENSOR_FLAG_PARAM | TENSOR_FLAG_CONST)) {
+                        cli_->mark_persistent(sid);
+                    }
                 }
             }
             if (rtrace()) {
@@ -731,6 +890,20 @@ bool RemoteServer::handle_tensor_set(rnet::RSocket& s, rnet::RHeader& h) {
         std::fprintf(stderr,
                      "[REMOTE-SRV] !!! 分配 %.1f MB 失败（id=%llu，RSS=%.0f MB）：%s ⇒ 回 ERROR_MSG(405)\n",
                      (double)h.nbytes / 1048576.0, (unsigned long long)h.tensor_id, cur_rss_mb(), e.what());
+        // 【2026-09-17 关键修复】bad_alloc 时**必须先排空 body 再回错** ✗：
+        //   原实现直接 `return send_header(err)`，h.nbytes 字节的 body 仍留在 socket 缓冲里
+        //   ⇒ 下一条消息的 header 被当成这条的 body 读掉 ⇒ **协议错位（desync）**
+        //   ⇒ 客户端卡在等 ACK、对端卡在等下一个 header（实测"两边互等"式卡死 ✗）。
+        //   现在：分块 recv 丢弃（不再分配 h.nbytes 那么大），保持流对齐后回 ERROR_MSG。
+        if (h.nbytes) {
+            std::vector<uint8_t> sink(65536);
+            size_t left = (size_t)h.nbytes;
+            while (left) {
+                const size_t chunk = left < sink.size() ? left : sink.size();
+                if (!s.recv_all(sink.data(), chunk)) return false;
+                left -= chunk;
+            }
+        }
         rnet::RHeader err;
         err.kind      = (uint32_t)rnet::RKind::ERROR_MSG;
         err.tensor_id = h.tensor_id;
@@ -738,6 +911,12 @@ bool RemoteServer::handle_tensor_set(rnet::RSocket& s, rnet::RHeader& h) {
         return s.send_header(err);
     }
     if (h.nbytes && !s.recv_all(body.data(), h.nbytes)) return false;
+    // 【2026-09-17】覆盖同名 id 时先扣掉旧占用：原实现只 `+=` ⇒ 同一 id 每被重传一次就虚增一次 ✗
+    //   （参数每步重传 ⇒ arena_bytes_ 单向膨胀，KEEP_MB 兜底判断因此失真；实测 arena 余量显示离谱 ✓）
+    if (auto old = arena_.find(h.tensor_id); old != arena_.end()) {
+        const size_t prev = old->second.size();
+        arena_bytes_ = (arena_bytes_ > prev) ? (arena_bytes_ - prev) : 0;
+    }
     arena_[h.tensor_id] = std::move(body);
     arena_bytes_ += h.nbytes;
     std::vector<int64_t> dims;
@@ -912,12 +1091,144 @@ bool RemoteServer::handle_graph_compute(rnet::RSocket& s, rnet::RHeader& h) {
     }
 
     // 3b) **自建 bump 分配**（与 BackendScheduler::reserve_graph_memory 同模式）：
-    //     统一给所有张量分配 host buffer 并绑定，然后回填输入数据，最后用 skip_alloc 执行。
+    //     统一给所有张量分配 buffer 并绑定，然后回填输入数据，最后用 skip_alloc 执行。
     //     若让本地 backend 自己跑 gallocr，它会把输入张量重绑到新 buffer → 数据丢失（实测全 0）。
+    // 注意：bump 总量 total 必须在**选定 buffer 类型之后**再算 ✗
+    //   TensorAllocator 用的对齐是 `buffer->type()->get_alignment()`（CPU=32 / **CUDA=128** ✓），
+    //   且 offset 与 size **各对齐一次**。原来按固定 64 补齐 ⇒ CUDA 下小张量多时
+    //   对齐开销累加会超出预算 ⇒ ta.alloc 返回 false ⇒ ERROR_MSG(403) ✗（2026-09-17 实测）。
+    //   ⇒ 见下面选择完 buft 之后的算法：Σ GGML_PAD(nbytes, A) + A（每张量留一个 A 的余量）。
+
+    // ============================================================
+    // 【2026-09-17 v1】服务端执行后端可选：CPU（默认）/ CUDA（PPML_REMOTE_SRV_CUDA=1）
+    //   设计取舍（v1 = 最小改动、零协议变更、零客户端改动）：
+    //     ① **骨架不动**：仍是"自建 bump + skip_alloc"，只把 buffer 类型从 CPU 换成 CUDA
+    //        ⇒ TensorAllocator 绑的 data_ 直接就是 device 指针 ✓
+    //        （不碰 gallocr ⇒ 规避"输入被 gallocr 重绑 ⇒ 数据丢失（全 0）"这个已踩过的坑 ✓）
+    //     ② H2D / D2H **不用手写**：DefaultBuffer::set_tensor/get_tensor 已按 is_host() 自动选
+    //        cudaMemcpy 方向 ✓（输入注入用它、结果落 results_ 也用它 ✓）
+    //     ③ 必须手写的一处：**执行后同步**（CUDA kernel 异步，不 sync 就读结果 = 读半成品 ✗）
+    //     ④ 回落策略（v1，粗粒度）：
+    //        · split 内**任一**节点不被 CUDA 支持 ⇒ 整段回 CPU ✓（打印被拒的 op ✓）
+    //        · 显存分配失败 ⇒ 也回 CPU（打印原因，不静默 ✗）
+    //   开关：PPML_REMOTE_SRV_CUDA=1（默认 0 = CPU，行为与老版完全一致 ✓）
+    //         PPML_REMOTE_SRV_DEVICE=<n>（默认 0）
+    // ============================================================
+    static std::unique_ptr<CPUBackend> s_cpu_backend;
+    auto get_cpu_backend = []() -> CPUBackend* {
+        if (!s_cpu_backend) {
+            const char* nt = std::getenv("PPML_REMOTE_SRV_THREADS");
+            const int n = nt ? std::atoi(nt) : 4;
+            s_cpu_backend = std::make_unique<CPUBackend>(n);
+        }
+        return s_cpu_backend.get();
+    };
+    static std::unique_ptr<CUDABackend> s_cuda_backend;
+    static bool s_cuda_probed = false;
+    static int  s_cuda_device = 0;
+    auto get_cuda_backend = []() -> CUDABackend* {
+        if (!s_cuda_probed) {
+            s_cuda_probed = true;
+            const char* cs = std::getenv("PPML_REMOTE_SRV_CUDA");
+            if (!(cs && *cs && std::atoi(cs) != 0)) return nullptr;   // 未开启 ⇒ 纯 CPU（老行为 ✓）
+            const char* ds = std::getenv("PPML_REMOTE_SRV_DEVICE");
+            s_cuda_device = (ds && *ds) ? std::atoi(ds) : 0;
+            int ndev = 0;
+            const cudaError_t ge = cudaGetDeviceCount(&ndev);
+            if (ge != cudaSuccess || ndev <= 0 || s_cuda_device < 0 || s_cuda_device >= ndev) {
+                std::fprintf(stderr,
+                             "[REMOTE-SRV] PPML_REMOTE_SRV_CUDA=1 但 CUDA 不可用"
+                             "（cudaGetDeviceCount=%s / n_dev=%d / device=%d）⇒ 永久回落 CPU\n",
+                             cudaGetErrorString(ge), ndev, s_cuda_device);
+                return nullptr;
+            }
+            cudaSetDevice(s_cuda_device);
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, s_cuda_device) == cudaSuccess) {
+                std::fprintf(stderr, "[REMOTE-SRV] CUDA 设备 %d = %s（sm_%d%d，%.0f MB 显存）\n",
+                             s_cuda_device, prop.name, prop.major, prop.minor,
+                             (double)prop.totalGlobalMem / 1048576.0);
+            }
+            cudaGetLastError();                                       // 清探测期 sticky error ✓
+            s_cuda_backend = std::make_unique<CUDABackend>(s_cuda_device);
+        }
+        return s_cuda_backend.get();
+    };
+
+    Backend*    be   = get_cpu_backend();
+    BufferType* buft = CPUBufferType::instance();
+    bool        use_cuda = false;
+    if (CUDABackend* cb = get_cuda_backend()) {
+        std::vector<int> unsupported;
+        for (uint32_t i = 0; i < n_nodes; ++i) {
+            auto it = by_id.find(nd[i].id);
+            if (it == by_id.end() || !it->second) continue;
+            if (!cb->supports_op(it->second)) {
+                if (unsupported.size() < 8) unsupported.push_back((int)it->second->op);
+            }
+        }
+        if (unsupported.empty()) {
+            be   = cb;
+            buft = CUDABufferType::instance(s_cuda_device);
+            use_cuda = true;
+        } else {
+            std::fprintf(stderr, "[REMOTE-SRV] split 含 CUDA 未支持 op（列举 %zu 个：",
+                         unsupported.size());
+            for (size_t k = 0; k < unsupported.size(); ++k) {
+                std::fprintf(stderr, "%s%d", k ? "," : "", unsupported[k]);
+            }
+            std::fprintf(stderr, "）⇒ 本 split 回落 CPU\n");
+        }
+    }
+
+    // bump 总量：按**选定 buffer 类型**的对齐算（CPU=32 / CUDA=128；offset 与 size 各对齐一次
+    //   ⇒ 每张量多留一个 A 的余量 ✓）。原实现固定按 64 补齐 ⇒ CUDA 下小张量多时不够 ✗
+    const size_t bump_align = buft ? buft->get_alignment() : 32;
     size_t total = 0;
-    for (auto& kv : by_id) total += GGML_PAD((size_t)kv.second->nbytes(), 64);
-    if (total == 0) total = 64;
-    auto big_buf = std::make_unique<DefaultBuffer>(CPUBufferType::instance(), total);
+    for (auto& kv : by_id) total += GGML_PAD((size_t)kv.second->nbytes(), bump_align) + bump_align;
+    if (total == 0) total = bump_align;
+
+    static int s_last_kind = -1;   // 0=CPU, 1=CUDA（只在变化时打印，避免刷屏 ✓）
+    if (use_cuda) ++g_srv_splits_cuda; else ++g_srv_splits_cpu;
+    if (s_cuda_backend && (s_last_kind != (use_cuda ? 1 : 0) || rtrace())) {
+        s_last_kind = use_cuda ? 1 : 0;
+        std::fprintf(stderr,
+                     "[REMOTE-SRV] split 执行：nodes=%u total=%.1f MB backend=%s"
+                     "（累计 CUDA=%ld / CPU=%ld）\n",
+                     n_nodes, (double)total / 1048576.0, use_cuda ? "CUDA" : "CPU(回落)",
+                     g_srv_splits_cuda, g_srv_splits_cpu);
+    }
+
+    std::unique_ptr<DefaultBuffer> big_buf;
+    try {
+        if (use_cuda) cudaSetDevice(s_cuda_device);
+        big_buf = std::make_unique<DefaultBuffer>(buft, total);
+    } catch (const std::exception& e) {
+        if (use_cuda) {
+            // 显存不足（或 cudaMalloc 失败）⇒ 本 split 回落 CPU（打印原因，不静默 ✗）
+            std::fprintf(stderr,
+                         "[REMOTE-SRV] !!! %.1f MB 显存分配失败（%s）⇒ 本 split 回落 CPU\n",
+                         (double)total / 1048576.0, e.what());
+            use_cuda = false;
+            be   = get_cpu_backend();
+            buft = CPUBufferType::instance();
+            try {
+                big_buf = std::make_unique<DefaultBuffer>(buft, total);
+            } catch (const std::exception& e2) {
+                std::fprintf(stderr, "[REMOTE-SRV] 分配失败（total=%zu / %s）\n", total, e2.what());
+                rnet::RHeader err;
+                err.kind = (uint32_t)rnet::RKind::ERROR_MSG;
+                err.aux0 = 403;
+                return s.send_header(err);
+            }
+        } else {
+            std::fprintf(stderr, "[REMOTE-SRV] 分配失败（total=%zu / %s）\n", total, e.what());
+            rnet::RHeader err;
+            err.kind = (uint32_t)rnet::RKind::ERROR_MSG;
+            err.aux0 = 403;
+            return s.send_header(err);
+        }
+    }
     {
         TensorAllocator ta(big_buf.get());
         for (auto& kv : by_id) {
@@ -933,21 +1244,33 @@ bool RemoteServer::handle_graph_compute(rnet::RSocket& s, rnet::RHeader& h) {
     for (uint64_t sid : input_ids) {
         auto ait = arena_.find(sid);
         auto tit = by_id.find(sid);
-        if (ait == arena_.end() || tit == by_id.end() || !tit->second->data()) continue;
-        std::memcpy(tit->second->data(), ait->second.data(), ait->second.size());
+        if (ait == arena_.end() || tit == by_id.end()) continue;
+        TensorF32* t = tit->second;
+        if (!t || !t->buffer_) continue;
+        // 【2026-09-17】改走 buffer_->set_tensor（不再裸 memcpy(t->data(), …)）：
+        //   host buffer ⇒ memcpy ✓；CUDA buffer ⇒ cudaMemcpy HostToDevice ✓（DefaultBuffer 自动判方向）
+        //   原实现直接对 t->data() 做 host memcpy，在 CUDA 下就是"往 device 指针 memcpy"
+        //   ⇒ 立刻 SIGSEGV ✗（这是 v1 必须改的三处之一）
+        t->buffer_->set_tensor(t, ait->second.data(), t->buffer_offs_, ait->second.size());
     }
 
-    // v1：服务端固定用本地 CPU 后端执行（对端机器可后续换 CUDA：set_use_cuda(true) 走同一接口）
-    static std::unique_ptr<Backend> srv_backend;
-    if (!srv_backend) {
-        const char* nt = std::getenv("PPML_REMOTE_SRV_THREADS");
-        srv_backend = std::make_unique<CPUBackend>(nt ? std::atoi(nt) : 4);
-        std::fprintf(stderr, "[REMOTE-SRV] 执行后端 = CPU(%d 线程)\n",
-                     nt ? std::atoi(nt) : 4);
+    // 执行（CPU / CUDA 二选一；分配已由上面完成 ⇒ skip_alloc 禁止后端再跑 gallocr ✓）
+    be->set_skip_alloc(true);
+    Status st = be->graph_compute(cg);
+    be->set_skip_alloc(false);
+    // 【2026-09-17 ★必须】CUDA kernel 是**异步**的 ⇒ 不等它跑完就读结果（第 4 步的 D2H）会读到
+    //   半成品/旧值，而且执行期错误（illegal address 等）会被完全吞掉 ✗。
+    //   这里同步取错误；出错则走 ERROR_MSG(402)，由客户端按既有失败路径处理 ✓。
+    if (use_cuda) {
+        cudaSetDevice(s_cuda_device);
+        const cudaError_t ce = cudaDeviceSynchronize();
+        cudaGetLastError();                // 清 sticky error，避免污染下一次判定 ✓
+        if (ce != cudaSuccess) {
+            std::fprintf(stderr, "[REMOTE-SRV] !!! CUDA 执行错误：%s ⇒ 回 ERROR_MSG(402)\n",
+                         cudaGetErrorString(ce));
+            st = Status::ABORTED;
+        }
     }
-    srv_backend->set_skip_alloc(true);     // 分配已由上面完成，禁止后端再跑 gallocr
-    Status st = srv_backend->graph_compute(cg);
-    srv_backend->set_skip_alloc(false);
     if (st != Status::SUCCESS) {
         std::fprintf(stderr, "[REMOTE-SRV] 本地执行失败 status=%d\n", (int)st);
         rnet::RHeader err;
@@ -1111,11 +1434,24 @@ bool RemoteServer::serve_forever(int world_size, int max_messages) {
         if (!first_conn) {
             // 【T1 2026-09-16】客户端重连：上一轮的 results_ 已无意义（id 不会再被引用；客户端已 invalidate_all）
             //   ⇒ 必须立刻丢掉，否则新连接的第一次取回可能命中**旧结果**（静默错值 ✗）
-            std::fprintf(stderr, "[REMOTE-SRV] 客户端重连：清空上一轮 results（%zu 条 / %.1f MB）\n",
-                         results_.size(), (double)results_bytes_ / 1048576.0);
+            // 【2026-09-17 补】**arena_ 也必须清** ✗：客户端是**新进程**（id 从 1 重新开始 ✓，
+            //   且 dirty_ 为空 ⇒ force 重传所有需要的张量 ✓）⇒ 旧 arena 纯属垃圾，害处有三：
+            //     ① 白占内存：实测第二轮起客户端日志出现 `arena=1749`（上一轮遗留）✗，
+            //        叠加多轮后对端 RSS 只增不减 ⇒ 容器内存上限下触 reclaim/thrash（表现为"不响应"✗）
+            //     ② arena_bytes_ 只增不减 ⇒ 计数虚高 ⇒ PPML_REMOTE_KEEP_MB 兜底判断失真 ✗
+            //     ③ 与旧 entries 的 dims/dtype 混在一起，调试时看不到真实占用 ✗
+            std::fprintf(stderr,
+                         "[REMOTE-SRV] 客户端重连：清空上一轮 results（%zu 条 / %.1f MB）"
+                         " + arena（%zu 项 / %.1f MB）\n",
+                         results_.size(), (double)results_bytes_ / 1048576.0,
+                         arena_.size(), (double)arena_bytes_ / 1048576.0);
             results_.clear();
             recent_ids_.clear();
             results_bytes_ = 0;
+            arena_.clear();
+            arena_dims_.clear();
+            arena_dtype_.clear();
+            arena_bytes_ = 0;
         }
         first_conn = false;
         std::fprintf(stderr, "[REMOTE-SRV] 客户端已连接（world=%d）\n", world_size);
@@ -1166,8 +1502,14 @@ bool RemoteServer::serve_forever(int world_size, int max_messages) {
                 if (!handle_results_clear(conn, h)) conn_broken = true;
                 break;
             case rnet::RKind::BYE:
-                std::fprintf(stderr, "[REMOTE-SRV] BYE（tensors=%zu, arena=%.2f MB）\n",
-                             arena_.size(), (double)arena_bytes_ / (1024.0 * 1024.0));
+                // 【2026-09-17 v1】本轮汇总：split 里有多少走了 GPU / 回落 CPU ✓
+                //   （不开 TRACE 也可见；纯 CPU 模式则显示 CPU=N ✓）
+                std::fprintf(stderr,
+                             "[REMOTE-SRV] BYE（tensors=%zu, arena=%.2f MB）"
+                             "｜本轮 split 执行：CUDA=%ld / CPU=%ld%s\n",
+                             arena_.size(), (double)arena_bytes_ / (1024.0 * 1024.0),
+                             g_srv_splits_cuda, g_srv_splits_cpu,
+                             g_srv_splits_cuda ? "（GPU 路径已生效 ✓）" : "");
                 return true;
             default:
                 // 未知消息：只记录并跳过（原实现直接 return false ⇒ 杀掉常驻服务 ✗，多 epoch 不可接受）
@@ -1240,21 +1582,25 @@ RemoteBackend* remote_make_backend_from_env() {
                           std::atoi(std::getenv("PPML_REMOTE_SLIM")) != 0;
 
         // 优先级（决定 scheduler 把节点分给谁）：
-        //   * 只有显式给了 PPML_REMOTE_OPS（= 真打算把某些 op 放远端）时才高于 CPU(0)/CUDA(1)，
-        //     默认 100，可用 PPML_REMOTE_PRIORITY 覆盖；
-        //   * 未给 PPML_REMOTE_OPS ⇒ -1（最低），且 supports_op 全 false ⇒ 完全不抢节点（惰性注册）。
+        //   * 显式给了 PPML_REMOTE_OPS **或** PPML_REMOTE_NODES（= 真打算把一部分图放远端）时
+        //     才高于 CPU(0)/CUDA(1)，默认 100，可用 PPML_REMOTE_PRIORITY 覆盖；
+        //   * 两者都没给 ⇒ -1（最低），且 supports_op 全 false ⇒ 完全不抢节点（惰性注册）。
+        //   【2026-09-17】补上 NODES：此前"纯区间模式"（只给 NODES 不给 OPS）prio=-1
+        //     ⇒ pass_fill_unassigned 按优先级顺序先问 CPU（它全支持）⇒ 节点全被 CPU 拿走 ✗
+        //     ⇒ 区间形同虚设，且无法做"纯区间 vs 纯 op"的 A/B 对照 ✗
+        const char* ops_env = std::getenv("PPML_REMOTE_OPS");
+        const char* rng_env = std::getenv("PPML_REMOTE_NODES");
         int prio = -1;
-        if (const char* ops = std::getenv("PPML_REMOTE_OPS")) {
-            if (*ops) {
-                const char* p = std::getenv("PPML_REMOTE_PRIORITY");
-                prio = p ? std::atoi(p) : 100;
-            }
+        if ((ops_env && *ops_env) || (rng_env && *rng_env)) {
+            const char* p = std::getenv("PPML_REMOTE_PRIORITY");
+            prio = p ? std::atoi(p) : 100;
         }
         be = std::make_unique<RemoteBackend>(cli, prio);
         be->set_slim(slim);
-        std::fprintf(stderr, "[REMOTE] RemoteBackend 已创建（slim=%d, ops=%s, priority=%d）\n",
+        std::fprintf(stderr, "[REMOTE] RemoteBackend 已创建（slim=%d, ops=%s, nodes=%s, priority=%d）\n",
                      (int)slim,
                      std::getenv("PPML_REMOTE_OPS") ? std::getenv("PPML_REMOTE_OPS") : "none",
+                     std::getenv("PPML_REMOTE_NODES") ? std::getenv("PPML_REMOTE_NODES") : "none",
                      prio);
     }
     return be.get();

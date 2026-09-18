@@ -439,6 +439,23 @@ public:
     // 优先级（越大越优先被调度）
     virtual int priority() const { return 0; }
 
+    // 是否受"显存预算 + CUDA 安全护栏"约束（默认把 priority>0 当作 GPU ✓）。
+    //   ★ 远端后端 priority 也 >0（用来抢节点），但它不占显存 ⇒ 必须 override 成 false ✗，
+    //     否则"按 block/区间"放上一大批节点时会因显存预算不足被逐出、切不回大 split ✗。
+    virtual bool vram_budgeted() const { return priority() > 0; }
+
+    // ===== 调度器注入的"当前节点在图中的下标"（block/区间切分用）=====
+    //   pass_fill_unassigned / set_backend_if_supported 在调用 supports_op 前会设置它；
+    //   后端可据此做"按图节点区间选择"（远端后端 `PPML_REMOTE_NODES` ✓）。
+    //   -1 = 未知（保守：区间条件不成立）
+    void set_sched_index(int i) const { sched_index_ = i; }
+    int  sched_index() const { return sched_index_; }
+
+    // ===== 新图开始通知（需要"整图信息"的策略用；默认无操作）=====
+    //   split_graph 在每次切图前对每个后端调用一次 ⇒ 远端据此**自动计算**节点区间
+    //   （`PPML_REMOTE_NODES=auto`，避免手填节点号 ✗）
+    virtual void on_graph_begin(ComputeGraph* g) { (void)g; }
+
     // ===== 预分配跳过开关 =====
     // 由 BackendScheduler 在混训时设置：scheduler 已通过 reserve_graph_memory 预分配了
     // 所有张量，后端 graph_compute 不应再跑自己的 gallocr（否则两套 gallocr 反复 re-bind
@@ -452,6 +469,7 @@ public:
 
 protected:
     bool skip_alloc_ = false;
+    mutable int sched_index_ = -1;   // 见 set_sched_index/sched_index（supports_op 是 const ⇒ mutable）
 };
 
 class BackendScheduler {
@@ -496,7 +514,8 @@ private:
     // host 生产者判定：OP_NONE 参数/常量节点（数据在 host，dispatch 跳过且不建 cpy），
     // 不能放 GPU，否则消费者裸读 host 指针崩溃。
     bool node_is_host_producer(TensorF32* node) const;
-    void set_backend_if_supported(TensorF32* node, int backend_id);
+    // idx = 该节点在图中的下标（供后端做区间/block 选择；-1 = 未知）
+    void set_backend_if_supported(TensorF32* node, int backend_id, int idx = -1);
     int  count_supported_inputs(TensorF32* node, int backend_id) const;
     bool tensor_buffer_compatible(const TensorF32* src, int backend_id) const;
 

@@ -244,6 +244,102 @@ TEST(CudaBackendTest, OutProd) {
     cudaFree(la->data()); cudaFree(lb->data());
 }
 
+// ============================================================
+// out_prod **真实 shape** 性能 + 正确性（2026-09-18）
+//   ⚠ 热点必须用真实 shape 量：上面的 `OutProd`（4×5×3 微图）**不能当热点代理** ✗（历史教训）。
+//   shape 来源 = ncu 实测的热点 launch `(4,1,2601)×(16,16,1)`：
+//     z 方向 2601 = ne0*ne1 = 51*51（ne0=ne1=L=51）、收缩维 ne01=51、ne2=16、ne3=64（planes=1024）
+//     ⇒ A/B/C 各 ≈10.65 MB（与 ncu 记录 "A+B+C 各 ~10.6 MB" 一致 ✓）；原耗时 46.38 ms / 51.15 ms。
+//   直接调 wrapper `out_prod_cuda`（绕开图/gallocr ⇒ 纯 kernel 计时）✓
+// ============================================================
+namespace ppml {
+extern void out_prod_cuda(const float* src0, const float* src1, float* dst,
+                          int64_t ne00, int64_t ne01, int64_t ne02, int64_t ne03,
+                          int64_t ne10, int64_t ne11, int64_t ne12, int64_t ne13,
+                          int64_t ne0,  int64_t ne1,  int64_t ne2,  int64_t ne3);
+}
+
+TEST(CudaBackendTest, OutProdRealShapePerfAndCorrect) {
+    if (!cuda_available()) { GTEST_SKIP() << "CUDA 不可用"; }
+
+    const int64_t L = 51, PL2 = 16, PL3 = 64, K = 51;
+    const int64_t ne00 = L, ne01 = K, ne02 = PL2, ne03 = PL3;
+    const int64_t ne10 = L, ne11 = K, ne12 = PL2, ne13 = PL3;
+    const int64_t ne0  = L, ne1  = L, ne2  = PL2, ne3  = PL3;
+
+    const size_t nA = (size_t)(ne00 * ne01 * ne02 * ne03);
+    const size_t nB = (size_t)(ne10 * ne11 * ne12 * ne13);
+    const size_t nC = (size_t)(ne0 * ne1 * ne2 * ne3);
+    std::vector<float> A(nA), B(nB);
+    for (size_t i = 0; i < nA; ++i) A[i] = (float)(i % 13) * 0.0625f - 0.5f;
+    for (size_t i = 0; i < nB; ++i) B[i] = (float)(i % 7) * 0.125f - 0.25f;
+
+    float *dA = nullptr, *dB = nullptr, *dC = nullptr;
+    ASSERT_EQ(cudaMalloc(&dA, nA * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&dB, nB * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&dC, nC * sizeof(float)), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(dA, A.data(), nA * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(dB, B.data(), nB * sizeof(float), cudaMemcpyHostToDevice), cudaSuccess);
+    cudaMemset(dC, 0, nC * sizeof(float));
+
+    auto run = [&]() {
+        ppml::out_prod_cuda(dA, dB, dC,
+                            ne00, ne01, ne02, ne03,
+                            ne10, ne11, ne12, ne13,
+                            ne0,  ne1,  ne2,  ne3);
+    };
+
+    // ---- 计时（3 次热身 + 20 次平均）----
+    for (int i = 0; i < 3; ++i) run();
+    cudaDeviceSynchronize();
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    cudaEventRecord(e0);
+    constexpr int R = 20;
+    for (int i = 0; i < R; ++i) run();
+    cudaEventRecord(e1);
+    cudaEventSynchronize(e1);
+    float ms = 0.f;
+    cudaEventElapsedTime(&ms, e0, e1);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    ms /= (float)R;
+
+    const double flops = 2.0 * (double)ne0 * (double)ne1 * (double)ne01
+                             * (double)(ne2 * ne3);
+    const double useful_mb = (double)(nA + nB + nC) * 4.0 / 1048576.0;
+    printf("[outprod-perf] ne0=ne1=%lld K=%lld planes=%lld | %.4f ms | %.2f GFLOPS | "
+           "useful %.1f MB (%.2f GB/s useful)\n",
+           (long long)ne0, (long long)ne01, (long long)(ne2 * ne3), (double)ms,
+           flops / ((double)ms * 1e-3) / 1e9, useful_mb,
+           useful_mb / 1024.0 / ((double)ms * 1e-3));
+
+    // ---- 正确性（真实 shape，抽查两个极端平面 × 全部 (i0,i1)）----
+    std::vector<float> C(nC);
+    ASSERT_EQ(cudaMemcpy(C.data(), dC, nC * sizeof(float), cudaMemcpyDeviceToHost), cudaSuccess);
+    const int64_t planes[2][2] = {{0, 0}, {ne2 - 1, ne3 - 1}};
+    double max_abs = 0.0;
+    for (int pi = 0; pi < 2; ++pi) {
+        const int64_t i2 = planes[pi][0], i3 = planes[pi][1];
+        const size_t s0p = (size_t)(i2 * ne00 * ne01 + i3 * ne00 * ne01 * ne02);
+        const size_t s1p = (size_t)(i2 * ne10 * ne11 + i3 * ne10 * ne11 * ne12);
+        const size_t dp  = (size_t)(i2 * ne0 * ne1 + i3 * ne0 * ne1 * ne2);
+        for (int64_t i1 = 0; i1 < ne1; ++i1) {
+            for (int64_t i0 = 0; i0 < ne0; ++i0) {
+                float s = 0.f;
+                for (int64_t k = 0; k < ne01; ++k) {
+                    s += A[s0p + (size_t)(i0 + k * ne00)] * B[s1p + (size_t)(i1 + k * ne10)];
+                }
+                const double diff = std::fabs((double)s - (double)C[dp + (size_t)(i0 + i1 * ne0)]);
+                if (diff > max_abs) max_abs = diff;
+            }
+        }
+    }
+    printf("[outprod-check] 真实 shape 抽查 max|Δ| = %.3e（参考 = CPU 按 ggml 布局手算）\n", max_abs);
+    EXPECT_LT(max_abs, 1e-3);
+
+    cudaFree(dA); cudaFree(dB); cudaFree(dC);
+}
+
 // concat：沿 dim 拼接
 TEST(CudaBackendTest, Concat) {
     if (!cuda_available()) { GTEST_SKIP() << "CUDA 不可用"; }
