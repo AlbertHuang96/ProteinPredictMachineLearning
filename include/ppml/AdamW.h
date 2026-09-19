@@ -79,10 +79,24 @@ private:
         bool               no_weight_decay;
         float              se3_lr_scale  = 1.0f;  // SE3 参数分层 lr 缩放（TENSOR_FLAG_SE3 时 0.01）
         float              lora_lr_scale = 1.0f;  // LoRA 参数分层 lr 缩放（TENSOR_FLAG_LORA 时放大）
-        std::vector<float> m;   // 一阶矩
-        std::vector<float> v;   // 二阶矩
+        std::vector<float> m;   // 一阶矩（host：checkpoint 用；GPU 路径下可能"过期"）
+        std::vector<float> v;   // 二阶矩（同上）
+        // ---- GPU 路径（2026-09-19）------------------------------------------------
+        //   参数/梯度都在显存时，m/v 也放显存 ⇒ 整步一个 kernel，**零 H2D/D2H** ✓
+        //   （原实现每参数 2×D2H + 1×H2D，实测 540 参数/step 造成 D2H 占 memcpy 时间 84.7% ✗）
+        //   状态机：dev_valid=显存副本是权威值；host_stale=host m/v 已落后（GPU step 之后）✓
+        //   ⇒ export_momentum（checkpoint）时按需 D2H 回 host；import_momentum 后按需 H2D 上去 ✓
+        void*   d_m        = nullptr;   // device 一阶矩（惰性分配）
+        void*   d_v        = nullptr;   // device 二阶矩（惰性分配）
+        int64_t dev_n      = 0;         // d_m/d_v 的元素容量
+        bool    dev_valid  = false;     // 显存副本是否有效（false ⇒ 下次 GPU step 前用 host 上传 ✓）
+        bool    host_stale = false;     // host m/v 是否落后于显存（true ⇒ export 前必须 D2H ✓）
     };
     std::vector<ParamState> states_;
+
+public:
+    // GPU 路径需要回收每个参数的 device m/v（若用过）✓
+    ~AdamW();
 
     float lr_;
     float weight_decay_;

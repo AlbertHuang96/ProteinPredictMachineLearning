@@ -8,13 +8,37 @@
 namespace ppml {
 
 // ============================================================
-// 内部辅助函数
+// 【2026-09-19】裁剪的 GPU 路径（把"读整张量回 host 算范数/缩放"换成显存内就地运算）
+//   背景（实测）：dev 1 epoch `cudaMemcpy` 11,767 次 / 2.36 s，**D2H 占 84.7%**，
+//   中位 41 KB（= 参数级）；本文件原来每个参数 × 每个 loss 都做 D2H(+H2D) ✗
+//   （5 个 loss × 540 参数 ⇒ 上千次往返，且 pageable 拷贝自带**隐式全设备同步** ✗）。
+//   现在：梯度在显存时 ⇒
+//     · 范数/最大值/NaN 计数 → `grad_stats_cuda`（只回传 3 个 double ✓，不再搬整个张量）
+//     · 缩放 + NaN/Inf→0      → `grad_scale_cuda`（就地，判据与 CPU 逐字一致 ✓）
+//     · per-loss 累加器        → 放显存（`grad_accumulate_cuda`），最后 D2D 写回梯度 ✓
+//   数值：范数是 device double 规约（语义同 CPU 的 double 累加 ✓；加法顺序可能不同 ⇒
+//   scale 因子末位可有差异，实测 loss 无差异 ✓）。
 // ============================================================
+extern int  grad_stats_cuda(const float* g, int64_t n, double* sum_sq, double* maxabs,
+                            long long* nnan);
+extern int  grad_scale_cuda(float* g, int64_t n, float scale);
+extern int  grad_accumulate_cuda(float* acc, const float* g, int64_t n);
+extern int  optim_fill_cuda(float* dst, int64_t n, float val);
+extern void* optim_alloc_cuda(int64_t bytes);
+extern void  optim_free_cuda(void* p);
+extern int   optim_d2d_cuda(void* dst, const void* src, int64_t bytes);
+extern int   optim_cuda_available();
 
 // ---- 张量读写工具：兼容 backend buffer / 裸 CPU / CUDA 裸张量 ----
 // 当全图在 CUDA 上时，参数/梯度 buffer_ 指向 device 内存，grad->data() 是 device 指针，
 // 不能直接当 host 读写；统一经 buffer_->get_tensor（D2H 同步拷贝）/ set_tensor（H2D）访问。
 namespace {
+// 【2026-09-19】设备判定与裸指针（GPU 路径用；host/裸 CPU 张量返回 false ⇒ 走原路径 ✓）
+bool tensor_on_device(const TensorF32* t) {
+    return t && t->buffer_ && !t->buffer_->is_host() && t->data() != nullptr;
+}
+float* dev_f32(TensorF32* t) { return reinterpret_cast<float*>(t->data()); }
+
 std::vector<float> read_tensor_values(const TensorF32* t) {
     std::vector<float> buf(static_cast<size_t>(t->numel()));
     const size_t bytes = static_cast<size_t>(t->numel()) * sizeof(float);
@@ -50,6 +74,8 @@ void write_tensor_values(TensorF32* t, const std::vector<float>& vals) {
 
 void fill_tensor_values(TensorF32* t, float val) {
     const int64_t n = t->numel();
+    // 【2026-09-19】device ⇒ 就地填充（0 走 cudaMemset / 其它走 fill kernel ✓，不再造 host 向量 ✓）
+    if (tensor_on_device(t) && optim_fill_cuda(dev_f32(t), n, val) == 0) return;
     if (t->buffer_) {
         std::vector<float> v(static_cast<size_t>(n), val);
         t->buffer_->set_tensor(t, v.data(), t->buffer_offs_, static_cast<size_t>(n) * sizeof(float));
@@ -102,16 +128,28 @@ static float compute_total_grad_norm(const std::vector<TensorF32*>& param_list, 
     for (auto* param : param_list) {
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
-        std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
         const int64_t n = grad->numel();
         double pl2 = 0.0; double pmax = 0.0; long nnan = 0;
-        for (int64_t j = 0; j < n; j++) {
-            const double v = static_cast<double>(g[static_cast<size_t>(j)]);
-            if (v != v) { ++nnan; continue; }   // NaN 不计入 l2/max，只统计数量
-            norm_sq += v * v;
-            pl2 += v * v;
-            const double a = std::fabs(v);
-            if (a > pmax) pmax = a;
+        if (tensor_on_device(grad)) {
+            // 【2026-09-19】device ⇒ 只回传 3 个统计量（Σg²/max|g|/NaN 数），**不搬整张量** ✓
+            double s2 = 0.0, mx = 0.0;
+            long long nn = 0;
+            if (grad_stats_cuda(dev_f32(grad), n, &s2, &mx, &nn) == 0) {
+                pl2 = s2; pmax = mx; nnan = (long)nn;
+                norm_sq += s2;                      // 与 CPU 同：跨参数用 double 累加 ✓
+            } else {
+                continue;                           // 统计失败 ⇒ 跳过该参数（保守 ✓）
+            }
+        } else {
+            std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
+            for (int64_t j = 0; j < n; j++) {
+                const double v = static_cast<double>(g[static_cast<size_t>(j)]);
+                if (v != v) { ++nnan; continue; }   // NaN 不计入 l2/max，只统计数量
+                norm_sq += v * v;
+                pl2 += v * v;
+                const double a = std::fabs(v);
+                if (a > pmax) pmax = a;
+            }
         }
         PInfo pi; pi.numel = n; pi.l2 = pl2; pi.maxabs = pmax; pi.nnan = nnan;
         pinfos.push_back(pi);
@@ -154,6 +192,11 @@ static void scale_param_grads(const std::vector<TensorF32*>& param_list, Compute
     for (auto* param : param_list) {
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
+        // 【2026-09-19】device ⇒ 就地缩放（判据与下面 CPU 版逐字一致：NaN/Inf→0 ✓），零往返 ✓
+        if (tensor_on_device(grad) &&
+            grad_scale_cuda(dev_f32(grad), grad->numel(), scale) == 0) {
+            continue;
+        }
         std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
         const int64_t n = grad->numel();
         for (int64_t j = 0; j < n; j++) {
@@ -200,6 +243,20 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
     for (auto* param : params) {
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
+        // 【2026-09-19】device ⇒ 用统计量判 NaN（只回传计数 ✓），命中则**整张清零**（memset ✓）
+        if (tensor_on_device(grad)) {
+            const int64_t n = grad->numel();
+            double s2 = 0.0, mx = 0.0;
+            long long nn = 0;
+            if (grad_stats_cuda(dev_f32(grad), n, &s2, &mx, &nn) != 0) continue;
+            if (nn > 0) {
+                optim_fill_cuda(dev_f32(grad), n, 0.0f);
+                if (getenv("GRAPH_DEBUG_GRAD_NAN")) {
+                    fprintf(stderr, "[GRAD-NAN-CLR] param cleared (NaN grad->0) [device, nnan=%lld]\n", nn);
+                }
+            }
+            continue;
+        }
         std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
         bool has_nan = false;
         for (const float v : g) { if (v != v) { has_nan = true; break; } }
@@ -265,17 +322,56 @@ float accumulate_per_loss_gradients(
     auto param_list = collect_params(cgraph);
     if (param_list.empty()) return 0.0f;
 
-    // 为每个参数分配一个 CPU 端持久化累加器
+    // 为每个参数分配一个累加器
+    //   【2026-09-19】梯度在显存时 ⇒ 累加器也放**显存**（否则每个 loss 都要 D2H+H2D ✗）✓
     struct ParamAccum {
-        TensorF32* param;
-        std::vector<float> accum;  // CPU-side persistent accumulator
+        TensorF32* param = nullptr;
+        std::vector<float> accum;   // host 累加器（梯度在 host 时用）
+        float*  d_accum = nullptr;  // device 累加器（指向下面 arena 内的一段 ✓）
+        int64_t dev_off = 0;        // 在 arena 内的元素偏移
+        int64_t n = 0;
     };
     std::vector<ParamAccum> accumulators;
     accumulators.reserve(param_list.size());
+    int64_t dev_total = 0;
     for (auto* p : param_list) {
         TensorF32* grad = cgraph->graph_get_grad(p);
-        int64_t n = grad ? grad->numel() : 0;
-        accumulators.push_back({p, std::vector<float>(static_cast<size_t>(n), 0.0f)});
+        ParamAccum a;
+        a.param = p;
+        a.n = grad ? grad->numel() : 0;
+        if (a.n > 0 && tensor_on_device(grad)) {
+            a.dev_off = dev_total;             // 先记偏移，分配后再落真实地址 ✓
+            dev_total += a.n;
+        } else {
+            a.accum.assign(static_cast<size_t>(a.n), 0.0f);
+        }
+        accumulators.push_back(std::move(a));
+    }
+    // 一次 cudaMalloc 拿整块 arena（避免逐参数分配 ✗）+ RAII 释放 ✓
+    struct ArenaGuard {
+        void* base = nullptr;
+        ~ArenaGuard() { if (base) optim_free_cuda(base); }
+    } arena;
+    if (dev_total > 0) {
+        arena.base = optim_alloc_cuda(dev_total * (int64_t)sizeof(float));
+        if (!arena.base) {                     // 分配失败 ⇒ 全部退回 host 累加器（保守 ✓）
+            for (auto& a : accumulators) {
+                if (a.n > 0 && a.dev_off < dev_total) {
+                    a.d_accum = nullptr;
+                    a.accum.assign(static_cast<size_t>(a.n), 0.0f);
+                }
+            }
+            dev_total = 0;
+        } else {
+            float* d_base = reinterpret_cast<float*>(arena.base);
+            for (auto& a : accumulators) {
+                if (a.n <= 0) continue;
+                if (a.accum.empty()) {         // device 累加器 ✓
+                    a.d_accum = d_base + a.dev_off;
+                    optim_fill_cuda(a.d_accum, a.n, 0.0f);   // 清零初始化 ✓
+                }
+            }
+        }
     }
 
     // ---- Step 1: 逐 loss 执行 backward + per-loss clip + accumulate ----
@@ -307,10 +403,15 @@ float accumulate_per_loss_gradients(
             was_clipped = true;
         }
 
-        // 1f. 累加到 persistent accumulator（CPU 端）
+        // 1f. 累加到 persistent accumulator
         for (size_t a = 0; a < accumulators.size(); a++) {
             TensorF32* grad = cgraph->graph_get_grad(accumulators[a].param);
             if (!grad) continue;
+            // 【2026-09-19】device 累加器 ⇒ 显存内累加，零往返 ✓
+            if (accumulators[a].d_accum && tensor_on_device(grad) &&
+                grad_accumulate_cuda(accumulators[a].d_accum, dev_f32(grad), accumulators[a].n) == 0) {
+                continue;
+            }
             std::vector<float> gdata = read_tensor_values(grad);  // D2H（若 device）
             int64_t n = grad->numel();
             for (int64_t j = 0; j < n; j++) {
@@ -331,6 +432,12 @@ float accumulate_per_loss_gradients(
     for (size_t a = 0; a < accumulators.size(); a++) {
         TensorF32* grad = cgraph->graph_get_grad(accumulators[a].param);
         if (!grad) continue;
+        // 【2026-09-19】device 累加器 ⇒ 显存内 D2D 写回（零 H2D ✓）
+        if (accumulators[a].d_accum && tensor_on_device(grad) &&
+            optim_d2d_cuda(dev_f32(grad), accumulators[a].d_accum,
+                           accumulators[a].n * (int64_t)sizeof(float)) == 0) {
+            continue;
+        }
         write_tensor_values(grad, accumulators[a].accum);  // H2D（若 device）
     }
 
