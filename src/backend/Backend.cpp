@@ -939,6 +939,19 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
             TensorF32* node = graph->graph_node(i);
             if (is_view_op(node->op)) continue;
 
+            // 【2026-09-19 ①-B】op=0 且**数据确实在 host**（无 data 的裸常量也按 host 处理）⇒ 钉死 CPU ✓。
+            //   ⚠️ 必须自己查数据位置，**不能用 node_is_host_producer**：它对**所有** op=0 都返回 true ✗
+            //      （Backend.cpp:100 先判 op==OP_NONE ✗），会把 device 常驻的权重/常量也拉回 host ✗
+            //      —— 实测这么做会让 epoch 19.9s→28.8s 且 loss 漂移 ⚠️。device 常驻的 op=0 保持原逻辑 ✓。
+            if (node->op == OP_NONE) {
+                const bool host_data = (node->data() == nullptr) ||
+                                       (node->buffer_ != nullptr && node->buffer_->is_host());
+                if (host_data) {
+                    if (tensor_backend_id(node) == -1) backend_map_[node] = n_backends_ - 1;  // CPU（最低优先级）
+                    continue;
+                }
+            }
+
             int node_id = tensor_backend_id(node);
 
             if (node_id != -1) {
@@ -963,6 +976,17 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
             TensorF32* node = graph->graph_node(i);
             if (is_view_op(node->op)) continue;
 
+            // 【2026-09-19 ①-B】同上（向上扩展）：op=0 且数据在 host ⇒ 钉 CPU ✓；
+            //   device 常驻的 op=0 保持原逻辑 ✓（不能用 node_is_host_producer ✗ 它把所有 op=0 都当 host ✗）
+            if (node->op == OP_NONE) {
+                const bool host_data = (node->data() == nullptr) ||
+                                       (node->buffer_ != nullptr && node->buffer_->is_host());
+                if (host_data) {
+                    if (tensor_backend_id(node) == -1) backend_map_[node] = n_backends_ - 1;
+                    continue;
+                }
+            }
+
             int node_id = tensor_backend_id(node);
 
             if (node_id != -1) {
@@ -985,10 +1009,13 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
             // 诊断：检测栈/堆地址范围的 node，定位悬垂指针
             uintptr_t a = (uintptr_t)node;
             int in_stack = (a >= 0x700000000000ULL && a <= 0x800000000000ULL);
+            // 【2026-09-19】补 data/buffer 信息：判断 op=0 节点是"host 参数/常量"还是"device 常驻" ✓
             fprintf(stderr,
-                "[sched] node[%d]=%p op=%d ndim=%d numel=%lld flag=0x%x %s\n",
+                "[sched] node[%d]=%p op=%d ndim=%d numel=%lld flag=0x%x data=%p buf=%p buf_host=%d %s\n",
                 i, (void*)node, (int)node->op, (int)node->shape().ndim(),
                 (long long)node->numel(), (unsigned)node->flag,
+                (void*)node->data(), (void*)node->buffer_,
+                node->buffer_ ? (node->buffer_->is_host() ? 1 : 0) : -1,
                 in_stack ? "<STACK?!>" : "");
         }
         if (is_view_op(node->op)) continue;
@@ -1103,14 +1130,17 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
 
     // 诊断（GRAPH_DEBUG_SCHED=1）：打印每 backend 分配的 op 数（检测 GPU 是否被调用）
     if (getenv("GRAPH_DEBUG_SCHED") && sched_backend_cnt_ != nullptr) {
-        int n_cpu = sched_backend_cnt_[0];
-        long gpu_total = 0;
-        for (int b = 1; b < n_backends_; b++) gpu_total += sched_backend_cnt_[b];
-        fprintf(stderr, "[sched] split_graph: total_op_cpu=%d total_op_gpu=%lld (gpu_backends=%d)\n",
-                n_cpu, (long long)gpu_total, n_backends_ - 1);
-        for (int b = 1; b < n_backends_; b++) {
-            fprintf(stderr, "[sched]   backend=%d op_count=%d last_op=%lld\n",
-                    b, sched_backend_cnt_[b], sched_backend_op_last_[b]);
+        // 【2026-09-19 标签修正】`backends_` 按 priority **降序**排序 ⇒ **下标 0 = 最高优先级（GPU/CUDA）**，
+        //   最后一个下标 = CPU（`n_backends_-1`）✓。原打印把 [0] 当 CPU、把 [1..] 当 GPU ⇒ **与实际相反** ✗
+        //   （此前分析被它误导过 ✓）⇒ 现在直接打印后端名字，杜绝猜 ✓。
+        fprintf(stderr, "[sched] split_graph: n_backends=%d（下标 0 = 最高优先级）\n", n_backends_);
+        for (int b = 0; b < n_backends_; b++) {
+            fprintf(stderr,
+                    "[sched]   backend[%d] name=%s priority=%d vram_budgeted=%d op_count=%d last_op=%lld\n",
+                    b, backends_[b] ? backends_[b]->get_name() : "?",
+                    backends_[b] ? backends_[b]->priority() : -1,
+                    backends_[b] ? (int)backends_[b]->vram_budgeted() : -1,
+                    sched_backend_cnt_[b], sched_backend_op_last_[b]);
         }
         // 【2026-09-19】预算逐出汇总：哪些 op 被"预算不足"逼回 CPU（前 6 个）✓
         if (g_budget_refuse_cnt_ > 0) {
@@ -1137,13 +1167,16 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
 void BackendScheduler::build_splits(ComputeGraph* graph) {
     int n_nodes = graph->n_nodes();
 
-    // ===== Step 1: 跳过开头的 view op，确定第一个 split 的 backend =====
+    // ===== Step 1: 跳过开头的 view op / op=0，确定第一个 split 的 backend =====
+    //   【2026-09-19 ①-A】op=0（参数/常量/输入，无 kernel）与 view 一样**不参与 backend 选择** ✗：
+    //   否则"开头一串 op=0"会先起一个只装 no-op 的 split ✗（实测有 824 个 1 节点孤岛 ✓）。
     int i = 0;
     for (; i < n_nodes; i++) {
         TensorF32* node = graph->graph_node(i);
-        if (!is_view_op(node->op)) break;
+        if (is_view_op(node->op) || node->op == OP_NONE) continue;
+        break;
     }
-    if (i >= n_nodes) return;  // 全是 view op
+    if (i >= n_nodes) return;  // 全是 view / op=0
 
     // ===== Step 2: 创建第一个 split =====
     splits_.resize(1);
@@ -1198,7 +1231,21 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
         }
 
         // ---- 3b. backend 变了 或 需要新 split → 切分 ----
-        if (node_backend_id != cur_backend_id || need_new_split) {
+        //   【2026-09-19 ①-A】op=0 对切分**透明**：no-op 节点不因自己的归属切开 split ✗。
+        //   安全性（已逐条核对 ✓）：
+        //     · 两个后端的 dispatch 都 skip OP_NONE（CUDABackend.cpp:419 / CPUBackend.cpp:367 ✓）⇒
+        //       它被并进 CUDA split 也只是个 no-op，不会被任何 kernel 读 ✗；
+        //     · 跨端拷贝按"src 数据实际位置 + backend 归属"判定（下方 3c）⇒ 与 split 边界无关 ✓；
+        //     · 归属 / buffer / 预算一概不动 ⇒ alloc 与拷贝语义与原实现完全一致 ✓。
+        //   注：`split_backend_id` 只用于**是否切分**的判断；真起新 split 时仍写 node_backend_id ✓。
+        //   开关：PPML_SCHED_OP0_MERGE=0 关闭本行为（A/B 用，默认开 ✓）。
+        static const bool op0_merge = []() {
+            const char* e = std::getenv("PPML_SCHED_OP0_MERGE");
+            return !(e && *e && std::atoi(e) == 0);
+        }();
+        const int split_backend_id =
+            (op0_merge && node->op == OP_NONE) ? cur_backend_id : node_backend_id;
+        if (split_backend_id != cur_backend_id || need_new_split) {
             split->i_end = i;
             n_splits_++;
 
@@ -1507,9 +1554,12 @@ Status BackendScheduler::graph_compute() {
                 snprintf(ops_buf + ops_off, sizeof(ops_buf) - (size_t)ops_off,
                          ",…+%d", n_nodes_here - n_show);
             }
+            // 【2026-09-19】backend 后面直接跟名字（下标 0 = 最高优先级 = GPU/CUDA ✓，最后 = CPU ✓）
+            const char* be_name = (sp.backend_id >= 0 && sp.backend_id < n_backends_ && backends_[sp.backend_id])
+                                      ? backends_[sp.backend_id]->get_name() : "?";
             fprintf(stderr,
-                    "[sched] COMPUTE split=%d backend=%d i=[%d,%d) nodes=%d scalar(numel=1)=%d ops=[%s]\n",
-                    si, sp.backend_id, sp.i_start, sp.i_end, n_nodes_here, n_scalar, ops_buf);
+                    "[sched] COMPUTE split=%d backend=%d(%s) i=[%d,%d) nodes=%d scalar(numel=1)=%d ops=[%s]\n",
+                    si, sp.backend_id, be_name, sp.i_start, sp.i_end, n_nodes_here, n_scalar, ops_buf);
         }
         int sub_n_nodes = sp.i_end - sp.i_start;
         TensorF32** saved_nodes = current_graph_->nodes;
