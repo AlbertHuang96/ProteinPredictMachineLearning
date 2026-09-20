@@ -334,6 +334,26 @@ void ComputeGraph::build_backward_expand(
     free(grads_needed);
 }
 
+// 【2026-09-21】梯度载体图辅助（见 ComputeGraph.h 注释 ✓）
+//   与 visit_parents_graph 的"首次见到"分支保持一致的登记语义（key + used 位 ✓）
+size_t ComputeGraph::graph_slot_of(TensorF32 * t) {
+    if (!t) return HASHSET_FULL;
+    const size_t pos = hash_find(&this->visited_hash_set, t);
+    if (pos == HASHSET_FULL) return HASHSET_FULL;
+    if (!bitset_get(this->visited_hash_set.used, pos)) {
+        this->visited_hash_set.keys[pos] = t;
+        bitset_set(this->visited_hash_set.used, pos);
+    }
+    return pos;
+}
+
+void ComputeGraph::graph_set_grad(TensorF32 * t, TensorF32 * g) {
+    if (!this->grads) return;
+    const size_t pos = graph_slot_of(t);
+    if (pos == HASHSET_FULL) return;
+    this->grads[pos] = g;
+}
+
 TensorF32 * ComputeGraph::graph_get_grad(const TensorF32 * node) {
     const size_t igrad = hash_find(&this->visited_hash_set, (void*)node);
     return igrad != HASHSET_FULL && bitset_get(this->visited_hash_set.used, igrad) && this->grads ? this->grads[igrad] : NULL;

@@ -25,24 +25,24 @@ static inline int ceil_div(int a, int b) {
 //   流量 2.19 GB 而有用数据仅 ~32 MB（**~68× 浪费**）、ncu OPT 判"87% 冗余 sectors"。
 //
 // ── 新映射（谁放进 threadIdx，取决于**谁是 stride=1**）────────────────────────
-//   threadIdx.x  → **i0**   ★ i0 在 src0 与 dst 中 **stride=1**（最内维）
+//   threadIdx.x  → **i0**    i0 在 src0 与 dst 中 **stride=1**（最内维）
 //                            ⇒ 同 warp 连续线程访问**连续地址**（每次迭代 32×4B = 128B
-//                              = 4 个 sector 全用满）✓
-//   threadIdx.y  → **i1**   ★ i1 在 src1 中 **stride=1**；且同一 warp 内 i1 相同
-//                            ⇒ src1 的读是**广播**（全 warp 同一地址 ⇒ 1 次事务）✓
-//   blockIdx.z   → 平面 (i2,i3)  ★ 按平面局部化：一个 block 只碰一个平面的数据，
-//                                  且带 grid-stride ⇒ 平面数超 gridDim.z(65535) 也不丢 ✓
-//   blockIdx.x/y → i0/i1 的 tile 序号（同样带 grid-stride ⇒ 任何 shape 都不丢数据 ✓）
+//                              = 4 个 sector 全用满）
+//   threadIdx.y  → **i1**    i1 在 src1 中 **stride=1**；且同一 warp 内 i1 相同
+//                            ⇒ src1 的读是**广播**（全 warp 同一地址 ⇒ 1 次事务）
+//   blockIdx.z   → 平面 (i2,i3)   按平面局部化：一个 block 只碰一个平面的数据，
+//                                  且带 grid-stride ⇒ 平面数超 gridDim.z(65535) 也不丢 
+//   blockIdx.x/y → i0/i1 的 tile 序号（同样带 grid-stride ⇒ 任何 shape 都不丢数据 ）
 //   K 维         在每线程内**串行**：步长只决定"每次迭代跳多远"，而**每次迭代内**
-//                warp 访问的仍是连续的 32 个 i0 ⇒ 依旧满利用 ✓
+//                warp 访问的仍是连续的 32 个 i0 ⇒ 依旧满利用 
 //
 // ── 数值一致性 ──────────────────────────────────────────────────────────────
-//   每个输出元素的累加顺序与旧实现**完全一致**（k = 0..ne01-1 依次累加）⇒ 结果逐位相同 ✓
-//   （所以这次优化不会改变 loss；改完可直接用 loss 做回归判据 ✓）
+//   每个输出元素的累加顺序与旧实现**完全一致**（k = 0..ne01-1 依次累加）⇒ 结果逐位相同 
+//   （所以这次优化不会改变 loss；改完可直接用 loss 做回归判据 ）
 //
 // ── 历史（新实现同样保留）────────────────────────────────────────────────────
 //   CUDA 硬限制 gridDim.y/z ≤ 65535（旧版曾因 ne0*ne1 折叠进 z 而"invalid configuration
-//   argument"）⇒ 新实现的三个方向**都**做 grid-stride + host 侧 clamp，不丢数据 ✓
+//   argument"）⇒ 新实现的三个方向**都**做 grid-stride + host 侧 clamp，不丢数据 
 // ============================================================
 #if 0  /* ===== 旧实现（原映射，2026-09-18 起停用；原样保留作对照，不参与编译）===== */
 
@@ -157,10 +157,10 @@ __global__ void kernel_out_prod(
 
 // ============================================================
 // 重映射版 kernel：threadIdx.x→i0、threadIdx.y→i1、blockIdx.z→平面(i2,i3)
-//   · i0 在 src0/dst 中 stride=1 ⇒ 同 warp 连续线程 = 连续地址 ✓
-//   · i1 在 src1 中 stride=1，且 warp 内 i1 相同 ⇒ src1 广播 ✓
-//   · 平面局部化到 blockIdx.z ⇒ 一个 block 只在一个平面内工作 ✓
-//   · 三个方向都带 grid-stride ⇒ 任何 shape 都不丢数据、不受 gridDim.y/z ≤ 65535 限制 ✓
+//   · i0 在 src0/dst 中 stride=1 ⇒ 同 warp 连续线程 = 连续地址 
+//   · i1 在 src1 中 stride=1，且 warp 内 i1 相同 ⇒ src1 广播 
+//   · 平面局部化到 blockIdx.z ⇒ 一个 block 只在一个平面内工作 
+//   · 三个方向都带 grid-stride ⇒ 任何 shape 都不丢数据、不受 gridDim.y/z ≤ 65535 限制 
 // ============================================================
 __global__ void kernel_out_prod_remapped(
     const float* __restrict__ src0,
@@ -179,7 +179,7 @@ __global__ void kernel_out_prod_remapped(
     const int64_t i1_base   = static_cast<int64_t>(blockIdx.y) * blockDim.y + threadIdx.y;
     const int64_t i0_base   = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
 
-    // ---- 平面循环（blockIdx.z + grid-stride）：按平面局部化 ✓ ----
+    // ---- 平面循环（blockIdx.z + grid-stride）：按平面局部化  ----
     for (int64_t plane = blockIdx.z; plane < n_planes; plane += gridDim.z) {
         const int64_t i2 = plane % ne2;
         const int64_t i3 = plane / ne2;
@@ -190,16 +190,16 @@ __global__ void kernel_out_prod_remapped(
         const int64_t d_plane  = i2 * ne0 * ne1 + i3 * ne0 * ne1 * ne2;
 
         for (int64_t i1 = i1_base; i1 < ne1; i1 += y_stride) {
-            // ★ warp 内所有线程 i1 相同（threadIdx.y 不随 lane 变）⇒ 下面每次读都是**广播**
+            //  warp 内所有线程 i1 相同（threadIdx.y 不随 lane 变）⇒ 下面每次读都是**广播**
             const float* __restrict__ b_col = src1 + s1_plane + i1;
             for (int64_t i0 = i0_base; i0 < ne0; i0 += x_stride) {
-                // ★ warp 内 lane 0..31 ↔ i0, i0+1, ... ⇒ src0 侧**连续地址**
+                //  warp 内 lane 0..31 ↔ i0, i0+1, ... ⇒ src0 侧**连续地址**
                 const float* __restrict__ a_row = src0 + s0_plane + i0;
                 float sum = 0.0f;
-                for (int64_t k = 0; k < ne01; ++k) {          // 累加顺序与旧实现一致 ⇒ 逐位相同 ✓
+                for (int64_t k = 0; k < ne01; ++k) {          // 累加顺序与旧实现一致 ⇒ 逐位相同 
                     sum += a_row[k * ne00] * b_col[k * ne10];
                 }
-                dst[d_plane + i1 * ne0 + i0] = sum;           // warp 内连续 i0 ⇒ 写回也合并 ✓
+                dst[d_plane + i1 * ne0 + i0] = sum;           // warp 内连续 i0 ⇒ 写回也合并 
             }
         }
     }

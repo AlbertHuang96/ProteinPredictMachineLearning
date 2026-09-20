@@ -4,8 +4,54 @@
 #include <cmath>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 
 namespace ppml {
+
+// ============================================================
+// 【2026-09-19】优化器 GPU 路径（把逐参数的 D2H/H2D 往返换成显存内就地 kernel）
+//   背景（实测）：dev 1 epoch 里 `cudaMemcpy` 11,767 次 / 2.36 s，其中 **D2H 占 84.7%**
+//   且中位 41 KB（= 参数级）—— 来源正是本文件的"读 w / 读 g / 写 w"三步往返 ✗
+//   （pageable 拷贝还会**隐式做一次全设备同步** ✗ ⇒ 代价 = 同步 + 传输）。
+//   现在：参数/梯度都在显存时 ⇒ 分配 device 版 m/v，整步 1 个 kernel，**零往返** ✓
+//   · kernel 逐元素运算顺序与下面 CPU 版**逐字相同** ⇒ 数值逐位一致 ✓（回归判据 ✓）
+//   · host m/v 保留为 checkpoint 镜像，只在 export/import_momentum 时同步 ✓
+//   · 关闭开关：PPML_OPTIM_GPU=0（回到原 CPU 路径，便于 A/B ✓）
+// ============================================================
+// 注意：必须在 **ppml 命名空间**声明（不是匿名 namespace ✗）—— 定义在 src/cuda/OptimKernels.cu
+//   里的 ppml::xxx ✓，放进匿名 namespace 会变成另一个符号 ⇒ 链接期 undefined reference ✗
+extern int   adamw_step_cuda(float* w, const float* g, float* m, float* v, int64_t n,
+                             float lr, float lr_scale, float beta1, float beta2, float eps,
+                             float wd, float bc1, float bc2, int no_weight_decay);
+extern void* optim_alloc_cuda(int64_t bytes);
+extern void  optim_free_cuda(void* p);
+extern int   optim_h2d_cuda(void* dst, const void* src, int64_t bytes);
+extern int   optim_d2h_cuda(void* dst, const void* src, int64_t bytes);
+extern int   optim_cuda_available();
+
+namespace {
+// 参数/梯度是否都在显存（host buffer 或裸 CPU 张量一律走原 CPU 路径 ✓）
+bool tensor_on_device(const TensorF32* t) {
+    return t && t->buffer_ && !t->buffer_->is_host() && t->data() != nullptr;
+}
+
+bool gpu_optim_enabled() {
+    static const bool on = [] {
+        const char* s = std::getenv("PPML_OPTIM_GPU");
+        if (s && *s && std::atoi(s) == 0) return false;   // 显式关闭（A/B 用 ✓）
+        return true;
+    }();
+    return on && optim_cuda_available() != 0;
+}
+} // namespace
+
+AdamW::~AdamW() {
+    // 回收 GPU 路径分配过的 m/v（没用过就是 nullptr，无副作用 ✓）
+    for (auto& s : states_) {
+        if (s.d_m) { optim_free_cuda(s.d_m); s.d_m = nullptr; }
+        if (s.d_v) { optim_free_cuda(s.d_v); s.d_v = nullptr; }
+    }
+}
 
 AdamW::AdamW(float lr, float weight_decay, float beta1, float beta2,
              float eps, bool bias_correction, float lora_lr_scale)
@@ -90,6 +136,11 @@ void AdamW::step(ComputeGraph* cgraph) {
     const float bc1 = bc ? (1.0f - std::pow(b1, static_cast<float>(t))) : 1.0f;
     const float bc2 = bc ? (1.0f - std::pow(b2, static_cast<float>(t))) : 1.0f;
 
+    const bool gpu_ok = gpu_optim_enabled();
+    // 诊断（GRAPH_DEBUG_OPTIM=1）：本步有多少参数走了 GPU 路径（不设则零开销 ✓）
+    static const bool dbg_optim = (std::getenv("GRAPH_DEBUG_OPTIM") != nullptr);
+    int n_gpu_params = 0, n_cpu_params = 0;
+
     for (auto& s : states_) {
         TensorF32* grad = cgraph->graph_get_grad(s.param);
         if (!grad) continue;
@@ -97,6 +148,42 @@ void AdamW::step(ComputeGraph* cgraph) {
         // 参数与梯度尺寸应一致；否则跳过（防御）
         const int64_t n = grad->numel();
         if (n != s.param->numel()) continue;
+
+        // ---- 【2026-09-19】GPU 路径：w/g/m/v 全在显存 ⇒ 1 个 kernel 完成整步，零 H2D/D2H ✓ ----
+        if (gpu_ok && tensor_on_device(s.param) && tensor_on_device(grad)) {
+            const int64_t bytes = n * (int64_t)sizeof(float);
+            if (!s.d_m || s.dev_n != n) {                  // 惰性分配 / 尺寸变化 ⇒ 重分配
+                if (s.d_m) { optim_free_cuda(s.d_m); s.d_m = nullptr; }
+                if (s.d_v) { optim_free_cuda(s.d_v); s.d_v = nullptr; }
+                s.dev_n     = 0;
+                s.dev_valid = false;
+                s.d_m = optim_alloc_cuda(bytes);
+                s.d_v = optim_alloc_cuda(bytes);
+                if (s.d_m && s.d_v) s.dev_n = n;
+            }
+            if (s.d_m && s.d_v && s.dev_n == n) {
+                if (!s.dev_valid) {                        // 首次 / import 之后：host→device 上传一次 ✓
+                    s.dev_valid = (optim_h2d_cuda(s.d_m, s.m.data(), bytes) == 0 &&
+                                   optim_h2d_cuda(s.d_v, s.v.data(), bytes) == 0);
+                }
+                if (s.dev_valid) {
+                    const float lr_scale = s.se3_lr_scale * s.lora_lr_scale;
+                    const int rc = adamw_step_cuda(
+                        reinterpret_cast<float*>(s.param->data()),
+                        reinterpret_cast<const float*>(grad->data()),
+                        reinterpret_cast<float*>(s.d_m),
+                        reinterpret_cast<float*>(s.d_v),
+                        n, lr, lr_scale, b1, b2, eps, wd, bc1, bc2,
+                        s.no_weight_decay ? 1 : 0);
+                    if (rc == 0) {
+                        s.host_stale = true;   // host m/v 已落后（export 时按需 D2H ✓）
+                        ++n_gpu_params;
+                        continue;              // ★ 跳过下面的 CPU 往返 ✓
+                    }
+                }
+            }
+            // 分配/上传失败 ⇒ 保守落到下面的 CPU 路径 ✓
+        }
 
         // 读取参数与梯度的 CPU 副本
         std::vector<float> w = read_tensor_values(s.param);
@@ -130,6 +217,29 @@ void AdamW::step(ComputeGraph* cgraph) {
 
         // 写回参数
         write_tensor_values(s.param, w);
+        ++n_cpu_params;
+    }
+
+    if (dbg_optim) {
+        std::fprintf(stderr,
+                     "[OPTIM] step %d：GPU 参数=%d / CPU 参数=%d"
+                     "（GPU 路径=显存内就地 kernel ⇒ 零 H2D/D2H ✓）\n",
+                     step_count_, n_gpu_params, n_cpu_params);
+        // 为什么没走 GPU？抽样打印前 2 个参数的 param/grad 是否在显存 ✓（定位 placement 问题）
+        int shown = 0;
+        for (auto& s : states_) {
+            if (shown >= 2) break;
+            TensorF32* g = cgraph->graph_get_grad(s.param);
+            std::fprintf(stderr,
+                         "[OPTIM]   样本 param buf=%p is_host=%d data=%p | grad buf=%p is_host=%d data=%p\n",
+                         (void*)s.param->buffer_,
+                         s.param->buffer_ ? (int)s.param->buffer_->is_host() : -1,
+                         (const void*)s.param->data(),
+                         (void*)(g ? g->buffer_ : nullptr),
+                         (g && g->buffer_) ? (int)g->buffer_->is_host() : -1,
+                         (const void*)(g ? g->data() : nullptr));
+            ++shown;
+        }
     }
 }
 
@@ -147,8 +257,18 @@ void AdamW::export_momentum(const std::vector<TensorF32*>& params,
             if (s.param == p) { st = &s; break; }
         }
         if (st) {
-            ms.push_back(st->m);
-            vs.push_back(st->v);
+            // 【2026-09-19】GPU 路径下 device m/v 才是权威值 ⇒ 先把 host 镜像刷新回来 ✓
+            ParamState& sm = const_cast<ParamState&>(*st);
+            if (sm.d_m && sm.d_v && sm.dev_valid && sm.host_stale &&
+                sm.dev_n == (int64_t)sm.m.size()) {
+                const int64_t bytes = sm.dev_n * (int64_t)sizeof(float);
+                if (optim_d2h_cuda(sm.m.data(), sm.d_m, bytes) == 0 &&
+                    optim_d2h_cuda(sm.v.data(), sm.d_v, bytes) == 0) {
+                    sm.host_stale = false;
+                }
+            }
+            ms.push_back(sm.m);
+            vs.push_back(sm.v);
         } else {
             ms.emplace_back();   // 无状态 → 空 (save 侧跳过)
             vs.emplace_back();
@@ -180,6 +300,19 @@ void AdamW::import_momentum(const std::vector<TensorF32*>& params,
             st->m = itm->second;
         if (itv != raw_tensors.end() && itv->second.size() == st->v.size())
             st->v = itv->second;
+
+        // 【2026-09-19】若已分配 device m/v ⇒ 立刻把恢复值传上去
+        //   （否则下次 GPU step 会把显存里的旧值当权威值用 ✗）
+        if (st->d_m && st->d_v && st->dev_n == (int64_t)st->m.size() && st->dev_n > 0) {
+            const int64_t bytes = st->dev_n * (int64_t)sizeof(float);
+            if (optim_h2d_cuda(st->d_m, st->m.data(), bytes) == 0 &&
+                optim_h2d_cuda(st->d_v, st->v.data(), bytes) == 0) {
+                st->dev_valid  = true;
+                st->host_stale = false;
+            } else {
+                st->dev_valid = false;   // 上传失败 ⇒ 下次 step 会重试（用 host 值 ✓）
+            }
+        }
     }
 }
 

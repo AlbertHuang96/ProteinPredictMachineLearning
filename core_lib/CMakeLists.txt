@@ -56,6 +56,8 @@ set(CORE_SOURCES
     ../src/cuda/CudaTensor.cu
     ../src/cuda/SE3MessagePassingKernel.cu
     ../src/cuda/ScanKernels.cu
+    ../src/cuda/OptimKernels.cu
+    ../src/cuda/StagingPool.cu
 )
 
 # 启用 CUDA 语言
