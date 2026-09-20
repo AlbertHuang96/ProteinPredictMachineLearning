@@ -81,19 +81,28 @@ bool BackendScheduler::is_view_op(int op) const {
 // 强制回落 CPU 后，GPU 消费者会经 build_splits 建 cpy（H2D），数值正确。
 // 沿 view_src 链解析到底层：若底层是 OP_NONE 参数/常量，或持有 host data（buffer 为 null/host），
 // 判定为 host 生产者。已显式挂 device buffer（非 host）的节点数据已在 device，不算。
+// 【2026-09-20】把"**逐节点级**"调度诊断从 GRAPH_DEBUG_SCHED 里拆出来：
+//   全量训练下 GRAPH_DEBUG_SCHED=1 每张图会打出上万行（[nhip] 每节点一次 + node dump + pass_fill + try b）✗，
+//   既刷屏又拖慢 I/O（长训练日志可达 GB 级 ✗）⇒ 这些逐节点日志改由 **GRAPH_DEBUG_SCHED_VERBOSE=1** 控制 ✓；
+//   **split 级**信息（`split_graph:` / PLAN / COMPUTE / `backend[…]=` / budget 逐出）仍由 GRAPH_DEBUG_SCHED=1 控制 ✓。
+static bool sched_verbose() {
+    static const bool on = (std::getenv("GRAPH_DEBUG_SCHED_VERBOSE") != nullptr);
+    return on;
+}
+
 bool BackendScheduler::node_is_host_producer(TensorF32* node) const {
     if (!node) return false;
     // 沿 view_src 链找底层数据载体（view 共享源数据，data 在源头）
     const TensorF32* base = node;
     int guard = 0;
-    if (getenv("GRAPH_DEBUG_SCHED")) {
+    if (sched_verbose()) {
         fprintf(stderr, "[nhip] node=%p op=%d view_src=%p buffer_=%p data=%p CALLER=%p\n",
                 (void*)node, (int)node->op, (void*)node->view_src,
                 (void*)node->buffer_, (void*)node->data(),
                 __builtin_return_address(0));
     }
     while (base->view_src && guard++ < 64) base = base->view_src;
-    if (getenv("GRAPH_DEBUG_SCHED") && base != node) {
+    if (sched_verbose() && base != node) {
         fprintf(stderr, "[nhip]   base=%p op=%d buffer_=%p data=%p\n",
                 (void*)base, (int)base->op, (void*)base->buffer_, (void*)base->data());
     }
@@ -1005,8 +1014,8 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
 void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
     for (int i = 0; i < graph->n_nodes(); i++) {
         TensorF32* node = graph->graph_node(i);
-        if (getenv("GRAPH_DEBUG_SCHED")) {
-            // 诊断：检测栈/堆地址范围的 node，定位悬垂指针
+        if (sched_verbose()) {
+            // 诊断（GRAPH_DEBUG_SCHED_VERBOSE=1）：检测栈/堆地址范围的 node，定位悬垂指针
             uintptr_t a = (uintptr_t)node;
             int in_stack = (a >= 0x700000000000ULL && a <= 0x800000000000ULL);
             // 【2026-09-19】补 data/buffer 信息：判断 op=0 节点是"host 参数/常量"还是"device 常驻" ✓
@@ -1033,7 +1042,7 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                 backend_map_[node] = best_backend;  // CPU
                 continue;
             }
-            if (getenv("GRAPH_DEBUG_SCHED")) {
+            if (sched_verbose()) {
                 fprintf(stderr,
                     "[sched] pass_fill node=%p op=%d n_bk=%d best0=%d bk0=%p v0=%p bk1=%p v1=%p\n",
                     (void*)node, (int)node->op, n_backends_, best_backend,
@@ -1043,7 +1052,7 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                     (n_backends_>1 && backends_[1])?*(void**)backends_[1]:nullptr);
             }
             for (int b = 0; b < n_backends_; b++) {
-                if (getenv("GRAPH_DEBUG_SCHED")) {
+                if (sched_verbose()) {
                     fprintf(stderr, "[sched]   try b=%d node=%p bk=%p v=%p\n",
                             b, (void*)node,
                             (void*)backends_[b],

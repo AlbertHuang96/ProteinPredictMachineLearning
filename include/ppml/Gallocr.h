@@ -52,7 +52,13 @@ public:
     };
 
     // 单后端分配器（一个 backend 对应一个 DynTalloc）
-    struct LiveRange { size_t off; size_t size; };
+    struct LiveRange {
+        size_t off;
+        size_t size;
+        // 【2026-09-20】诊断：这条 live 记录属于哪个张量/节点（判定"真共存 ⚠️ vs 跟踪残留 ✗"）
+        const TensorF32* t  = nullptr;
+        const NodeInfo*  ni = nullptr;
+    };
     struct BackendAlloc {
         BufferType* buft   = nullptr;
         size_t      peak   = 0;                 // Phase1 计算的峰值（对齐后，= 最大同时存活字节数）
@@ -139,8 +145,13 @@ private:
     void bind_tensor(NodeInfo* ni);
     // 方向3：Phase2 分配时检查新区间是否与当前存活区间重叠（应恒不重叠）
     void check_live_overlap(BackendAlloc& ba, const NodeInfo* ni);
-    void add_live(BackendAlloc& ba, size_t off, size_t size);
-    void remove_live(BackendAlloc& ba, size_t off, size_t size);
+    void add_live(BackendAlloc& ba, size_t off, size_t size, const NodeInfo* ni);
+    void remove_live(BackendAlloc& ba, size_t off, size_t size, const NodeInfo* ni);
+    // 【2026-09-20】LIVE-OVERLAP 校验计数（release 时汇总；明细只打前 20 条 ✓）
+    long long n_live_overlap_seen_  = 0;   // 检查到的重叠次数
+    long long n_live_overlap_stale_ = 0;   // 对方**已释放** ⇒ 跟踪残留（假警报 ✓）
+    long long n_live_overlap_real_  = 0;   // 对方**仍存活** ⇒ 真共存（必须查 lifetime ⚠️）
+    long long n_remove_live_miss_   = 0;   // 【关键】free 时在 live 集合里**找不到**该区间 ⇒ 跟踪漏洞
 
     // ---- needs_realloc 接入（2026-08-31）----
     // 单张量预留记录（对标 ggml tensor_alloc）

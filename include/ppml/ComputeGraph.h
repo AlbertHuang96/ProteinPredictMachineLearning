@@ -84,6 +84,16 @@ public:
     TensorF32 ** graph_grads() { return grads; }
     int          graph_grad_slots() { return static_cast<int>(visited_hash_set.size); }
 
+    // 【2026-09-21】"梯度载体图"辅助（多样本路径：每样本结束即可释放样本图 ✓）：
+    //   graph_slot_of(t)：把 t 登记进 visited_hash_set（补 used 位，等价 visit_parents_graph 的
+    //                     "首次见到"分支 ✓ —— 参数都是叶子，无需递归 src ✓）并返回其 grad 槽位 ✓
+    //   graph_set_grad(t,g)：把 g 写为该槽位的梯度（等价 build_backward_expand 里 grads[isrc]=g ✓）
+    //   用途：step 阶段（写回/DP/clip/AdamW/远端同步）需要 `graph_get_grad(param)` 有值，
+    //        而这些函数内部只查 (param → 槽位 → grads) ✓ ⇒ 只要载体图登记了 param 并挂上
+    //        **持久梯度张量**，step 就与"样本图"解耦 ✓（否则必须把样本图保留到 step ⇒ 累积 ✗）
+    size_t graph_slot_of(TensorF32 * t);
+    void   graph_set_grad(TensorF32 * t, TensorF32 * g);
+
     void build_forward_expand(TensorF32 * tensor);
     void build_backward_expand(
         struct PPMLContext *  ctx,

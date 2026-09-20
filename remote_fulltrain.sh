@@ -13,6 +13,22 @@
 #                PPML_MULTI_MSA_DEPTH(stage 2 MSA depth, **default 256**; stage 1 fixed 256)
 #                PPML_CUDA_NO_SCATTER(default 1, scatter falls back to CPU for reliable mixed training)
 #                SKIP_P04637(default 1) PPML_DATASET_DIR(default training_batch_data_le103)
+#   【2026-09-20 新增】
+#                PPML_STAGING_ASYNC(default 1)     pinned 双缓冲异步 H2D/D2H（=0 关闭 ✓）
+#                PPML_GPU_BUDGET_MB(默认空 = 空闲显存×4/5)   显存预算
+#                GRAPH_DEBUG_SCHED(default 1)      **splits 汇总**（split_graph/PLAN/COMPUTE/backend[]/budget 逐出）
+#                GRAPH_DEBUG_GALLOCR(default 1)    [gallocr] reserve done（各后端峰值）
+#                PPML_DEBUG_ALLOC(default 1)       [alloc-buffer] 每次分配（=0 则只自动打 ≥1GB 的 ✓）
+#                GRAPH_DEBUG_SCHED_VERBOSE(default 0) 逐**节点** dump（很吵 ⚠️，排障才开）
+#                GRAPH_DEBUG_STAGING(default 0)    逐条 staging 拷贝（很吵 ⚠️）
+#                RFAA_LEAN=1                       一键精简：关掉上述全部调试打印 ✓
+#                （topo pass 如需要：PPML_DEV_SE3=1 PPML_SE3_TOPO=pass1 PPML_TOPO_PASS=graph）
+#   【2026-09-21 新增】多样本内存自检（方案 B：grad 张量化 ⇒ 每样本释放 ✓）
+#                PPML_DEBUG_CTX(default 1)         每样本打印 '[ctx] … n_objects=…'（应持平 ✓；RFAA_LEAN=1 关闭）
+#                · 跑完会自动做两件自检：① 是否有 '[grad-carrier]'（没有 ⇒ 服务器二进制是旧版 ⚠️ 需重编）；
+#                  ② '[ctx] n_objects' 是否持平（单调增长 ✗ ⇒ accum 窗口内样本图仍在累积 ⚠️）。
+#                · 旧版症状：`ContextImpl.cpp:178 Assertion "Context memory exhausted"` ⇒ exit 134（SIGABRT）✗
+#                · 兜底开关（万一仍累积）：PPML_ACCUM=1（或 2）+ PPML_MULTI_MSA_DEPTH=128 ✓
 # Progress: neither stage has a timeout, training ends naturally. Live progress:
 #   tail -f remote_fulltrain_*.log  and watch 'Epoch N/M completed ... loss:' lines;
 #   if no output for a long time, check whether '[FWD-GRAPH] ... build ...' was printed (slow first full-size build is normal).
@@ -50,6 +66,23 @@ CUDA_SCHED="${PPML_CUDA_SCHED:-1}"
 #    Set PPML_CUDA_NO_SCATTER=0 to disable the fallback (GPU scatter), generally not recommended.
 CUDA_NO_SCATTER="${PPML_CUDA_NO_SCATTER:-1}"
 
+# 【2026-09-20 新增】staging async（默认开 ✓；=0 回落到原阻塞拷贝路径）
+STAGING_ASYNC="${PPML_STAGING_ASYNC:-1}"
+# 显存预算（MB）；空 = 后端自定（空闲显存×4/5）
+GPU_BUDGET_MB="${PPML_GPU_BUDGET_MB:-}"
+# 【2026-09-20 新增】打印：splits + alloc（RFAA_LEAN=1 可一键全关 ✓）
+if [ "${RFAA_LEAN:-0}" = "1" ]; then
+    DBG_SPLITS=0; DBG_GALLOCR=0; DBG_ALLOC=0; DBG_SCHED_VERBOSE=0; DBG_STAGING=0; DBG_CTX=0
+else
+    DBG_SPLITS="${GRAPH_DEBUG_SCHED:-1}"                  # split 级：split_graph / PLAN / COMPUTE / backend[] / budget
+    DBG_GALLOCR="${GRAPH_DEBUG_GALLOCR:-1}"               # [gallocr] reserve done
+    DBG_ALLOC="${PPML_DEBUG_ALLOC:-1}"                    # [alloc-buffer] 每次分配
+    DBG_SCHED_VERBOSE="${GRAPH_DEBUG_SCHED_VERBOSE:-0}"   # 逐节点 dump（很吵 ⚠️）
+    DBG_STAGING="${GRAPH_DEBUG_STAGING:-0}"               # 逐条 staging 拷贝（很吵 ⚠️）
+    # 【2026-09-21】每样本上下文对象数（内存自检 ✓）：开销≈每样本一行，建议长训练留着 ✓
+    DBG_CTX="${PPML_DEBUG_CTX:-1}"
+fi
+
 # ---------- Log ----------
 LOG="remote_fulltrain_$(date +%Y%m%d_%H%M%S).log"
 
@@ -78,7 +111,19 @@ fi
 export FULL_TRAIN PPML_NUM_EPOCHS="$NUM_EPOCHS" PPML_LR="$LR" PPML_CLIP_NORM="$CLIP" \
        PPML_ACCUM="$ACCUM" PPML_MSA_DEPTH="$MSA_DEPTH" \
        PPML_USE_CUDA="$USE_CUDA" PPML_CUDA_SCHED="$CUDA_SCHED" \
-       PPML_CUDA_NO_SCATTER="$CUDA_NO_SCATTER"
+       PPML_CUDA_NO_SCATTER="$CUDA_NO_SCATTER" \
+       PPML_STAGING_ASYNC="$STAGING_ASYNC" \
+       GRAPH_DEBUG_SCHED="$DBG_SPLITS" GRAPH_DEBUG_GALLOCR="$DBG_GALLOCR" \
+       PPML_DEBUG_ALLOC="$DBG_ALLOC" \
+       PPML_DEBUG_CTX="$DBG_CTX"
+# 可选：显存预算（非空才导出 ✓；不导出则后端用 空闲显存×4/5）
+if [ -n "$GPU_BUDGET_MB" ]; then
+    export PPML_GPU_BUDGET_MB="$GPU_BUDGET_MB"
+fi
+# 可选：逐节点 dump / 逐条 staging（默认 0 = 关 ✓，避免长训练日志爆量 ✗）
+if [ "$DBG_SCHED_VERBOSE" != "0" ]; then export GRAPH_DEBUG_SCHED_VERBOSE=1; fi
+if [ "$DBG_STAGING" != "0" ]; then export GRAPH_DEBUG_STAGING=1; fi
+echo "[env] staging_async=$STAGING_ASYNC | budget=${GPU_BUDGET_MB:-auto(4/5 free)} | prints: splits=$DBG_SPLITS gallocr=$DBG_GALLOCR alloc=$DBG_ALLOC verbose=$DBG_SCHED_VERBOSE staging_dbg=$DBG_STAGING ctx=$DBG_CTX" | tee -a "$LOG"
 export LD_LIBRARY_PATH="$PYLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 if [ -n "$STDCPP_PRELOAD" ] && [ -f "$STDCPP_PRELOAD" ]; then
     export LD_PRELOAD="$STDCPP_PRELOAD"
@@ -143,12 +188,57 @@ else
     #   To switch back to the full set: PPML_DATASET_DIR=$PROJ/data/training_batch_data
     export PPML_DATASET_DIR="${PPML_DATASET_DIR:-$PROJ/data/training_batch_data_le103}"
     echo "[multi] dataset: $PPML_DATASET_DIR" | tee -a "$LOG"
+    # 【2026-09-20】stage 2 的 CUDA / staging / 打印开关回显（便于事后核对这次跑的是什么）
+    echo "[multi] CUDA=$USE_CUDA sched=$CUDA_SCHED staging_async=$STAGING_ASYNC budget=${GPU_BUDGET_MB:-auto}MB" | tee -a "$LOG"
+    echo "[multi] prints: splits=$DBG_SPLITS gallocr=$DBG_GALLOCR alloc=$DBG_ALLOC（verbose=$DBG_SCHED_VERBOSE staging_dbg=$DBG_STAGING）" | tee -a "$LOG"
+    echo "[multi] 行样例：'[sched] COMPUTE split=7 backend=0(CUDA) i=[..) nodes=210 ops=[…]'、'[sched] split_graph: pre-merge … after merge …'、'[alloc-buffer] CUDA usage=COMPUTE size=1.38 GB'、'[gallocr] reserve done: backend=0 peak=… GB'" | tee -a "$LOG"
+    echo "[multi] ⚠️ 全量打印会让日志变大：需要精简用 RFAA_LEAN=1（或 PPML_DEBUG_ALLOC=0 只保留 ≥1GB）" | tee -a "$LOG"
+    # 【2026-09-21】内存自检提示（方案 B：grad 张量化 ⇒ 每样本释放 ✓）
+    echo "[multi] 内存自检：启动后应看到 '[grad-carrier] 持久梯度载体图已建：params=N/N' ✓（=每样本即可释放样本图 ✓）" | tee -a "$LOG"
+    echo "[multi] 内存自检：PPML_DEBUG_CTX=$DBG_CTX ⇒ 每样本一行 '[ctx] … n_objects=…'，**应持平** ✓；单调增长 ✗ = 仍在累积（跑完脚本会自动判定 ✓）" | tee -a "$LOG"
+    echo "[multi] ⚠️ 若这两类行都没有 ⇒ 服务器二进制是旧版：git pull && bash build_remote.sh ppml_train（旧版会在 accum 窗口内累积 ⇒ Context memory exhausted / exit 134 ✗）" | tee -a "$LOG"
     echo "[multi] no timeout, ends when training finishes" | tee -a "$LOG"
     # stage 2 has no timeout: 10 epochs of multi-sample training take a long time, ends naturally.
     "$BIN" \
         "" "" "" "" "" 2>&1 | tee -a "$LOG"
     st2=${PIPESTATUS[0]}
     echo "[stage2] exit=$st2" | tee -a "$LOG"
+
+    # 【2026-09-20】stage 2 运行摘要：splits / 显存 / staging / epoch（全在 $LOG 里，这里把关键行汇总到日志尾 ✓）
+    echo "[stage2] ---- 运行摘要（splits / 显存 / staging / epoch）----" | tee -a "$LOG"
+    grep -aE 'split_graph: (pre-merge|after merge)|split_graph: n_backends' "$LOG" | tail -3 | tee -a "$LOG"
+    echo "[stage2] split 数按后端（backend id：0=CUDA 最高优先级，1=CPU）：" | tee -a "$LOG"
+    grep -a 'COMPUTE split=' "$LOG" | sed -E 's/.*backend=([0-9]+).*/\1/' | sort | uniq -c | tee -a "$LOG"
+    grep -a 'budget 拒绝总数' "$LOG" | tail -1 | tee -a "$LOG"
+    grep -a 'reserve done' "$LOG" | tail -4 | tee -a "$LOG"
+    grep -a 'STAGING' "$LOG" | head -2 | tee -a "$LOG"
+    grep -aE 'Epoch [0-9]+/[0-9]+ completed' "$LOG" | tail -5 | tee -a "$LOG"
+
+    # ---- 【2026-09-21】内存自检（方案 B：grad 张量化 ⇒ 每样本释放 ✓）----
+    #   ① 有没有 '[grad-carrier]'：没有 ⇒ 旧二进制（累积风险 ✗）；
+    #   ② '[ctx] n_objects' 是否持平：峰值 > 首值×2+200 ⇒ 判定为仍在累积 ✗（给兜底开关建议 ✓）。
+    #   注：先算完再打印（打印内容里含这些关键字，避免自我匹配 ✗）。
+    echo "[stage2] ---- 内存自检（每样本释放 / 上下文对象数）----" | tee -a "$LOG"
+    carrier_line=$(grep -a 'grad-carrier' "$LOG" | tail -1)
+    ctx_n=$(grep -ac '\[ctx\]' "$LOG")
+    ctx_first=$(grep -a '\[ctx\]' "$LOG" | head -1 | sed -E 's/.*n_objects=([0-9]+).*/\1/')
+    ctx_max=$(grep -ao 'n_objects=[0-9]*' "$LOG" | sed 's/n_objects=//' | sort -n | tail -1)
+    ctx_grow=$(awk -v a="${ctx_first:-0}" -v b="${ctx_max:-0}" 'BEGIN{print (b > a*2+200) ? 1 : 0}')
+    if [ -n "$carrier_line" ]; then
+        echo "[stage2] ✅ $carrier_line" | tee -a "$LOG"
+    else
+        echo "[stage2] ⚠️ 未找到 '[grad-carrier]' ⇒ 服务器二进制可能是旧版：git pull && bash build_remote.sh ppml_train 后重跑（旧版 accum 窗口内不释放 ⇒ 可能 exit 134 ✗）" | tee -a "$LOG"
+    fi
+    if [ "$ctx_n" -gt 0 ]; then
+        echo "[stage2] [ctx] 行数=$ctx_n  首个样本 n_objects=${ctx_first:-?}  峰值=${ctx_max:-?}" | tee -a "$LOG"
+        if [ "$ctx_grow" = "1" ]; then
+            echo "[stage2] ⚠️ 对象数仍在累积（峰值 > 首值×2+200）⇒ 兜底：PPML_ACCUM=1（或 2）+ PPML_MULTI_MSA_DEPTH=128 重跑 ✓" | tee -a "$LOG"
+        else
+            echo "[stage2] ✅ 对象数基本持平 ⇒ 内存与 PPML_ACCUM 已解耦（长训练不会因 accum 窗口累积而爆 ✗→✓）" | tee -a "$LOG"
+        fi
+    else
+        echo "[stage2] （没看到 '[ctx]' 行：本脚本默认 PPML_DEBUG_CTX=1 ✓；若被 RFAA_LEAN=1 关掉属预期 ✓）" | tee -a "$LOG"
+    fi
     # multi-sample returns 2 when space is insufficient (stops without lowering config)
     if [ "$st2" = "2" ]; then
         echo "[ERROR] multi-sample stopped due to insufficient space (exit 2). Server free memory must be >= PPML_MIN_FREE_GB (default 22)" | tee -a "$LOG"

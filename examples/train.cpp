@@ -695,6 +695,63 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
     if (getenv("PPML_SE3_LEARN_SCALE") && std::string(getenv("PPML_SE3_LEARN_SCALE")) == "1") {
         model.se3_scale_tensor();
     }
+
+    // ============================================================
+    // 【2026-09-21 B 落地】**梯度载体图** `grad_carrier`：只含 param 节点 + **持久梯度张量** ✓
+    //   问题：原来 step（写回/DP/clip/AdamW/远端同步）必须依赖"最近一个样本图" ✗ ⇒
+    //         它要活到 step ⇒ accum 窗口内多个样本图全部驻留 ⇒ 对象/内存单调累积 ✗
+    //         （服务器实测：n_nodes 每样本 +1952、CPU 峰值 106.74 GB ⇒ 分配 120 GB ⇒
+    //           Context memory exhausted ⇒ SIGABRT(134) ✗）
+    //   做法：载体图 & 每参数一张持久梯度张量都建在 `ms_arena_mark` **之前** ✓ ⇒
+    //         每样本结束即可 `reset_objects_to(mark)`（连样本图一起回收 ✓），step 时照常
+    //         调 clip_grad_norm / AdamW::step / DP 等 —— 它们内部只查 `graph_get_grad(param)` ✓
+    //         ⇒ 只要载体图登记过 param 并挂上梯度即可 ✓（见 ComputeGraph::graph_slot_of ✓）
+    //   注：梯度张量是 **host** 存储 ⇒ 优化器走 CPU 路径 ✓（本就如此 ✓）；开销：每参数一份
+    //       与参数同尺寸的常驻缓冲（可在需要时再上 device ✓）。
+    // ============================================================
+    ComputeGraph* grad_carrier = ComputeGraph::new_graph(&context());
+    size_t carrier_ok = 0;
+    for (size_t i = 0; i < params.size(); ++i) {
+        TensorF32* p = params[i];
+        if (!p) continue;
+        grad_carrier->build_forward_expand(p);     // param 进载体图（成为节点 ✓）
+        TensorF32* g = context().new_tensor<float>(p->shape().ndim(), p->shape().dims.data());
+        if (g) {
+            // ⚠️ 训练 context 是 **no_alloc** 模式：new_tensor 只给"空壳"（data()==nullptr ✗）⇒
+            //    必须自己配 host 存储，否则 clip/AdamW 读梯度时越界 ⇒ SIGSEGV
+            //    （实测崩溃点 GradientClipper.cpp:146 compute_total_grad_norm ✓）
+            //    scratch_alloc 的块在 `ms_scratch_mark` 之前 ⇒ 每样本 reset 不会回收 ✓
+            const size_t gbytes = static_cast<size_t>(g->numel()) * sizeof(float);
+            void* gmem = context().scratch_alloc(gbytes);
+            if (gmem) {
+                std::memset(gmem, 0, gbytes);
+                g->bind_data(static_cast<float*>(gmem));
+                grad_carrier->graph_set_grad(p, g);
+                ++carrier_ok;
+            }
+        }
+    }
+    std::cout << "  [grad-carrier] 持久梯度载体图已建：params=" << carrier_ok
+              << "/" << params.size()
+              << "（每样本可立即释放样本图 ✓；step 不再依赖样本图 ✓）" << std::endl;
+
+    // 【2026-09-21 B ★关键★】**optimizer 初始化必须也在 mark 之前** ✓：
+    //   `init_from_graph` 会为每个参数建立 m/v 状态（可能在 arena/scratch 里 ✗）⇒
+    //   若像原来那样留在样本循环内（mark **之后**）执行，随后的"每样本 reset"会把
+    //   **优化器状态一起回收** ✗ ⇒ 悬垂指针 ⇒ 首次 step / checkpoint / 下一次 step 段错误
+    //   （实测 exit=139 ✗）。⇒ 提到这里：载体图已含全部 param 节点 ✓，与样本图完全解耦 ✓。
+    setup_dp_param_shard(optimizer);                 // 阶段 A：分片门闩（必须在 init 之前 ✓）
+    optimizer.init_from_graph(grad_carrier);
+    if (!ckpt_opt_tensors.empty()) {
+        std::vector<TensorF32*> cps;
+        std::vector<std::string> cns;
+        model.collect_params_with_names(cps, cns);
+        optimizer.import_momentum(cps, cns, ckpt_opt_tensors);
+        if (ckpt_opt_step >= 0) optimizer.set_step_count(ckpt_opt_step);
+        std::cout << "  [resume] 已恢复优化器状态 (opt tensors=" << ckpt_opt_tensors.size()
+                  << ", step=" << optimizer.step_count() << ")" << std::endl;
+    }
+
     void* ms_arena_mark = context().mark_objects();
     // scratch 水位：模型参数（new_param_tensor）创建于 scratch_ 前部，之后才是各样本
     // 构建期 leaf/常量数据（bind_leaf_data）。记录水位，样本 reset 后仅释放水位之后新增的块，
@@ -981,27 +1038,22 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
             // 仅保留引用供 step 写回；arena 释放由 step 完成后的 reset_objects_to 统一回退。
             last_cgraph = cgraph;
 
-            // 首个样本图建好后初始化 optimizer (AdamW 需遍历图节点找参数)
-            if (optimizer.param_count() == 0) {
-                setup_dp_param_shard(optimizer);          // 阶段 A：分片门闩（必须在 init 之前）
-                optimizer.init_from_graph(cgraph);
-                // 断点续训: 恢复 AdamW m/v 动量 + 偏差校正 step 计数
-                // (须在 init_from_graph 之后；缺失/尺寸不符 → 保持 0 初始化)
-                if (!ckpt_opt_tensors.empty()) {
-                    std::vector<TensorF32*> ps;
-                    std::vector<std::string> ns;
-                    model.collect_params_with_names(ps, ns);
-                    optimizer.import_momentum(ps, ns, ckpt_opt_tensors);
-                    if (ckpt_opt_step >= 0) optimizer.set_step_count(ckpt_opt_step);
-                    std::cout << "  [resume] 已恢复优化器状态 (opt tensors="
-                              << ckpt_opt_tensors.size() << ", step="
-                              << optimizer.step_count() << ")" << std::endl;
-                }
-            }
+            // 【2026-09-21 B】optimizer 初始化已**前移到 ms_arena_mark 之前** ✓（见上方）
+            //   —— 否则 init 建立的 m/v 状态会被"每样本 reset"回收 ⇒ 悬垂 ⇒ 段错误 ✗
 
             std::cout << "  [" << s.uniprot << "] L=" << L
                       << " loss=" << std::fixed << std::setprecision(4) << batch_loss
                       << " (acc " << acc_count << "/" << accum_steps << ")" << std::endl;
+            // 【2026-09-21】诊断（PPML_DEBUG_CTX=1）：每个样本后的**上下文对象数** ✓
+            //   用途：量化"多样本路径每样本累积图对象"（服务器 abort 的直接指标 ✗）：
+            //     n_objects 在 accum 窗口内应**单调增长** ✗（`reset_objects_to` 只在 step 时执行 ✗），
+            //     `PPML_ACCUM=1` 时应**基本持平** ✓（每样本都 step ⇒ 每样本都释放 ✓）。
+            if (std::getenv("PPML_DEBUG_CTX")) {
+                std::fprintf(stderr,
+                             "[ctx] sample_idx=%d uniprot=%s L=%d acc=%d/%d n_objects=%d scratch=%zu\n",
+                             (int)si_idx, s.uniprot.c_str(), (int)L, acc_count, accum_steps,
+                             context().n_objects, context().scratch_.size());
+            }
 
             // ---- 达到累加步数 -> 平均 + 写回 + 裁剪 + step ----
             if (acc_count >= accum_steps) {
@@ -1011,50 +1063,52 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                     float inv = 1.0f / (float)acc_count;
                     for (int64_t j = 0; j < n; ++j) acc[pi][(size_t)j] *= inv;
                 }
-                // 2) 写回平均梯度到保留的 last_cgraph 的 grad 节点
+                // 2) 写回平均梯度到**载体图**的持久梯度张量 ✓（不再依赖样本图 ✓）
                 for (size_t pi = 0; pi < params.size(); ++pi) {
-                    ms_write_grad(last_cgraph, params[pi], acc[pi]);
+                    ms_write_grad(grad_carrier, params[pi], acc[pi]);
                 }
                 // 2b) 数据并行（可选，PPML_DP=1）：梯度 Allreduce 平均。
                 //     位置必须在 clip **之前** —— 这样两端裁剪后的 grad_norm 才一致。
                 if (RemoteClient* dp = remote_dp_client_if_enabled()) {
-                    const int n_dp = remote_dp_allreduce_grads(last_cgraph, dp);
+                    const int n_dp = remote_dp_allreduce_grads(grad_carrier, dp);
                     if (n_dp > 0) {
                         std::cout << "  [DP] allreduce 完成: tensors=" << n_dp
                                   << " world=" << dp->world_size() << std::endl;
                     }
                 } else {
-                    dp_allreduce_grads_dispatch(last_cgraph);   // 阶段 A：rank0/acceptor 走 root 队列
+                    dp_allreduce_grads_dispatch(grad_carrier);   // 阶段 A：rank0/acceptor 走 root 队列
                 }
-                // 3) 全局梯度裁剪 + 参数更新
-                float gnorm = clip_grad_norm(last_cgraph, clip_norm);
-                optimizer.step(last_cgraph);
+                // 3) 全局梯度裁剪 + 参数更新（都走载体图 ✓）
+                float gnorm = clip_grad_norm(grad_carrier, clip_norm);
+                optimizer.step(grad_carrier);
                 // 阶段 A：把本 rank owner 的新权重同步给对端（未分片/未连接时零开销）
                 if (optimizer.shard_enabled()) {
-                    const int n_psync = remote_dp_broadcast_owned_params(last_cgraph, remote_dp_client_if_enabled());
+                    const int n_psync = remote_dp_broadcast_owned_params(grad_carrier, remote_dp_client_if_enabled());
                     std::cout << "  [DP-SHARD] 参数同步: tensors=" << n_psync << std::endl;
                 }
                 // 权重已更新：作废远端副本 ⇒ 下一轮 compute 自动重传（未启用时零开销）
-                remote_after_optimizer_step(last_cgraph);
+                remote_after_optimizer_step(grad_carrier);
                 // 4) 清零累加器
                 for (size_t pi = 0; pi < params.size(); ++pi)
                     std::fill(acc[pi].begin(), acc[pi].end(), 0.0f);
                 acc_count = 0;
                 std::cout << "  >> step (grad_norm=" << gnorm << ")" << std::endl;
 
-                // 5) step 完成：本样本图已不再需要（grad 已读入 acc、参数已更新）
-                //    → reset arena 回退释放 mark 之后的所有图节点（保留参数区），
-                //      防止多样本跨样本 arena 单调增长（实测每样本 +84MB/n_objects 翻倍）。
-                //    仅 acc 未满时不清（last_cgraph 需留到下次 step）。
-                if (ms_arena_mark) context().reset_objects_to(ms_arena_mark);
-                // 同步释放本样本新增的 scratch leaf 数据（图节点已 reset，数据无引用者）
-                for (size_t si = ms_scratch_mark; si < context().scratch_.size(); ++si) {
-                    ::free(context().scratch_[si]);
-                }
-                context().scratch_.resize(ms_scratch_mark);
-                last_cgraph = nullptr;
-                print_rss("sample-released");
+                // 5) step 完成：梯度已写入载体图（样本图此时**已经被释放** ✓，见下方每样本释放 ✓）
             }
+
+            // ---- 【2026-09-21 B】**每样本结束即释放样本图**（不再等 step ✓）----
+            //    原来只在 step 时释放 ⇒ accum 窗口内多个样本图叠加 ⇒ 对象/内存单调累积 ✗
+            //    （服务器实测：n_nodes 每样本 +1952、CPU peak 106.74 GB、arena 耗尽 ⇒ SIGABRT 134 ✗）
+            //    现在：该样本梯度已读入 acc（host ✓），step 走 grad_carrier（持久 ✓）⇒ 立即回收 ✓
+            if (ms_arena_mark) context().reset_objects_to(ms_arena_mark);
+            // 同步释放本样本新增的 scratch leaf 数据（图节点已 reset，数据无引用者 ✓）
+            for (size_t si = ms_scratch_mark; si < context().scratch_.size(); ++si) {
+                ::free(context().scratch_[si]);
+            }
+            context().scratch_.resize(ms_scratch_mark);
+            last_cgraph = nullptr;
+            print_rss("sample-released");
 
             // ---- 断点续训 checkpoint：每样本完成后保存权重+进度 ----
             //  SIGKILL/OOM 中途退出后，重启加 PPML_LOAD_CKPT=<path> 即可从
@@ -1088,11 +1142,11 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
             float inv = 1.0f / (float)acc_count;
             for (int64_t j = 0; j < n; ++j) acc[pi][(size_t)j] *= inv;
         }
-        if (last_cgraph) {
+        if (grad_carrier) {                     // 【2026-09-21 B】收尾 step 也走载体图 ✓
             for (size_t pi = 0; pi < params.size(); ++pi)
-                ms_write_grad(last_cgraph, params[pi], acc[pi]);
-            float gnorm = clip_grad_norm(last_cgraph, clip_norm);
-            optimizer.step(last_cgraph);
+                ms_write_grad(grad_carrier, params[pi], acc[pi]);
+            float gnorm = clip_grad_norm(grad_carrier, clip_norm);
+            optimizer.step(grad_carrier);
             std::cout << "  >> final step (grad_norm=" << gnorm << ")" << std::endl;
         }
         acc_count = 0;

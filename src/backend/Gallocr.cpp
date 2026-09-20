@@ -295,7 +295,7 @@ bool Gallocr::allocate_node(NodeInfo* ni) {
 
         // 方向3：分配前检查新区间与当前存活区间是否重叠（应恒不重叠，防御性断言）
         if (getenv("GRAPH_DEBUG_GALLOCR")) check_live_overlap(ba, ni);
-        add_live(ba, offset, alloc_size);
+        add_live(ba, offset, alloc_size, ni);
     }
 
     ni->offset     = offset;
@@ -318,7 +318,7 @@ void Gallocr::free_node(NodeInfo* ni) {
         ba.talloc->free_bytes(ni->offset, ni->alloc_size);
     } else {
         // Phase2：从存活区间集合移除（方向3）
-        remove_live(ba, ni->offset, ni->alloc_size);
+        remove_live(ba, ni->offset, ni->alloc_size, ni);
     }
     ni->allocated = false;
 }
@@ -621,17 +621,23 @@ bool Gallocr::alloc_rebuild(
             auto it = node_map_.find(src);
             if (it == node_map_.end()) continue;
             NodeInfo* sni = it->second;
+            // 【2026-09-20 修复：两阶段不对称 ⇒ 假碰撞 ✗→✓】
+            //   Phase1（reserve，第 414-435 行）在 2026-09-14 修成"view 源**整条链逐层减一**"，
+            //   而 Phase2 这里原来只减**一层**、还额外要求 view 计数先到 0 ✗ ⇒
+            //   某些 src 的 n_children 在 Phase2 到不了 0 ⇒ **永不 free_node/remove_live** ✗
+            //   ⇒ live 集合残留 ⇒ 后续同 offset 分配被误报 `[LIVE-OVERLAP] 真共存` ⚠️（实测 384 次/epoch ✗）。
+            //   现在与 Phase1 **逐字对称**（含深层链 + 不额外依赖 managed/view 计数 ✓）⇒ 断言恢复有效 ✓。
             if (src->view_src) {
+                // src 是 view：整条链逐层减一（与 reserve 对称 ✓）
                 if (--sni->n_children <= 0) {
                     free_node(sni);  // view 非 managed，free_node 应跳过实际释放
-                    TensorF32* under = src->src[0];
-                    if (under) {
-                        auto uit = node_map_.find(under);
-                        if (uit != node_map_.end() && uit->second->managed &&
-                            --uit->second->n_children <= 0) {
-                            free_node(uit->second);
-                        }
-                    }
+                }
+                TensorF32* lay = src->src[0];
+                for (int g = 0; lay && g < 64; ++g) {
+                    auto uit = node_map_.find(lay);
+                    if (uit == node_map_.end()) break;
+                    if (--uit->second->n_children <= 0) free_node(uit->second);  // 非 managed 层为 no-op
+                    lay = lay->src[0];
                 }
             } else if (sni->managed && --sni->n_children <= 0) {
                 free_node(sni);
@@ -773,20 +779,31 @@ void Gallocr::bind_tensor(NodeInfo* ni) {
 //   Phase2 复用 Phase1 偏移，布局本身一致；此处为防御性校验，
 //   若未来有任何布局 bug 导致两个同时存活的张量区间重叠，立即暴露。
 // ============================================================
-void Gallocr::add_live(BackendAlloc& ba, size_t off, size_t size) {
+void Gallocr::add_live(BackendAlloc& ba, size_t off, size_t size, const NodeInfo* ni) {
     if (size == 0) return;
-    ba.live.push_back({off, size});
+    const TensorF32* t = (ni ? ni->tensor : nullptr);
+    ba.live.push_back({off, size, t, ni});
 }
 
-void Gallocr::remove_live(BackendAlloc& ba, size_t off, size_t size) {
+void Gallocr::remove_live(BackendAlloc& ba, size_t off, size_t size, const NodeInfo* ni) {
     if (size == 0) return;
+    const TensorF32* t = (ni ? ni->tensor : nullptr);
     for (size_t i = 0; i < ba.live.size(); ++i) {
-        if (ba.live[i].off == off && ba.live[i].size == size) {
+        // 【2026-09-20】优先按张量指针精确匹配（同 (off,size) 的重复项不再可能错删 ✓）；
+        //   无指针信息时退回 (off,size) 匹配（兼容旧调用 ✓）。
+        const bool ptr_ok = (t == nullptr) || (ba.live[i].t == nullptr) || (ba.live[i].t == t);
+        if (ba.live[i].off == off && ba.live[i].size == size && ptr_ok) {
             ba.live.erase(ba.live.begin() + i);
             return;
         }
     }
-    // 未找到（如重复 free）—— 幂等，忽略。
+    // 【关键指标】未找到 ⇒ 说明这条区间当初没被 add_live（或已被删/尺寸不符）⇒ **live 跟踪有漏洞** ✓
+    ++n_remove_live_miss_;
+    if (n_remove_live_miss_ <= 10) {
+        fprintf(stderr,
+                "[gallocr][LIVE-MISS] free 时未在 live 找到：t=%p op=%d [off=%zu,+%zu)（live 现有 %zu 条）\n",
+                (void*)t, (ni && ni->tensor) ? (int)ni->tensor->op : -1, off, size, ba.live.size());
+    }
 }
 
 void Gallocr::check_live_overlap(BackendAlloc& ba, const NodeInfo* ni) {
@@ -795,11 +812,49 @@ void Gallocr::check_live_overlap(BackendAlloc& ba, const NodeInfo* ni) {
     if (size == 0) return;
     for (const auto& r : ba.live) {
         if (off < r.off + r.size && r.off < off + size) {
-            fprintf(stderr,
-                    "[gallocr][LIVE-OVERLAP] tensor=%p n_bytes=%zu [off=%zu,+%zu) overlaps "
-                    "live [off=%zu,+%zu) -- 两阶段布局错位/复用碰撞!\n",
-                    (void*)ni->tensor, ni->tensor ? ni->tensor->nbytes() : 0,
-                    off, size, r.off, r.size);
+            // 【2026-09-20】判定这条 live 记录对应的张量**此刻是否还活着**：
+            //   alive=1 ⇒ **真共存**（lifetime 计算可能有问题 ⇒ 必须查 ⚠️）
+            //   alive=0 ⇒ 该张量已 free，却仍在 live 集合里 ⇒ **跟踪残留**（假警报 ✗）
+            const NodeInfo* rn = nullptr;
+            if (r.t) {
+                auto it = node_map_.find(const_cast<TensorF32*>(r.t));
+                if (it != node_map_.end()) rn = it->second;
+            }
+            const bool r_alive = (rn != nullptr) && rn->allocated;
+            const bool r_out   = (rn != nullptr) && rn->is_output;
+            ++n_live_overlap_seen_;
+            if (r_alive) ++n_live_overlap_real_; else ++n_live_overlap_stale_;
+            // 明细只打前 20 条（长训练可达数万条 ✗），其余靠 release 汇总 ✓
+            if (n_live_overlap_seen_ <= 20) {
+                // 【2026-09-20】附带上两侧的节点身份：idx（在 nodes_/leaves_ 里的下标）/refcount/是否 leaf ✓
+                auto idx_of = [&](const NodeInfo* p, const char** kind) -> long {
+                    if (!p) { *kind = "?"; return -1; }
+                    if (!nodes_.empty() && p >= nodes_.data() && p < nodes_.data() + nodes_.size()) {
+                        *kind = "node"; return (long)(p - nodes_.data());
+                    }
+                    if (!leaves_.empty() && p >= leaves_.data() && p < leaves_.data() + leaves_.size()) {
+                        *kind = "leaf"; return (long)(p - leaves_.data());
+                    }
+                    *kind = "?"; return -1;
+                };
+                const char* k_new = "?";
+                const char* k_live = "?";
+                const long idx_new  = idx_of(ni, &k_new);
+                const long idx_live = idx_of(r.ni, &k_live);
+                fprintf(stderr,
+                        "[gallocr][LIVE-OVERLAP] new t=%p op=%d numel=%lld nbytes=%zu [off=%zu,+%zu) "
+                        "%s[%ld] refc=%d alloc=%d | live t=%p op=%d numel=%lld [off=%zu,+%zu) "
+                        "%s[%ld] refc=%d alloc=%d is_out=%d ⇒ %s\n",
+                        (void*)ni->tensor, ni->tensor ? (int)ni->tensor->op : -1,
+                        ni->tensor ? (long long)ni->tensor->numel() : -1,
+                        ni->tensor ? ni->tensor->nbytes() : 0,
+                        off, size, k_new, idx_new, ni->n_children, (int)ni->allocated,
+                        (void*)r.t, r.t ? (int)r.t->op : -1,
+                        r.t ? (long long)r.t->numel() : -1,
+                        r.off, r.size, k_live, idx_live,
+                        r.ni ? r.ni->n_children : -1, (int)r_alive, (int)r_out,
+                        r_alive ? "★真共存(need lifetime check)" : "stale(已释放 ⇒ 假警报)");
+            }
         }
     }
 }
@@ -841,6 +896,15 @@ void Gallocr::release() {
         ba.high_watermark = 0;
         ba.live.clear();
         ba.use = false;
+    }
+    // 【2026-09-20】LIVE-OVERLAP / LIVE-MISS 汇总（只在出现过时打印 ✓）
+    //   真共存 > 0 ⇒ 布局/lifetime 可能真有问题 ⚠️；miss > 0 ⇒ 跟踪漏洞（live 集合会残留 ✗）
+    if (n_live_overlap_seen_ > 0 || n_remove_live_miss_ > 0) {
+        fprintf(stderr,
+                "[gallocr] LIVE 校验汇总：overlap=%lld（真共存=%lld / 跟踪残留=%lld）｜free 未命中=%lld\n",
+                n_live_overlap_seen_, n_live_overlap_real_, n_live_overlap_stale_, n_remove_live_miss_);
+        n_live_overlap_seen_ = n_live_overlap_real_ = n_live_overlap_stale_ = 0;
+        n_remove_live_miss_  = 0;
     }
     node_map_.clear();
     nodes_.clear();
