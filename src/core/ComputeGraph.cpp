@@ -909,6 +909,61 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, dx);
             }
         } break;
+        // 【2026-09-22 Step ⑤】Flash Attention 融合算子反向（前向建图见 ComputeGraphHelper.cpp::flash_attn_ext）
+        //   forward: O = softmax(scale·KQᵀ + bias)·V（无 L×L 落地 ✓）
+        //     srcs: [0]=Qf [1]=Kf [2]=Vf [3]=bias(可空) [4]=LSE；dst = Of（均为 flash 布局 [D,L,H,B] ✓）
+        //   backward: 单个 OP_FLASH_ATTN_BACK 节点**一次**算出 dQf/dKf/dVf（挂 src[7..9] ✓ = 多输出惯例）
+        //     与 dbias（写 dst ✓，由 op_params[5] 决定是否计算 ✓）。
+        //   ⚠️ 多输出 op 必须 build_forward_expand(back)：否则挂在 src 上的输出张量不进图、永不执行 ✗
+        //      （同 OP_TRI_MUL_BACK / OP_OUTER_PROD_BACK 的注释 ✓）。
+        //   ⚠️ bias 在 src[3]，而 compute_backward 预取的 isrc*_needs_grads 只到 src[2] ⇒ 这里自行查 hash ✓。
+        case OP_FLASH_ATTN_EXT: {
+            TensorF32* Qf   = src0;
+            TensorF32* Kf   = src1;
+            TensorF32* Vf   = src2;
+            TensorF32* bias = tensor->src[3];
+            TensorF32* lse  = tensor->src[4];
+            if (!Qf || !Kf || !Vf || !lse) break;      // 缺 LSE 无法反算 ⇒ 跳过（正常不该发生 ✓）
+
+            const size_t isrc3 = bias ? hash_find(hash_set, bias) : (size_t)-1;
+            const bool src3_needs_grads = bias && isrc3 != HASHSET_FULL &&
+                                          bitset_get(hash_set->used, isrc3) && grads_needed[isrc3];
+
+            if (src0_needs_grads || src1_needs_grads || src2_needs_grads || src3_needs_grads) {
+                TensorF32* gq = src0_needs_grads
+                    ? context().new_tensor<float>(Qf->shape().ndim(), Qf->shape().dims.data()) : nullptr;
+                TensorF32* gk = src1_needs_grads
+                    ? context().new_tensor<float>(Kf->shape().ndim(), Kf->shape().dims.data()) : nullptr;
+                TensorF32* gv = src2_needs_grads
+                    ? context().new_tensor<float>(Vf->shape().ndim(), Vf->shape().dims.data()) : nullptr;
+
+                int64_t dummy_dims[GGML_MAX_DIMS] = {1, 1, 1, 1};
+                TensorF32* back = src3_needs_grads
+                    ? context().new_tensor<float>(bias->shape().ndim(), bias->shape().dims.data())
+                    : context().new_tensor<float>(1, dummy_dims);     // dbias 不需要 ⇒ 占位 1 元素 ✓
+
+                back->op     = OP_FLASH_ATTN_BACK;
+                back->src[0] = Qf;
+                back->src[1] = Kf;
+                back->src[2] = Vf;
+                back->src[3] = bias;      // 可空 ✓
+                back->src[4] = tensor;    // O（本节点的前向输出 ✓）
+                back->src[5] = grad;      // dO（上游梯度 ✓）
+                back->src[6] = lse;       // LSE ✓
+                back->src[7] = gq;
+                back->src[8] = gk;
+                back->src[9] = gv;
+                memcpy(back->op_params, tensor->op_params, 3 * sizeof(int32_t));   // scale/causal/eps ✓
+                back->op_params[5] = src3_needs_grads ? 1 : 0;
+
+                build_forward_expand(back);
+
+                if (gq) add_or_set(ctx, cgraph, isrc0, gq);
+                if (gk) add_or_set(ctx, cgraph, isrc1, gk);
+                if (gv) add_or_set(ctx, cgraph, isrc2, gv);
+                if (src3_needs_grads) add_or_set(ctx, cgraph, isrc3, back);   // dst = dbias ✓
+            }
+        } break;
         case OP_ROPE: {
             if (src0_needs_grads) {
                 // const int n_dims     = ((const int32_t *) tensor->op_params)[1];

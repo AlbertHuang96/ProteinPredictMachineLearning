@@ -694,6 +694,9 @@ private:
     static void kernel_outer_prod_back(TensorF32 * node, ComputeParams * p);
     static void kernel_softmax (TensorF32 * node, ComputeParams * p);
     static void kernel_softmax_back(TensorF32 * node, ComputeParams * p);
+    // 【2026-09-22 Step ⑤】Flash Attention 融合算子（CPU 侧纯调 Step ① 实现；单线程 ⇒ 仅 ith==0 干活 ✓）
+    static void kernel_flash_attn_ext (TensorF32 * node, ComputeParams * p);
+    static void kernel_flash_attn_back(TensorF32 * node, ComputeParams * p);
     static void kernel_rms_norm (TensorF32 * node, ComputeParams * p);
     static void kernel_norm     (TensorF32 * node, ComputeParams * p);
     static void kernel_norm_back(TensorF32 * node, ComputeParams * p);
@@ -812,6 +815,10 @@ private:
     static void kernel_out_prod_cuda(TensorF32 * node, ComputeParams * p);
     static void kernel_softmax_cuda (TensorF32 * node, ComputeParams * p);
     static void kernel_softmax_back_cuda(TensorF32 * node, ComputeParams * p);
+    // 【2026-09-22 Step ⑤】Flash Attention 融合算子（复用 src/cuda/FlashAttnKernel.cu 的 host 包装 ✓）
+    //   上限由 CUDABackend::supports_op 把关（前向 d≤64 / 反向 d≤32 ✓）⇒ rc!=0 属异常 ⇒ *st 上报 ✗
+    static void kernel_flash_attn_ext_cuda (TensorF32 * node, ComputeParams * p, Status * st);
+    static void kernel_flash_attn_back_cuda(TensorF32 * node, ComputeParams * p, Status * st);
     static void kernel_norm_cuda     (TensorF32 * node, ComputeParams * p);
     static void kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p);
     static void kernel_dup_cuda      (TensorF32 * node);

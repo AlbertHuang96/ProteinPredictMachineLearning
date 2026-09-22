@@ -310,9 +310,24 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         // ===== kernel 为空函数体或 NOT_SUPPORTED，暂不支持 =====
         // UNARY_OP_*  → kernel_relu/gelu/sigmoid/silu/tanh/exp_cuda 均为空函数体
 
+        // ===== Flash Attention（Step ⑤）：按 head_dim 上限决定留 CUDA 还是回落 CPU =====
+        //   ⚠️ 上限必须与 src/cuda/FlashAttnKernel.cu 内的一致：前向 d ≤ 64、反向 d ≤ 32（寄存器约束 ✗）
+        //   超限 ⇒ 返回 false ⇒ 调度器（Backend.cpp set_backend_if_supported）自动把该节点派给 CPU ✓
+        //   也可用现成的 PPML_CUDA_DISABLE_OPS=<op 号> 强制本 op 回落（做 A/B 用 ✓）
+        case OP_FLASH_ATTN_EXT: {
+            if (!src0 || !src1 || !src2) return false;
+            if (src0->type != TENSOR_TYPE_F32) return false;
+            const int d = static_cast<int>(src0->shape().dim(0));   // flash 布局 dims[0] = d ✓
+            return d > 0 && d <= 64;
+        }
+        case OP_FLASH_ATTN_BACK: {
+            if (!src0) return false;
+            if (src0->type != TENSOR_TYPE_F32) return false;
+            const int d = static_cast<int>(src0->shape().dim(0));
+            return d > 0 && d <= 32;
+        }
+
         // ===== 未实现的 op =====
-        case OP_FLASH_ATTN_EXT:
-        case OP_FLASH_ATTN_BACK:
         case OP_CROSS_ENTROPY_LOSS:
         default:
             return false;

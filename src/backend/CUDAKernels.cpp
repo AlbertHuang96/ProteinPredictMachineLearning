@@ -1,5 +1,6 @@
 #include "ppml/Backend.h"
 #include "ppml/ComputeGraph.h"
+#include "ppml/FlashAttn.h"     // 【Step ⑤】FlashAttnConfig + flash_attn_{forward,backward}_cuda 声明 ✓
 #include <cstring>
 #include <vector>
 
@@ -64,6 +65,14 @@ extern void softmax_backward_cuda(
     int M, int N, int block_size, float scale);
 
 extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
+
+// 【2026-09-22 Step ⑤】Flash Attention 融合算子（实现见 src/cuda/FlashAttnKernel.cu ✓）
+//   返回 0 = 已执行；1 = 不支持（无设备 / head_dim 超上限 / 参数非法）⇒ *st 上报 ✗
+extern int flash_attn_forward_cuda(const FlashAttnConfig& cfg, const float* Q, const float* K, const float* V,
+                                   const float* bias, float* O, float* LSE);
+extern int flash_attn_backward_cuda(const FlashAttnConfig& cfg, const float* Q, const float* K, const float* V,
+                                    const float* bias, const float* O, const float* dO, const float* LSE,
+                                    float* dQ, float* dK, float* dV, float* dbias);
 
 // OP_MUL_MAT fp16 输入（前期支持，2026-09-10）：A/B 按 16 位 half 存储，kernel 内转 fp32
 // 累加，输出仍 fp32。M/K/N 语义与 mul_mat_cuda 完全一致（B 以 [N][K] 转置存储）。
@@ -262,6 +271,16 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
 
         case OP_SOFT_MAX_BACK:
             kernel_softmax_back_cuda(node, p);
+            break;
+
+        // 【2026-09-22 Step ⑤】Flash Attention 融合算子（PPML_FLASH_ATTN=1 时由 Attention.cpp 建图 ✓）
+        //   supports_op 已按 head_dim 上限把关（前向 d≤64 / 反向 d≤32 ✓）⇒ 超限的节点会派给 CPU ✓
+        case OP_FLASH_ATTN_EXT:
+            kernel_flash_attn_ext_cuda(node, p, &st);
+            break;
+
+        case OP_FLASH_ATTN_BACK:
+            kernel_flash_attn_back_cuda(node, p, &st);
             break;
 
         case OP_NORM: {
@@ -581,6 +600,61 @@ void CUDABackend::kernel_softmax_back_cuda(TensorF32 * node, ComputeParams * p) 
     float *       dst    = node->data();
     // scale = 1.0f (standard softmax backward, no scaling)
     softmax_backward_cuda(grad, output, dst, M, N, 256, 1.0f);
+}
+
+// ============================================================
+// 【2026-09-22 Step ⑤】Flash Attention 融合算子 —— CUDA 侧（包装 Step ②/③ 的 host 函数 ✓）
+//   srcs/dst/op_params 约定与 CPU 侧同名函数完全一致（见 CPUKernels.cpp 注释 ✓）
+//   布局：[d,L,h,B]（flash 布局 ✓，由 ComputeGraphHelper::flash_attn_ext 的 permute 保证 ✓）
+//   rc != 0 只可能是"supports_op 的上限判定与实际不符"（不该发生 ✗）⇒ *st 上报，由 graph_compute 中止 ✓
+// ============================================================
+namespace {
+FlashAttnConfig flash_attn_cfg_of_cuda(const TensorF32* const qkv[3], const TensorF32* node) {
+    FlashAttnConfig cfg;
+    const TensorF32* q = qkv[0];
+    cfg.B = static_cast<int>(q->shape().dim(3));
+    cfg.h = static_cast<int>(q->shape().dim(2));
+    cfg.L = static_cast<int>(q->shape().dim(1));
+    cfg.d = static_cast<int>(q->shape().dim(0));
+    cfg.scale       = reinterpret_cast<const float&>(node->op_params[0]);
+    cfg.causal      = node->op_params[1] != 0;
+    cfg.softmax_eps = reinterpret_cast<const float&>(node->op_params[2]);
+    cfg.Br          = node->op_params[3] > 0 ? node->op_params[3] : 64;
+    cfg.Bc          = node->op_params[4] > 0 ? node->op_params[4] : 64;
+    return cfg;
+}
+}  // namespace
+
+void CUDABackend::kernel_flash_attn_ext_cuda(TensorF32 * node, ComputeParams * /*p*/, Status * st) {
+    const TensorF32* qkv[3] = { node->src[0], node->src[1], node->src[2] };
+    if (!qkv[0] || !qkv[1] || !qkv[2]) { if (st) *st = Status::NOT_SUPPORTED; return; }
+    const FlashAttnConfig cfg = flash_attn_cfg_of_cuda(qkv, node);
+    const float* bias = node->src[3] ? node->src[3]->data() : nullptr;
+    float*       lse  = node->src[4] ? node->src[4]->data() : nullptr;
+    const int rc = flash_attn_forward_cuda(cfg,
+        qkv[0]->data(), qkv[1]->data(), qkv[2]->data(), bias, node->data(), lse);
+    if (st) *st = (rc == 0) ? Status::SUCCESS : Status::NOT_SUPPORTED;
+}
+
+void CUDABackend::kernel_flash_attn_back_cuda(TensorF32 * node, ComputeParams * /*p*/, Status * st) {
+    const TensorF32* qkv[3] = { node->src[0], node->src[1], node->src[2] };
+    const TensorF32* O   = node->src[4];
+    const TensorF32* dO  = node->src[5];
+    const TensorF32* lse = node->src[6];
+    if (!qkv[0] || !qkv[1] || !qkv[2] || !O || !dO || !lse) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const FlashAttnConfig cfg = flash_attn_cfg_of_cuda(qkv, node);
+    const float* bias = node->src[3] ? node->src[3]->data() : nullptr;
+    float* dq = node->src[7] ? node->src[7]->data() : nullptr;
+    float* dk = node->src[8] ? node->src[8]->data() : nullptr;
+    float* dv = node->src[9] ? node->src[9]->data() : nullptr;
+    float* db = (node->op_params[5] != 0) ? node->data() : nullptr;   // dbias 写 dst ✓
+    const int rc = flash_attn_backward_cuda(cfg,
+        qkv[0]->data(), qkv[1]->data(), qkv[2]->data(), bias,
+        O->data(), dO->data(), lse->data(), dq, dk, dv, db);
+    if (st) *st = (rc == 0) ? Status::SUCCESS : Status::NOT_SUPPORTED;
 }
 
 void CUDABackend::kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p) {
