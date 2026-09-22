@@ -224,6 +224,19 @@ TensorF32* SelfAttention::forward_graph(TensorF32* Q, TensorF32* K, TensorF32* V
     // 输入约定: Q, K, V 均为 (batch, n_head, D_head, L)
     // GGML dims = [L, D_head, n_head, batch]
 
+    // 【2026-09-22 Step ⑤】融合路径：PPML_FLASH_ATTN=1 ⇒ 用**单个** OP_FLASH_ATTN_EXT 替换下面 5 步
+    //   （不落地 L×L 的 scores/P ✗ ⇒ 显存与 HBM 流量从 O(L²) 降为 O(L·D) ✓）。
+    //   数值口径与旧路径一致：scale = 1/√d_head ✓、bias 同一张量同一顺序相加 ✓、
+    //   softmax 分母 eps = 1e-9（对齐 kernel_softmax 的 1/(Σ+1e-9) ✓）、非 causal ✓。
+    //   默认关闭（未设/为 "0"）⇒ 走老路，行为逐位不变 ✓；回溯用 PPML_FLASH_ATTN=0 ✓。
+    static const bool kFlashAttn = []() {
+        const char* e = getenv("PPML_FLASH_ATTN");
+        return e && e[0] && e[0] != '0';
+    }();
+    if (kFlashAttn) {
+        return flash_attn_ext(Q, K, V, bias, /*scale=*/0.f, /*causal=*/false, /*softmax_eps=*/1e-9f);
+    }
+
     // 1. scores = K @ Q^T (key 最内 dims[0], 使 softmax 沿 key 轴归一)
     // out_prod(K, Q): src0=K [L_k,D_head,H,B], src1=Q [L_q,D_head,H,B]
     // 收缩 dims[1]=D_head → [L_k, L_q, H, B]

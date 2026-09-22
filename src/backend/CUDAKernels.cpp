@@ -1,5 +1,6 @@
 #include "ppml/Backend.h"
 #include "ppml/ComputeGraph.h"
+#include "ppml/FlashAttn.h"     // 【Step ⑤】FlashAttnConfig + flash_attn_{forward,backward}_cuda 声明 ✓
 #include <cstring>
 #include <vector>
 
@@ -65,9 +66,26 @@ extern void softmax_backward_cuda(
 
 extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
 
+// 【2026-09-22 Step ⑤】Flash Attention 融合算子（实现见 src/cuda/FlashAttnKernel.cu ✓）
+//   返回 0 = 已执行；1 = 不支持（无设备 / head_dim 超上限 / 参数非法）⇒ *st 上报 ✗
+extern int flash_attn_forward_cuda(const FlashAttnConfig& cfg, const float* Q, const float* K, const float* V,
+                                   const float* bias, float* O, float* LSE);
+extern int flash_attn_backward_cuda(const FlashAttnConfig& cfg, const float* Q, const float* K, const float* V,
+                                    const float* bias, const float* O, const float* dO, const float* LSE,
+                                    float* dQ, float* dK, float* dV, float* dbias);
+
 // OP_MUL_MAT fp16 输入（前期支持，2026-09-10）：A/B 按 16 位 half 存储，kernel 内转 fp32
 // 累加，输出仍 fp32。M/K/N 语义与 mul_mat_cuda 完全一致（B 以 [N][K] 转置存储）。
 extern void mul_mat_cuda_f16(const void* A, const void* B, float* C, int M, int K, int N);
+
+// 【2026-09-22 Step 1】TF32 tensor-core GEMM（smem + cp.async 双缓冲流水）
+//   C[M,N] = A[M,K] * B[N,K]ᵀ（fp32 输入 → 硬件 tf32 截断；fp32 累加）。
+//   返回 0 = 已执行；1 = 不支持（< sm_80+）或尺寸非法 ⇒ 调用方回落 mul_mat_cuda（SIMT）。
+extern int mul_mat_mma_tf32_smem(const void* A, const void* B, float* C, int M, int K, int N);
+
+// 【2026-09-22 Step 0】MUL_MAT 统计（PPML_MULMAT_STATS=1）：CUDA event 计时，begin/end 夹一次 launch
+extern void mulmat_stats_cuda_begin(int M, int K, int N);
+extern void mulmat_stats_cuda_end(const char* path);
 
 // OP_MUL_MAT fp16 tensor-core（mma.m16n8k16, fp32 累加，2026-09-10）
 //   返回 0 = 已执行；1 = 硬件 < sm_80（调用方回落 mul_mat_cuda_f16）。
@@ -253,6 +271,16 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
 
         case OP_SOFT_MAX_BACK:
             kernel_softmax_back_cuda(node, p);
+            break;
+
+        // 【2026-09-22 Step ⑤】Flash Attention 融合算子（PPML_FLASH_ATTN=1 时由 Attention.cpp 建图 ✓）
+        //   supports_op 已按 head_dim 上限把关（前向 d≤64 / 反向 d≤32 ✓）⇒ 超限的节点会派给 CPU ✓
+        case OP_FLASH_ATTN_EXT:
+            kernel_flash_attn_ext_cuda(node, p, &st);
+            break;
+
+        case OP_FLASH_ATTN_BACK:
+            kernel_flash_attn_back_cuda(node, p, &st);
             break;
 
         case OP_NORM: {
@@ -506,6 +534,7 @@ void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
         const void* B16 = reinterpret_cast<const void*>(B);
         // 优先级：流水版（smem+ldmatrix+cp.async）→ 简化 MMA → SIMT fp16
         const char* path = "tensor-core-smem-pipeline";
+        mulmat_stats_cuda_begin(M, K, N);
         int rc = mul_mat_mma_f16_smem(A16, B16, C, M, K, N);
         if (rc != 0) {
             path = "tensor-core-mma-simple";
@@ -515,13 +544,40 @@ void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
             path = "fallback-simt-f16";
             mul_mat_cuda_f16(A16, B16, C, M, K, N);
         }
+        mulmat_stats_cuda_end(path);
         if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
             fprintf(stderr, "[MMA] M=%d K=%d N=%d path=%s\n", M, K, N, path);
         }
         return;
     }
 
+    // ===== 【2026-09-22】F32 → TF32 tensor core（Step 1）=====
+    //   开关 PPML_MUL_MAT_TC=1（默认 0 = 纯 SIMT，与历史行为完全一致 ✓）。
+    //   按用户要求**不设尺寸阈值**（小形状可能更慢，已接受 ✓）；仅当"非 sm_80+ / 尺寸非法"时
+    //   回落 SIMT（由 mul_mat_mma_tf32_smem 内部判定并返回 1 ✓）。
+    //   ⚠️ 反向的 mul_mat（compute_backward 也是用 mul_mat 拼的）同样经过这里 ⇒ 前后向一致 ✓。
+    static const bool tc_on = []() {
+        const char* e = std::getenv("PPML_MUL_MAT_TC");
+        return e && e[0] && e[0] != '0';     // "0" = 关（默认）；其它值 = 开（TF32）
+    }();
+    if (tc_on) {
+        mulmat_stats_cuda_begin(M, K, N);
+        const int rc_tc = mul_mat_mma_tf32_smem(A, B, C, M, K, N);
+        mulmat_stats_cuda_end(rc_tc == 0 ? "tf32-smem" : "tf32-unavailable");
+        if (rc_tc == 0) {
+            if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
+                fprintf(stderr, "[MMA] M=%d K=%d N=%d path=tf32-smem\n", M, K, N);
+            }
+            return;
+        }
+    }
+
+    mulmat_stats_cuda_begin(M, K, N);
     mul_mat_cuda(A, B, C, M, K, N);
+    mulmat_stats_cuda_end("simt-128x128");
+    if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
+        fprintf(stderr, "[MMA] M=%d K=%d N=%d path=simt-128x128\n", M, K, N);
+    }
 }
 
 void CUDABackend::kernel_softmax_cuda(TensorF32 * node, ComputeParams * p) {
@@ -544,6 +600,61 @@ void CUDABackend::kernel_softmax_back_cuda(TensorF32 * node, ComputeParams * p) 
     float *       dst    = node->data();
     // scale = 1.0f (standard softmax backward, no scaling)
     softmax_backward_cuda(grad, output, dst, M, N, 256, 1.0f);
+}
+
+// ============================================================
+// 【2026-09-22 Step ⑤】Flash Attention 融合算子 —— CUDA 侧（包装 Step ②/③ 的 host 函数 ✓）
+//   srcs/dst/op_params 约定与 CPU 侧同名函数完全一致（见 CPUKernels.cpp 注释 ✓）
+//   布局：[d,L,h,B]（flash 布局 ✓，由 ComputeGraphHelper::flash_attn_ext 的 permute 保证 ✓）
+//   rc != 0 只可能是"supports_op 的上限判定与实际不符"（不该发生 ✗）⇒ *st 上报，由 graph_compute 中止 ✓
+// ============================================================
+namespace {
+FlashAttnConfig flash_attn_cfg_of_cuda(const TensorF32* const qkv[3], const TensorF32* node) {
+    FlashAttnConfig cfg;
+    const TensorF32* q = qkv[0];
+    cfg.B = static_cast<int>(q->shape().dim(3));
+    cfg.h = static_cast<int>(q->shape().dim(2));
+    cfg.L = static_cast<int>(q->shape().dim(1));
+    cfg.d = static_cast<int>(q->shape().dim(0));
+    cfg.scale       = reinterpret_cast<const float&>(node->op_params[0]);
+    cfg.causal      = node->op_params[1] != 0;
+    cfg.softmax_eps = reinterpret_cast<const float&>(node->op_params[2]);
+    cfg.Br          = node->op_params[3] > 0 ? node->op_params[3] : 64;
+    cfg.Bc          = node->op_params[4] > 0 ? node->op_params[4] : 64;
+    return cfg;
+}
+}  // namespace
+
+void CUDABackend::kernel_flash_attn_ext_cuda(TensorF32 * node, ComputeParams * /*p*/, Status * st) {
+    const TensorF32* qkv[3] = { node->src[0], node->src[1], node->src[2] };
+    if (!qkv[0] || !qkv[1] || !qkv[2]) { if (st) *st = Status::NOT_SUPPORTED; return; }
+    const FlashAttnConfig cfg = flash_attn_cfg_of_cuda(qkv, node);
+    const float* bias = node->src[3] ? node->src[3]->data() : nullptr;
+    float*       lse  = node->src[4] ? node->src[4]->data() : nullptr;
+    const int rc = flash_attn_forward_cuda(cfg,
+        qkv[0]->data(), qkv[1]->data(), qkv[2]->data(), bias, node->data(), lse);
+    if (st) *st = (rc == 0) ? Status::SUCCESS : Status::NOT_SUPPORTED;
+}
+
+void CUDABackend::kernel_flash_attn_back_cuda(TensorF32 * node, ComputeParams * /*p*/, Status * st) {
+    const TensorF32* qkv[3] = { node->src[0], node->src[1], node->src[2] };
+    const TensorF32* O   = node->src[4];
+    const TensorF32* dO  = node->src[5];
+    const TensorF32* lse = node->src[6];
+    if (!qkv[0] || !qkv[1] || !qkv[2] || !O || !dO || !lse) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const FlashAttnConfig cfg = flash_attn_cfg_of_cuda(qkv, node);
+    const float* bias = node->src[3] ? node->src[3]->data() : nullptr;
+    float* dq = node->src[7] ? node->src[7]->data() : nullptr;
+    float* dk = node->src[8] ? node->src[8]->data() : nullptr;
+    float* dv = node->src[9] ? node->src[9]->data() : nullptr;
+    float* db = (node->op_params[5] != 0) ? node->data() : nullptr;   // dbias 写 dst ✓
+    const int rc = flash_attn_backward_cuda(cfg,
+        qkv[0]->data(), qkv[1]->data(), qkv[2]->data(), bias,
+        O->data(), dO->data(), lse->data(), dq, dk, dv, db);
+    if (st) *st = (rc == 0) ? Status::SUCCESS : Status::NOT_SUPPORTED;
 }
 
 void CUDABackend::kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p) {

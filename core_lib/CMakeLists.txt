@@ -23,6 +23,7 @@ set(CORE_SOURCES
     ../src/ops/LayerNorm.cpp
     ../src/ops/MathUtils.cpp
     ../src/ops/Dropout.cpp
+    ../src/ops/FlashAttn.cpp
     ../src/model/PositionalEncoding.cpp
     ../src/data/DataLoader.cpp
     ../src/data/AtomFrame.cpp
@@ -58,6 +59,7 @@ set(CORE_SOURCES
     ../src/cuda/ScanKernels.cu
     ../src/cuda/OptimKernels.cu
     ../src/cuda/StagingPool.cu
+    ../src/cuda/FlashAttnKernel.cu
 )
 
 # 启用 CUDA 语言

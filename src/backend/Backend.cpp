@@ -118,6 +118,50 @@ bool BackendScheduler::node_is_host_producer(TensorF32* node) const {
     return false;
 }
 
+// 【2026-09-22】构建期"数据居住地"判定（与运行期 buffer 状态解耦）★
+//   背景：040350 与 043548 是**同一配置、同一张图**（split=0/2/4 行逐字一致 ✓），但同一个
+//   CUDA split（i=[7191,7231)，含 3× op=0）一次崩（`[CUDA-ERR] illegal memory access` →
+//   CPU 回退 → exit 134 ✗）一次正常 ✓。根因：build_splits 的 host 判据用**运行期** `buffer_`
+//   状态（`src->buffer_ == nullptr || is_host()` ✗），而参数 transfer / staging rebind 的时机
+//   在两次 run 里不同 ⇒ 判定漂移 ✗。
+//   规则（构建期钉死 ✓）：
+//     · op=0（参数/常量/输入）：首次观测记录居住地（1=host, 2=device）；随后
+//       host→device 允许**单调升级** ✓（参数 transfer 完成后合法）；device→host 视为漂移，
+//       **保守按 host 处理** ✓（宁可多建一次 H2D cpy，也不让 GPU 内核裸读 host 指针 ✗）。
+//     · 其它 op：仍按当次构建的真实 buffer 状态判定（其生命周期由 gallocr 管理，稳定 ✓）。
+bool BackendScheduler::sched_data_is_host(const TensorF32* t) {
+    if (!t) return true;
+    const bool cur_host = (t->buffer_ == nullptr) || t->buffer_->is_host();
+    if (t->op != OP_NONE) return cur_host;
+
+    unsigned char& rec = residence_fix_[t];   // 0 = 未记录
+    if (rec == 0) {
+        rec = cur_host ? 1u : 2u;
+        if (getenv("GRAPH_DEBUG_SCHED")) {
+            fprintf(stderr, "[sched] residence fix: op=0 %p numel=%lld bytes=%zu → %s（钉死 ✓）\n",
+                    (const void*)t, (long long)t->numel(), t->nbytes(), cur_host ? "host" : "device");
+        }
+        return cur_host;
+    }
+    if (rec == 1u && !cur_host) {             // host→device：合法升级（参数被搬到显存 ✓）
+        rec = 2u;
+        if (getenv("GRAPH_DEBUG_SCHED")) {
+            fprintf(stderr, "[sched] residence fix: op=0 %p host→device（升级记录 ✓）\n", (const void*)t);
+        }
+        return false;
+    }
+    if (rec == 2u && cur_host) {              // device→host：漂移 ⇒ 保守按 host（并在记录里降级，避免重复告警 ✓）
+        static long drift_warn = 0;
+        rec = 1u;
+        if (getenv("GRAPH_DEBUG_SCHED") && drift_warn++ < 20) {
+            fprintf(stderr, "[sched] residence fix: op=0 %p device→host 漂移 ⇒ 保守按 host（建 H2D cpy ✓）\n",
+                    (const void*)t);
+        }
+        return true;
+    }
+    return rec == 1u;
+}
+
 void BackendScheduler::set_backend_if_supported(TensorF32* node, int backend_id, int idx) {
     // host 生产者（OP_NONE 参数/常量）不得放 GPU：数据在 host，dispatch 跳过它，
     // 也不会建 cpy（与消费者同后端），GPU kernel 会读 host 指针。
@@ -151,12 +195,54 @@ bool BackendScheduler::gpu_assign_if_affordable(TensorF32* node, int gpu_backend
     const BufferType* bt = (gpu_backend_id < n_backends_)
                                ? backends_[gpu_backend_id]->buffer_type() : nullptr;
 
-    // 无预算（0=不限/未启用）或该节点已有独立 device buffer（data()!=nullptr 非复用）→ 直接放行。
-    if (gpu_vram_budget_ == 0 || node->data() != nullptr) {
-        if (node->data() == nullptr && bt) {
-            // 计入预算（node 尚未绑定 device buffer）
-            gpu_reserved_bytes_ += GGML_PAD(bt->get_alloc_size(node), bt->get_alignment());
+    // 【2026-09-22】"host 源 ⇒ H2D cpy" 的**构建期**预算判定 ★
+    //   本节点的输入里若有"host 居住"的源，而本节点要放 GPU ⇒ build_splits 必须为它建
+    //   H2D cpy（持久 buffer，占显存）✓。这里**提前**把这份拷贝的字节计入预算：
+    //     显存够 ⇒ 放行（构建期就定下"插 cpy"✓，与运行期 buffer 状态无关 ✓）；
+    //     显存不够 ⇒ 拒绝该节点上 GPU（回落 CPU ✓），而不是构建期漏建 cpy 让内核裸读 host ✗。
+    //   同一 src 只计一次（host_cpy_bytes_ ✓，每次构建由 assign_backends 清空 ✓）。
+    auto h2d_bytes_for = [&](TensorF32* nd, std::vector<TensorF32*>* newly) -> size_t {
+        if (gpu_vram_budget_ == 0) return 0;
+        size_t sum = 0;
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            TensorF32* s = nd->src[j];
+            if (!s) continue;
+            if (!sched_data_is_host(s)) continue;      // 已在 device / 会在 device 上算 ✓
+            if (host_cpy_bytes_.count(s)) continue;    // 本次构建已计过 ✓
+            sum += s->nbytes();
+            if (newly) newly->push_back(s);
         }
+        return sum;
+    };
+    auto h2d_account = [&](const std::vector<TensorF32*>& v) {
+        for (TensorF32* s : v) {
+            host_cpy_bytes_[s] = s->nbytes();
+            host_cpy_reserved_ += s->nbytes();
+        }
+    };
+    // 拒绝原因统计（与 op 无关的 H2D 预算拒绝 ✓）
+    static long h2d_refuse_cnt = 0;
+
+    // 无预算（0=不限/未启用）→ 直接放行（不做任何记账 ✓）
+    if (gpu_vram_budget_ == 0) return true;
+
+    // 该节点已有独立 device buffer（非复用分配）→ 仍要判定它的 host 输入的 H2D cpy 预算 ✓
+    if (node->data() != nullptr) {
+        std::vector<TensorF32*> newly;
+        const size_t h2d = h2d_bytes_for(node, &newly);
+        if (gpu_reserved_bytes_ + h2d > gpu_vram_budget_) {
+            ++h2d_refuse_cnt;
+            if (getenv("GRAPH_DEBUG_SCHED") && h2d_refuse_cnt <= 20) {
+                fprintf(stderr,
+                        "[sched] H2D-cpy refuse #%ld: op=%d need=%.2f MB used=%.1f/%.1f MB（回落 CPU ✓）\n",
+                        h2d_refuse_cnt, (int)node->op, (double)h2d / 1048576.0,
+                        (double)gpu_reserved_bytes_ / 1048576.0,
+                        (double)gpu_vram_budget_ / 1048576.0);
+            }
+            return false;
+        }
+        gpu_reserved_bytes_ += h2d;
+        h2d_account(newly);
         return true;
     }
 
@@ -166,23 +252,28 @@ bool BackendScheduler::gpu_assign_if_affordable(TensorF32* node, int gpu_backend
         est = GGML_PAD(bt->get_alloc_size(node), bt->get_alignment());
     }
 
+    // 连同"host 输入的 H2D cpy"一起算预算 ✓
+    std::vector<TensorF32*> newly;
+    const size_t h2d = h2d_bytes_for(node, &newly);
+
     // 预算不足：拒绝放 GPU（回落 CPU）
-    if (gpu_reserved_bytes_ + est > gpu_vram_budget_) {
+    if (gpu_reserved_bytes_ + est + h2d > gpu_vram_budget_) {
         // 【2026-09-19】诊断：记录被逐出的 op（前 20 次打明细 ✓）
         ++g_budget_refuse_cnt_;
         const int op_id = (int)node->op;
         g_budget_refuse_by_op_[(op_id >= 0 && op_id < 160) ? op_id : 0]++;
         if (getenv("GRAPH_DEBUG_SCHED") && g_budget_refuse_cnt_ <= 20) {
             fprintf(stderr,
-                    "[sched] budget refuse #%ld: op=%d est=%.2f MB used=%.1f/%.1f MB\n",
-                    g_budget_refuse_cnt_, op_id, (double)est / 1048576.0,
+                    "[sched] budget refuse #%ld: op=%d est=%.2f MB h2d=%.2f MB used=%.1f/%.1f MB\n",
+                    g_budget_refuse_cnt_, op_id, (double)est / 1048576.0, (double)h2d / 1048576.0,
                     (double)gpu_reserved_bytes_ / 1048576.0,
                     (double)gpu_vram_budget_ / 1048576.0);
         }
         return false;
     }
 
-    gpu_reserved_bytes_ += est;
+    gpu_reserved_bytes_ += est + h2d;
+    h2d_account(newly);
     return true;
 }
 
@@ -874,6 +965,13 @@ void BackendScheduler::split_graph(ComputeGraph * graph) {
 
     // 显存预算：GPU 空闲显存扣 20% 余量作预算；0 = 不限（无 GPU 或显存探测失败）。
     gpu_reserved_bytes_ = 0;
+    // 【2026-09-22】H2D cpy 记账清零（每次构建重新统计 ✓）；顺带回显上一次的预留量（便于观察 ✓）
+    if (getenv("GRAPH_DEBUG_SCHED") && (host_cpy_reserved_ > 0 || !host_cpy_bytes_.empty())) {
+        fprintf(stderr, "[sched] H2D cpy 预留（上一构建）: %.2f MB / %zu 个 host 源\n",
+                (double)host_cpy_reserved_ / 1048576.0, host_cpy_bytes_.size());
+    }
+    host_cpy_bytes_.clear();
+    host_cpy_reserved_ = 0;
     if (n_backends_ > 1) {
         // 仅当存在非 CPU 后端（CUDA）时启用预算
         bool has_gpu = false;
@@ -957,8 +1055,9 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
             //      （Backend.cpp:100 先判 op==OP_NONE ✗），会把 device 常驻的权重/常量也拉回 host ✗
             //      —— 实测这么做会让 epoch 19.9s→28.8s 且 loss 漂移 ⚠️。device 常驻的 op=0 保持原逻辑 ✓。
             if (node->op == OP_NONE) {
-                const bool host_data = (node->data() == nullptr) ||
-                                       (node->buffer_ != nullptr && node->buffer_->is_host());
+                // 【2026-09-22】改用构建期冻结的居住地判定（sched_data_is_host ✓）：原先直接看
+                //   运行期 buffer_ 状态 ⇒ 同配置两次 run 可能给出不同归属 ✗（偶发 CUDA 裸读 host ✗）。
+                const bool host_data = sched_data_is_host(node);
                 if (host_data) {
                     if (tensor_backend_id(node) == -1) backend_map_[node] = n_backends_ - 1;  // CPU（最低优先级）
                     continue;
@@ -992,8 +1091,8 @@ void BackendScheduler::pass_expand_assignments(ComputeGraph * graph) {
             // 【2026-09-19 ①-B】同上（向上扩展）：op=0 且数据在 host ⇒ 钉 CPU ✓；
             //   device 常驻的 op=0 保持原逻辑 ✓（不能用 node_is_host_producer ✗ 它把所有 op=0 都当 host ✗）
             if (node->op == OP_NONE) {
-                const bool host_data = (node->data() == nullptr) ||
-                                       (node->buffer_ != nullptr && node->buffer_->is_host());
+                // 【2026-09-22】同上（向上扩展）：构建期冻结判定 ✓
+                const bool host_data = sched_data_is_host(node);
                 if (host_data) {
                     if (tensor_backend_id(node) == -1) backend_map_[node] = n_backends_ - 1;
                     continue;
@@ -1295,7 +1394,9 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
             //   一律视为 host 后端，走下方不兼容分支强制建 cpy。
             //   （混合训练 loss=0 真根因：GPU REPEAT 读 host mask → dispatch NOT_SUPPORTED
             //     → graph_compute 中断 → loss 链从未执行。）
-            bool src_data_host = (src->buffer_ == nullptr) || src->buffer_->is_host();
+            //   【2026-09-22 改造】判据改为**构建期冻结**的 sched_data_is_host ✓（原先用运行期
+            //   `src->buffer_` 状态 ⇒ 同配置两次 run 判据不同 ⇒ 偶发漏建 cpy ⇒ GPU 裸读 host ✗）。
+            bool src_data_host = sched_data_is_host(src);
             bool cur_is_gpu    = !backends_[cur_backend_id]->buffer_type()->is_host();
             if (src_data_host && cur_is_gpu) {
                 src_backend_id = n_backends_ - 1;   // host 数据 == CPU backend
@@ -1584,6 +1685,48 @@ Status BackendScheduler::graph_compute() {
 
         // 混训：scheduler 已通过 reserve_graph_memory 预分配全部张量，
         // 让后端跳过自身 gallocr（避免两套 gallocr re-bind 冲突）。
+        // 【2026-09-22】GPU split 前置守卫（运行期核验，专治"构建后状态漂移"✗）★
+        //   构建期已按 sched_data_is_host 冻结判定并建 H2D cpy ✓，但极端情况下（staging rebind /
+        //   参数被重新绑回 host）仍可能出现"输入此刻在 host"✗ ⇒ 若直接 launch，CUDA 内核会裸读
+        //   host 指针 ⇒ `illegal memory access`（040350 的 exit 134 根因 ✗，且会污染 CUDA 上下文 ✗）。
+        //   本守卫在 **launch 之前**用 is_device_pointer 核验：发现 host 输入 ⇒ 放弃本 split 并走
+        //   既有 CPU 回退（返回 ABORTED ✓），而不是让内核崩 ✗。
+        //   开关：PPML_SCHED_HOST_GUARD=0 关闭（A/B 用 ✓，默认开）。
+        if (!backend->buffer_type()->is_host()) {
+            static const bool guard_on = []() {
+                const char* e = std::getenv("PPML_SCHED_HOST_GUARD");
+                return !(e && *e && std::atoi(e) == 0);
+            }();
+            if (guard_on) {
+                static long guard_hits = 0;
+                TensorF32* bad_t = nullptr;
+                for (int k = sp.i_start; k < sp.i_end && !bad_t; ++k) {
+                    TensorF32* nd = current_graph_->graph_node(k);
+                    if (!nd || is_view_op(nd->op) || nd->op == OP_NONE) continue;   // 无 kernel ✓
+                    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                        TensorF32* s = nd->src[j];
+                        if (!s || !s->data()) continue;        // 未计算 ✓
+                        if (is_device_pointer(s, s->data())) continue;
+                        bad_t = s;
+                        break;
+                    }
+                }
+                if (bad_t) {
+                    if (guard_hits++ < 20) {
+                        fprintf(stderr,
+                                "[CUDA-GUARD] split=%d backend=%d i=[%d,%d) 输入 op=%d numel=%lld data=%p 在 host ⇒ "
+                                "放弃本 split（避免裸读 host ✗，转 CPU 回退 ✓）\n",
+                                si, sp.backend_id, sp.i_start, sp.i_end, (int)bad_t->op,
+                                (long long)bad_t->numel(), (const void*)bad_t->data());
+                    }
+                    if (saved_nodes) current_graph_->nodes = saved_nodes;
+                    current_graph_->n_nodes_ = saved_n_nodes;
+                    restore_graph_nodes();
+                    return Status::ABORTED;
+                }
+            }
+        }
+
         backend->set_skip_alloc(true);
         Status st = backend->graph_compute(current_graph_);
         backend->set_skip_alloc(false);

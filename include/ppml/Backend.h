@@ -514,6 +514,12 @@ private:
     // host 生产者判定：OP_NONE 参数/常量节点（数据在 host，dispatch 跳过且不建 cpy），
     // 不能放 GPU，否则消费者裸读 host 指针崩溃。
     bool node_is_host_producer(TensorF32* node) const;
+
+    // 【2026-09-22】构建期"数据居住地"判定（与运行期 buffer 状态解耦）：op=0（参数/常量/输入）
+    //   首次观测即钉死（host→device 允许升级；device→host 视为漂移、保守按 host 处理 ✓）。
+    //   用途：让 "CUDA split 是否需要 H2D cpy" 在**构建期**就固定下来，消除 040350/043548 那类
+    //   同配置两次 run 结果不同的偶发崩溃（illegal memory access → CPU 回退 → exit 134 ✗）。
+    bool sched_data_is_host(const TensorF32* t);
     // idx = 该节点在图中的下标（供后端做区间/block 选择；-1 = 未知）
     void set_backend_if_supported(TensorF32* node, int backend_id, int idx = -1);
     int  count_supported_inputs(TensorF32* node, int backend_id) const;
@@ -570,6 +576,15 @@ private:
     // ===== 显存预算（把部分节点放 GPU，防止 OOM）=====
     size_t gpu_vram_budget_ = 0;     // 预算字节数；0 = 不限制
     size_t gpu_reserved_bytes_ = 0;  // 已累计分配给 GPU 的估算字节数
+
+    // 【2026-09-22】"host 生产者 → H2D cpy" 的构建期冻结记录（见 sched_data_is_host 注释）：
+    //   residence_fix_   : op=0 节点的居住地（1=host / 2=device），首次观测即钉死 ⇒ 不再随
+    //                      transfer / staging rebind 的时机漂移 ✗（040350 vs 043548 的根因 ✓）
+    //   host_cpy_bytes_  : 本构建内每个 host 源已计入显存预算的字节（同一 src 只计一次 ✓）
+    //   host_cpy_reserved_: 本构建为 H2D cpy 预留的总字节（诊断 / 预算日志用 ✓）
+    std::unordered_map<const TensorF32*, unsigned char> residence_fix_;
+    std::unordered_map<const TensorF32*, size_t>        host_cpy_bytes_;
+    size_t host_cpy_reserved_ = 0;
 
     // CPU split 兜底：device 输入 D2H 暂存（Step 1b），split 后恢复。
     std::vector<std::pair<TensorF32*, float*>> host_stage_;   // <tensor, 原 device 指针>
@@ -679,6 +694,9 @@ private:
     static void kernel_outer_prod_back(TensorF32 * node, ComputeParams * p);
     static void kernel_softmax (TensorF32 * node, ComputeParams * p);
     static void kernel_softmax_back(TensorF32 * node, ComputeParams * p);
+    // 【2026-09-22 Step ⑤】Flash Attention 融合算子（CPU 侧纯调 Step ① 实现；单线程 ⇒ 仅 ith==0 干活 ✓）
+    static void kernel_flash_attn_ext (TensorF32 * node, ComputeParams * p);
+    static void kernel_flash_attn_back(TensorF32 * node, ComputeParams * p);
     static void kernel_rms_norm (TensorF32 * node, ComputeParams * p);
     static void kernel_norm     (TensorF32 * node, ComputeParams * p);
     static void kernel_norm_back(TensorF32 * node, ComputeParams * p);
@@ -797,6 +815,10 @@ private:
     static void kernel_out_prod_cuda(TensorF32 * node, ComputeParams * p);
     static void kernel_softmax_cuda (TensorF32 * node, ComputeParams * p);
     static void kernel_softmax_back_cuda(TensorF32 * node, ComputeParams * p);
+    // 【2026-09-22 Step ⑤】Flash Attention 融合算子（复用 src/cuda/FlashAttnKernel.cu 的 host 包装 ✓）
+    //   上限由 CUDABackend::supports_op 把关（前向 d≤64 / 反向 d≤32 ✓）⇒ rc!=0 属异常 ⇒ *st 上报 ✗
+    static void kernel_flash_attn_ext_cuda (TensorF32 * node, ComputeParams * p, Status * st);
+    static void kernel_flash_attn_back_cuda(TensorF32 * node, ComputeParams * p, Status * st);
     static void kernel_norm_cuda     (TensorF32 * node, ComputeParams * p);
     static void kernel_norm_back_cuda(TensorF32 * node, ComputeParams * p);
     static void kernel_dup_cuda      (TensorF32 * node);

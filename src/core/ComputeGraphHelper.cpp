@@ -295,6 +295,53 @@ TensorF32* softmax_backward(TensorF32* grad, TensorF32* output) {
     return result;
 }
 
+// ============================================================
+// Flash Attention 融合算子（Step ⑤，2026-09-22）—— 声明与参数约定见 ComputeGraph.h ✓
+//   替换 SelfAttention 的「out_prod(K,Q) → scale → +bias → softmax → out_prod(attn,V)」五步：
+//   不再落地 L×L 的 scores/P ✗（旧路径的显存与 HBM 流量都是 O(L²) ✗）。
+//   ★ 布局桥接：本仓库的 permute 是**真实拷贝**（非 ggml 的 strides 视图 ✓）⇒
+//     permute(Q,{1,0,2,3}) 直接给出连续 [D,L,H,B]，正是 flash kernel（Step ②/③）要求的布局 ✓
+//     ⇒ kernel 一行都不用改 ✓；反向时 permute 的 backward（ComputeGraph.cpp:701）会把
+//     dQf/dKf/dVf 逆置换回 [L,D,H,B] 交给上游 ✓。
+//   ★ 数值口径与旧路径对齐：scores = scale·(K·Q) + bias（同一张 bias 张量、同一相加顺序 ✓）；
+//     softmax 分母 eps 默认 1e-9（与 kernel_softmax 的 1/(Σ+1e-9) 一致 ✓）；默认非 causal ✓。
+// ============================================================
+TensorF32* flash_attn_ext(TensorF32* Q, TensorF32* K, TensorF32* V, TensorF32* bias,
+                          float scale, bool causal, float softmax_eps, int Br, int Bc) {
+    if (!Q || !K || !V) return nullptr;
+
+    // 1) 转到 flash 布局 [D, L, H, B]（permute = 拷贝 ✓，连续 ✓）
+    TensorF32* Qf = permute(Q, {1, 0, 2, 3});
+    TensorF32* Kf = permute(K, {1, 0, 2, 3});
+    TensorF32* Vf = permute(V, {1, 0, 2, 3});
+
+    const int64_t Lq = Q->shape().dim(0);
+    const int64_t D  = Q->shape().dim(1);
+    const int64_t H  = Q->shape().dim(2);
+    const int64_t B  = Q->shape().dim(3);
+
+    // 2) 融合节点：dst = Of [D, Lq, H, B]；src[3]=bias（可空 ✓）；src[4]=LSE 输出缓冲 ✓
+    int64_t o_ne[4] = {D, Lq, H, B};
+    TensorF32* Of = context().new_tensor<float>(4, o_ne);
+    Of->op     = OP_FLASH_ATTN_EXT;
+    Of->src[0] = Qf;
+    Of->src[1] = Kf;
+    Of->src[2] = Vf;
+    Of->src[3] = bias;
+    int64_t lse_ne[3] = {Lq, H, B};
+    Of->src[4] = context().new_tensor<float>(3, lse_ne);
+
+    const float sc = (scale > 0.f) ? scale : 1.0f / std::sqrt(static_cast<float>(D));
+    reinterpret_cast<float&>(Of->op_params[0]) = sc;
+    Of->op_params[1] = causal ? 1 : 0;
+    reinterpret_cast<float&>(Of->op_params[2]) = softmax_eps;
+    Of->op_params[3] = Br;
+    Of->op_params[4] = Bc;
+
+    // 3) 转回项目布局 [Lq, D, H, B]（= 旧路径 out_prod 的输出布局 ✓）
+    return permute(Of, {1, 0, 2, 3});
+}
+
 // silu(a) — SiLU / Swish 激活
 TensorF32* silu(TensorF32* a) {
     TensorF32* result = context().new_tensor<float>(a->shape().ndim(), a->shape().dims.data());

@@ -11,6 +11,9 @@
 #include <algorithm>
 #include "ppml/CpuFeatures.h"   // 运行时 AVX2 检测（cpuid + XCR0）
 #include "ppml/HalfUtils.h"     // fp16→fp32 位运算转换（mul_mat fp16 输入）
+#include "ppml/MulMatStats.h"   // MUL_MAT 形状/耗时统计（PPML_MULMAT_STATS=1，Step 0）
+#include "ppml/FlashAttn.h"     // 【Step ⑤】融合注意力：CPU 侧直接复用 flash_attn_forward/backward_cpu ✓
+#include <chrono>
 #if defined(__x86_64__) || defined(_M_X64)
 #  include <immintrin.h>        // _mm256_loadu_ps / add / storeu
 #endif
@@ -118,6 +121,9 @@ Status CPUBackend::dispatch_body(TensorF32* node, ComputeParams* p) {
         // online softmax
         case OP_SOFT_MAX:  kernel_softmax(node, p);  break;
         case OP_SOFT_MAX_BACK: kernel_softmax_back(node, p); break;
+        // 【2026-09-22 Step ⑤】Flash Attention 融合算子（PPML_FLASH_ATTN=1 时由 Attention.cpp 建图 ✓）
+        case OP_FLASH_ATTN_EXT:  kernel_flash_attn_ext (node, p); break;
+        case OP_FLASH_ATTN_BACK: kernel_flash_attn_back(node, p); break;
         case OP_RMS_NORM:  kernel_rms_norm(node, p); break;
         case OP_NORM:      kernel_norm(node, p);     break;
         case OP_NORM_BACK: kernel_norm_back(node, p); break;
@@ -734,6 +740,10 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
         if (bnelt > 0 && b) { bmn = b[0]; bmx = b[0]; for (int64_t q = 0; q < bnelt; q++) { float v = b[q]; if (v != v) { bnan++; bbad = true; } else { if (v < bmn) bmn = v; if (v > bmx) bmx = v; } } if (bmx > 1e6f || bmn < -1e6f) bbad = true; }
         if (bbad) fprintf(stderr, "[mulmat-in-b] N=%d K=%d numel=%lld min=%.6g max=%.6g nan=%lld\n", N, K, (long long)bnelt, (double)bmn, (double)bmx, (long long)bnan);
     }
+    // 【2026-09-22 Step 0】MUL_MAT 统计（PPML_MULMAT_STATS=1）：ith==0 量墙钟（含 barrier 等待）
+    const bool mm_stat = ppml::mulmat_stats_enabled();
+    std::chrono::steady_clock::time_point mm_t0{};
+    if (mm_stat && p->ith == 0) mm_t0 = std::chrono::steady_clock::now();
     if (p->ith == 0) tp->current_chunk.store(0);
     tp->barrier_wait();
 
@@ -751,6 +761,13 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
         }
     }
     tp->barrier_wait();
+
+    // 【2026-09-22 Step 0】统计落账（ith==0 的墙钟 ≈ 该节点在 CPU 上的并行耗时 ✓）
+    if (mm_stat && p->ith == 0) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - mm_t0).count();
+        ppml::mulmat_stats_record("CPU", "simt-naive", M, K, N, ms);
+    }
 }
 
 // ===== out_prod =====
@@ -1338,6 +1355,80 @@ void CPUBackend::kernel_tri_mul_back(TensorF32 * node, ComputeParams * p) {
 }
 
 // ===== softmax =====
+// ============================================================
+// 【2026-09-22 Step ⑤】Flash Attention 融合算子 —— CPU 侧（直接复用 Step ① 的算子实现 ✓）
+//   OP_FLASH_ATTN_EXT：srcs [0]=Q [1]=K [2]=V [3]=bias(可空) [4]=LSE(输出缓冲)；dst = O
+//     Q/K/V/O 都是 flash 布局 [d,L,h,B]（由 ComputeGraphHelper::flash_attn_ext 的 permute 保证 ✓）
+//     op_params: [0]=scale(f32) [1]=causal(int) [2]=softmax_eps(f32) [3]=Br [4]=Bc [5]=dbias 需要(int)
+//   OP_FLASH_ATTN_BACK：srcs [0]=Q [1]=K [2]=V [3]=bias [4]=O [5]=dO [6]=LSE [7]=dQ [8]=dK [9]=dV
+//     dst = dbias（op_params[5]=1 时才算 ✓，否则传 nullptr ⇒ 不分配也不写 ✓）
+//   ⚠️ flash_attn_*_cpu 内部是单线程 ⇒ 只让 ith==0 干活、其余线程 barrier 等待 ✓
+//      （否则 nth 个线程重复算同一份结果 ✗ + 写冲突 ✗）
+// ============================================================
+namespace {
+// 从 flash 布局张量（[d,L,h,B] ✓）+ op_params 还原 FlashAttnConfig ✓
+FlashAttnConfig flash_attn_cfg_of(const TensorF32* const qkv[3], const TensorF32* node) {
+    FlashAttnConfig cfg;
+    const TensorF32* q = qkv[0];
+    cfg.B = static_cast<int>(q->shape().dim(3));
+    cfg.h = static_cast<int>(q->shape().dim(2));
+    cfg.L = static_cast<int>(q->shape().dim(1));
+    cfg.d = static_cast<int>(q->shape().dim(0));
+    cfg.scale       = reinterpret_cast<const float&>(node->op_params[0]);
+    cfg.causal      = node->op_params[1] != 0;
+    cfg.softmax_eps = reinterpret_cast<const float&>(node->op_params[2]);
+    cfg.Br          = node->op_params[3] > 0 ? node->op_params[3] : 64;
+    cfg.Bc          = node->op_params[4] > 0 ? node->op_params[4] : 64;
+    return cfg;
+}
+}  // namespace
+
+void CPUBackend::kernel_flash_attn_ext(TensorF32 * node, ComputeParams * p) {
+    if (p->ith != 0) { p->threadpool->barrier_wait(); return; }
+    const TensorF32* qkv[3] = { node->src[0], node->src[1], node->src[2] };
+    if (!qkv[0] || !qkv[1] || !qkv[2]) {
+        p->threadpool->ec = Status::NOT_SUPPORTED;
+        p->threadpool->barrier_wait();
+        return;
+    }
+    const FlashAttnConfig cfg = flash_attn_cfg_of(qkv, node);
+    const float* bias = node->src[3] ? node->src[3]->data() : nullptr;
+    float*       lse  = node->src[4] ? node->src[4]->data() : nullptr;
+    const bool ok = flash_attn_forward_cpu(cfg,
+        qkv[0]->data(), qkv[1]->data(), qkv[2]->data(), bias, node->data(), lse);
+    if (!ok) p->threadpool->ec = Status::NOT_SUPPORTED;
+    p->threadpool->barrier_wait();
+}
+
+void CPUBackend::kernel_flash_attn_back(TensorF32 * node, ComputeParams * p) {
+    if (p->ith != 0) { p->threadpool->barrier_wait(); return; }
+    const TensorF32* qkv[3] = { node->src[0], node->src[1], node->src[2] };
+    const TensorF32* O   = node->src[4];
+    const TensorF32* dO  = node->src[5];
+    const TensorF32* lse = node->src[6];
+    if (!qkv[0] || !qkv[1] || !qkv[2] || !O || !dO || !lse) {
+        p->threadpool->ec = Status::NOT_SUPPORTED;
+        p->threadpool->barrier_wait();
+        return;
+    }
+    const FlashAttnConfig cfg = flash_attn_cfg_of(qkv, node);
+    const float* bias = node->src[3] ? node->src[3]->data() : nullptr;
+    float* dq = node->src[7] ? node->src[7]->data() : nullptr;
+    float* dk = node->src[8] ? node->src[8]->data() : nullptr;
+    float* dv = node->src[9] ? node->src[9]->data() : nullptr;
+    float* db = (node->op_params[5] != 0) ? node->data() : nullptr;   // dbias 写 dst ✓
+    if (!dq && !dk && !dv && !db) {
+        p->threadpool->ec = Status::NOT_SUPPORTED;
+        p->threadpool->barrier_wait();
+        return;
+    }
+    const bool ok = flash_attn_backward_cpu(cfg,
+        qkv[0]->data(), qkv[1]->data(), qkv[2]->data(), bias,
+        O->data(), dO->data(), lse->data(), dq, dk, dv, db);
+    if (!ok) p->threadpool->ec = Status::NOT_SUPPORTED;
+    p->threadpool->barrier_wait();
+}
+
 void CPUBackend::kernel_softmax(TensorF32 * node, ComputeParams * p) {
     int D    = static_cast<int>(node->shape().dims[0]);
     int rows = static_cast<int>(node->numel() / D);

@@ -240,6 +240,11 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
     //   scale_param_grads 不会被调用 → NaN 梯度原样进入 AdamW → 参数 NaN → Epoch2 全链 NaN
     //   （实测：混合 per_block Epoch1 后 SE3 embed_x/embed_e 权重 NaN，Epoch2 loss=-nan；
     //    CPU per_block 无此问题 → GPU 反向链个别参数梯度 NaN）。
+    // 【2026-09-22 扩展】原来**只清 NaN、不清 ±inf** ✗ ⇒ inf 参与范数 ⇒ total=inf ⇒ scale=max/inf=0
+    //   ⇒ 该步梯度被整体写成 0（= 静默 no-op ✗），而 `>> step (grad_norm=…)` 仍打印 0.1+0.01
+    //   （看起来完全正常 ✗ 极具欺骗性）。实测见 remote_fulltrain_20260921_143344.log 的
+    //   `[GRAD-NORM] total=inf params=1710`（多参数 l2=inf，nnan=0 ✗）。现在 NaN 与 ±inf 一并清零 ✓。
+    long n_cleared = 0;   // 本步被清零的参数个数（供 [CLIP] 诊断 ✓）
     for (auto* param : params) {
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
@@ -249,22 +254,31 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
             double s2 = 0.0, mx = 0.0;
             long long nn = 0;
             if (grad_stats_cuda(dev_f32(grad), n, &s2, &mx, &nn) != 0) continue;
-            if (nn > 0) {
+            // 【2026-09-22】kernel 的 nn 只数 NaN ✓；±inf 会让 max|g| 变 inf ⇒ 一并判非有限 ✓
+            const bool nonfinite = (nn > 0) || !std::isfinite(mx);
+            if (nonfinite) {
                 optim_fill_cuda(dev_f32(grad), n, 0.0f);
+                ++n_cleared;
                 if (getenv("GRAPH_DEBUG_GRAD_NAN")) {
-                    fprintf(stderr, "[GRAD-NAN-CLR] param cleared (NaN grad->0) [device, nnan=%lld]\n", nn);
+                    fprintf(stderr,
+                            "[GRAD-NAN-CLR] param cleared (%s grad->0) [device, nnan=%lld max_abs=%.4e]\n",
+                            (nn > 0) ? "NaN" : "Inf", nn, mx);
                 }
             }
             continue;
         }
         std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
-        bool has_nan = false;
-        for (const float v : g) { if (v != v) { has_nan = true; break; } }
-        if (has_nan) {
+        long n_nan = 0, n_inf = 0;
+        for (const float v : g) {
+            if (v != v) ++n_nan;
+            else if (!std::isfinite(v)) ++n_inf;   // 【2026-09-22】±inf 现在也清零 ✓（原来漏掉 ✗）
+        }
+        if (n_nan > 0 || n_inf > 0) {
             for (float& v : g) v = 0.0f;
             write_tensor_values(grad, g);  // H2D 写回
+            ++n_cleared;
             if (getenv("GRAPH_DEBUG_GRAD_NAN")) {
-                fprintf(stderr, "[GRAD-NAN-CLR] param cleared (NaN grad->0)\n");
+                fprintf(stderr, "[GRAD-NAN-CLR] param cleared (NaN=%ld Inf=%ld ->0)\n", n_nan, n_inf);
             }
         }
     }
@@ -304,6 +318,21 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
     // clip 后：主图 ≤ max_norm，SE3 ≤ se3_max，二者之和即真实步长量级。
     const float applied_main = std::min(main_norm, max_norm);
     const float applied_se3 = std::min(se3_norm, se3_max);
+
+    // 【2026-09-22】一步一行的裁剪诊断 ✓：暴露"原始范数 / 实际 scale / 是否非有限 / 清零点数"。
+    //   动机：inf 导致的 **静默 no-op**（scale=0 ⇒ 梯度全 0 ⇒ 参数不动 ✗）与正常步在
+    //   `>> step (grad_norm=0.1100)` 里长得一模一样 ✗ ⇒ 必须显式暴露。
+    //   读法：scale_main=0 ⇒ 主图被清零 ⇒ 这一步**等于没更新** ✗；
+    //         nonfinite=yes ⇒ 本步有 NaN/inf 被清零（若 scale 仍正常 ⇒ 只清了部分参数 ⚠️）。
+    {
+        const double scale_main = (main_norm > max_norm && main_norm > 0.0f) ? (double)max_norm / (double)main_norm : 1.0;
+        const double scale_se3  = (se3_norm  > se3_max  && se3_norm  > 0.0f) ? (double)se3_max  / (double)se3_norm  : 1.0;
+        const bool nonfinite = (n_cleared > 0) || !std::isfinite(main_norm) || !std::isfinite(se3_norm);
+        fprintf(stderr,
+                "[CLIP] main=%.4e se3=%.4e scale_main=%.3e scale_se3=%.3e applied=%.4f cleared=%ld nonfinite=%s\n",
+                (double)main_norm, (double)se3_norm, scale_main, scale_se3,
+                (double)(applied_main + applied_se3), n_cleared, nonfinite ? "yes" : "no");
+    }
     return applied_main + applied_se3;
 }
 

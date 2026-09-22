@@ -5,6 +5,8 @@
 #include <cstring>
 #include <vector>
 
+#include "ppml/MulMatStats.h"   // MUL_MAT 形状/耗时统计（PPML_MULMAT_STATS=1，Step 0）
+
 namespace ppml {
 
 // ============================================================
@@ -45,7 +47,10 @@ bool cutlass_hw_supported(int* out_major, int* out_minor) {
 //   到 19bit tf32，累加 fp32）。RTX 2050 = sm_86 支持。
 //   每 warp 独立算一个 16×8 C 子块 + 沿 K 循环 step 8；grid 覆盖 M×N。
 //   fragment 布局（PTX mma.m16n8k8 tf32 官方表，row.col）：
-//     A(16×8): a0=(g,t) a1=(g,t+4) a2=(g+8,t) a3=(g+8,t+4)，g=lane>>2, t=lane&3
+//     A(16×8): a0=(g,t) a1=(g+8,t) a2=(g,t+4) a3=(g+8,t+4)，g=lane>>2, t=lane&3
+//              ⚠️ 2026-09-22 修正：原为 a1=(g,t+4)/a2=(g+8,t) —— 穷举探针
+//              （experiments/dist/_mma_layout_probe.cu，可解码输入 + 8 种排布）实测证明那是**错的** ✗，
+//              仅因本 kernel 的测试容差偏松（2% of mean|ref|）而未暴露。正确排布见上。
 //     B(8×8) : b0=(t,g) b1=(t+4,g)
 //     C(16×8): c0=(g,2t) c1=(g,2t+1) c2=(g+8,2t) c3=(g+8,2t+1)
 //   tf32 截断：输入 fp32 位掩低 13 bit mantissa（round-toward-zero 近似 tf32）。
@@ -1472,6 +1477,246 @@ int mul_mat_mma_f16_smem(const void* A, const void* B, float* C, int M, int K, i
         reinterpret_cast<const __half*>(A), reinterpret_cast<const __half*>(B), C, M, K, N);
     cudaCheck(cudaGetLastError());
     return 0;
+}
+
+// ============================================================
+// TF32 Tensor-Core GEMM（smem + cp.async 双缓冲流水）—— 2026-09-22（Step 1）
+//   C[M,N] = A[M,K] × B[N,K]ᵀ（A[M][K]、B[N][K] 行主序 **fp32**；fp32 累加）
+//   与 fp16 v2（mul_mat_mma_f16_smem）同构，四处差异：
+//     ① fragment 用**手工 lane 索引**从 smem 直接取（ldmatrix 不支持 4B 元素 ✗）；
+//     ② mma 指令 m16n8k8.tf32（K step = 8，不是 16）；
+//     ③ 载入前用 `cvt.rna.tf32.f32` 做**就近舍入**（不是位掩截断 —— 消除有偏 ✗）；
+//     ④ smem 行跨距 = BK + PAD(4)：仍 16B 对齐 ✓ 且消除 bank 冲突（4g+t 铺满 32 行 ✓）。
+//   分块：BM=BN=64, BK=32；block=128 线程(4 warps)；每 warp 32(M)×32(N) = 2×4 个 m16n8k8 tile。
+//   边界：cp.async 的 src-size 做零填充（越界行/列不读 global）；K 尾部不足 16B 走手工拷贝 + 补零；
+//         不做 block 级 early return（否则 __syncthreads 死锁 ✗）→ epilogue 按 M/N 跳过写回。
+//   守卫：仅 sm_80+ 编译（低架构空实现），运行时由 cutlass_hw_supported() 拦截。
+//   ⚠️ 精度：tf32 是 19 bit（10 bit mantissa）⇒ 相对误差上界 ≈2⁻¹¹≈4.9e-4/元素；
+//      exponent 与 fp32 同（8 bit）⇒ **不会像 fp16 那样溢出** ✓。
+// ============================================================
+#define PPML_T32_BM 64
+#define PPML_T32_BN 64
+#define PPML_T32_BK 32
+#define PPML_T32_PAD 4                       // 行跨距 = BK+4（144B ⇒ 16B 对齐 ✓）
+#define PPML_T32_STAGES 2
+#define PPML_T32_THREADS 128
+
+// fp32 → tf32（就近舍入 round-to-nearest-away，PTX cvt.rna；仅 sm_80+ 可用）
+__device__ __forceinline__ float tf32_rna(float x) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    unsigned r;
+    asm volatile("cvt.rna.tf32.f32 %0, %1;\n" : "=r"(r) : "f"(x));
+    return __uint_as_float(r);
+#else
+    return x;   // 低架构不会调用（调用点有守卫）；留空实现避免 ptxas 报错 ✓
+#endif
+}
+
+// m16n8k8：D = A×B + D（A/B tf32，C/D f32 累加）。fragment 排布见 kernel 内注释。
+__device__ __forceinline__ void mma_tf32_f32_acc(float (&c)[4], const unsigned (&a)[4], const unsigned (&b)[2]) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    asm volatile(
+        "mma.sync.aligned.m16n8k8.row.col.f32.tf32.tf32.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+#else
+    (void)c; (void)a; (void)b;
+#endif
+}
+
+__global__ void mul_mat_mma_tf32_smem_kernel(const float* __restrict__ A,
+                                             const float* __restrict__ B,
+                                             float* __restrict__ C,
+                                             const int M, const int K, const int N) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+    constexpr int BM = PPML_T32_BM, BN = PPML_T32_BN, BK = PPML_T32_BK;
+    constexpr int PAD = PPML_T32_PAD, STRIDE = BK + PAD;
+    constexpr int STAGES = PPML_T32_STAGES;
+    constexpr int NTH = PPML_T32_THREADS;
+    constexpr int SEG = BK / 4;                  // 每行 16B 片段数（4 float/片段）
+
+    __shared__ __align__(16) float sA[STAGES][BM][STRIDE];
+    __shared__ __align__(16) float sB[STAGES][BN][STRIDE];
+
+    const int tid      = (int)threadIdx.x;
+    const int m_block  = blockIdx.y * BM;
+    const int n_block  = blockIdx.x * BN;
+    const int k_blocks = (K + BK - 1) / BK;
+
+    // ---- 异步加载一块 [k0, k0+BK) 到 stage s（A: BM×BK，B: BN×BK，越界补 0）----
+    // cp.async 约束（同 fp16 v2）：src-size 只允许 4/8/16；源地址必须按 16B 对齐。
+    //   K 是 4 的倍数时行偏移 m*K*4 恒为 16B 倍数 ⇒ 全部走 cp.async ✓
+    //   否则（或尾部不足 4 float）退化为同步手工拷贝 + 补零（正确性优先）。
+    auto load_tile = [&](int k0, int s) {
+        for (int idx = tid; idx < BM * SEG; idx += NTH) {                   // A
+            const int row = idx / SEG, seg = idx % SEG;
+            const int m = m_block + row, k = k0 + seg * 4;
+            float* dst = &sA[s][row][seg * 4];
+            const int rem = (m < M) ? (K - k) : 0;                          // 有效 float 数
+            const float* src = (rem > 0) ? (A + (size_t)m * K + k) : A;
+            if (rem >= 4 && ((reinterpret_cast<uintptr_t>(src) & 15u) == 0u)) {
+                cp_async_16B(dst, src, 16u);
+            } else {
+                for (int i = 0; i < 4; ++i) dst[i] = (i < rem) ? src[i] : 0.f;
+            }
+        }
+        for (int idx = tid; idx < BN * SEG; idx += NTH) {                   // B
+            const int row = idx / SEG, seg = idx % SEG;
+            const int n = n_block + row, k = k0 + seg * 4;
+            float* dst = &sB[s][row][seg * 4];
+            const int rem = (n < N) ? (K - k) : 0;
+            const float* src = (rem > 0) ? (B + (size_t)n * K + k) : B;
+            if (rem >= 4 && ((reinterpret_cast<uintptr_t>(src) & 15u) == 0u)) {
+                cp_async_16B(dst, src, 16u);
+            } else {
+                for (int i = 0; i < 4; ++i) dst[i] = (i < rem) ? src[i] : 0.f;
+            }
+        }
+    };
+
+    float acc[2][4][4];
+#pragma unroll
+    for (int i = 0; i < 2; ++i)
+#pragma unroll
+        for (int j = 0; j < 4; ++j)
+#pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][j][q] = 0.f;
+
+    const int lane   = tid & 31;
+    const int warp   = tid >> 5;
+    const int g      = lane >> 2;                // groupID 0..7
+    const int t      = lane & 3;                 // threadID_in_group 0..3
+    const int warp_m = warp >> 1;                // 0..1（M 方向 32 行）
+    const int warp_n = warp & 1;                 // 0..1（N 方向 32 列）
+
+    load_tile(0, 0);
+    cp_async_commit_group();
+
+    for (int kb = 0; kb < k_blocks; ++kb) {
+        if (kb + 1 < k_blocks) load_tile((kb + 1) * BK, (kb + 1) % STAGES);
+        cp_async_commit_group();                 // 空组也合法 → 统一 wait 语义
+        cp_async_wait_group<1>();                // 至多 1 组在途（= 下一块）→ 当前块已就绪
+        __syncthreads();
+
+        const int s = kb % STAGES;
+        const int a_row0 = warp_m * 32;
+        const int b_row0 = warp_n * 32;
+
+#pragma unroll
+        for (int k8 = 0; k8 < BK; k8 += 8) {
+            // A fragment（m16k8 行主序，2 个 tile；供 4 个 N tile 复用）
+            //   a0=(g,k8+t) a1=(g+8,k8+t) a2=(g,k8+t+4) a3=(g+8,k8+t+4)
+            //   ⚠️ 2026-09-22 由穷举探针（experiments/dist/_mma_layout_probe.cu）**实测**确认：
+            //      a1 必须是 (g+8, t)（K 前半、行加 8），a2 才是 (g, t+4)。
+            //      （写成 a1=(g,t+4)/a2=(g+8,t) 会整体算错 ✗ —— 原 bench kernel 就是这个错排布。）
+            unsigned a[2][4];
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {
+                const int r = a_row0 + i * 16;
+                a[i][0] = __float_as_uint(tf32_rna(sA[s][r + g][k8 + t]));
+                a[i][1] = __float_as_uint(tf32_rna(sA[s][r + g + 8][k8 + t]));
+                a[i][2] = __float_as_uint(tf32_rna(sA[s][r + g][k8 + t + 4]));
+                a[i][3] = __float_as_uint(tf32_rna(sA[s][r + g + 8][k8 + t + 4]));
+            }
+            // B fragment（k8n8，col-major ⇒ 输入 B 的 B[n][k] 即 B_l[k][n]）
+            //   b0=(k8+t, n) b1=(k8+t+4, n)，n = b_row0 + j*8 + g
+            unsigned b[4][2];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int r = b_row0 + j * 8 + g;
+                b[j][0] = __float_as_uint(tf32_rna(sB[s][r][k8 + t]));
+                b[j][1] = __float_as_uint(tf32_rna(sB[s][r][k8 + t + 4]));
+            }
+#pragma unroll
+            for (int i = 0; i < 2; ++i)
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    mma_tf32_f32_acc(acc[i][j], a[i], b[j]);
+        }
+        __syncthreads();                         // 所有 warp 用完本 stage 后才能覆写
+    }
+
+    // ---- epilogue：写回 C（C fragment: c0=(g,2t) c1=(g,2t+1) c2=(g+8,2t) c3=(g+8,2t+1)）----
+    const int m_base = m_block + warp_m * 32;
+    const int n_base = n_block + warp_n * 32;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int r0 = m_base + i * 16 + g;
+        const int r1 = r0 + 8;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int c0 = n_base + j * 8 + 2 * t;
+            const int c1 = c0 + 1;
+            if (r0 < M) { if (c0 < N) C[(size_t)r0 * N + c0] = acc[i][j][0];
+                          if (c1 < N) C[(size_t)r0 * N + c1] = acc[i][j][1]; }
+            if (r1 < M) { if (c0 < N) C[(size_t)r1 * N + c0] = acc[i][j][2];
+                          if (c1 < N) C[(size_t)r1 * N + c1] = acc[i][j][3]; }
+        }
+    }
+#else
+    (void)A; (void)B; (void)C; (void)M; (void)K; (void)N;
+#endif
+}
+
+// TF32 流水版入口：返回 0 = 已执行；1 = 不支持（< sm_80 或尺寸非法）→ 调用方回落 SIMT
+int mul_mat_mma_tf32_smem(const void* A, const void* B, float* C, int M, int K, int N) {
+    if (!cutlass_hw_supported(nullptr, nullptr)) return 1;
+    if (M <= 0 || N <= 0 || K <= 0) return 1;
+    dim3 block(PPML_T32_THREADS);
+    dim3 grid((unsigned)((N + PPML_T32_BN - 1) / PPML_T32_BN),
+              (unsigned)((M + PPML_T32_BM - 1) / PPML_T32_BM));
+    mul_mat_mma_tf32_smem_kernel<<<grid, block>>>(
+        reinterpret_cast<const float*>(A), reinterpret_cast<const float*>(B), C, M, K, N);
+    cudaCheck(cudaGetLastError());
+    return 0;
+}
+
+// ============================================================
+// 【2026-09-22】MUL_MAT 统计（Step 0）：CUDA 侧用 event 计时（不打断异步）
+//   begin/end 夹住一次 kernel launch（同流），ms 在 finalizer（进程退出）里汇总后
+//   喂给 ppml::mulmat_stats_record("CUDA", path, …)。
+//   未开 PPML_MULMAT_STATS 时 begin/end 都只做一次 static bool 判断（开销≈0）✓
+// ============================================================
+namespace {
+struct MulMatEvtRec { int M, K, N; const char* path; cudaEvent_t e0, e1; };
+std::vector<MulMatEvtRec>* g_mm_evts = nullptr;   // 故意泄漏（atexit 阶段仍要可用）
+bool g_mm_finalizer_added = false;
+
+void mm_cuda_finalize() {
+    if (!g_mm_evts) return;
+    for (MulMatEvtRec& r : *g_mm_evts) {
+        cudaEventSynchronize(r.e1);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, r.e0, r.e1);
+        ppml::mulmat_stats_record("CUDA", r.path ? r.path : "unknown", r.M, r.K, r.N, (double)ms);
+        cudaEventDestroy(r.e0);
+        cudaEventDestroy(r.e1);
+    }
+    g_mm_evts->clear();
+}
+}  // namespace
+
+// path 在 end 时给（begin 时还不知道是否回落 ⇒ 不能提前定名 ✗）
+void mulmat_stats_cuda_begin(int M, int K, int N) {
+    if (!ppml::mulmat_stats_enabled()) return;
+    if (!g_mm_evts) g_mm_evts = new std::vector<MulMatEvtRec>();
+    if (!g_mm_finalizer_added) {
+        ppml::mulmat_stats_add_finalizer(mm_cuda_finalize);
+        g_mm_finalizer_added = true;
+    }
+    MulMatEvtRec r;
+    r.M = M; r.K = K; r.N = N; r.path = nullptr;
+    cudaEventCreate(&r.e0);
+    cudaEventCreate(&r.e1);
+    cudaEventRecord(r.e0);
+    g_mm_evts->push_back(r);
+}
+
+void mulmat_stats_cuda_end(const char* path) {
+    if (!g_mm_evts || g_mm_evts->empty()) return;
+    g_mm_evts->back().path = path;
+    cudaEventRecord(g_mm_evts->back().e1);
 }
 
 // ============================================================

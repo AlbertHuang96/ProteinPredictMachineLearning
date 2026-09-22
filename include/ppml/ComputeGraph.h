@@ -191,6 +191,18 @@ TensorF32* triangle_mul(TensorF32* left, TensorF32* right, float L, bool outgoin
 // 3. 激活
 TensorF32* softmax(TensorF32* a);
 TensorF32* softmax_backward(TensorF32* grad, TensorF32* output);
+
+// 3.5 Flash Attention 融合算子（Step ⑤，2026-09-22）—— 由 Attention.cpp 里的 PPML_FLASH_ATTN=1 门控
+//   Q/K/V: [L, D, H, B]（本项目 attention 原生布局 ✓ dims[0]=L）；bias: [Lk, Lq, H, B]（可空 ✓）
+//   内部把 Q/K/V 各 permute 成 [D, L, H, B]（★ 本仓库 permute = 真实拷贝 ✓）⇒ flash kernel 直接吃
+//   连续 [d, L, h, B]，**kernel 侧无需任何改动** ✓；返回 permute(Of,{1,0,2,3}) = [Lq, D, H, B]
+//   = 旧三段路径的输出布局 ✓（可直接替换 ✓）。
+//   LSE 缓冲 [Lq, H, B] 挂在节点 src[4]（照 norm() 的 mean/rstd 惯例 ✓），供反向读回 ✓。
+//   op_params: [0]=scale(f32) [1]=causal(int) [2]=softmax_eps(f32) [3]=Br(int) [4]=Bc(int)
+//              [5]=dbias 需要(int)（反向节点用 ✓）
+TensorF32* flash_attn_ext(TensorF32* Q, TensorF32* K, TensorF32* V, TensorF32* bias,
+                          float scale = 0.f, bool causal = false, float softmax_eps = 1e-9f,
+                          int Br = 64, int Bc = 64);
 TensorF32* silu   (TensorF32* a);
 TensorF32* gelu   (TensorF32* a);
 TensorF32* relu   (TensorF32* a);
