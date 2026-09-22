@@ -2187,7 +2187,10 @@ std::vector<TensorF32*> GMABSE3::forward_graph(
     TensorF32* s_edge = edge_gather_rows(s_node, edge_tgt_idx);          // [n_heads, E]
     // 除零保护：s_edge 为 0 的目标节点（无入边）→ 分母加 eps，避免 div(exp,0)=inf → NaN
     TensorF32* s_eps  = add1_impl(s_edge, constant_scalar(1e-6f), false);
-    TensorF32* a      = div(exp_e, s_eps);                               // [n_heads, E] softmax
+    // 【2026-09-22 修复】同样的硬底线（clamp ≥ 1e-6）：exp_e ∈ (0,1] ⇒ 最多放大 1e6（有限 ✓），
+    //   但绝不允许除数为 0 ⇒ 消除 div(exp,0)=inf / 0/0=NaN ✗。
+    TensorF32* s_eps_s = clamp(s_eps, 1e-6f, 1e30f);                     // [n_heads, E]
+    TensorF32* a      = div(exp_e, s_eps_s);                             // [n_heads, E] softmax
 
     // ===== Step 5: 每度注意力加权聚合 =====
     std::vector<TensorF32*> out(f_value_.size(), nullptr);
@@ -2703,7 +2706,14 @@ std::vector<TensorF32*> GNormBias::forward_graph(
 
         // ---- Step 3: 重组 out = v * t/(norm+eps) ----
         TensorF32* denom    = add1_impl(norm, constant_scalar(eps_), /*inplace=*/false);  // [1,m,N]
-        TensorF32* scale3   = div(t, denom);                            // [1,m,N]
+        // 【2026-09-22 修复】除零硬底线（clamp ≥ eps_）：
+        //   服务器 043548.log 实测 `[nan-node] FIRST_NAN node_n=15 op=8(DIV) src0op=2(ADD) dims=[1,32,103]`
+        //   ⇒ **被除数(t)与除数(denom)抽样全为 0 ⇒ 0/0 = NaN** ✗（该 NaN 随后经 MUL_MAT/EDGE_GATHER/
+        //   PER_EDGE_MATMUL 扩散到全图 1876 个节点，并让 3 个 epoch 的 step 全成 no-op）。
+        //   即使 `+eps_` 因某条路径未生效（或 eps_ 被外部设为 0），clamp 也保证分母 ≥ eps_ ✓。
+        //   语义安全：norm=0 ⇒ v 全 0 ⇒ out = 0 × (t/eps_) = 0（有限 ✓）；norm>0 时 clamp 不改数值 ✓。
+        TensorF32* denom_s  = clamp(denom, eps_, 1e30f);                // [1,m,N]（下限 eps_）
+        TensorF32* scale3   = div(t, denom_s);                          // [1,m,N]
         // scale3 [1,m,N] → [d_dim,m,N]（每通道 d_dim 个 Wigner 分量共享同一 scale）→ view 回 [m*d_dim,N]
         TensorF32* scale3d  = repeat(scale3, v3);                       // [d_dim, m, N]
         TensorF32* scale_f  = view(scale3d, Shape({m * d_dim, N}));     // [m*d_dim, N]

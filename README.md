@@ -3,6 +3,19 @@
 PPML project  
 Inspired by RosettaFoldAllAtom(RFAA) and GGML  
 
+## References / 引用项目
+
+> **EN** — This repository is an independent C++ re-implementation (research / engineering prototype); the two
+> projects below are its conceptual and engineering references. For the related-work discussion
+> (SE(3)-Transformer family), see [`LiteratureReview.md`](LiteratureReview.md).
+> **中文** — 本仓库是独立的 C++ 重实现（研究 / 工程原型）；下面两个项目是它的概念与工程参考。
+> 相关工作（SE(3)-Transformer 家族）见 [`LiteratureReview.md`](LiteratureReview.md)。
+
+| # | Project / 项目 | Reference point / 参考点 |
+|---|---|---|
+| 1 | **RoseTTAFold-All-Atom (RFAA)** — Baker lab<br><https://github.com/baker-laboratory/RoseTTAFold-All-Atom> | 全原子结构预测；三轨（1D/2D/3D）网络 + SE(3) 等变注意力；本项目对齐其训练管线与配置。<br>All-atom structure prediction; three-track (1D/2D/3D) network with SE(3)-equivariant attention; the training pipeline and configs mirrored here. |
+| 2 | **ggml** — tensor library & inference runtime<br><https://github.com/ggml-org/ggml> | 无依赖的 C/C++ 张量运行时（内存池 + 图执行器），本项目 C++ 运行时的工程参照。<br>Dependency-free C/C++ tensor runtime (memory pools + graph executor) used as the engineering model for our runtime. |
+
 ## Quick Start (command line)
 
 ### Build environment (tested)
@@ -57,7 +70,6 @@ LD_PRELOAD=$(gcc -print-file-name=libstdc++.so.6) \
 > see the scripts **`build_remote.sh`** (build) and **`remote_fulltrain.sh`** (two-stage training).
 
 ## 训练基准 (Training Benchmark)
-
 ### Small setting CPU training  
 Env: Intel i5-1335U 12 Core / 15 GB RAM / Pure CPU (LD_PRELOAD libstdc++)
 
@@ -103,6 +115,50 @@ small setting CUDA train 5 epoch (P62891, L=51, MSA_DEPTH=8, N_EXTRA=1, N_MAIN=2
 dev/training data:
 
 data/training_batch_data/P62891_alignment.a3m data/P62891.fasta  
+
+### Remote FULL_TRAIN multi-sample benchmark (le103, blocks 2-4-2, 10 epoch) — 2026-09-21
+
+Env: AMD Ryzen Threadripper PRO 3955WX 32 threads / 220 GB RAM / NVIDIA A800 80GB (compute 8.0) / mixed CPU+CUDA scheduler + staging async  
+环境: AMD Ryzen Threadripper PRO 3955WX 32 线程 / 220 GB RAM / NVIDIA A800 80GB / 混合调度 (BackendScheduler, CPU+CUDA) + staging async
+
+Config: `FULL_TRAIN=1 SKIP_P04637=1` / dataset `training_batch_data_le103` / MSA_DEPTH=256 / blocks `extra 2 + main 4 + refine 2` (8 boundaries) / accum=4 / epochs=10 / lr=1e-4 / clip=0.1 / `SE3_TOPO=per_block` (learnable scale) / `PPML_USE_CUDA=1` / `PPML_STAGING_ASYNC=1` / VRAM budget auto (4/5 free)  
+配置: 同上 — 块数 2-4-2（8 个边界）、MSA=256、累积 4、10 epoch、per_block 拓扑、CUDA 混合 + staging async、显存预算自动
+
+Samples: 2 — `P62805` (L=103) + `P62891` (L=51); 20 sample-steps (10 epoch × 2); 5 optimizer steps (accum=4)  
+样本: 2 个（P62805 L=103 / P62891 L=51）；共 20 个样本步；5 次优化步
+
+| 指标 Metric | 值 Value |
+|---|---|
+| 总耗时 Total elapsed | **23,264.1 s** (6 h 27 min) |
+| 每 epoch Per epoch (2 samples) | ≈**2,326 s** (38.8 min) |
+| 每样本 Per sample-step | ≈1,163 s (19.4 min) |
+| 优化步 Optimizer steps | 5 |
+| avg loss (20 sample-steps) | **12.5463** |
+| grad_norm | 0.1000 (clip 饱和 / clipped)；其中 1 次 0.0000 |
+| 峰值 Peak (gallocr) | CUDA **18.7 GB** / CPU **6.2 GB** |
+| 退出 Exit | **0** ✓ 10/10 epoch 完成 |
+
+| Epoch | 耗时 s (est.)* | P62805 (L=103) loss | P62891 (L=51) loss | step grad_norm |
+|---|---|---|---|---|
+| 1  | 2,404 | 12.5447 | 12.5451 | — |
+| 2  | 2,167 | 12.5447 | 12.5732 | 0.1000 |
+| 3  | 2,390 | 12.5447 | 12.5451 | — |
+| 4  | 2,172 | 12.5447 | 12.5451 | 0.1000 |
+| 5  | 2,387 | 12.5447 | 12.5451 | — |
+| 6  | 2,384 | 12.5447 | 12.5451 | 0.1000 |
+| 7  | 2,399 | 12.5447 | 12.5451 | — |
+| 8  | 2,386 | 12.5447 | 12.5451 | 0.0000 |
+| 9  | 2,393 | 12.5447 | 12.5451 | — |
+| 10 | 2,401 | 12.5447 | 12.5451 | 0.1000 |
+
+\* 该多样本路径**不打印 per-epoch ms** ⇒ 每 epoch 耗时按"日志行跨度 × 总耗时/总行数"线性估算（估算合计 23,483 s vs 实测 23,264 s，偏差约 1%）；**总耗时与每 epoch 均值是实测值** ✓。  
+\* The multi-sample path does not print per-epoch ms; per-epoch values are interpolated from log-length spans (Σ 23,483 s vs measured 23,264 s, ~1%). Total elapsed and per-epoch average are measured.
+
+- 10 epoch finished with EXIT=0, no NaN (`FWD-NAN=0`), loss all finite, `[ctx]` object count flat (no accumulation).  
+- 10 epoch 全部完成 EXIT=0，无 NaN（`FWD-NAN=0`），loss 全有限，`[ctx]` 对象数持平（无累积）。  
+
+
+
 
 ## 实验记录 (Experiments)
 

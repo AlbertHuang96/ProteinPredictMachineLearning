@@ -11,6 +11,8 @@
 #include <algorithm>
 #include "ppml/CpuFeatures.h"   // 运行时 AVX2 检测（cpuid + XCR0）
 #include "ppml/HalfUtils.h"     // fp16→fp32 位运算转换（mul_mat fp16 输入）
+#include "ppml/MulMatStats.h"   // MUL_MAT 形状/耗时统计（PPML_MULMAT_STATS=1，Step 0）
+#include <chrono>
 #if defined(__x86_64__) || defined(_M_X64)
 #  include <immintrin.h>        // _mm256_loadu_ps / add / storeu
 #endif
@@ -734,6 +736,10 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
         if (bnelt > 0 && b) { bmn = b[0]; bmx = b[0]; for (int64_t q = 0; q < bnelt; q++) { float v = b[q]; if (v != v) { bnan++; bbad = true; } else { if (v < bmn) bmn = v; if (v > bmx) bmx = v; } } if (bmx > 1e6f || bmn < -1e6f) bbad = true; }
         if (bbad) fprintf(stderr, "[mulmat-in-b] N=%d K=%d numel=%lld min=%.6g max=%.6g nan=%lld\n", N, K, (long long)bnelt, (double)bmn, (double)bmx, (long long)bnan);
     }
+    // 【2026-09-22 Step 0】MUL_MAT 统计（PPML_MULMAT_STATS=1）：ith==0 量墙钟（含 barrier 等待）
+    const bool mm_stat = ppml::mulmat_stats_enabled();
+    std::chrono::steady_clock::time_point mm_t0{};
+    if (mm_stat && p->ith == 0) mm_t0 = std::chrono::steady_clock::now();
     if (p->ith == 0) tp->current_chunk.store(0);
     tp->barrier_wait();
 
@@ -751,6 +757,13 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
         }
     }
     tp->barrier_wait();
+
+    // 【2026-09-22 Step 0】统计落账（ith==0 的墙钟 ≈ 该节点在 CPU 上的并行耗时 ✓）
+    if (mm_stat && p->ith == 0) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - mm_t0).count();
+        ppml::mulmat_stats_record("CPU", "simt-naive", M, K, N, ms);
+    }
 }
 
 // ===== out_prod =====

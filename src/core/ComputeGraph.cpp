@@ -1084,16 +1084,26 @@ void ComputeGraph::add_or_set(
     //GGML_ASSERT(src);
     assert(src);
     if (getenv("GRAPH_DEBUG_GRADACC") && cgraph->grads[isrc]) {
+        // 【2026-09-22 修复打印 bug】原先直接读 dims[0..3]：ndim<4 的节点其 dims[ndim..3] 是
+        //   未初始化内存 ⇒ 日志里出现 `dims=[1,140656626310368,0,33]` 之类垃圾值 ✗（会误导分析）。
+        //   改为按 ndim 输出，缺失维补 -1 ✓；顺带给 grad_old 补上 ndim ✓。
+        auto dims4_of = [](const TensorF32* t, long long out4[4]) {
+            const int nd = (int)t->shape().ndim();
+            for (int i = 0; i < 4; ++i) out4[i] = (i < nd) ? (long long)t->shape().dims[i] : -1;
+        };
+        long long sd4[4], gd4[4], nd4[4];
+        dims4_of(src, sd4);
+        dims4_of(cgraph->grads[isrc], gd4);
+        dims4_of(tensor, nd4);
         fprintf(stderr, "[gradacc] src op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld | "
-                        "grad_old op=%d numel=%lld | grad_new op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld\n",
-                src->op, (int)src->shape().ndim(),
-                (long long)src->shape().dims[0], (long long)src->shape().dims[1],
-                (long long)src->shape().dims[2], (long long)src->shape().dims[3],
+                        "grad_old op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld | "
+                        "grad_new op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld\n",
+                src->op, (int)src->shape().ndim(), sd4[0], sd4[1], sd4[2], sd4[3],
                 (long long)src->numel(),
-                cgraph->grads[isrc]->op, (long long)cgraph->grads[isrc]->numel(),
-                tensor->op, (int)tensor->shape().ndim(),
-                (long long)tensor->shape().dims[0], (long long)tensor->shape().dims[1],
-                (long long)tensor->shape().dims[2], (long long)tensor->shape().dims[3],
+                cgraph->grads[isrc]->op, (int)cgraph->grads[isrc]->shape().ndim(),
+                gd4[0], gd4[1], gd4[2], gd4[3],
+                (long long)cgraph->grads[isrc]->numel(),
+                tensor->op, (int)tensor->shape().ndim(), nd4[0], nd4[1], nd4[2], nd4[3],
                 (long long)tensor->numel());
     }
     if (cgraph->grads[isrc]) {

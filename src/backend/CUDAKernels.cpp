@@ -69,6 +69,15 @@ extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
 // 累加，输出仍 fp32。M/K/N 语义与 mul_mat_cuda 完全一致（B 以 [N][K] 转置存储）。
 extern void mul_mat_cuda_f16(const void* A, const void* B, float* C, int M, int K, int N);
 
+// 【2026-09-22 Step 1】TF32 tensor-core GEMM（smem + cp.async 双缓冲流水）
+//   C[M,N] = A[M,K] * B[N,K]ᵀ（fp32 输入 → 硬件 tf32 截断；fp32 累加）。
+//   返回 0 = 已执行；1 = 不支持（< sm_80+）或尺寸非法 ⇒ 调用方回落 mul_mat_cuda（SIMT）。
+extern int mul_mat_mma_tf32_smem(const void* A, const void* B, float* C, int M, int K, int N);
+
+// 【2026-09-22 Step 0】MUL_MAT 统计（PPML_MULMAT_STATS=1）：CUDA event 计时，begin/end 夹一次 launch
+extern void mulmat_stats_cuda_begin(int M, int K, int N);
+extern void mulmat_stats_cuda_end(const char* path);
+
 // OP_MUL_MAT fp16 tensor-core（mma.m16n8k16, fp32 累加，2026-09-10）
 //   返回 0 = 已执行；1 = 硬件 < sm_80（调用方回落 mul_mat_cuda_f16）。
 extern int mul_mat_mma_f16(const void* A, const void* B, float* C, int M, int K, int N);
@@ -506,6 +515,7 @@ void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
         const void* B16 = reinterpret_cast<const void*>(B);
         // 优先级：流水版（smem+ldmatrix+cp.async）→ 简化 MMA → SIMT fp16
         const char* path = "tensor-core-smem-pipeline";
+        mulmat_stats_cuda_begin(M, K, N);
         int rc = mul_mat_mma_f16_smem(A16, B16, C, M, K, N);
         if (rc != 0) {
             path = "tensor-core-mma-simple";
@@ -515,13 +525,40 @@ void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
             path = "fallback-simt-f16";
             mul_mat_cuda_f16(A16, B16, C, M, K, N);
         }
+        mulmat_stats_cuda_end(path);
         if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
             fprintf(stderr, "[MMA] M=%d K=%d N=%d path=%s\n", M, K, N, path);
         }
         return;
     }
 
+    // ===== 【2026-09-22】F32 → TF32 tensor core（Step 1）=====
+    //   开关 PPML_MUL_MAT_TC=1（默认 0 = 纯 SIMT，与历史行为完全一致 ✓）。
+    //   按用户要求**不设尺寸阈值**（小形状可能更慢，已接受 ✓）；仅当"非 sm_80+ / 尺寸非法"时
+    //   回落 SIMT（由 mul_mat_mma_tf32_smem 内部判定并返回 1 ✓）。
+    //   ⚠️ 反向的 mul_mat（compute_backward 也是用 mul_mat 拼的）同样经过这里 ⇒ 前后向一致 ✓。
+    static const bool tc_on = []() {
+        const char* e = std::getenv("PPML_MUL_MAT_TC");
+        return e && e[0] && e[0] != '0';     // "0" = 关（默认）；其它值 = 开（TF32）
+    }();
+    if (tc_on) {
+        mulmat_stats_cuda_begin(M, K, N);
+        const int rc_tc = mul_mat_mma_tf32_smem(A, B, C, M, K, N);
+        mulmat_stats_cuda_end(rc_tc == 0 ? "tf32-smem" : "tf32-unavailable");
+        if (rc_tc == 0) {
+            if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
+                fprintf(stderr, "[MMA] M=%d K=%d N=%d path=tf32-smem\n", M, K, N);
+            }
+            return;
+        }
+    }
+
+    mulmat_stats_cuda_begin(M, K, N);
     mul_mat_cuda(A, B, C, M, K, N);
+    mulmat_stats_cuda_end("simt-128x128");
+    if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
+        fprintf(stderr, "[MMA] M=%d K=%d N=%d path=simt-128x128\n", M, K, N);
+    }
 }
 
 void CUDABackend::kernel_softmax_cuda(TensorF32 * node, ComputeParams * p) {
