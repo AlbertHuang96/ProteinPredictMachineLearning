@@ -1092,11 +1092,17 @@ std::vector<TensorF32*> IterBlock::run_se3_structural(TensorF32*& msa, TensorF32
                                                       TensorF32*& state,
                                                       const TensorF32& coords,
                                                       const TensorI64& residx,
-                                                      const TensorF32& seq1hot) {
+                                                      const TensorF32& seq1hot,
+                                                      const se3::TopoRefineCfg*   topo_cfg,
+                                                      se3::TopoRefineState*       topo_st) {
     // ---- Phase A: make_graph 拓扑（edge_index/edge_d 只依赖 host coords）----
     // 空 pair（numel=0）传给 make_graph：edge_w 留空（run_se3_graph 内图化），拓扑照常。
     TensorF32 empty_pair;   // 默认构造 numel=1 data=nullptr → has_pair=false
-    se3::GraphData G = se3::make_graph(coords, empty_pair, residx, 64, 9);
+    // 【refined topo pass L1/L2】cfg/st 非空 ⇒ 冻结边索引（L1）+ margin 门控局部重算（L2）✓；
+    //   两者都为空 ⇒ 与原来逐位一致 ✓（见 SE3Transformer.h 的契约 ✓）
+    se3::GraphData G = (topo_cfg && topo_st)
+        ? se3::make_graph_refined(coords, empty_pair, residx, 64, 9, *topo_cfg, *topo_st)
+        : se3::make_graph(coords, empty_pair, residx, 64, 9);
     SE3Basis basis;
     basis.compute(G.edge_d, 2);
     // 无有效边图（拓扑空）时跳过 SE3
@@ -2014,13 +2020,18 @@ std::vector<TensorF32*> RefineBlock::run_se3_structural_refine(TensorF32*& msa, 
                                                                TensorF32*& state,
                                                                const TensorF32& coords,
                                                                const TensorI64& residx,
-                                                               const TensorF32& seq1hot) {
+                                                               const TensorF32& seq1hot,
+                                                               const se3::TopoRefineCfg*   topo_cfg,
+                                                               se3::TopoRefineState*       topo_st) {
     // ---- Phase A: make_graph 拓扑（edge_index/edge_d 只依赖 host coords）----
     // 【阶段1.5 重构】不再回落 pair 值。edge_w 在 run_se3_graph_refine 内从主图 pair 图化
     // （阶段1 简化：仅 pair→norm_pair_→embed_e1_→norm_edge1_→gather，暂不注入 rbf/neighbor
     //  增强特征；阶段2 补全）。
     TensorF32 empty_pair;   // 默认构造 numel=1 data=nullptr → has_pair=false
-    se3::GraphData G = se3::make_graph(coords, empty_pair, residx, 64, 9);
+    // 【refined topo pass L1/L2】与 IterBlock 共用同一份 topo_st ⇒ 跨 iter/refine 边界的 Ω 门控连续 ✓
+    se3::GraphData G = (topo_cfg && topo_st)
+        ? se3::make_graph_refined(coords, empty_pair, residx, 64, 9, *topo_cfg, *topo_st)
+        : se3::make_graph(coords, empty_pair, residx, 64, 9);
     SE3Basis basis;
     basis.compute(G.edge_d, 2);
     // 无有效边图（拓扑空）时跳过 SE3
@@ -3097,11 +3108,39 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     //   PPML_SE3_TOPO 缺省/其它 → 开关A（fixed）：所有 block 用初始 coords 构图（拓扑固定），block 循环后
     //    主图一次 graph_compute 物化全部 offset/state，再从主图 buffer 读 offset 链式更新 coords。
     //    无独立回落 compute → 无跨 cgraph 冲突 → 根治偶发 NaN（代价：拓扑用初始坐标，长程接触边略糙）。
-    const bool se3_fixed_topo = run_se3 && (
-        !getenv("PPML_SE3_TOPO") || std::strcmp(getenv("PPML_SE3_TOPO"), "per_block") != 0);
+    // 【refined topo pass：L1/L2】（2026-09-23）新增两个模式（设计/数学见 TopoPassRefinement.md §6.3 + 附录 A ✓）：
+    //   PPML_SE3_TOPO=l1 → **冻结边索引**（首次边界算一次）+ 每边界用**实时坐标**重算几何 ✓
+    //   PPML_SE3_TOPO=l2 → 上述 + **margin 门控局部重算**（Ω = {i : ‖x_i−x⁰_i‖ ≥ κ_i}，κ_i = σ·m_i/2 ✓）
+    //   两者都沿用 per_block 的**驱动**逻辑（每边界回落 offset + 链式更新 coords ✓），只把"构图那一步"换掉 ✓
+    //   调参：PPML_TOPO_SIGMA（默认 0.5 ✓）；PPML_TOPO_L2_CLOSURE=0 关 Ω 邻居封闭（默认开 ✓）；
+    //         PPML_TOPO_DEBUG=1 打印 [TOPO-L1/L2] 快照/|Ω|/对称差统计 ✓
+    const char* topo_env = std::getenv("PPML_SE3_TOPO");
+    const bool  topo_l1  = run_se3 && topo_env && std::strcmp(topo_env, "l1") == 0;
+    const bool  topo_l2  = run_se3 && topo_env && std::strcmp(topo_env, "l2") == 0;
+    const bool  topo_l3  = run_se3 && topo_env && std::strcmp(topo_env, "l3") == 0;
+    const bool se3_fixed_topo = run_se3 && !topo_l1 && !topo_l2 && !topo_l3 && (
+        !topo_env || std::strcmp(topo_env, "per_block") != 0);
+    se3::TopoRefineCfg topo_cfg;
+    topo_cfg.l3 = topo_l3;
+    topo_cfg.l1 = topo_l1 || topo_l3;          // l3 = l1 + l2 + 阻尼基准 ✓
+    topo_cfg.l2 = topo_l2 || topo_l3;
+    topo_cfg.closure = !(std::getenv("PPML_TOPO_L2_CLOSURE") &&
+                         std::strcmp(std::getenv("PPML_TOPO_L2_CLOSURE"), "0") == 0);
+    if (const char* _sg = std::getenv("PPML_TOPO_SIGMA")) topo_cfg.sigma = static_cast<float>(std::atof(_sg));
+    if (const char* _gm = std::getenv("PPML_TOPO_GAMMA")) topo_cfg.gamma = static_cast<float>(std::atof(_gm));
+    topo_cfg.debug = (std::getenv("PPML_TOPO_DEBUG") != nullptr);
+    // ★ 状态是**本函数局部** ⇒ 跨 block 边界存活、随每次 forward 自然重置 ✓（x⁰ 快照/冻结索引/margin ✓）
+    se3::TopoRefineState topo_st;
+    if (run_se3 && (topo_l1 || topo_l2 || topo_l3)) {
+        std::fprintf(stderr, "[SE3-TOPO] mode=%s  sigma=%.3f  gamma=%.3f  closure=%d  (refined topo pass ✓；"
+                             "求解见 TopoPassRefinement.md 附录 A ✓)\n",
+                     topo_l3 ? "l3" : (topo_l1 ? "l1" : "l2"), topo_cfg.sigma, topo_cfg.gamma,
+                     (int)topo_cfg.closure);
+    }
     if (run_se3 && getenv("GRAPH_DEBUG_COORD")) {
-        std::fprintf(stderr, "[SE3-TOPO] mode=%s (fixed=%d per_block=%d)\n",
-            se3_fixed_topo ? "fixed" : "per_block", (int)se3_fixed_topo, (int)(!se3_fixed_topo));
+        std::fprintf(stderr, "[SE3-TOPO] mode=%s (fixed=%d per_block=%d l1=%d l2=%d l3=%d)\n",
+            se3_fixed_topo ? "fixed" : (topo_l3 ? "l3" : (topo_l1 ? "l1" : (topo_l2 ? "l2" : "per_block"))),
+            (int)se3_fixed_topo, (int)(!se3_fixed_topo), (int)topo_l1, (int)topo_l2, (int)topo_l3);
     }
     // 开关A：收集各 block 的 offset 图节点（iter/refine 分开，因 apply_coord_update 类型不同），
     // block 循环后统一 graph_compute + 读值 + 链式更新 coords。
@@ -3236,11 +3275,13 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
             vleaf_msa  = val_to_graph_leaf(vmsa);
             vleaf_pair = val_to_graph_leaf(vpair);
             se3_out = (vleaf_msa && vleaf_pair) ? blk->run_se3_structural(
-                vleaf_msa, vleaf_pair, rbf, state, current_coords, input.residx, seq1hot)
+                vleaf_msa, vleaf_pair, rbf, state, current_coords, input.residx, seq1hot,
+                &topo_cfg, &topo_st)                                   // 【L1/L2】✓（关时零变化 ✓）
                                  : std::vector<TensorF32*>();
         } else {
             se3_out = blk->run_se3_structural(
-                msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot);
+                msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot,
+                &topo_cfg, &topo_st);                                  // 【L1/L2】✓
         }
         // 开关A（fixed）：只构图，收集 offset 图节点，block 循环后统一 compute + 读值更新。
         //   ~2100Å 巨型扰动 → FAPE 发散）。改为循环结束后一次性 build（sum/N，N=block 数），
@@ -3351,11 +3392,13 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
             vleaf_msa  = val_to_graph_leaf(vmsa);
             vleaf_pair = val_to_graph_leaf(vpair);
             se3_out = (vleaf_msa && vleaf_pair) ? blk->run_se3_structural_refine(
-                vleaf_msa, vleaf_pair, rbf, state, current_coords, input.residx, seq1hot)
+                vleaf_msa, vleaf_pair, rbf, state, current_coords, input.residx, seq1hot,
+                &topo_cfg, &topo_st)                                   // 【L1/L2】✓（与 iter 共用状态 ✓）
                                  : std::vector<TensorF32*>();
         } else {
             se3_out = blk->run_se3_structural_refine(
-                msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot);
+                msa_ref, pair_ref, rbf, state, current_coords, input.residx, seq1hot,
+                &topo_cfg, &topo_st);                                  // 【L1/L2】✓
         }
         // 开关A（fixed）：只构图，收集 offset 图节点，block 循环后统一 compute + 读值更新。
         if (se3_fixed_topo) {
