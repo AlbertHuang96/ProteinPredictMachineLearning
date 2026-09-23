@@ -304,10 +304,10 @@ TensorF32* cross_entropy_loss(TensorF32* logits, TensorF32* targets);
 TensorF32* torsion_angle_loss(TensorF32* pred, TensorF32* gt, TensorF32* chi_mask);
 TensorF32* masked_msa_loss(TensorF32* logits, TensorF32* true_msa, TensorF32* bert_mask);
 TensorF32* distogram_loss(
-    TensorF32* logits_dist, TensorF32* logits_ω,
-    TensorF32* logits_θ,    TensorF32* logits_ϕ,
-    TensorF32* D_onehot,    TensorF32* Ω_onehot,
-    TensorF32* Θ_onehot,    TensorF32* Φ_onehot,
+    TensorF32* logits_dist, TensorF32* logits_omega,
+    TensorF32* logits_theta, TensorF32* logits_phi,
+    TensorF32* D_onehot,    TensorF32* Omega_onehot,
+    TensorF32* Theta_onehot, TensorF32* Phi_onehot,
     TensorF32* pair_mask);
 TensorF32* angle_norm_loss(TensorF32* unnormed, TensorF32* seq_mask, float eps = 1e-6f);
 TensorF32* supervised_chi_loss(

@@ -7,7 +7,9 @@
 
 #include <cassert>
 #include <cstdlib>   // std::free
+#if !defined(_WIN32)
 #include <execinfo.h> // backtrace/backtrace_symbols (Linux; 诊断用)
+#endif
 
 namespace ppml {
 
@@ -151,12 +153,14 @@ TensorF32* mul_mat(TensorF32* a, TensorF32* b) {
                 (long long)a->shape().dim(2), (long long)a->shape().dim(3), (int)a->op,
                 b->shape().ndim(), (long long)b->shape().dim(0), (long long)b->shape().dim(1),
                 (long long)b->shape().dim(2), (long long)b->shape().dim(3), (int)b->op);
+#if !defined(_WIN32)
         void* bt[20];
         int n = backtrace(bt, 20);
         char** syms = backtrace_symbols(bt, n);
         for (int i = 0; i < n && i < 10; i++)
             fprintf(stderr, "[MULMAT-SHAPE]   #%d %s\n", i, syms[i] ? syms[i] : "?");
         std::free(syms);
+#endif
     }
 
     int64_t ne[2] = {b->shape().dims[1], a->shape().dims[1]};
@@ -499,11 +503,13 @@ TensorF32* view(TensorF32* a, const Shape& new_shape) {
             (long long)(a->shape().dims.size()>3?a->shape().dims[3]:-1),
             (int)a->shape().ndim(), (long long)a->numel(), (int)a->op);
         // 打印调用栈（需 -g；Linux 下 backtrace_symbols 解析符号名）
+#if !defined(_WIN32)
         void* bt[24]; int n = backtrace(bt, 24);
         char** syms = backtrace_symbols(bt, n);
         for (int i = 0; i < n && i < 12; i++)
             std::fprintf(stderr, "  [VIEW-CALL] #%d %s\n", i, syms[i] ? syms[i] : "?");
         std::free(syms);
+#endif
     }
     assert(new_shape.numel() == a->numel());
     // view 不分配新数据，指针复用
@@ -1062,10 +1068,10 @@ TensorF32* masked_msa_loss(TensorF32* logits, TensorF32* true_msa, TensorF32* be
 //   masked_CE = CE * pair_mask
 //   loss = sum(masked_CE) / (sum(pair_mask) + eps)
 TensorF32* distogram_loss(
-    TensorF32* logits_dist, TensorF32* logits_ω,
-    TensorF32* logits_θ,    TensorF32* logits_ϕ,
-    TensorF32* D_onehot,    TensorF32* Ω_onehot,
-    TensorF32* Θ_onehot,    TensorF32* Φ_onehot,
+    TensorF32* logits_dist, TensorF32* logits_omega,
+    TensorF32* logits_theta, TensorF32* logits_phi,
+    TensorF32* D_onehot,    TensorF32* omega_onehot,
+    TensorF32* theta_onehot, TensorF32* phi_onehot,
     TensorF32* pair_mask)
 {
     float eps = 1e-8f;
@@ -1091,13 +1097,13 @@ TensorF32* distogram_loss(
     // 4 个 CE loss 分量
     // ================================================================
     auto loss_dist = ce_channel(logits_dist, D_onehot, pair_mask);  // 距离 (60 bins)
-    auto loss_ω    = ce_channel(logits_ω,    Ω_onehot, pair_mask);  // Ω (36 bins)
-    auto loss_θ    = ce_channel(logits_θ,    Θ_onehot, pair_mask);  // Θ (36 bins)
-    auto loss_ϕ    = ce_channel(logits_ϕ,    Φ_onehot, pair_mask);  // Φ (18 bins)
+    auto loss_omega = ce_channel(logits_omega, omega_onehot, pair_mask);  // omega (36 bins)
+    auto loss_theta = ce_channel(logits_theta, theta_onehot, pair_mask);  // theta (36 bins)
+    auto loss_phi   = ce_channel(logits_phi,   phi_onehot,   pair_mask);  // phi (18 bins)
 
     // 总损失 = 四者之和
-    auto loss_2d = add_impl(add_impl(loss_dist, loss_ω, false),
-                            add_impl(loss_θ,  loss_ϕ, false), false);
+    auto loss_2d = add_impl(add_impl(loss_dist, loss_omega, false),
+                            add_impl(loss_theta, loss_phi, false), false);
 
     return loss_2d;
 }

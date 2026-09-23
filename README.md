@@ -21,6 +21,7 @@ projects below are its conceptual and engineering references.
 
 | Item | Version / note |
 |---|---|
+
 | OS | Ubuntu 22.04.5 LTS on WSL2 — kernel `5.15.167.4-microsoft-standard-WSL2` |
 | CMake | 3.22.1 (project minimum: 3.18) |
 | Compiler | GCC 11.4.0 (C++17) |
@@ -29,6 +30,7 @@ projects below are its conceptual and engineering references.
 
 Notes
 - Windows is not fully supported yet. Build/run is verified on Linux only (WSL2 + Ubuntu 22.04).
+
   Windows PowerShell cannot drive the existing CMake cache — use WSL or a Linux host.
   
   Server build: `build_remote.sh [target]` (also auto-detects python/CUDA).

@@ -11,8 +11,24 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace ppml {
+
+static void sleep_milliseconds(unsigned milliseconds) {
+#if defined(_WIN32)
+    ::Sleep(milliseconds);
+#else
+    struct timespec ts{static_cast<time_t>(milliseconds / 1000),
+                       static_cast<long>(milliseconds % 1000) * 1000000L};
+    nanosleep(&ts, nullptr);
+#endif
+}
 
 // ============================================================
 // 诊断探针（PPML_REMOTE_TRACE=1）—— 2026-09-14 为定位 "TENSOR_GET 未命中 ⇒ abort" 而加
@@ -289,7 +305,7 @@ bool RemoteClient::reconnect() {
         int ms = 500 << (i - 1);                     // 0.5s, 1s, 2s, 4s … 上限 5s
         if (ms > 5000) ms = 5000;
         struct timespec ts{ms / 1000, (long)(ms % 1000) * 1000000L};
-        nanosleep(&ts, nullptr);
+        sleep_milliseconds(static_cast<unsigned>(ms));
     }
     std::fprintf(stderr, "[REMOTE] 重连失败（%d 次）✗ ⇒ 本轮远端不可用\n", retry);
     return false;
@@ -713,8 +729,13 @@ bool RemoteBackend::supports_op(TensorF32* node) const {
     // 形如 "1,7,33"：tensor_op 数值列表
     char buf[512];
     std::snprintf(buf, sizeof(buf), "%s", list);
+#if defined(_WIN32)
+    char* save = nullptr;
+    for (char* tok = ::strtok_s(buf, ",", &save); tok; tok = ::strtok_s(nullptr, ",", &save)) {
+#else
     char* save = nullptr;
     for (char* tok = ::strtok_r(buf, ",", &save); tok; tok = ::strtok_r(nullptr, ",", &save)) {
+#endif
         if (std::atoi(tok) == (int)node->op) return true;
     }
     return false;
@@ -1405,7 +1426,7 @@ bool RemoteServer::serve_forever(int world_size, int max_messages) {
         if (!listener_.accept_one(conn)) {
             if (++accept_fail > 1000) return false;      // 连续失败过多（listener 已坏）才退出
             struct timespec ts{0, 50 * 1000 * 1000};     // 50ms，避免忙等
-            nanosleep(&ts, nullptr);
+            sleep_milliseconds(50);
             continue;
         }
         accept_fail = 0;
@@ -1772,7 +1793,7 @@ static int dp_roundtrip_root(ComputeGraph* cgraph, bool is_grad, int world, int 
         std::fprintf(stderr, "[REMOTE-DP] root 等待对端连接（启动屏障）...\n");
         for (int i = 0; i < 6000 && !g_dp_peer_seen; ++i) {
             struct timespec ts{0, 100 * 1000 * 1000};   // 100ms
-            nanosleep(&ts, nullptr);
+            sleep_milliseconds(100);
         }
         if (!g_dp_peer_seen) {
             std::fprintf(stderr, "[REMOTE-DP] root 等对端连接 600s 超时 ⇒ 放弃本轮同步\n");
