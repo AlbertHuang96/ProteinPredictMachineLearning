@@ -233,8 +233,32 @@ TensorF32* SelfAttention::forward_graph(TensorF32* Q, TensorF32* K, TensorF32* V
         const char* e = getenv("PPML_FLASH_ATTN");
         return e && e[0] && e[0] != '0';
     }();
-    if (kFlashAttn) {
-        return flash_attn_ext(Q, K, V, bias, /*scale=*/0.f, /*causal=*/false, /*softmax_eps=*/1e-9f);
+    // 【2026-09-23 调试】融合路径与旧五步**不等价**的定位工具 ✓：
+    //   PPML_FLASH_ATTN_TRACE=1 ⇒ 每次调用打印序号与 Q/K/bias 形状（用于把序号映射到具体模块 ✓）；
+    //   PPML_FLASH_ATTN_LIMIT=n ⇒ 只让**前 n 次**调用走融合（默认 -1 = 全开）⇒ 用 loss 二分定位 ✓。
+    static const int kLimit = []() {
+        const char* e = getenv("PPML_FLASH_ATTN_LIMIT");
+        return e ? atoi(e) : -1;
+    }();
+    static int s_call_no = 0;
+    const int  my_call  = s_call_no++;
+    if (getenv("PPML_FLASH_ATTN_TRACE")) {
+        auto d = [](const TensorF32* t, int i) -> long long {
+            return t ? (long long)t->shape().dims[i] : -1LL;
+        };
+        fprintf(stderr, "[FA] call#%d  Q=(%lld,%lld,%lld,%lld)  K=(%lld,%lld,%lld,%lld)  bias=(%lld,%lld,%lld,%lld)\n",
+                my_call, d(Q,0), d(Q,1), d(Q,2), d(Q,3),
+                d(K,0), d(K,1), d(K,2), d(K,3),
+                d(bias,0), d(bias,1), d(bias,2), d(bias,3));
+    }
+    if (kFlashAttn && (kLimit < 0 || my_call < kLimit)) {
+        //  必须**显式**传 scale ✗→✓（2026-09-23 定位的 E2E 不等价根因）：
+        //   旧五步路径用 `1/√config_.head_dim` ✓；而融合算子对 `scale ≤ 0` 会**自动取 `1/√D`**
+        //   （D = 张量的 head 维 ⇒ dims[1] ✓）。二者只在"张量 head 维 == config_.head_dim"时相等 ✓，
+        //   而 FullBlock 的 msa_full/H = 8 ≠ config head_dim = 32 ✗ ⇒ **softmax 温度不同** ⇒ 前向不等价 ✗
+        //   （实测：fusion-on 的 loss 15.54 vs 旧路径 14.29 ✗；用 PPML_FLASH_ATTN_LIMIT 二分到 call#0 ✓）。
+        const float fa_scale = 1.0f / std::sqrt(static_cast<float>(config_.head_dim));
+        return flash_attn_ext(Q, K, V, bias, fa_scale, /*causal=*/false, /*softmax_eps=*/1e-9f);
     }
 
     // 1. scores = K @ Q^T (key 最内 dims[0], 使 softmax 沿 key 轴归一)

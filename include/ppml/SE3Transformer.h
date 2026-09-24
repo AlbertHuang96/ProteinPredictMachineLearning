@@ -140,6 +140,53 @@ GraphData make_graph(const TensorF32& xyz,
                      int top_k = 64,
                      int kmin = 9);
 
+// ============================================================
+// 【refined topo pass：L1 / L2】（2026-09-23）—— 环境变量门控（见 PPML.cpp 的 PPML_SE3_TOPO=l1|l2 ✓）
+//   背景：per_block 每个 block 边界都用**最新坐标**重跑 kNN ⇒ 边集随坐标漂移（edge flapping ✗）：
+//     ① 微积分：G(x) 是分片常值 ⇒ 不连续、a.e. 梯度为 0（拓扑选择**不可微** ✗）；
+//     ② margin 引理：|Δd_ij| ≤ ‖δ_i‖+‖δ_j‖ ≤ 2Δ ⇒ **Δ < m_i/4**（双侧）/ **Δ_i < m_i/2**（单侧）时不翻边 ✓
+//        （m_i = d_(k+1) − d_(k) ✓；推导见 TopoPassRefinement.md 附录 A.1.3 ✓）
+//   L1 = **冻结边索引**（首次边界算一次）+ 每边界用**实时坐标**重算几何（edge_d / edge_w ✓），成本 O(E) ✓
+//   L2 = 在 L1 基础上，只对"越出 margin 信任域"的节点做**局部** kNN 重算（Ω 门控 + 候选集 C_i ✓），
+//        并默认对 Ω 做**邻居封闭**（Ω ← Ω ∪ N(E(x⁰), Ω) ✓）—— 否则"邻居移动导致自己翻边"会被漏掉 ✗
+//        候选集 C_i = 冻结出邻居 ∪ 其二跳（与 python_scripts/topo_policy_replay.py 的 local_repair 同构 ✓）
+//   ⚠️ 契约：只在 `cfg` 与 `st` 都非空且 (l1||l2) 时走 refined ✓；否则**行为与 make_graph 逐位一致** ✓
+//   ⚠️ `TopoRefineState` 应放在 **每次 forward 的局部**（PPMLModel::forward_graph ✓）：
+//      它持有 x⁰ 快照 + 冻结边索引 + margin/κ + 邻接表，跨 block 边界存活、随 forward 自然重置 ✓
+// ============================================================
+struct TopoRefineCfg {
+    bool  l1      = false;   // 冻结边索引 + 实时几何 ✓
+    bool  l2      = false;   // margin 门控局部重算 ✓
+    bool  l3      = false;   // ★ 阻尼 + 信任域基准 B = x⁰ + clamp(γ(x−x⁰), ±κ) ✓（见下 ✓）
+    bool  closure = true;    // L2 的 Ω 邻居封闭（默认开 ✓，附录 A.4.3 推论 3 ✓）
+    float sigma   = 0.5f;    // κ_i = σ·m_i/2 ✓（σ≤1/2 = "可证不翻边"；σ≈2~4 = "追踪真值" ✓）
+    float gamma   = 1.0f;    // L3 的回放阻尼 ✓（γ=1 纯 clamp；γ<1 滞后跟踪 ✓；γ=0 ⇒ 冻结基准 ✓）
+    bool  debug   = false;   // 打印 [TOPO-L1/L2/L3] 统计 ✓
+};
+
+struct TopoRefineState {
+    bool ready = false;
+    int  B = 0, L = 0, top_k = 0, kmin = 0;
+    int64_t E0 = 0;                                  // |E(x⁰)| ✓
+    std::vector<int64_t> src, tgt;                   // 冻结边集 E(x⁰)（host 副本 ✓：GraphData 是 move-only ✗）
+    std::vector<std::vector<int64_t>> adj_out;       // 冻结出邻接表（L2 候选集/邻居封闭用 ✓）
+    std::vector<uint64_t> keys;                      // E(x⁰) 的 (src,tgt) 排序键（算对称差 = D 分子 ✓）
+    std::vector<float>   x0;                         // x⁰ 的整份骨架坐标 (B*L*3*3) ✓
+    std::vector<float>   margin;                     // m_i（B*L；k ≥ L−1 ⇒ +inf ✓）
+    std::vector<float>   kappa;                      // κ_i = σ·m_i/2 ✓
+    int      calls = 0;                              // refined 调用次数（首次建立快照 ✓）
+    int64_t  last_omega = 0, last_diff = 0;          // 上次 |Ω| / |E_t Δ E(x⁰)|（诊断 ✓）
+    void reset() { *this = TopoRefineState(); }
+};
+
+GraphData make_graph_refined(const TensorF32& xyz,
+                             const TensorF32& pair,
+                             const TensorI64& idx,
+                             int top_k,
+                             int kmin,
+                             const TopoRefineCfg& cfg,
+                             TopoRefineState& st);
+
 // 获取键合邻居信息
 // - idx: (B, L) 残基索引
 // - 返回: (B, L, L, 1)

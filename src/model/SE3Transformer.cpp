@@ -548,6 +548,264 @@ GraphData make_graph(const TensorF32& xyz,
     return graph;
 }
 
+// ============================================================
+// 【refined topo pass：L1 / L2】实现（2026-09-23）—— 接口/数学见 SE3Transformer.h 与
+//   TopoPassRefinement.md §6.3 + 附录 A.1/A.4 ✓
+// ============================================================
+namespace {
+
+// 由 host 边列表 + **实时**坐标 + pair 填三件张量（与 make_graph 第 3 步同构 ✓）
+//   ⚠️ 第一参数用**裸指针**（不是张量）⇒ 可以传 L3 的基准 B（host 缓冲 ✓，不一定等于某个张量 ✓）
+GraphData graph_from_edgelist(const float* xyz_data, const TensorF32& pair,
+                              const std::vector<int64_t>& src,
+                              const std::vector<int64_t>& tgt,
+                              int B, int L) {
+    const int64_t num_edges = static_cast<int64_t>(src.size());
+    const bool has_pair = (pair.numel() > 0) && (pair.data() != nullptr);
+    const int E_dim = (has_pair && pair.shape().ndim() >= 4)
+                          ? static_cast<int>(pair.shape().dims[3]) : 0;
+    const float* pair_data = has_pair ? pair.data() : nullptr;
+
+    GraphData graph;
+    graph.edge_index = TensorI64(Shape({ 2, num_edges }), Device::CPU);
+    graph.edge_d     = TensorF32(Shape({ num_edges, 3 }), Device::CPU);
+    graph.edge_w     = TensorF32(Shape({ num_edges, E_dim }), Device::CPU);
+
+    int64_t* ei = graph.edge_index.data();
+    for (int64_t e = 0; e < num_edges; ++e) {
+        ei[e]             = src[e];      // 行 0 = src ✓
+        ei[num_edges + e] = tgt[e];      // 行 1 = tgt ✓
+    }
+    float* ed = graph.edge_d.data();
+    float* ew = graph.edge_w.data();
+    for (int64_t e = 0; e < num_edges; ++e) {
+        const int64_t s = src[e], t = tgt[e];
+        const int64_t b = s / L, i = s % L, j = t % L;
+        const int bi = static_cast<int>(((b * L + i) * 3 + 1) * 3);   // CA = 原子索引 1 ✓
+        const int bj = static_cast<int>(((b * L + j) * 3 + 1) * 3);
+        ed[e * 3]     = xyz_data[bj]     - xyz_data[bi];
+        ed[e * 3 + 1] = xyz_data[bj + 1] - xyz_data[bi + 1];
+        ed[e * 3 + 2] = xyz_data[bj + 2] - xyz_data[bi + 2];
+        if (pair_data) {
+            const int64_t base = ((b * L + i) * L + j) * E_dim;
+            for (int f = 0; f < E_dim; ++f) ew[e * E_dim + f] = pair_data[base + f];
+        }
+    }
+    (void)B;
+    return graph;
+}
+
+// 每节点第 k 与第 k+1 近邻**距离**之差 = margin m_i ✓
+//   ⚠️ 与 make_graph 同距离口径：float 减法 + sqrt ✓（对角线 i==j 跳过 ✓）
+//   ⚠️ margin 只需要**距离值** ⇒ 与 tie-break 无关 ✓（并列时 m_i = 0 ✓，正是"危险"信号 ✓）
+void topo_margins(const TensorF32& xyz, int B, int L, int kk, std::vector<float>& m_out) {
+    const float* xd = xyz.data();
+    m_out.assign(static_cast<size_t>(B) * L, std::numeric_limits<float>::infinity());
+    std::vector<float> d(L > 1 ? L - 1 : 0);
+    for (int b = 0; b < B; ++b) {
+        for (int i = 0; i < L; ++i) {
+            const int bi = ((b * L + i) * 3 + 1) * 3;
+            int n = 0;
+            for (int j = 0; j < L; ++j) {
+                if (i == j) continue;
+                const int bj = ((b * L + j) * 3 + 1) * 3;
+                const float dx = xd[bj]     - xd[bi];
+                const float dy = xd[bj + 1] - xd[bi + 1];
+                const float dz = xd[bj + 2] - xd[bi + 2];
+                d[n++] = std::sqrt(dx * dx + dy * dy + dz * dz);
+            }
+            if (kk <= 0 || kk >= n) continue;               // 无第 k+1 个 ⇒ 保持 +inf ✓
+            std::nth_element(d.begin(), d.begin() + (kk - 1), d.begin() + n);
+            const float dk = d[kk - 1];                     // 第 k 小 ✓
+            std::nth_element(d.begin(), d.begin() + kk, d.begin() + n);
+            m_out[static_cast<size_t>(b) * L + i] = d[kk] - dk;
+        }
+    }
+}
+
+inline uint64_t topo_key(int64_t s, int64_t t) {
+    return (static_cast<uint64_t>(s) << 32) ^ static_cast<uint64_t>(t);
+}
+
+}  // namespace
+
+GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const TensorI64& idx,
+                             int top_k, int kmin, const TopoRefineCfg& cfg, TopoRefineState& st) {
+    if ((!cfg.l1 && !cfg.l2) || xyz.numel() <= 0 || idx.numel() <= 0 || xyz.shape().ndim() < 2) {
+        return make_graph(xyz, pair, idx, top_k, kmin);      // 关闭 ⇒ 零行为变化 ✓
+    }
+    const int B = static_cast<int>(xyz.shape().dims[0]);
+    const int L = static_cast<int>(xyz.shape().dims[1]);
+    const int kk = std::min(top_k, L - 1);
+
+    // ---------- 首次调用：建立 x⁰ 快照 + 冻结边索引 E(x⁰) + margin/κ + 邻接表 ----------
+    if (!st.ready || st.B != B || st.L != L || st.top_k != top_k || st.kmin != kmin) {
+        GraphData G0 = make_graph(xyz, pair, idx, top_k, kmin);
+        st.B = B; st.L = L; st.top_k = top_k; st.kmin = kmin;
+        st.E0 = (G0.edge_index.numel() > 0) ? G0.edge_index.shape().dims[1] : 0;
+        const int64_t* ei = (st.E0 > 0) ? G0.edge_index.data() : nullptr;
+        st.src.assign(static_cast<size_t>(st.E0), 0);
+        st.tgt.assign(static_cast<size_t>(st.E0), 0);
+        st.adj_out.assign(static_cast<size_t>(B) * L, {});
+        st.keys.assign(static_cast<size_t>(st.E0), 0);
+        for (int64_t e = 0; e < st.E0; ++e) {
+            st.src[e] = ei[e];
+            st.tgt[e] = ei[st.E0 + e];
+            st.keys[e] = topo_key(st.src[e], st.tgt[e]);
+            st.adj_out[static_cast<size_t>(st.src[e])].push_back(st.tgt[e]);
+        }
+        std::sort(st.keys.begin(), st.keys.end());           // 对称差用 ✓
+        st.x0.assign(xyz.numel(), 0.f);
+        std::memcpy(st.x0.data(), xyz.data(), st.x0.size() * sizeof(float));   // x⁰ 快照（CA 分支用于 margin ✓）
+        topo_margins(xyz, B, L, kk, st.margin);
+        st.kappa.resize(st.margin.size());
+        for (size_t s = 0; s < st.margin.size(); ++s) {
+            st.kappa[s] = 0.5f * cfg.sigma * st.margin[s];   // κ_i = σ·m_i/2 ✓
+        }
+        st.ready = true; st.calls = 0; st.last_omega = 0; st.last_diff = 0;
+        if (cfg.debug) {
+            float mn = std::numeric_limits<float>::infinity(), md = 0.f, mx = 0.f;
+            int zeros = 0;
+            for (float m : st.margin) {
+                if (std::isfinite(m)) { mn = std::min(mn, m); mx = std::max(mx, m); }
+                if (m == 0.f) zeros++;
+            }
+            std::fprintf(stderr, "[TOPO-%s] snapshot(x⁰): B=%d L=%d |E0|=%lld k=%d m: min=%.4g max=%.4g "
+                                 "m==0:%d/%zu sigma=%.3f\n",
+                         cfg.l2 ? "L2" : "L1", B, L, (long long)st.E0, kk,
+                         std::isfinite(mn) ? mn : 0.f, mx, zeros, st.margin.size(), cfg.sigma);
+        }
+        return G0;                                          // 首次边界 => 与原图逐位一致 ✓（几何同源 ✓）
+    }
+    st.calls++;
+
+    // ---------- L3：构造**阻尼 + 信任域投影**基准 B = x⁰ + clamp(γ(x−x⁰), ±κ) ✓ ----------
+    //   数学（TopoPassRefinement.md §6.3 / 附录 A.2.2–A.2.3 ✓）：
+    //     · γ 是最小方差线性组合（BLUE）⇒ 在"冻结(先验)"与"活坐标(预测)"之间做最优加权 ✓
+    //     · clamp 是 ℓ∞ 信任域投影（firmly nonexpansive ✓）⇒ 把基准限制在 margin 可证有效的区域内 ✓
+    //     · 极限：γ=1 且 κ=∞ ⇒ B ≡ x ⇒ **退化为 per_block**（神谕锚点 ✓）；γ=0 ⇒ B ≡ x⁰（纯冻结 ✓）
+    //   ⚠️ 只有 CA（原子轴 1）参与几何与门控 ⇒ 只改 CA 通道即可（其余通道下游不读基准 ✓）
+    std::vector<float> basis;
+    const float* xg = xyz.data();                          // 默认：几何/门控用**活坐标**（L1/L2 ✓）
+    if (cfg.l3) {
+        basis.assign(xyz.numel(), 0.f);
+        std::memcpy(basis.data(), xyz.data(), basis.size() * sizeof(float));
+        for (int b = 0; b < B; ++b) {
+            for (int l = 0; l < L; ++l) {
+                const size_t gi   = static_cast<size_t>(b) * L + l;
+                const size_t base = ((static_cast<size_t>(b) * L + l) * 3 + 1) * 3;   // CA ✓
+                const float  kap  = st.kappa[gi];
+                for (int c = 0; c < 3; ++c) {
+                    float dv = cfg.gamma * (xyz.data()[base + c] - st.x0[base + c]);
+                    if (dv >  kap) dv =  kap;                  // ±κ 逐坐标截断（ℓ∞ 盒投影 ✓）
+                    if (dv < -kap) dv = -kap;
+                    basis[base + c] = st.x0[base + c] + dv;
+                }
+            }
+        }
+        xg = basis.data();
+    }
+
+    // ---------- 之后每次：边集 = 冻结 E(x⁰)（L2 时按 Ω 局部替换）+ 基准几何（L3 ⇒ B ✓） ----------
+    std::vector<int64_t> nsrc, ntgt;
+    if (!cfg.l2) {
+        nsrc = st.src; ntgt = st.tgt;                       // L1：边集完全冻结 ✓
+    } else {
+        // 1) Ω = { i : ‖x_i − x⁰_i‖ ≥ κ_i } ✓
+        std::vector<char> om(static_cast<size_t>(B) * L, 0);
+        for (int b = 0; b < B; ++b) {
+            for (int l = 0; l < L; ++l) {
+                const size_t gi   = static_cast<size_t>(b) * L + l;
+                const size_t base = ((static_cast<size_t>(b) * L + l) * 3 + 1) * 3;
+                const float dx = xg[base]     - st.x0[base];   // L3 ⇒ 用基准 B 判定 Ω（附录 A.2.3 ✓）
+                const float dy = xg[base + 1] - st.x0[base + 1];
+                const float dz = xg[base + 2] - st.x0[base + 2];
+                const float disp = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (disp >= st.kappa[gi]) om[gi] = 1;
+            }
+        }
+        // 2) Ω 邻居封闭（默认 ✓）：Ω ← Ω ∪ N(E(x⁰), Ω) —— 否则"邻居移动导致自己翻边"会被漏掉 ✗
+        if (cfg.closure) {
+            for (int64_t e = 0; e < st.E0; ++e) {
+                const int64_t s = st.src[e], t = st.tgt[e];
+                if (om[static_cast<size_t>(s)] && !om[static_cast<size_t>(t)]) om[static_cast<size_t>(t)] = 1;
+                else if (om[static_cast<size_t>(t)] && !om[static_cast<size_t>(s)]) om[static_cast<size_t>(s)] = 1;
+            }
+        }
+        int64_t omega_n = 0;
+        for (char c : om) omega_n += (c ? 1 : 0);
+
+        // 3) 逐行重建：非 Ω 行照抄冻结边 ✓；Ω 行在候选集 C_i 内按实时距离取 top-k ✓（并保留 kmin 支 ✓）
+        nsrc.reserve(static_cast<size_t>(st.E0));
+        ntgt.reserve(static_cast<size_t>(st.E0));
+        std::vector<int64_t> cand;
+        std::vector<std::pair<float, int>> ds;
+        std::vector<char> in_topk(static_cast<size_t>(L), 0);
+        for (int b = 0; b < B; ++b) {
+            for (int l = 0; l < L; ++l) {
+                const int64_t gi = static_cast<int64_t>(b) * L + l;
+                if (!om[static_cast<size_t>(gi)]) {
+                    for (int64_t j : st.adj_out[static_cast<size_t>(gi)]) {
+                        nsrc.push_back(gi); ntgt.push_back(j);
+                    }
+                    continue;
+                }
+                // 候选集 C_i = 冻结出邻居 ∪ 其二跳 ✓（去重、排除自身 ✓）
+                cand.clear();
+                for (int64_t j : st.adj_out[static_cast<size_t>(gi)]) cand.push_back(j);
+                const size_t n1 = cand.size();
+                for (size_t t = 0; t < n1; ++t)
+                    for (int64_t j2 : st.adj_out[static_cast<size_t>(cand[t])]) cand.push_back(j2);
+                std::sort(cand.begin(), cand.end());
+                cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+                cand.erase(std::remove(cand.begin(), cand.end(), gi), cand.end());
+                // 实时距离 + (dist, j) 全序 ⇒ 与 make_graph 同 tie-break ✓
+                ds.clear();
+                const int bi = static_cast<int>(((gi / L * L + l) * 3 + 1) * 3);
+                for (int64_t j : cand) {
+                    const int bj = static_cast<int>((((j / L) * L + (j % L)) * 3 + 1) * 3);
+                    const float dx = xg[bj]     - xg[bi];        // L3 ⇒ 局部重选距离也用基准 B ✓
+                    const float dy = xg[bj + 1] - xg[bi + 1];
+                    const float dz = xg[bj + 2] - xg[bi + 2];
+                    ds.push_back({ std::sqrt(dx * dx + dy * dy + dz * dz), static_cast<int>(j) });
+                }
+                const int take = std::min<int>(kk, static_cast<int>(ds.size()));
+                if (take > 0) std::partial_sort(ds.begin(), ds.begin() + take, ds.end());
+                std::fill(in_topk.begin(), in_topk.end(), 0);
+                for (int t = 0; t < take; ++t) in_topk[static_cast<size_t>(ds[t].second % L)] = 1;
+                // 逐 j 判定（与 make_graph 同规则：top-k 空间近邻 OR sep<kmin ✓）
+                const int64_t ridx_i = idx.data()[b * L + l];
+                for (int j = 0; j < L; ++j) {
+                    if (j == l) continue;
+                    const int sep = std::abs(static_cast<int>(idx.data()[b * L + j] - ridx_i));
+                    if (in_topk[static_cast<size_t>(j)] || sep < kmin) {
+                        nsrc.push_back(gi); ntgt.push_back(static_cast<int64_t>(b) * L + j);
+                    }
+                }
+            }
+        }
+        st.last_omega = omega_n;
+    }
+
+    GraphData G = graph_from_edgelist(xg, pair, nsrc, ntgt, B, L);   // L3 ⇒ 几何来自基准 B ✓（L1/L2 ⇒ 活坐标 ✓）
+
+    if (cfg.debug) {
+        // |E_t Δ E(x⁰)| = D 的分子 ✓（与离线 topo_policy_replay.py 的口径一致 ✓）
+        std::vector<uint64_t> k2(nsrc.size());
+        for (size_t e = 0; e < nsrc.size(); ++e) k2[e] = topo_key(nsrc[e], ntgt[e]);
+        std::sort(k2.begin(), k2.end());
+        std::vector<uint64_t> sym;
+        std::set_symmetric_difference(st.keys.begin(), st.keys.end(), k2.begin(), k2.end(),
+                                      std::back_inserter(sym));
+        st.last_diff = static_cast<int64_t>(sym.size());
+        std::fprintf(stderr, "[TOPO-%s] call=%d |E|=%zu (E0=%lld) |Omega|=%lld |E Δ E0|=%lld (D=%.4f)\n",
+                     cfg.l2 ? "L2" : "L1", st.calls, nsrc.size(), (long long)st.E0,
+                     (long long)st.last_omega, (long long)st.last_diff,
+                     st.E0 > 0 ? double(st.last_diff) / double(st.E0 + nsrc.size() - st.last_diff) : 0.0);
+    }
+    return G;
+}
+
 } // namespace se3
 
 // ============================================================================

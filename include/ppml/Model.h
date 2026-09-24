@@ -226,7 +226,11 @@ public:
                                                TensorF32*& state,
                                                const TensorF32& coords,
                                                const TensorI64& residx,
-                                               const TensorF32& seq1hot);
+                                               const TensorF32& seq1hot,
+                                               // 【refined topo pass L1/L2】可选：非空时走 make_graph_refined ✓
+                                               //   （cfg/st 为空 ⇒ 与原来逐位一致 ✓，见 SE3Transformer.h ✓）
+                                               const se3::TopoRefineCfg*   topo_cfg = nullptr,
+                                               se3::TopoRefineState*       topo_st  = nullptr);
 
     // 坐标更新（图外值回落）：把 SE3 度1 offset 值叠加到 coords → xyz_new_（值版 Step4k）。
     // offset_value 布局 (B*L, 3, 3)，[N,CA,C] 通道；CA 为绝对位移。供训练入口在 graph_compute
@@ -381,7 +385,11 @@ public:
                                                       TensorF32*& state,
                                                       const TensorF32& coords,
                                                       const TensorI64& residx,
-                                                      const TensorF32& seq1hot);
+                                                      const TensorF32& seq1hot,
+                                                      // 【refined topo pass L1/L2】同 IterBlock ✓（与 refine 块**共用同一份**状态 ⇒
+                                                      //   跨 iter/refine 边界的 Ω 门控是连续的 ✓）
+                                                      const se3::TopoRefineCfg*   topo_cfg = nullptr,
+                                                      se3::TopoRefineState*       topo_st  = nullptr);
 
     // 设置额外输入（在 forward 调用前设置）
     //void set_seq_info(const TensorF32& seq1hot, const TensorI64& idx);

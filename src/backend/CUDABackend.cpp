@@ -318,13 +318,16 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             if (!src0 || !src1 || !src2) return false;
             if (src0->type != TENSOR_TYPE_F32) return false;
             const int d = static_cast<int>(src0->shape().dim(0));   // flash 布局 dims[0] = d ✓
-            return d > 0 && d <= 64;
+            // ⚠️【②-v2】前向改 lane 切分后要求 d 是 4 的倍数（每 lane 的切片要 16B 对齐 ✓）
+            //   不满足 ⇒ 返回 false ⇒ 调度器把该节点派给 CPU ✓（CPU 版无此限制 ✓）
+            return d > 0 && d <= 64 && (d % 4) == 0;
         }
         case OP_FLASH_ATTN_BACK: {
             if (!src0) return false;
             if (src0->type != TENSOR_TYPE_F32) return false;
             const int d = static_cast<int>(src0->shape().dim(0));
-            return d > 0 && d <= 32;
+            // ⚠️【②-v2】反向同样 lane 切分 ⇒ 也要求 d 是 4 的倍数 ✓（不满足 ⇒ 派给 CPU ✓）
+            return d > 0 && d <= 32 && (d % 4) == 0;
         }
 
         // ===== 未实现的 op =====
