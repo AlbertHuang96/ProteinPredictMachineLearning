@@ -555,7 +555,7 @@ GraphData make_graph(const TensorF32& xyz,
 namespace {
 
 // 由 host 边列表 + **实时**坐标 + pair 填三件张量（与 make_graph 第 3 步同构 ✓）
-//   ⚠️ 第一参数用**裸指针**（不是张量）⇒ 可以传 L3 的基准 B（host 缓冲 ✓，不一定等于某个张量 ✓）
+//    第一参数用**裸指针**（不是张量）⇒ 可以传 L3 的基准 B（host 缓冲 ✓，不一定等于某个张量 ✓）
 GraphData graph_from_edgelist(const float* xyz_data, const TensorF32& pair,
                               const std::vector<int64_t>& src,
                               const std::vector<int64_t>& tgt,
@@ -596,8 +596,8 @@ GraphData graph_from_edgelist(const float* xyz_data, const TensorF32& pair,
 }
 
 // 每节点第 k 与第 k+1 近邻**距离**之差 = margin m_i ✓
-//   ⚠️ 与 make_graph 同距离口径：float 减法 + sqrt ✓（对角线 i==j 跳过 ✓）
-//   ⚠️ margin 只需要**距离值** ⇒ 与 tie-break 无关 ✓（并列时 m_i = 0 ✓，正是"危险"信号 ✓）
+//    与 make_graph 同距离口径：float 减法 + sqrt ✓（对角线 i==j 跳过 ✓）
+//    margin 只需要**距离值** ⇒ 与 tie-break 无关 ✓（并列时 m_i = 0 ✓，正是"危险"信号 ✓）
 void topo_margins(const TensorF32& xyz, int B, int L, int kk, std::vector<float>& m_out) {
     const float* xd = xyz.data();
     m_out.assign(static_cast<size_t>(B) * L, std::numeric_limits<float>::infinity());
@@ -684,7 +684,7 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
     //     · γ 是最小方差线性组合（BLUE）⇒ 在"冻结(先验)"与"活坐标(预测)"之间做最优加权 ✓
     //     · clamp 是 ℓ∞ 信任域投影（firmly nonexpansive ✓）⇒ 把基准限制在 margin 可证有效的区域内 ✓
     //     · 极限：γ=1 且 κ=∞ ⇒ B ≡ x ⇒ **退化为 per_block**（神谕锚点 ✓）；γ=0 ⇒ B ≡ x⁰（纯冻结 ✓）
-    //   ⚠️ 只有 CA（原子轴 1）参与几何与门控 ⇒ 只改 CA 通道即可（其余通道下游不读基准 ✓）
+    //    只有 CA（原子轴 1）参与几何与门控 ⇒ 只改 CA 通道即可（其余通道下游不读基准 ✓）
     std::vector<float> basis;
     const float* xg = xyz.data();                          // 默认：几何/门控用**活坐标**（L1/L2 ✓）
     if (cfg.l3) {

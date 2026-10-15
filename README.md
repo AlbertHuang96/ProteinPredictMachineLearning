@@ -5,6 +5,10 @@ Inspired by RosettaFoldAllAtom(RFAA) and GGML
 
 Chinese version: [README.zh-CN.md](README.zh-CN.md)
 
+## Research Notes
+
+Do some research about the input coords of SE(3) blocks: https://arxiv.org/pdf/2610.19246
+
 ## References
 
 This repository is an independent C++ re-implementation (research / engineering prototype); the two
