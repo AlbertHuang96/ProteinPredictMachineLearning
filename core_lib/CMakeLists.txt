@@ -75,6 +75,9 @@ target_link_libraries(ppml_core_static PUBLIC
     CUDA::cublas
     #CUDA::cudnn
 )
+if(WIN32)
+    target_link_libraries(ppml_core_static PUBLIC ws2_32)
+endif()
 
 # 动态库 (对外暴露接口)
 add_library(ppml_core SHARED ${CORE_SOURCES})
@@ -86,6 +89,9 @@ target_link_libraries(ppml_core PUBLIC
     CUDA::cublas
     #CUDA::cudnn
 )
+if(WIN32)
+    target_link_libraries(ppml_core PUBLIC ws2_32)
+endif()
 
 # 设置 DLL 导出宏
 target_compile_definitions(ppml_core PRIVATE PPML_BUILD_DLL)

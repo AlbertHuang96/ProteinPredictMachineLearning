@@ -4,16 +4,28 @@
 // ============================================================
 #include "ppml/RemoteProtocol.h"
 
+#if defined(_WIN32)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#ifndef MSG_NOSIGNAL
+#define MSG_NOSIGNAL 0
+#endif
+#define PPML_SET_SOCKOPT(fd, level, optname, value, length) \
+    ::setsockopt(fd, level, optname, reinterpret_cast<const char*>(value), static_cast<int>(length))
+#else
 #include <arpa/inet.h>
-#include <cerrno>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#define PPML_SET_SOCKOPT(fd, level, optname, value, length) \
+    ::setsockopt(fd, level, optname, value, length)
+#endif
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 namespace ppml {
 namespace rnet {
@@ -61,7 +73,14 @@ RSocket& RSocket::operator=(RSocket&& o) noexcept {
 }
 
 void RSocket::close() {
-    if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
+    if (fd_ >= 0) {
+#if defined(_WIN32)
+        ::closesocket(static_cast<SOCKET>(fd_));
+#else
+        ::close(fd_);
+#endif
+        fd_ = -1;
+    }
 }
 
 void RSocket::set_timeout_ms(int ms) {
@@ -75,13 +94,13 @@ void RSocket::set_timeout_ms(int ms) {
     //   后续长等待（DP allreduce：等对端算完一个 forward，可达数十秒）被 EAGAIN 打断 ⇒
     //   allreduce_sum 返回 false 但 UP 已发出 ⇒ 请求/回包**流错位一格** ⇒ 静默错值 + 崩溃。
     //   现在：ms<=0 → tv 全 0 = 不限时（真正的阻塞），与调用处语义一致。
-    ::setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    ::setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    PPML_SET_SOCKOPT(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    PPML_SET_SOCKOPT(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
 static void set_tcp_nodelay(int fd) {
     int one = 1;
-    ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    PPML_SET_SOCKOPT(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 }
 
 bool RSocket::listen_on(int port, int backlog) {
@@ -89,7 +108,7 @@ bool RSocket::listen_on(int port, int backlog) {
     fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd_ < 0) return false;
     int one = 1;
-    ::setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    PPML_SET_SOCKOPT(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
 
     sockaddr_in addr{};
     addr.sin_family      = AF_INET;
@@ -111,7 +130,11 @@ bool RSocket::listen_on(int port, int backlog) {
 bool RSocket::accept_one(RSocket& out) {
     if (fd_ < 0) return false;
     sockaddr_in peer{};
-    socklen_t len = sizeof(peer);
+ #if defined(_WIN32)
+     int len = sizeof(peer);
+ #else
+     socklen_t len = sizeof(peer);
+ #endif
     int c = ::accept(fd_, (sockaddr*)&peer, &len);
     if (c < 0) {
         std::fprintf(stderr, "[rnet] accept failed: %s\n", std::strerror(errno));
@@ -147,11 +170,11 @@ bool RSocket::connect_to(const std::string& host, int port, int timeout_ms) {
     // TCP keepalive（T1 2026-09-16）：让内核在链路静默死亡时能发现（默认 2h ✗ 太久 ⇒ 缩到 60s 探测）
     {
         int one = 1;
-        ::setsockopt(fd_, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+        PPML_SET_SOCKOPT(fd_, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
         int idle = 60, intvl = 15, cnt = 4;
-        ::setsockopt(fd_, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
-        ::setsockopt(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-        ::setsockopt(fd_, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
+        PPML_SET_SOCKOPT(fd_, IPPROTO_TCP, TCP_KEEPIDLE,  &idle,  sizeof(idle));
+        PPML_SET_SOCKOPT(fd_, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+        PPML_SET_SOCKOPT(fd_, IPPROTO_TCP, TCP_KEEPCNT,   &cnt,   sizeof(cnt));
     }
     // 后续等待改为**耐心但有界**：DP allreduce 要等对端算完一个 forward（数十秒），
     // 原 `set_timeout_ms(0)` 既没生效（未清超时）又会让真正的死连接永久挂住。
@@ -169,7 +192,7 @@ bool RSocket::send_all(const void* data, size_t n) {
     const uint8_t* p = static_cast<const uint8_t*>(data);
     size_t left = n;
     while (left > 0) {
-        ssize_t w = ::send(fd_, p, left, MSG_NOSIGNAL);
+        int w = ::send(fd_, reinterpret_cast<const char*>(p), static_cast<int>(left), MSG_NOSIGNAL);
         if (w < 0) {
             if (errno == EINTR) continue;
             std::fprintf(stderr, "[rnet] send failed: %s\n", std::strerror(errno));
@@ -184,7 +207,7 @@ bool RSocket::recv_all(void* data, size_t n) {
     uint8_t* p = static_cast<uint8_t*>(data);
     size_t left = n;
     while (left > 0) {
-        ssize_t r = ::recv(fd_, p, left, 0);
+        int r = ::recv(fd_, reinterpret_cast<char*>(p), static_cast<int>(left), 0);
         if (r == 0) { std::fprintf(stderr, "[rnet] peer closed\n"); return false; }
         if (r < 0) {
             if (errno == EINTR) continue;

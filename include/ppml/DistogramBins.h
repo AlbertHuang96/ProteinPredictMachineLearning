@@ -250,7 +250,7 @@ void compute_distance_onehot(
 void compute_omega_onehot(
     const TensorF32& coords,
     const float* seq_mask,
-    float* Ω_onehot);
+    float* omega_onehot);
 
 /**
  * @brief 从坐标计算 Θ (theta) 二面角 one-hot labels
@@ -264,7 +264,7 @@ void compute_omega_onehot(
 void compute_theta_onehot(
     const TensorF32& coords,
     const float* seq_mask,
-    float* Θ_onehot);
+    float* theta_onehot);
 
 /**
  * @brief 从坐标计算 Φ (phi) 平面角 one-hot labels
@@ -278,7 +278,7 @@ void compute_theta_onehot(
 void compute_phi_onehot(
     const TensorF32& coords,
     const float* seq_mask,
-    float* Φ_onehot);
+    float* phi_onehot);
 
 /**
  * @brief 一次性计算全部 4 个 one-hot label 张量
@@ -296,8 +296,8 @@ void compute_all_distogram_onehots(
     const TensorF32& coords,
     const float* seq_mask,
     float* D_onehot,
-    float* Ω_onehot,
-    float* Θ_onehot,
-    float* Φ_onehot);
+    float* omega_onehot,
+    float* theta_onehot,
+    float* phi_onehot);
 
 } // namespace ppml

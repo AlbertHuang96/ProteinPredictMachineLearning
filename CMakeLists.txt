@@ -38,7 +38,8 @@ include_directories(
 
 # 编译选项
 if(MSVC)
-    add_compile_options(/W4)
+    add_compile_definitions(NOMINMAX _USE_MATH_DEFINES)
+    add_compile_options($<$<COMPILE_LANGUAGE:CXX>:/W4>)
     # /O2
 else()
     # 训练性能需要：朴素矩阵乘等在 -O0 下极慢(5-20x)，开 -O2 保留 -g 符号 (RelWithDebInfo 风格)。

@@ -52,6 +52,7 @@ TensorF32 PairTrack::templ_stack(const TensorF32& in_templ, const TensorF32& rbf
     out = templ;  // placeholder
     out = out.view({B, T, L, L, 64});
     return out; */
+    return TensorF32();
 }
 
 void PairTrack::inject_template(const TensorF32& in_templ) {

@@ -20,6 +20,7 @@ target_include_directories(ppml_gpu PUBLIC
 )
 
 target_link_libraries(ppml_gpu PRIVATE
+    ppml_core_static
     CUDA::cudart
     CUDA::cublas
     CUDA::cufft

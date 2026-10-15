@@ -24,9 +24,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <thread>          // 阶段 A：peer 模式后台服务线程（rank0 既训练又服务对端）
+#if defined(__linux__)
 #include <unistd.h>        // sysconf 用于页大小/物理页数 (内存)
 #include <sys/sysinfo.h>   // sysinfo 用于总/可用内存
 #include <sys/resource.h>  // getrusage 用于 RSS 峰值
+#endif
 #include <cuda_runtime.h>  // cudaGetDeviceProperties 用于 GPU 信息
 
 // 远端后端是否**真的**可用：必须同时有 `PPML_REMOTE_HOST` 且 `PPML_REMOTE_OPS` 非空。
@@ -86,6 +88,14 @@ using namespace ppml;
 //   本项目日志混用 std::cout(stdout) 与 fprintf(stderr)：重定向到文件时 stdout 被块缓冲 ⇒
 //   两路日志的交错顺序是**伪造的** ⇒ 不能用行序推断因果 ✗（2026-09-14 深夜据此误判过一次，已撤回结论）。
 namespace {
+void set_train_environment(const char* name, const char* value) {
+#if defined(_WIN32)
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 0);
+#endif
+}
+
 struct StdoutLineBuffered {
     StdoutLineBuffered() { std::setvbuf(stdout, nullptr, _IOLBF, 0); }
 } g_stdout_line_buffered;
@@ -180,12 +190,18 @@ static int dp_allreduce_grads_dispatch(ComputeGraph* g) {
 void print_system_info() {
     // ---- CPU ----
     std::cout << "==== System Info ====" << std::endl;
-    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+        long ncpu =
+    #if defined(__linux__)
+        sysconf(_SC_NPROCESSORS_ONLN);
+    #else
+        static_cast<long>(std::thread::hardware_concurrency());
+    #endif
     std::cout << "  CPU   : " << ncpu << " logical cores" << std::endl;
     // 运行时检测 x86 SIMD 特性（SSE/AVX/AVX2/AVX-512/FMA 等，含 OS XCR0 校验）
     ppml::print_cpu_features(stdout);
 
     // ---- 内存 (Linux sysinfo) ----
+#if defined(__linux__)
     struct sysinfo si;
     if (sysinfo(&si) == 0) {
         const double gb = 1024.0 * 1024.0 * 1024.0;
@@ -194,6 +210,7 @@ void print_system_info() {
                   << "available " << (si.freeram * si.mem_unit / gb) << " GB"
                   << std::endl;
     }
+#endif
 
     // ---- GPU (CUDA) ----
     int dev_count = 0;
@@ -552,15 +569,19 @@ void print_rss(const char* tag) {
             else if (line.rfind("VmHWM:", 0) == 0)  vmhwm  = std::atoll(line.c_str() + 6);
         }
     }
+    long long rss_max = -1;
+#if defined(__linux__)
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
+    rss_max = ru.ru_maxrss / 1024;
+#endif
     const PPMLContext& ctx = context();
     size_t arena_used = 0;                       // context 固定缓冲区已用字节
     if (ctx.objects_end) arena_used = ctx.objects_end->offs + ctx.objects_end->size;
     std::cout << "[RSS:" << tag << "] VmRSS=" << (vmrss / 1024)
               << "MB VmSize=" << (vmsize / 1024)
               << "MB VmHWM=" << (vmhwm / 1024)
-              << "MB rss_max=" << (ru.ru_maxrss / 1024)
+              << "MB rss_max=" << rss_max
               << "MB arena_used=" << (arena_used / (1024 * 1024))
               << "MB n_objects=" << ctx.n_objects
               << " scratch_blocks=" << ctx.scratch_.size() << std::endl;
@@ -608,9 +629,11 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
         } catch (...) {}
     }
     double need_gb = estimate_peak_gb(max_L, msa_max_seqs);
-    struct sysinfo si;
     double free_gb = 0;
+#if defined(__linux__)
+    struct sysinfo si;
     if (sysinfo(&si) == 0) free_gb = (double)si.freeram * si.mem_unit / (1024.0*1024.0*1024.0);
+#endif
     double min_free_gb = 22.0;
     if (const char* mg = std::getenv("PPML_MIN_FREE_GB")) min_free_gb = std::atof(mg);
     std::cout << "[space] 最大 L=" << max_L << " 估算峰值≈" << std::fixed << std::setprecision(1)
@@ -1201,7 +1224,7 @@ int main(int argc, char* argv[]) {
     // ===== FULL_TRAIN 默认配置注入（2026-08-23）=====
     // 1) 开关B（per_block SE3 拓扑）：FULL_TRAIN 时默认开启，除非用户显式指定 PPML_SE3_TOPO。
     if (full_train && std::getenv("PPML_SE3_TOPO") == nullptr) {
-        setenv("PPML_SE3_TOPO", "per_block", 0);  // overwrite=0：不覆盖用户显式值
+        set_train_environment("PPML_SE3_TOPO", "per_block");
     }
     // 2) scale 可学习策略（回答"大样本 scale 应可学习还是超参数"）：
     //    - 大样本 + 多样本梯度累加(PPML_MULTI_SAMPLE=1)：scale 自动【可学习】。单样本实验已证
@@ -1214,7 +1237,7 @@ int main(int argc, char* argv[]) {
         (std::getenv("PPML_MULTI_SAMPLE") != nullptr) &&
         (std::strcmp(std::getenv("PPML_MULTI_SAMPLE"), "1") == 0);
     if (full_train && multi_sample && std::getenv("PPML_SE3_LEARN_SCALE") == nullptr) {
-        setenv("PPML_SE3_LEARN_SCALE", "1", 0);
+        set_train_environment("PPML_SE3_LEARN_SCALE", "1");
     }
     std::cout << "[FULL_TRAIN cfg] SE3_TOPO="
               << (std::getenv("PPML_SE3_TOPO") ? std::getenv("PPML_SE3_TOPO") : "(unset)")
