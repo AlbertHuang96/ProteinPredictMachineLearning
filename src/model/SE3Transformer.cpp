@@ -5,6 +5,7 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <cstdlib>
 
 
 
@@ -2475,11 +2476,33 @@ std::vector<TensorF32*> GMABSE3::forward_graph(
     TensorF32* s_node = scatter_add(exp_e, edge_tgt_idx, N);             // [n_heads, N]
     TensorF32* s_edge = edge_gather_rows(s_node, edge_tgt_idx);          // [n_heads, E]
     // 除零保护：s_edge 为 0 的目标节点（无入边）→ 分母加 eps，避免 div(exp,0)=inf → NaN
-    TensorF32* s_eps  = add1_impl(s_edge, constant_scalar(1e-6f), false);
-    // 【2026-09-22 修复】同样的硬底线（clamp ≥ 1e-6）：exp_e ∈ (0,1] ⇒ 最多放大 1e6（有限 ✓），
-    //   但绝不允许除数为 0 ⇒ 消除 div(exp,0)=inf / 0/0=NaN ✗。
-    TensorF32* s_eps_s = clamp(s_eps, 1e-6f, 1e30f);                     // [n_heads, E]
+    // 除零保护：s_edge 为 0 的目标节点（无入边 / 全部下溢）→ 分母加 eps，避免 div(exp,0)=inf → NaN
+    // 【2026-10-19】地板 1e-6 → 1e-2（env PPML_GMAB_FLOOR 可调）：
+    //   前向 exp/1e-6 无害（分子同时下溢，商≈0），但反向 d/da = grad/s 会放大 1e6。
+    //   实测（GRAPH_DEBUG_NAN + PPML_HASH_NODES，node 8752）：分母整片命中地板，
+    //   grad~1e-3 ⇒ 商 1e3~1e5，SE3 桶裁剪前梯度 3.4e5。
+    //   s_edge = 目标节点入边 exp 之和（逐边 gather，恒 ≥ exp_e）⇒ 只有该节点全部入边
+    //   下溢时才为 0，此时 a = 0/floor = 0 仍然精确；抬地板只改变 0<s<floor 那段的放大倍数。
+    // 【可选】PPML_GMAB_MASK=1：把 s_edge<=0 的边显式置 a=0（连同其反向梯度），用于对比
+    //   "抬地板" vs "掩掉零分母"；s_edge>0 的分支数值完全不变。
+    static const float gmab_floor = [] {
+        const char* e = std::getenv("PPML_GMAB_FLOOR");
+        return e ? static_cast<float>(std::atof(e)) : 1e-2f;
+    }();
+    static const bool gmab_mask = [] {
+        const char* e = std::getenv("PPML_GMAB_MASK");
+        return e && std::atoi(e) != 0;
+    }();
+    TensorF32* s_eps  = add1_impl(s_edge, constant_scalar(gmab_floor), false);
+    // 【2026-09-22】硬底线（clamp ≥ floor）：即使 add1 因某条路径未生效也保证分母 ≥ floor。
+    TensorF32* s_eps_s = clamp(s_eps, gmab_floor, 1e30f);                // [n_heads, E]
     TensorF32* a      = div(exp_e, s_eps_s);                             // [n_heads, E] softmax
+    if (gmab_mask) {
+        std::vector<float> ones(static_cast<size_t>(n_heads_) * static_cast<size_t>(E), 1.0f);
+        TensorF32* ones_t = constant_tensor({static_cast<int64_t>(n_heads_), E}, ones.data());
+        TensorF32* step   = relu_back(ones_t, s_edge);                   // 1 where s_edge > 0
+        a = mul(a, step);
+    }
 
     // ===== Step 5: 每度注意力加权聚合 =====
     std::vector<TensorF32*> out(f_value_.size(), nullptr);
@@ -3000,9 +3023,25 @@ std::vector<TensorF32*> GNormBias::forward_graph(
         //   ⇒ **被除数(t)与除数(denom)抽样全为 0 ⇒ 0/0 = NaN** ✗（该 NaN 随后经 MUL_MAT/EDGE_GATHER/
         //   PER_EDGE_MATMUL 扩散到全图 1876 个节点，并让 3 个 epoch 的 step 全成 no-op）。
         //   即使 `+eps_` 因某条路径未生效（或 eps_ 被外部设为 0），clamp 也保证分母 ≥ eps_ ✓。
-        //   语义安全：norm=0 ⇒ v 全 0 ⇒ out = 0 × (t/eps_) = 0（有限 ✓）；norm>0 时 clamp 不改数值 ✓。
-        TensorF32* denom_s  = clamp(denom, eps_, 1e30f);                // [1,m,N]（下限 eps_）
-        TensorF32* scale3   = div(t, denom_s);                          // [1,m,N]
+        //
+        // 【2026-10-19 修复】上面这条只有"防 0/0"的作用，防不住放大：
+        //   t = ReLU(norm + bias)，norm≈0 而 bias>0 时 t≈bias>0，而 denom 被夹到 eps_=1e-5
+        //   ⇒ 单步增益 t/eps_ ≈ 1e4~1e5。实测（GRAPH_DEBUG_NAN=1，node_n=5410，L=51）
+        //      t ∈ [0.174, 0.269]，denom 命中下限 1e-5，商 1.74e4，随后乘到 v 上逐层放大 ⇒
+        //      反向 se3 桶裁剪前梯度 1e8~1e11（[CLIP] scale_se3 低到 6.5e-14）。
+        //   原注释"norm=0 ⇒ v 全 0 ⇒ out=0"只在 bias ≤ 0 时成立，bias 是学出来的、可为正。
+        //   两道闸：① 分母地板取**特征量级**（默认 1e-2，env PPML_SE3_GNORM_FLOOR）；
+        //           ② 直接夹门控增益 ±C（默认 10，env PPML_SE3_GNORM_MAX），保证 out 与 v 同量级。
+        static const float gnorm_floor = [] {
+            const char* e = std::getenv("PPML_SE3_GNORM_FLOOR");
+            return e ? static_cast<float>(std::atof(e)) : 1e-2f;
+        }();
+        static const float gnorm_gain = [] {
+            const char* e = std::getenv("PPML_SE3_GNORM_MAX");
+            return e ? static_cast<float>(std::atof(e)) : 10.0f;
+        }();
+        TensorF32* denom_s  = clamp(denom, gnorm_floor, 1e30f);                 // [1,m,N] 地板=特征量级
+        TensorF32* scale3   = clamp(div(t, denom_s), -gnorm_gain, gnorm_gain);  // [1,m,N] 增益有界
         // scale3 [1,m,N] → [d_dim,m,N]（每通道 d_dim 个 Wigner 分量共享同一 scale）→ view 回 [m*d_dim,N]
         TensorF32* scale3d  = repeat(scale3, v3);                       // [d_dim, m, N]
         TensorF32* scale_f  = view(scale3d, Shape({m * d_dim, N}));     // [m*d_dim, N]

@@ -503,6 +503,63 @@ void CPUBackend::compute_thread(ThreadState * state) {
             }
         }
 
+        // ---- 开发诊断：src 的 min/max 采样必须放在 dispatch **之前**（2026-10-19）----
+        //   为什么：dispatch + barrier 之后，ith=1..n-1 已经在算下一个节点，而 gallocr 可能把
+        //   刚释放的 src buffer 复用给那个节点的输出 ⇒ 事后统计会读到被覆盖的字节。
+        //   实测 node 8752：事后打出 denom min=-1101，而同一 buffer 在执行前（[NHP]）是
+        //   1e-6（clamp 地板）⇒ 事后读数是假警报。这里只在"本节点还没执行"时采样一次。
+        //   仅对 explode 打印需要的 op 采样（DIV / PER_EDGE_MATMUL），开销受限。
+        struct SrcSnap {
+            bool    valid = false;
+            int64_t numel = 0;
+            float   mn = 0.f, mx = 0.f;
+            // 仅当本张量是 CLAMP：地板/上限 + 其输入（未裁剪的 s_edge+eps）的统计
+            bool    is_clamp = false;
+            float   clo = 0.f, chi = 0.f;
+            bool    in_valid = false;
+            float   imn = 0.f, imx = 0.f;
+            int64_t i_zero = 0;      // 输入 <= 0 的元素数（无入边 / 全部下溢）
+            int64_t i_at_floor = 0;  // 输入 <= 地板 的元素数（s_edge 被 floor 吞掉，含恰好 0）
+        };
+        SrcSnap snap0, snap1;
+        if (ith == 0 && std::getenv("GRAPH_DEBUG_NAN") &&
+            (node->op == OP_DIV || node->op == OP_PER_EDGE_MATMUL)) {
+            auto take = [](TensorF32* t) {
+                SrcSnap s;
+                if (!t || !t->data() || t->numel() <= 0) return s;
+                const float* p = t->data();
+                s.valid = true;
+                s.numel = t->numel();
+                s.mn = s.mx = p[0];
+                for (int64_t k = 1; k < s.numel; ++k) {
+                    float v = p[k];
+                    if (v < s.mn) s.mn = v;
+                    if (v > s.mx) s.mx = v;
+                }
+                if ((int)t->op == 51 /*OP_CLAMP*/) {
+                    s.is_clamp = true;
+                    memcpy(&s.clo, t->op_params,     sizeof(float));
+                    memcpy(&s.chi, t->op_params + 1, sizeof(float));
+                    TensorF32* in = t->src[0];
+                    if (in && in->data() && in->numel() > 0) {
+                        const float* q = in->data();
+                        s.in_valid = true;
+                        s.imn = s.imx = q[0];
+                        for (int64_t k = 0; k < in->numel(); ++k) {
+                            float v = q[k];
+                            if (v < s.imn) s.imn = v;
+                            if (v > s.imx) s.imx = v;
+                            if (v <= 0.f)    ++s.i_zero;
+                            if (v <= s.clo)  ++s.i_at_floor;
+                        }
+                    }
+                }
+                return s;
+            };
+            snap0 = take(node->src[0]);
+            snap1 = take(node->src[1]);
+        }
+
         dispatch_node(node, &params);
 
         if (ith == 0 && cplan->abort_callback &&
@@ -555,59 +612,64 @@ void CPUBackend::compute_thread(ThreadState * state) {
                             (long long)(s1&&s1->shape().ndim()>2?s1->shape().dims[2]:-1),
                             (long long)(s1&&s1->shape().ndim()>3?s1->shape().dims[3]:-1),
                             opname(s1?s1->src[0]:nullptr));
-                    //    denom(src1=norm+eps) 统计。若 t≈norm 但 norm 巨大而输入 x 正常 → 布局错位。
-                    if ((int)node->op == 8 /*OP_DIV*/ && node->shape().ndim() >= 3) {
-                        const float* td = s0 ? s0->data() : nullptr;
-                        const float* dd_ = s1 ? s1->data() : nullptr;
-                        if (td && s0->numel() > 0) {
-                            float tmin = td[0], tmax = td[0];
-                            for (int64_t kk = 1; kk < s0->numel(); ++kk) { float tv = td[kk]; if (tv<tmin)tmin=tv; if (tv>tmax)tmax=tv; }
-                            fprintf(stderr, "  [div-gnorm] t(src0=relu) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
-                                    (long long)(s0->shape().ndim()>0?s0->shape().dims[0]:-1),
-                                    (long long)(s0->shape().ndim()>1?s0->shape().dims[1]:-1),
-                                    (long long)(s0->shape().ndim()>2?s0->shape().dims[2]:-1),
-                                    (double)tmin, (double)tmax, (long long)s0->numel());
+                    //    祖先链（沿 src[0] 上溯 5 层）：用于把这个节点对回源码里的表达式
+                    {
+                        TensorF32* anc = node;
+                        for (int lv = 0; lv < 5 && anc; ++lv) {
+                            const int ndv = anc->shape().ndim();
+                            fprintf(stderr, "    anc lv%d op=%d dims=[%lld,%lld,%lld,%lld] numel=%lld s0op=%d s1op=%d\n",
+                                    lv, (int)anc->op,
+                                    (long long)(ndv>0?anc->shape().dims[0]:-1),
+                                    (long long)(ndv>1?anc->shape().dims[1]:-1),
+                                    (long long)(ndv>2?anc->shape().dims[2]:-1),
+                                    (long long)(ndv>3?anc->shape().dims[3]:-1),
+                                    (long long)anc->numel(),
+                                    opname(anc->src[0]), opname(anc->src[1]));
+                            anc = anc->src[0];
                         }
-                        if (dd_ && s1->numel() > 0) {
-                            float dmin = dd_[0], dmax = dd_[0];
-                            for (int64_t kk = 1; kk < s1->numel(); ++kk) { float dv = dd_[kk]; if (dv<dmin)dmin=dv; if (dv>dmax)dmax=dv; }
-                            fprintf(stderr, "  [div-gnorm] denom(src1=norm+eps) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
-                                    (long long)(s1->shape().ndim()>0?s1->shape().dims[0]:-1),
-                                    (long long)(s1->shape().ndim()>1?s1->shape().dims[1]:-1),
-                                    (long long)(s1->shape().ndim()>2?s1->shape().dims[2]:-1),
-                                    (double)dmin, (double)dmax, (long long)s1->numel());
+                    }
+                    //    denom 统计用 dispatch 前的快照（snap0/snap1）⇒ 不会被下一个节点的 buffer 复用污染。
+                    if ((int)node->op == 8 /*OP_DIV*/ && node->shape().ndim() >= 2) {
+                        if (snap0.valid) {
+                            fprintf(stderr, "  [div-gnorm] t(src0) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld (pre-dispatch)\n",
+                                    (long long)(node->shape().ndim()>0?node->shape().dims[0]:-1),
+                                    (long long)(s0&&s0->shape().ndim()>1?s0->shape().dims[1]:-1),
+                                    (long long)(s0&&s0->shape().ndim()>2?s0->shape().dims[2]:-1),
+                                    (double)snap0.mn, (double)snap0.mx, (long long)snap0.numel);
+                        }
+                        if (snap1.valid) {
+                            // 分母若是 CLAMP：[lo,hi] + 其输入（未裁剪的 s_edge+eps）分布
+                            // ⇒ 可直接判断"真放大(命中地板)"还是"脏数据(越界)"，并量化 s_edge==0 的比例。
+                            if (snap1.is_clamp) {
+                                fprintf(stderr, "  [div-clamp] src1 lo=%g hi=%g | input(s_edge+eps) min=%g max=%g zero=%lld at_floor=%lld/%lld\n",
+                                        (double)snap1.clo, (double)snap1.chi,
+                                        (double)snap1.imn, (double)snap1.imx,
+                                        (long long)snap1.i_zero, (long long)snap1.i_at_floor,
+                                        (long long)snap1.numel);
+                            }
+                            fprintf(stderr, "  [div-gnorm] denom(src1) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld (pre-dispatch)\n",
+                                    (long long)(node->shape().ndim()>0?node->shape().dims[0]:-1),
+                                    (long long)(s1&&s1->shape().ndim()>1?s1->shape().dims[1]:-1),
+                                    (long long)(s1&&s1->shape().ndim()>2?s1->shape().dims[2]:-1),
+                                    (double)snap1.mn, (double)snap1.mx, (long long)snap1.numel);
                         }
                     }
                     //    定位 SE3 核生成爆炸是 kernel 值异常还是 gathered(节点特征) 异常。
                     if ((int)node->op == 107 /*OP_PER_EDGE_MATMUL*/) {
-                        const float* kd = s0 ? s0->data() : nullptr;
-                        const float* gd = s1 ? s1->data() : nullptr;
-                        if (kd && s0->numel() > 0) {
-                            float kmin = kd[0], kmax = kd[0];
-                            for (int64_t kk = 1; kk < s0->numel(); ++kk) {
-                                float kv = kd[kk];
-                                if (kv < kmin) kmin = kv;
-                                if (kv > kmax) kmax = kv;
-                            }
-                            fprintf(stderr, "  [per-edge] KERNEL dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
-                                    (long long)(s0->shape().ndim()>0?s0->shape().dims[0]:-1),
-                                    (long long)(s0->shape().ndim()>1?s0->shape().dims[1]:-1),
-                                    (long long)(s0->shape().ndim()>2?s0->shape().dims[2]:-1),
-                                    (double)kmin, (double)kmax, (long long)s0->numel());
+                        if (snap0.valid) {
+                            fprintf(stderr, "  [per-edge] KERNEL dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld (pre-dispatch)\n",
+                                    (long long)(s0&&s0->shape().ndim()>0?s0->shape().dims[0]:-1),
+                                    (long long)(s0&&s0->shape().ndim()>1?s0->shape().dims[1]:-1),
+                                    (long long)(s0&&s0->shape().ndim()>2?s0->shape().dims[2]:-1),
+                                    (double)snap0.mn, (double)snap0.mx, (long long)snap0.numel);
                         } else {
                             fprintf(stderr, "  [per-edge] KERNEL data=null\n");
                         }
-                        if (gd && s1->numel() > 0) {
-                            float gmin = gd[0], gmax = gd[0];
-                            for (int64_t kk = 1; kk < s1->numel(); ++kk) {
-                                float gv = gd[kk];
-                                if (gv < gmin) gmin = gv;
-                                if (gv > gmax) gmax = gv;
-                            }
-                            fprintf(stderr, "  [per-edge] GATHERED dims=[%lld,%lld] min=%g max=%g numel=%lld\n",
-                                    (long long)(s1->shape().ndim()>0?s1->shape().dims[0]:-1),
-                                    (long long)(s1->shape().ndim()>1?s1->shape().dims[1]:-1),
-                                    (double)gmin, (double)gmax, (long long)s1->numel());
+                        if (snap1.valid) {
+                            fprintf(stderr, "  [per-edge] GATHERED dims=[%lld,%lld] min=%g max=%g numel=%lld (pre-dispatch)\n",
+                                    (long long)(s1&&s1->shape().ndim()>0?s1->shape().dims[0]:-1),
+                                    (long long)(s1&&s1->shape().ndim()>1?s1->shape().dims[1]:-1),
+                                    (double)snap1.mn, (double)snap1.mx, (long long)snap1.numel);
                         } else {
                             fprintf(stderr, "  [per-edge] GATHERED data=null\n");
                         }

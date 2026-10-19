@@ -1521,7 +1521,7 @@ int main(int argc, char* argv[]) {
                 float mx = 0;
                 for (int64_t q = 0; q < t->numel(); q++) {
                     float v = t->data()[q];
-                    if (v != v) { mx = mx; continue; }
+                    if (std::isnan(v)) { mx = mx; continue; }
                     float a = (v < 0) ? -v : v;
                     if (a > mx) mx = a;
                 }
@@ -1718,7 +1718,7 @@ int main(int argc, char* argv[]) {
                 double mn=1e30, mx=-1e30, s=0; int nnan=0, ninf=0;
                 for (size_t q = 0; q < av.size(); q++) {
                     float v = av[q];
-                    if (v != v) { nnan++; continue; }
+                    if (std::isnan(v)) { nnan++; continue; }
                     if (v > 3.0e38f || v < -3.0e38f) { ninf++; continue; }
                     if (v < mn) mn = v; if (v > mx) mx = v; s += (double)v;
                 }
@@ -2048,7 +2048,7 @@ int main(int argc, char* argv[]) {
             bool has_nan = false; float mn = 1e30f, mx = -1e30f;
             for (int64_t k = 0; k < pdN; ++k) {
                 float v = pd[k];
-                if (v != v) { has_nan = true; break; }
+                if (std::isnan(v)) { has_nan = true; break; }
                 if (v < mn) mn = v;
                 if (v > mx) mx = v;
             }
@@ -2072,7 +2072,7 @@ int main(int argc, char* argv[]) {
                 if (s0->data()) {
                     float smn = s0->data()[0], smx = s0->data()[0]; bool snan = false;
                     for (int64_t q = 0; q < s0->numel(); ++q) { float v = s0->data()[q];
-                        if (v != v) { snan = true; break; } if (v < smn) smn = v; if (v > smx) smx = v; }
+                        if (std::isnan(v)) { snan = true; break; } if (v < smn) smn = v; if (v > smx) smx = v; }
                     std::cout << " s0_nan=" << snan << " s0_min=" << smn << " s0_max=" << smx;
                 }
             }
@@ -2084,7 +2084,7 @@ int main(int argc, char* argv[]) {
             if (cval.numel() > 0 && cval.data()) {
                 bool cnan = false; long nnan = 0; float cmn = 1e30f, cmx = -1e30f;
                 for (int64_t q = 0; q < cval.numel(); ++q) { float v = cval.data()[q];
-                    if (v != v) { cnan = true; ++nnan; } else { if (v < cmn) cmn = v; if (v > cmx) cmx = v; } }
+                    if (std::isnan(v)) { cnan = true; ++nnan; } else { if (v < cmn) cmn = v; if (v > cmx) cmx = v; } }
                 std::cout << "[COORDS-VAL] numel=" << cval.numel() << " nnan=" << nnan
                           << " min=" << (cnan ? -1.f : cmn) << " max=" << (cnan ? -1.f : cmx)
                           << " has_cg=" << (go.coords_graph != nullptr) << std::endl;
@@ -2092,6 +2092,12 @@ int main(int argc, char* argv[]) {
         }
         // ---- 开发诊断：forward 图第一个 NaN 节点（在 backward 之前扫描，此时 buffer 未被反向破坏）----
         {
+            // 阈值/条数可用环境变量下调，用于**上游溯源**：
+            //   PPML_FWD_BAD=1e3 PPML_FWD_BAD_MAX=20
+            // 按拓扑序打印最早越线的若干节点，第一个越线的就是真正的发散起点。
+            const float bad_thr = getenv("PPML_FWD_BAD") ? (float)atof(getenv("PPML_FWD_BAD")) : 1e6f;
+            const int   bad_max = getenv("PPML_FWD_BAD_MAX") ? atoi(getenv("PPML_FWD_BAD_MAX")) : 1;
+            int bad_cnt = 0;
             for (int gi = 0; gi < cgraph->n_nodes(); ++gi) {
                 TensorF32* nd = cgraph->graph_node(gi);
                 if (!nd || !nd->data()) continue;
@@ -2102,13 +2108,34 @@ int main(int argc, char* argv[]) {
                 bool bad = false; float firstbad = 0; int64_t firstidx = -1;
                 for (int64_t v = 0; v < nelt; ++v) {
                     float x = nd->data()[v];
-                    if (x != x || std::fabs(x) > 1e6f) { bad = true; firstbad = x; firstidx = v; break; }
+                    // 用 std::isnan 而不是 `x != x`：后者在 -ffast-math 下会被优化成恒 false
+                    //   （编译器据此假设无 NaN），当前构建虽只有 -O2 也统一改成显式判据。
+                    if (std::isnan(x) || std::fabs(x) > bad_thr) { bad = true; firstbad = x; firstidx = v; break; }
                 }
                 if (bad) {
+                    // 该节点的 |x| 最大值：区分“刚过线”与“已经彻底爆掉”。
+                    //   isfinite 同时排除 NaN 与 Inf（Inf 已由上面的 |x|>thr 判为 bad）。
+                    float maxabs = 0.f;
+                    for (int64_t v = 0; v < nelt; ++v) {
+                        float x = nd->data()[v];
+                        if (std::isfinite(x)) { float ax = std::fabs(x); if (ax > maxabs) maxabs = ax; }
+                    }
+                    auto maxabs_of = [](TensorF32* t) -> float {
+                        if (!t || !t->data() || t->numel() <= 0) return -1.f;
+                        float mx = 0.f;
+                        for (int64_t q = 0; q < t->numel(); ++q) {
+                            float x = t->data()[q];
+                            if (std::isfinite(x)) { float ax = std::fabs(x); if (ax > mx) mx = ax; }
+                        }
+                        return mx;
+                    };
                     std::cout << "[FWD-NAN] first_bad node_idx=" << gi << " op=" << nd->op
                               << " numel=" << nelt << " bad=" << firstbad << " @flat=" << firstidx
+                              << " maxabs=" << maxabs
                               << " src0_op=" << (nd->src[0] ? (int)nd->src[0]->op : -1)
-                              << " src1_op=" << (nd->src[1] ? (int)nd->src[1]->op : -1);
+                              << " src0_maxabs=" << maxabs_of(nd->src[0])
+                              << " src1_op=" << (nd->src[1] ? (int)nd->src[1]->op : -1)
+                              << " src1_maxabs=" << maxabs_of(nd->src[1]);
                     if (nd->op == 41 /*OP_GET_ROWS*/) {
                         TensorF32* W = nd->src[0];
                         TensorF32* I = nd->src[1];
@@ -2136,7 +2163,7 @@ int main(int argc, char* argv[]) {
                         std::cout << "]";
                     }
                     std::cout << std::endl;
-                    break;
+                    if (++bad_cnt >= bad_max) break;
                 }
             }
         }
@@ -2184,7 +2211,7 @@ int main(int argc, char* argv[]) {
                 std::vector<float> gv = read_tensor_cpu(gr);
                 PStat ps; ps.numel = gr->numel(); ps.idx = gi;
                 for (float v : gv) {
-                    if (v != v) { gnan += 1.0; continue; }
+                    if (std::isnan(v)) { gnan += 1.0; continue; }
                     ps.l2 += (double)(v*v);
                     ps.maxabs = std::max(ps.maxabs, (double)std::fabs(v));
                 }
@@ -2304,7 +2331,7 @@ int main(int argc, char* argv[]) {
                 bool bad = false; float firstbad = 0; int64_t firstidx = -1;
                 for (int64_t v = 0; v < (int64_t)vals.size(); ++v) {
                     float x = vals[v];
-                    if (x != x || std::fabs(x) > 1e6f) { bad = true; firstbad = x; firstidx = v; break; }
+                    if (std::isnan(x) || std::fabs(x) > 1e6f) { bad = true; firstbad = x; firstidx = v; break; }
                 }
                 if (bad) {
                     std::cout << "[nanop] node_idx=" << gi << " op=" << nd->op
@@ -2599,7 +2626,7 @@ int main(int argc, char* argv[]) {
                 const float* d = t.data();
                 double s = 0; int64_t nn = t.numel();
                 float mn = 1e30f, mx = -1e30f; int64_t nnan = 0;
-                for (int64_t i = 0; i < nn; i++) { float v = d[i]; if (v != v) { nnan++; continue; } s += v; if (v<mn) mn=v; if (v>mx) mx=v; }
+                for (int64_t i = 0; i < nn; i++) { float v = d[i]; if (std::isnan(v)) { nnan++; continue; } s += v; if (v<mn) mn=v; if (v>mx) mx=v; }
                 std::cout << "  [input] " << name << " numel=" << nn << " sum=" << s
                           << " min=" << (nn?mn:0) << " max=" << (nn?mx:0) << " nnan=" << nnan;
                 if (nn > 0) std::cout << " v[0..3]=" << d[0] << "," << d[1] << "," << d[2] << "," << d[3];
