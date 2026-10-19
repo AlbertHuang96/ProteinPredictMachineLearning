@@ -100,7 +100,7 @@ bool CPUBackend::supports_op(TensorF32* node) const {
                     (src0 != nullptr) &&
                     (!is_quantized_type(src0->type) || src0->quant_shape_valid()) &&
                     (!is_quantized_type(src1->type) || src1->quant_shape_valid());
-                return QUANT_MUL_MAT_KERNELS_READY && shape_ok &&
+                return QUANT_MUL_MAT_CPU_READY && shape_ok &&
                        quant_mul_mat_combo_supported(src0->type, src1->type) &&
                        node->type == TENSOR_TYPE_F32;
             }

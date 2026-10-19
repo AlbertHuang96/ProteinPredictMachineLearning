@@ -1200,10 +1200,16 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                 //     天然 ≠ dst numel（收缩/归约），属正常语义，不是广播。
                 static const int kElemwiseBroadcastOps[] = {
                     OP_ADD, OP_ADD1, OP_ADD_ID, OP_SUB, OP_MUL, OP_DIV,
-                    OP_SCALE, OP_SUM, OP_MEAN, OP_SQR, OP_SQRT, OP_LOG,
+                    OP_SCALE, OP_SQR, OP_SQRT, OP_LOG,
                     OP_SIN, OP_COS, OP_LEAKY_RELU, OP_UNARY, OP_CLAMP,
-                    OP_FILL, OP_ARANGE, OP_GLU, OP_TRI_MUL, OP_OUTER_PROD_MEAN,
-                    OP_OUTER_PROD,
+                    OP_FILL, OP_ARANGE, OP_GLU,
+                    // 门控融合 act_mul（2026-10-18）：kernel 内对 g 做 i % g_numel 广播，
+                    //   与 OP_MUL 同语义 ⇒ 前缀对齐可留 GPU，否则回落 CPU（见下方 kernel_has_bcast）
+                    OP_ACT_MUL, OP_ACT_MUL_BACK_X, OP_ACT_MUL_BACK_G,
+                    // 2026-10-18 移除：OP_SUM / OP_MEAN（全元素归约，src numel≠dst 是**归约语义**
+                    //   而非广播；CUDA sum/mean kernel 本就按 src numel 归约）、
+                    //   OP_OUTER_PROD / OP_OUTER_PROD_MEAN / OP_TRI_MUL（CUDABackend::supports_op
+                    //   返回 false，永远到不了 GPU，放这里只是死条目）。
                     -1
                 };
                 bool is_elemwise = false;
@@ -1211,6 +1217,31 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
                     if (node->op == (tensor_op)kElemwiseBroadcastOps[k]) { is_elemwise = true; break; }
                 }
                 bool real_broadcast = broadcast && is_elemwise;
+                // (2') 2026-10-18：ADD/SUB/MUL/DIV 的 CUDA kernel 已在**体内**做广播
+                //   （bcast_elemwise_cuda：src[i % src_numel]，与 CPU kernel_elemwise 同语义，
+                //    该 kernel 2026-08-31 落地，晚于本护栏 2026-08-22 ⇒ 上面的旧注释已过期）。
+                //   只要每个 src 都是"最内维前缀对齐"或满尺寸，就允许留在 GPU；
+                //   其余（如外层维广播 [1,M]→[D,M]）仍回落 CPU，避免静默错值。
+                if (real_broadcast) {
+                    const tensor_op eop = node->op;
+                    // OP_ADD1：src[1] 是标量（numel=1），bcast_prefix_aligned 对"1 元素源"恒真；
+                    //   其 CUDA kernel 读 src[1][0]（标量由 build_splits 的 H2D cpy 搬到 device）。
+                    const bool kernel_has_bcast =
+                        (eop == OP_ADD || eop == OP_SUB || eop == OP_MUL || eop == OP_DIV ||
+                         eop == OP_ADD1 ||
+                         // act_mul 前向/反向 wrt x：g(src1/src2) 用 i % g_numel 广播
+                         eop == OP_ACT_MUL || eop == OP_ACT_MUL_BACK_X);
+                    if (kernel_has_bcast) {
+                        bool aligned = true;
+                        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                            TensorF32* s = node->src[j];
+                            if (!s) continue;
+                            if ((long long)s->numel() == (long long)node->numel()) continue;
+                            if (!bcast_prefix_aligned(node, s)) { aligned = false; break; }
+                        }
+                        if (aligned) real_broadcast = false;   // kernel 能承接 ⇒ 不驱逐
+                    }
+                }
                 // (3) host 数据传递：
                 //     历史护栏曾把"任一 src 沿视图链是 host"的节点整节点强制 CPU，
                 //     导致叶子全 host 时所有节点都被拽回 CPU → GPU 0 算子。

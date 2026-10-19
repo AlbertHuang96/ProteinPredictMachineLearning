@@ -53,6 +53,13 @@ enum tensor_type {
     TENSOR_TYPE_I8,
     TENSOR_TYPE_I16,
     TENSOR_TYPE_I32,
+    // ===== 运行时 repack 布局（2026-10-17，**只存在于内存/设备，绝不落盘**）=====
+    //   Q8_0R = Q8_0 的 32B 对齐重排副本，字节数完全相同（34B / 32 元素，零额外开销）：
+    //     qs 平面：每行 nblk 个 32B 组连续 ⇒ 每组 32B 对齐（可 2 × 16B / 4 × 8B 向量读）
+    //     d  平面：紧跟 qs 之后，每行 nblk 个 half
+    //   ⇒ 权重在绑定时重排一次，MMQ 的 A 侧从 16 × LDG.E.U16 降到 2 × LDG.128（每 32 元素块）。
+    //   ⚠️ GGUF/权重落盘一律按 F32 语义，遇到本类型必须拒绝（见 save_gguf 的守卫）。
+    TENSOR_TYPE_Q8_0R,
     TENSOR_TYPE_COUNT,
 };
 
@@ -66,7 +73,7 @@ inline bool is_quantized_type(tensor_type t) {
     switch (t) {
         case TENSOR_TYPE_Q4_0: case TENSOR_TYPE_Q4_1:
         case TENSOR_TYPE_Q5_0: case TENSOR_TYPE_Q5_1:
-        case TENSOR_TYPE_Q8_0: case TENSOR_TYPE_Q8_1:
+        case TENSOR_TYPE_Q8_0: case TENSOR_TYPE_Q8_1: case TENSOR_TYPE_Q8_0R:
         case TENSOR_TYPE_Q2_K: case TENSOR_TYPE_Q3_K: case TENSOR_TYPE_Q4_K:
         case TENSOR_TYPE_Q5_K: case TENSOR_TYPE_Q6_K: case TENSOR_TYPE_Q8_K:
             return true;
@@ -75,26 +82,29 @@ inline bool is_quantized_type(tensor_type t) {
     }
 }
 
-// 已实现支持的量化类型（准备阶段：仅 Q8_0/Q8_1；其余枚举存在但无块结构/kernel）
+// 已实现支持的量化类型（Q8_0/Q8_1 + 运行时 repack 的 Q8_0R；其余枚举存在但无块结构/kernel）
 inline bool is_quantized_type_supported(tensor_type t) {
-    return t == TENSOR_TYPE_Q8_0 || t == TENSOR_TYPE_Q8_1;
+    return t == TENSOR_TYPE_Q8_0 || t == TENSOR_TYPE_Q8_1 || t == TENSOR_TYPE_Q8_0R;
 }
 
 // 每块元素数（Q8 家族 = 32；不支持的量化类型返回 0）
 inline int quant_block_elems(tensor_type t) {
     switch (t) {
-        case TENSOR_TYPE_Q8_0: return QK8_0;
-        case TENSOR_TYPE_Q8_1: return QK8_1;
-        default:               return 0;
+        case TENSOR_TYPE_Q8_0:  return QK8_0;
+        case TENSOR_TYPE_Q8_1:  return QK8_1;
+        case TENSOR_TYPE_Q8_0R: return QK8_0;
+        default:                return 0;
     }
 }
 
 // 每块字节数（含 scale/中间量；不支持的量化类型返回 0）
+//   Q8_0R 与 Q8_0 总字节相同（32B qs + 2B d），只是排布从「交错」变成「双平面」。
 inline size_t quant_block_bytes(tensor_type t) {
     switch (t) {
-        case TENSOR_TYPE_Q8_0: return sizeof(block_q8_0);
-        case TENSOR_TYPE_Q8_1: return sizeof(block_q8_1);
-        default:               return 0;
+        case TENSOR_TYPE_Q8_0:  return sizeof(block_q8_0);
+        case TENSOR_TYPE_Q8_1:  return sizeof(block_q8_1);
+        case TENSOR_TYPE_Q8_0R: return 32u + sizeof(__half);
+        default:                return 0;
     }
 }
 
@@ -108,8 +118,9 @@ inline double quant_bytes_per_elem(tensor_type t) {
 //   Q8_0 权重 → 激活量化成 Q8_1（带 sum，供后续带 zero-point 组合修正）
 inline tensor_type quant_vec_dot_type(tensor_type w) {
     switch (w) {
-        case TENSOR_TYPE_Q8_0: return TENSOR_TYPE_Q8_1;
-        default:               return TENSOR_TYPE_F32;
+        case TENSOR_TYPE_Q8_0:
+        case TENSOR_TYPE_Q8_0R: return TENSOR_TYPE_Q8_1;
+        default:                return TENSOR_TYPE_F32;
     }
 }
 
@@ -253,7 +264,26 @@ enum tensor_op {
     OP_MAX_ALL,
     // relu 反向：relu_back(grad, x) → grad * (x>0)（解决 RadialFunc 里 relu 无反向断链）
     OP_RELU_BACK,
+    // ===== 门控融合（2026-10-18）=====
+    // OP_ACT_MUL：dst = act(src0) * src1（逐元素、要求同形）。act 存于 op_params[0]（见 act_kind）。
+    //   典型形态：Attention 的 gate = sigmoid(to_g(msa)) 再 gated = mul(gate, merged)，
+    //   原本 sigmoid + mul 两个节点 + 一份 [H*D,L,N,B] 中间态；融合后一个节点零中间态。
+    OP_ACT_MUL,
+    // 反向（专用 back op，避免用基础 op 拼出 4~6 个节点）：
+    //   src[0]=grad, src[1]=x(src0), src[2]=g(src1) → dx = grad*g*act'(x)
+    OP_ACT_MUL_BACK_X,
+    //   src[0]=grad, src[1]=x(src0)                  → dg = grad*act(x)
+    OP_ACT_MUL_BACK_G,
     OP_COUNT,
+};
+
+// OP_ACT_MUL 的激活种类（存 op_params[0]）；与 CPU/CUDA kernel 的 switch 一一对应。
+enum act_kind : int {
+    ACT_SIGMOID = 0,
+    ACT_SILU    = 1,
+    ACT_GELU    = 2,
+    ACT_TANH    = 3,
+    ACT_RELU    = 4,
 };
 
 

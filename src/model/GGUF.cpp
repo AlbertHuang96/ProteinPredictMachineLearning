@@ -200,6 +200,19 @@ void save_gguf(const std::vector<TensorF32*>& params,
 {
     const size_t n_all = params.size() + extra_tensors.size();
 
+    // ===== 守卫（2026-10-17）：量化权重不能按 F32 落盘 =====
+    //   PPML_INT8_BIGOPS 打开后部分权重是 Q8_0/Q8_0R（34B/32 元素），本函数一律按
+    //   numel*sizeof(float) 读写（type 字段固定写 F32）⇒ 会越界读并把字节写坏。
+    //   显式拒绝比静默产出坏检查点安全。
+    for (size_t i = 0; i < params.size(); ++i) {
+        if (params[i] && params[i]->is_quantized()) {
+            throw std::runtime_error(
+                "save_gguf: 参数 #" + std::to_string(i) +
+                " 是量化类型（int8 开关 PPML_INT8_BIGOPS 生效中）—— 无法按 F32 落盘；"
+                "请关闭该开关或先反量化后再保存。");
+        }
+    }
+
     // ===== 阶段 0: 计算布局指纹 (仅模型参数: 名字+形状) 并注入元数据 =====
     //   extra_tensors (优化器 m/v) 不参与 hash → 旧文件 (无 opt) 与 新文件 (有 opt)
     //   的 layout_hash 一致，保证向后兼容。

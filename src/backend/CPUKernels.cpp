@@ -32,7 +32,8 @@
 #include <cuda_runtime.h>
 namespace ppml {
 // mul_mat_cuda 实现于 src/cuda/CUDAKernels.cu（host 函数，launch blockTileGEMM kernel）
-extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
+extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N,
+                         const float* bias = nullptr);
 // ===== 禁用内部 GPU 自跑路径 =====
 // mul_mat 应完全由 BackendScheduler 分配：要 GPU 时 scheduler 会 dispatch 到 CUDABackend
 // (kernel_mul_mat_cuda)，无需 CPU kernel 内部再 cudaMalloc 自跑一次。内部旁路(PPML_MUL_MAT_GPU)
@@ -132,6 +133,10 @@ Status CPUBackend::dispatch_body(TensorF32* node, ComputeParams* p) {
         case OP_MEAN:   kernel_mean(node, p);        break;
         case OP_MAX_ALL: kernel_max_all(node, p);    break;
         case OP_RELU_BACK: kernel_relu_back(node, p); break;
+        // 门控融合（2026-10-18）：前向 dst=act(x)*g，反向两个专用核
+        case OP_ACT_MUL:        kernel_act_mul(node, p);        break;
+        case OP_ACT_MUL_BACK_X: kernel_act_mul_back_x(node, p); break;
+        case OP_ACT_MUL_BACK_G: kernel_act_mul_back_g(node, p); break;
         case OP_REPEAT:      kernel_repeat(node, p);      break;
         case OP_REPEAT_BACK: kernel_repeat_back(node, p); break;
         case OP_CONCAT:      kernel_concat(node, p);      break;
@@ -598,6 +603,9 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
     const float * a = node->src[0]->data();
     const float * b = node->src[1]->data();
     float * d = node->data();
+    // GEMM epilogue 融合（2026-10-18）：src[2]=bias，形如 [N]，dst[n,m] += bias[n]。
+    //   为 nullptr 时三条路径的行为与旧版逐位一致（+0.0f 会改变 -0.0 的符号，故用分支而非加 0）。
+    const float * bias = node->src[2] ? node->src[2]->data() : nullptr;
     // 防御（int8 量化准备，2026-09-10）：量化输入尚无 kernel（supports_op 已返回 false，
     //   正常不会到达）；万一被误调度，直接返回避免把块结构当 float 读而越界。
     //   所有线程走同一分支 → 不破坏 barrier 计数（与下面 NULL 检查同理）。
@@ -654,8 +662,9 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
             const uint16_t* arow = a16 + static_cast<size_t>(i) * K;
             for (int j = 0; j < N; j++) {
                 const uint16_t* brow = b16 + static_cast<size_t>(j) * K;
-                d[j + i * N] = use_f16c ? dot_half_row_f16c(arow, brow, K)
-                                        : dot_half_row_soft(arow, brow, K);
+                const float dot = use_f16c ? dot_half_row_f16c(arow, brow, K)
+                                           : dot_half_row_soft(arow, brow, K);
+                d[j + i * N] = bias ? (dot + bias[j]) : dot;
             }
         }
         tp->barrier_wait();
@@ -707,7 +716,7 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
                         cudaMalloc(&dC, bC) == cudaSuccess) {
                         cudaMemcpy(dA, a, bA, cudaMemcpyHostToDevice);
                         cudaMemcpy(dB, b, bB, cudaMemcpyHostToDevice);
-                        mul_mat_cuda(dA, dB, dC, M, K, N);
+                        mul_mat_cuda(dA, dB, dC, M, K, N, bias);
                         cudaDeviceSynchronize();
                         cudaMemcpy(d, dC, bC, cudaMemcpyDeviceToHost);
                         gpu_ok = 1;
@@ -755,7 +764,7 @@ void CPUBackend::kernel_mul_mat(TensorF32 * node, ComputeParams * p) {
         int i = tp->current_chunk.fetch_add(1);
         if (i >= M) break;
         for (int j = 0; j < N; j++) {
-            float sum = 0;
+            float sum = bias ? bias[j] : 0.0f;   // epilogue：bias 先入累加器（省一次读改写）
             for (int k = 0; k < K; k++) sum += a[i * K + k] * b[j * K + k];
             d[j + i * N] = sum;
         }
@@ -1757,9 +1766,13 @@ void CPUBackend::kernel_clamp(TensorF32 * node, ComputeParams * p) {
 }
 
 // ===== add1 (加标量): dst = src0 + b =====
-// b 是标量张量 node->src[1]（读其 data()[0]）
+// b 的来源（2026-10-19）：
+//   ① 建图期常量 → 已烤进 op_params[0]（float 位模式，同 OP_SCALE），src[1]==nullptr
+//   ② 运行期标量 → 仍挂在 src[1] 标量张量上（读其 data()[0]）
 void CPUBackend::kernel_add1(TensorF32 * node, ComputeParams * p) {
-    const float b    = node->src[1]->data()[0];
+    const TensorF32* bs = node->src[1];
+    const float b    = bs ? bs->data()[0]
+                          : reinterpret_cast<const float&>(node->op_params[0]);
     const float * src = node->src[0]->data();
     float       * dst = node->data();
 
@@ -1876,10 +1889,124 @@ void CPUBackend::kernel_relu_back(TensorF32 * node, ComputeParams * p) {
     }
 }
 
+// ===== 门控融合 act_mul（2026-10-18）=====
+//   标量激活：与 compute_forward_* 的公式逐字对齐（sigmoid/silu/gelu/tanh/relu），
+//   保证 act_mul 与 "unary 激活 + mul" 两条路径前向逐位一致（容差内）。
+static inline float act_fwd_scalar(int kind, float x) {
+    switch (kind) {
+        case ACT_SIGMOID: return 1.0f / (1.0f + expf(-x));
+        case ACT_SILU:    return x / (1.0f + expf(-x));
+        case ACT_GELU: {
+            const float C1 = 0.044715f;
+            const float C2 = sqrtf(2.0f / (float)M_PI);
+            return 0.5f * x * (1.0f + tanhf(C2 * (x + C1 * x * x * x)));
+        }
+        case ACT_TANH:    return tanhf(x);
+        case ACT_RELU:    return (x > 0.0f) ? x : 0.0f;
+        default:          return x;
+    }
+}
+
+//   标量激活导数 d act(x)/dx（与上面 fwd 同一近似式）
+static inline float act_grad_scalar(int kind, float x) {
+    switch (kind) {
+        case ACT_SIGMOID: {
+            const float s = 1.0f / (1.0f + expf(-x));
+            return s * (1.0f - s);
+        }
+        case ACT_SILU: {
+            const float s = 1.0f / (1.0f + expf(-x));
+            return s * (1.0f + x * (1.0f - s));
+        }
+        case ACT_GELU: {
+            const float C1 = 0.044715f;
+            const float C2 = sqrtf(2.0f / (float)M_PI);
+            const float u  = C2 * (x + C1 * x * x * x);
+            const float t  = tanhf(u);
+            const float du = C2 * (1.0f + 3.0f * C1 * x * x);
+            return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * du;
+        }
+        case ACT_TANH: {
+            const float t = tanhf(x);
+            return 1.0f - t * t;
+        }
+        case ACT_RELU:    return (x > 0.0f) ? 1.0f : 0.0f;
+        default:          return 1.0f;
+    }
+}
+
+// 前向：dst[i] = act(src0[i]) * src1[i]（src1 可小于 dst ⇒ i % src1_numel，同 kernel_elemwise）
+void CPUBackend::kernel_act_mul(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * x   = node->src[0];
+    const TensorF32 * g   = node->src[1];
+    TensorF32       * dst = node;
+    if (!x || !g || !x->data() || !g->data() || !dst->data()) return;
+    const int     kind = static_cast<int>(node->op_params[0]);
+    const int64_t n    = dst->numel();
+    const int64_t gn   = g->numel();
+    if (n <= 0 || gn <= 0) return;
+    const int64_t per  = (n + p->nth - 1) / p->nth;
+    const int64_t i_lo = per * p->ith;
+    const int64_t i_hi = (i_lo + per < n) ? (i_lo + per) : n;
+    const float * xd = x->data();
+    const float * gd = g->data();
+    float       * d  = dst->data();
+    if (gn == n) {   // 常规同形（门控链）：免取模
+        for (int64_t i = i_lo; i < i_hi; ++i) d[i] = act_fwd_scalar(kind, xd[i]) * gd[i];
+    } else {
+        for (int64_t i = i_lo; i < i_hi; ++i) d[i] = act_fwd_scalar(kind, xd[i]) * gd[i % gn];
+    }
+}
+
+// 反向 wrt x：dx = grad * g * act'(x)（src0=grad, src1=x, src2=g）
+void CPUBackend::kernel_act_mul_back_x(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * grad = node->src[0];
+    const TensorF32 * x    = node->src[1];
+    const TensorF32 * g    = node->src[2];
+    TensorF32       * dst  = node;
+    if (!grad || !x || !g || !grad->data() || !x->data() || !g->data() || !dst->data()) return;
+    const int     kind = static_cast<int>(node->op_params[0]);
+    const int64_t n    = dst->numel();
+    const int64_t gn   = g->numel();
+    if (n <= 0 || gn <= 0) return;
+    const int64_t per  = (n + p->nth - 1) / p->nth;
+    const int64_t i_lo = per * p->ith;
+    const int64_t i_hi = (i_lo + per < n) ? (i_lo + per) : n;
+    const float * gd  = grad->data();
+    const float * xd  = x->data();
+    const float * gg  = g->data();
+    float       * d   = dst->data();
+    if (gn == n) {
+        for (int64_t i = i_lo; i < i_hi; ++i)
+            d[i] = gd[i] * gg[i] * act_grad_scalar(kind, xd[i]);
+    } else {
+        for (int64_t i = i_lo; i < i_hi; ++i)
+            d[i] = gd[i] * gg[i % gn] * act_grad_scalar(kind, xd[i]);
+    }
+}
+
+// 反向 wrt g：dg = grad * act(x)（src0=grad, src1=x）
+void CPUBackend::kernel_act_mul_back_g(TensorF32 * node, ComputeParams * p) {
+    const TensorF32 * grad = node->src[0];
+    const TensorF32 * x    = node->src[1];
+    TensorF32       * dst  = node;
+    if (!grad || !x || !grad->data() || !x->data() || !dst->data()) return;
+    const int     kind = static_cast<int>(node->op_params[0]);
+    const int64_t n    = dst->numel();
+    if (n <= 0) return;
+    const int64_t per  = (n + p->nth - 1) / p->nth;
+    const int64_t i_lo = per * p->ith;
+    const int64_t i_hi = (i_lo + per < n) ? (i_lo + per) : n;
+    const float * gd = grad->data();
+    const float * xd = x->data();
+    float       * d  = dst->data();
+    for (int64_t i = i_lo; i < i_hi; ++i) d[i] = gd[i] * act_fwd_scalar(kind, xd[i]);
+}
+
 // ===== repeat (广播) =====
-// 语义: 将 src0 广播到 node(=src1) 的形状。src0 的尾部维与 dst 尾部维对齐，
-//       src0 维度数少于 dst 时，缺失的前导维按 1 处理（即广播）。
-//       src0 某维 == dst 该维 或 src0 该维 == 1 时合法。
+// 语义: 将 src0 广播到 node(=src1) 的形状，逐维取模：dst[i0,i1,i2,i3] = src[i0%s0, i1%s1, ...]
+//       即 dim d ↔ dim d（ggml 布局下 dims[0] 为最内维）；src0 维度数少于 dst 时，
+//       缺失维按 1 处理（取模 1 = 0，等价于沿该维广播）。与 kernel_repeat_back 互逆。
 // 使用场景: sum/mean 反向 add1_or_set 首次设置 grad 时，把标量 grad 广播成 src 形状。
 void CPUBackend::kernel_repeat(TensorF32 * node, ComputeParams * p) {
     const TensorF32 * src0 = node->src[0];
@@ -1924,13 +2051,18 @@ void CPUBackend::kernel_repeat(TensorF32 * node, ComputeParams * p) {
     const int64_t end   = (start + per < total) ? (start + per) : total;
 
     for (int64_t idx = start; idx < end; idx++) {
+        // 布局：ggml 约定 dims[0] 为最内（连续）维 ⇒ idx 必须按 dim0 最快分解。
+        // 2026-10-18 修正：原实现按 dim3 最快（行主序/C 序）分解 dst，而 src 索引仍按
+        //   dim0 最快计算 ⇒ 2D 以上 repeat 把 src 的 dim0 映射到 dst 的**最外层**维
+        //   （实测 repeat([5]→[5,7]) 得 bias[idx/7] 而非 bias[idx%5]），与
+        //   kernel_repeat_back 的 ggml 分解互不逆 ⇒ bias/gamma 广播整体错位。
         int64_t t = idx;
-        const int64_t i3 = t % nd3; t /= nd3;
-        const int64_t i2 = t % nd2; t /= nd2;
+        const int64_t i0 = t % nd0; t /= nd0;
         const int64_t i1 = t % nd1; t /= nd1;
-        const int64_t i0 = t;
+        const int64_t i2 = t % nd2; t /= nd2;
+        const int64_t i3 = t;
 
-        // 尾部对齐的 src0 索引（缺失维取模 1 = 0）
+        // 逐维取模的 src0 索引（缺失维/维=1 取模 1 = 0，天然处理跨 ndim 广播）
         const int64_t s0 = i0 % ne0[0];
         const int64_t s1 = i1 % ne0[1];
         const int64_t s2 = i2 % ne0[2];
@@ -1955,9 +2087,16 @@ void CPUBackend::kernel_repeat_back(TensorF32 * node, ComputeParams * p) {
     const int nd_src = src0->shape().ndim();
     const int nd_dst = dst->shape().ndim();
 
-    // 尾部对齐维度。dst 的维 d (0=最内维) 对应 src0 的维 (d + off)，off = nd_src - nd_dst。
-    // dst 缺失前导维（d >= nd_dst）按 1 处理；src0 缺失前导维（d+off >= nd_src）按 1 处理。
-    const int off = nd_src - nd_dst;
+    // 维度对齐（2026-10-18 修正）。
+    //   前向 kernel_repeat 是**逐维取模** s_d = i_d % src_d（缺维按 1）⇒ dim d ↔ dim d，
+    //   因此 repeat_back 必须同样按 dim d ↔ dim d 归约，src0 多出的**尾随**维（d >= nd_dst，
+    //   dst 视作 1）整体累加。
+    //   原实现 off = nd_src - nd_dst 是**右对齐**，跨 ndim 时把 dst 的 dim0 对到 src 的 dim1：
+    //   实测 grad[N,M] → bias[N] 会去算 M/N 而不是 N/M ⇒ dbias 只取 1 个元素（梯度全错）。
+    //   （前向 kernel_repeat 同日也修了 dst 索引分解：原按 dim3 最快即行主序，与 ggml 布局
+    //     不符、与本函数的 dim0 最快分解互不逆；两处修完后二者才真正互为逆操作。）
+    //   仅当 dst 维数更多（src 被广播到更高维，罕见）时保留旧的右对齐兜底。
+    const int off = (nd_src >= nd_dst) ? 0 : (nd_src - nd_dst);
 
     int64_t dd[4] = {1, 1, 1, 1};   // dst 各维
     int64_t sd[4] = {1, 1, 1, 1};   // src0 各维

@@ -934,8 +934,9 @@ TensorF32* IterBlock::forward_graph(TensorF32*& msa, TensorF32*& pair,
     TensorF32* gate_right = pair2pair_right_proj_->forward_graph(state_normed); // [16, L, B]
     TensorF32* gate       = outer_product_graph(gate_left, gate_right);         // [256, L, L, B]
     gate = pair2pair_gate_proj_->forward_graph(gate);                           // [128, L, L, B]
-    gate = sigmoid(gate);                                                       // [0,1]
-    rbf_proj = mul(rbf_proj, gate);                                             // element-wise gate
+    // 门控融合（2026-10-18）：sigmoid + mul → 单节点 act_mul
+    //   （省掉一份 [128,L,L,B] 的 sigmoid 中间态；逐元素乘法可交换，等价 mul(rbf_proj, gate)）
+    rbf_proj = act_mul(gate, rbf_proj, ACT_SIGMOID);                             // element-wise gate
 
     // Biased Axial Attention (row/col) + residual
     pair = add_impl(pair, pair_row_attn_->forward_graph(pair, rbf_proj),
@@ -1543,8 +1544,9 @@ TensorF32* FullBlock::forward_graph(TensorF32*& msa_full, TensorF32*& pair,
     TensorF32* gate_right = pair2pair_right_proj_->forward_graph(state_normed); // [16, L, B]
     TensorF32* gate       = outer_product_graph(gate_left, gate_right);         // [256, L, L, B]
     gate = pair2pair_gate_proj_->forward_graph(gate);                           // [128, L, L, B]
-    gate = sigmoid(gate);                                                       // [0,1]
-    rbf_proj = mul(rbf_proj, gate);                                             // element-wise gate
+    // 门控融合（2026-10-18）：sigmoid + mul → 单节点 act_mul
+    //   （省掉一份 [128,L,L,B] 的 sigmoid 中间态；逐元素乘法可交换，等价 mul(rbf_proj, gate)）
+    rbf_proj = act_mul(gate, rbf_proj, ACT_SIGMOID);                             // element-wise gate
 
     // Biased Axial Attention (row/col) + residual
     pair = add_impl(pair, pair_row_attn_->forward_graph(pair, rbf_proj),
@@ -4330,6 +4332,121 @@ void PPMLModel::transfer_params_to_backend() {
         // 旧数据在 context arena 中，无法释放，但 data_ 已指向新 buffer
         // 后续可通过 t->buffer_ 和 t->buffer_offs_ 访问
     }
+
+    // ===== int8 开关（2026-10-17）：搬迁完成后再做「薄化」——量化块原地写回 param_buf =====
+    //   放在这里的原因：此时权重已连续排布在 param_buf 内，且每个张量都有 buffer_offs_，
+    //   量化块（34B/32 元素）比 f32（4B/元素）小 ⇒ 直接覆盖自己的区间即可，无需新分配。
+    quantize_big_weight_matrices();
+}
+
+// ============================================================
+// int8 开关（2026-10-17）—— 选择规则
+// ============================================================
+//   动机：本模型峰值内存 99.9% 是激活（实测 32 GB COMPUTE vs 22 MB WEIGHTS），所以
+//   「权重 int8」不省内存；它省的是**带宽**——这些大矩阵乘的权重流量降 4×，
+//   MMQ(mma.s8)/MMVQ(dp4a) 直接吃 int8，不必先反量化成 float。
+//   只覆盖「最大的那批」：attention 的 QKV/O 投影 + outer product 的投影层。
+const char* ppml_int8_bigop_default_list() {
+    return "attention.msa_row.,attention.msa_col.,attention.pair_row.,attention.pair_col.,"
+           "msa2pair_left_proj,msa2pair_right_proj,msa2pair_out_proj,pair2pair_gate_proj";
+}
+
+bool ppml_int8_bigop_selected(const std::string& name, const char* env_list) {
+    if (!env_list || env_list[0] == '\0') return false;          // 未设置 = 关
+    std::string list(env_list);
+    if (list == "0" || list == "off") return false;
+    if (list == "1" || list == "on" || list == "all") list = ppml_int8_bigop_default_list();
+    size_t pos = 0;
+    while (pos <= list.size()) {
+        const size_t comma = list.find(',', pos);
+        std::string tok = list.substr(pos, comma == std::string::npos ? std::string::npos
+                                                                     : comma - pos);
+        while (!tok.empty() && (tok.back()  == ' ' || tok.back()  == '\t')) tok.pop_back();
+        while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) tok.erase(tok.begin());
+        if (!tok.empty() && name.find(tok) != std::string::npos) return true;
+        if (comma == std::string::npos) break;
+        pos = comma + 1;
+    }
+    return false;
+}
+
+// 把选中的权重原地转成 Q8_0（块大小 32，d = amax/127，见 QuantBlocks.h）。
+//   ⚠️ 仅推理可用：权重不再是 f32 ⇒ 反向（dW = Xᵀ·dY 会把块当 float 读）、AdamW、
+//      权重落盘（save_weights 按 numel*4 写）都会读错，所以训练模式一律跳过。
+void PPMLModel::quantize_big_weight_matrices() {
+    const char* env = std::getenv("PPML_INT8_BIGOPS");
+    if (!env || env[0] == '\0') return;                 // 未设置 = 关
+    const std::string env_s(env);
+    if (env_s == "0" || env_s == "off") return;         // 显式关闭
+    if (training_) {
+        fprintf(stderr, "[int8-bigops] 训练模式（train()）下不启用量化权重 —— 反向/优化器按 f32 读，"
+                        "结果会错。本次跳过（如需只跑前向基准，请用 eval() 路径）。\n");
+        return;
+    }
+
+    std::vector<TensorF32*> ps;
+    std::vector<std::string> ns;
+    collect_params_with_names(ps, ns);
+
+    std::vector<TensorF32*> sel;
+    size_t n_skip_shape = 0;
+    for (size_t i = 0; i < ps.size(); ++i) {
+        TensorF32* t = ps[i];
+        if (!t || t->type != TENSOR_TYPE_F32) continue;               // 已量化/非 f32 跳过（幂等）
+        const std::string nm = (i < ns.size()) ? ns[i] : std::string();
+        if (!ppml_int8_bigop_selected(nm, env)) continue;
+        // 量化块不能跨行：最内维（K）必须是块元素数的整数倍
+        if (t->shape().ndim() != 2 || (t->shape().dims[0] % QK8_0) != 0 ||
+            (t->numel() % QK8_0) != 0) {
+            ++n_skip_shape;
+            fprintf(stderr, "[int8-bigops] 跳过 %s：形状 [%lld,%lld] 的最内维不是 %d 的倍数\n",
+                    nm.c_str(), (long long)t->shape().dim(0), (long long)t->shape().dim(1), QK8_0);
+            continue;
+        }
+        if (!t->data()) continue;
+        sel.push_back(t);
+    }
+
+    if (sel.empty()) {
+        fprintf(stderr, "[int8-bigops] 开关已开，但没有命中的权重（形状跳过 %zu 个）\n", n_skip_shape);
+        return;
+    }
+
+    size_t bytes_before = 0, bytes_after = 0, done = 0;
+    std::vector<float>      f32;
+    std::vector<block_q8_0> q;
+    std::vector<uint8_t>    packed;      // Q8_0R repack 结果（32B 对齐，字节数同 Q8_0）
+    for (TensorF32* t : sel) {
+        const int64_t n  = t->numel();
+        const int64_t nb = n / QK8_0;
+        f32.resize(static_cast<size_t>(n));
+        if (t->buffer_) {
+            t->buffer_->get_tensor(t, f32.data(), t->buffer_offs_, static_cast<size_t>(n) * sizeof(float));
+        } else {
+            std::memcpy(f32.data(), t->data(), static_cast<size_t>(n) * sizeof(float));
+        }
+        q.resize(static_cast<size_t>(nb));
+        if (!quantize_q8_0_host(f32.data(), q.data(), n)) continue;
+        // 重排成 Q8_0R（qs 平面 32B 对齐 + 尾部 d 平面）：字节数与 Q8_0 完全相同，
+        //   ⇒ 同样「原地薄化」；区别是 CUDA 侧每 32 元素块可用 16B 向量读。
+        packed.resize(q8_0_repacked_bytes(n));
+        repack_q8_0_host(q.data(), nb, packed.data());
+        if (t->buffer_) {
+            t->buffer_->set_tensor(t, packed.data(), t->buffer_offs_, packed.size());
+        } else {
+            std::memcpy(t->data(), packed.data(), packed.size());
+        }
+        t->type = TENSOR_TYPE_Q8_0R;       // 之后 nbytes() = nb*34，调度/拷贝都按块结构
+        bytes_before += static_cast<size_t>(n) * 4;
+        bytes_after  += static_cast<size_t>(nb) * sizeof(block_q8_0);
+        ++done;
+    }
+
+    fprintf(stderr,
+            "[int8-bigops] %zu 个权重 → Q8_0：%.2f MB → %.2f MB (%.2fx)，形状不合法跳过 %zu 个\n",
+            done, (double)bytes_before / (1024.0 * 1024.0),
+            (double)bytes_after / (1024.0 * 1024.0),
+            bytes_after ? (double)bytes_before / (double)bytes_after : 0.0, n_skip_shape);
 }
 
 void PPMLModel::save_weights(const std::string& path) const {
@@ -4357,6 +4474,15 @@ void PPMLModel::save_weights(const std::string& path) const {
     std::vector<TensorF32*> ps;
     std::vector<std::string> ns;
     const_cast<PPMLModel*>(this)->collect_params_with_names(ps, ns);   // dev 设施：只读收集
+
+    // 守卫（2026-10-17）：量化权重（int8 开关）不是 f32 布局，本函数按 numel*4 写会越界。
+    for (auto* t : ps) {
+        if (t && t->is_quantized()) {
+            std::cerr << "  [save_weights] 拒绝保存：存在量化参数（PPML_INT8_BIGOPS 生效中）"
+                         "—— 本设施只支持 F32 权重。请关闭开关后再存。" << std::endl;
+            return;
+        }
+    }
     std::FILE* f = std::fopen(out.c_str(), "wb");
     if (!f) {
         std::cerr << "  [save_weights] 打开失败: " << out << std::endl;

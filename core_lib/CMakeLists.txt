@@ -60,6 +60,9 @@ set(CORE_SOURCES
     ../src/cuda/OptimKernels.cu
     ../src/cuda/StagingPool.cu
     ../src/cuda/FlashAttnKernel.cu
+    # int8 分块量化（W8A8，2026-10-17）：设备端量化/反量化 + MMVQ(dp4a)
+    ../src/cuda/QuantKernels.cu
+    ../src/cuda/MulMatQ8Kernel.cu
 )
 
 # 启用 CUDA 语言

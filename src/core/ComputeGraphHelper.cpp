@@ -4,6 +4,7 @@
 #include "ppml/SymmetryResolver.h"
 
 #include "ppml/ComputeGraph.h"
+#include "ppml/Backend.h"   // add1_opt_on()/add1_bake_on()（ADD1 优化开关）
 
 #include <cassert>
 #include <cstdlib>   // std::free
@@ -13,6 +14,50 @@
 
 namespace ppml {
 
+// ============================================================
+// 逐元素广播的"同一迭代空间"判定（2026-10-18）
+//   本仓库 CPU(kernel_elemwise)/CUDA(bcast_elemwise_cuda) 都用扁平等长索引
+//   `src[i % src_numel]`，只有 src 覆盖 dst 的**最内维前缀**时才等价于逐维广播。
+//   构造期（add_impl/mul/sub/div）检查一次，避免"静默错值"这类最难查的失败。
+// ============================================================
+bool bcast_prefix_aligned(const TensorF32* dst, const TensorF32* src) {
+    if (!dst || !src) return false;
+    const int64_t dn = dst->numel();
+    const int64_t sn = src->numel();
+    if (sn == dn) return true;                 // 无广播（同形，或同 numel 的扁平视图）
+    if (sn <= 0 || dn <= 0 || dn % sn != 0) return false;
+    const int nd = dst->shape().ndim();
+    const int ns = src->shape().ndim();
+    if (ns > nd) return false;
+    bool tail_one = false;                     // 已进入"尾部维=1"区
+    for (int d = 0; d < ns; ++d) {
+        const int64_t sd = src->shape().dims[d];
+        const int64_t dd = dst->shape().dims[d];
+        if (sd == 1) { tail_one = true; continue; }
+        if (tail_one) return false;            // src=[D,1,M]：中间维有"洞"，扁平取模无法表达
+        if (sd != dd) return false;            // src 的实维必须与 dst 同维相等
+    }
+    return true;
+}
+
+// 构造期告警（最多 8 条）：numel 不等且非前缀对齐 ⇒ kernel 读错元素（不崩、静默错值）。
+static void warn_unaligned_bcast(const char* opname, const TensorF32* dst, const TensorF32* src) {
+    if (!dst || !src || src->numel() == dst->numel()) return;
+    if (bcast_prefix_aligned(dst, src)) return;
+    static int shown = 0;
+    if (shown++ >= 8) return;
+    fprintf(stderr,
+            "[ELEM-BCAST-SHAPE] %s: src numel=%lld dims=[%lld,%lld,%lld,%lld] 无法前缀对齐到 "
+            "dst numel=%lld dims=[%lld,%lld,%lld,%lld] ⇒ 逐元素 kernel 按 i%%src_numel 取值会错位；"
+            "请用 repeat()/view() 把要广播的那几维放到最内层（本告警最多打印 8 条）\n",
+            opname, (long long)src->numel(),
+            (long long)src->shape().dim(0), (long long)src->shape().dim(1),
+            (long long)src->shape().dim(2), (long long)src->shape().dim(3),
+            (long long)dst->numel(),
+            (long long)dst->shape().dim(0), (long long)dst->shape().dim(1),
+            (long long)dst->shape().dim(2), (long long)dst->shape().dim(3));
+}
+
 TensorF32 * add_impl( 
         TensorF32  * a,  
         TensorF32  * b,  
@@ -20,7 +65,10 @@ TensorF32 * add_impl(
     //GGML_ASSERT(ggml_can_repeat(b, a)); 
     // 放宽断言：梯度累加中 b(新梯度) 常为扁平 2D，a(累加器) 为 4D(如 pair [128,51,51,1] vs [332928,1])。
     // 只要 numel 相同（同数据布局的视图）或 b 可广播到 a，累加均合法（kernel_add 逐元素加）。
-    if (b->numel() != a->numel() && !b->can_repeat(*a)) {
+    // 2026-10-18：再允许"最内维前缀"广播（b 比 a 小，kernel 体内 i % b_numel）——
+    //   b->can_repeat(*a) 的整除方向是 b 为 a 的**倍数**，无法表达"b 更小"这种常见广播
+    //   （gamma/beta [D,1] 加到 [D,M]）⇒ 必须显式判 bcast_prefix_aligned，否则误断言。
+    if (b->numel() != a->numel() && !b->can_repeat(*a) && !bcast_prefix_aligned(a, b)) {
         if (getenv("GRAPH_DEBUG_NODE")) {
             fprintf(stderr, "[add_impl] FAIL a(acc) op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld a_src0_op=%d a_src0_ndim=%d a_src0_dims=[%lld,%lld,%lld,%lld] | b(new) op=%d ndim=%d dims=[%lld,%lld,%lld,%lld] numel=%lld b_src0_op=%d b_src0_ndim=%d b_src0_dims=[%lld,%lld,%lld,%lld]\n",
                     a->op, a->shape().ndim(), (long long)a->shape().dims[0], (long long)a->shape().dims[1],
@@ -55,7 +103,11 @@ TensorF32 * add_impl(
     result->op     = OP_ADD;  
     result->src[0] = a;  
     result->src[1] = b;  
-  
+
+    // 构造期检查：广播必须"最内维前缀对齐"（见 bcast_prefix_aligned 注释）
+    warn_unaligned_bcast("add", result, a);
+    warn_unaligned_bcast("add", result, b);
+
     return result;  
 }
 
@@ -80,6 +132,57 @@ TensorF32 * repeat_back(
     return result;  
 }
 
+// ============================================================
+// ADD1 常量标量判据（2026-10-19）
+//   b 可作为"建图期常量"烤进 op_params[0] 的充要条件（用户指定 + 值可读）：
+//     ① numel==1 且 op==OP_NONE（叶子，不是算出来的节点）
+//     ② !(flag & TENSOR_FLAG_PARAM)（参数会被优化器改，绝不能冻结）
+//     ③ 取值来源只认两种：
+//        (a) flag & TENSOR_FLAG_CONST   → 值在 const_data_[0]（constant_scalar/constant_tensor）
+//        (b) 已 bind 的 host 叶子       → data() 非空且无 buffer_（make_scalar 那类）
+//   返回 false 时 why 给出原因（供一次性告警），调用方保留 src[1] 走标量张量路径。
+// ============================================================
+static bool add1_scalar_const_value(const TensorF32* b, float* out, const char** why) {
+    if (!b)                 { *why = "null";                       return false; }
+    if (b->numel() != 1)    { *why = "numel!=1";                   return false; }
+    if (b->op != OP_NONE)   { *why = "computed node (op!=OP_NONE)"; return false; }
+    // 风险②：**可学习标量必须带 TENSOR_FLAG_PARAM**，否则会落到下面"常量"分支被烤死
+    //   （值固定在建图那一刻，训练中永不更新，且是**静默**错值：本函数返回 true ⇒
+    //     不会打 [ADD1-NOBAKE]）。新增调用点若传的是参数张量，务必置 PARAM 标记。
+    if (b->flag & TENSOR_FLAG_PARAM) { *why = "TENSOR_FLAG_PARAM"; return false; }
+    if (b->flag & TENSOR_FLAG_CONST) {
+        if (b->const_data_.empty()) { *why = "CONST but const_data_ empty"; return false; }
+        *out = b->const_data_[0];
+        return true;
+    }
+    // 风险③：这条分支**无法 100% 证明是常量** —— 值版（非图）算子的结果张量同样是
+    //   op==OP_NONE + 有 host data + 无 buffer_，若把它传进 add1 也会被烤成常量 ⇒ 用到旧值。
+    //   之所以保留：`make_scalar` 那类"值版常量"靠它（当前 10 个 add1 调用点全是常量）。
+    //   命中本分支**不会**打印任何告警（因为判定为"可烤"）。
+    //   ⇒ 要彻底封死这个口子：删掉本 if 分支，只留 TENSOR_FLAG_CONST 一条判据即可。
+    if (b->data() && !b->buffer_) {          // 已 bind 的 host 叶子
+        *out = b->data()[0];
+        return true;
+    }
+    *why = b->data() ? "device-backed scalar (runtime)" : "no host data";
+    return false;
+}
+
+// 一次性告警（最多 4 条）：优化开着但退回了"标量张量"路径时打印，说明原因。
+//   注意：运行期标量（反向里的标量梯度，一次迭代 ~44 个）**本就应该**走这条路径，
+//   这里只是把"为什么没烤"记录下来，不是错误。
+static void add1_bake_fallback_warn(const TensorF32* b, const char* why) {
+    static int shown = 0;
+    if (shown >= 4) return;
+    ++shown;
+    fprintf(stderr,
+            "[ADD1-NOBAKE] 标量未烤入 op_params（保留 src[1] 走标量张量/device 指针）："
+            "reason=%s numel=%lld op=%d flag=0x%x | 只在预期为常量时才需要排查；"
+            "PPML_ADD1_BAKE=0 可整体关闭本优化（仅 4 条，不再重复）\n",
+            why ? why : "?", (long long)(b ? b->numel() : -1),
+            b ? (int)b->op : -1, b ? (int)b->flag : 0);
+}
+
 // add a scalar
 TensorF32 * add1_impl(
         TensorF32  * a,
@@ -92,7 +195,7 @@ TensorF32 * add1_impl(
     // 注: 不要求 a 连续。图模式 a 为未 compute 的 op 节点（own_data_=false，
     //     is_contiguous() 返回 false），但 dup/new_tensor 不访问 a 的 data，
     //     OP_ADD1 在 graph_compute 时才读 src[0]。值模式 a 天然连续，同样安全。
- 
+
     //struct Tensor * result = inplace ? ggml_view_tensor(ctx, a) : ggml_dup_tensor(ctx, a);
     TensorF32 * result;
     if (inplace) {
@@ -100,11 +203,31 @@ TensorF32 * add1_impl(
     } else {
         result = dup(a);
     }
- 
+
     result->op     = OP_ADD1;
     result->src[0] = a;
+
+    // ---- 常量标量：烤进 op_params[0]（照 OP_SCALE 的做法，见 scale()），不留 src[1] ----
+    //   收益：省一个 host 标量叶子 + 调度器一条 H2D cpy 节点 + CUDA 端每节点一次 D2H drain。
+    //    风险②【本函数调用方必读】：传入的 b 若是**可学习标量**（会被优化器更新的 1 元素
+    //      参数张量），必须置 TENSOR_FLAG_PARAM！否则它满足"常量"判据 → 值在这一刻被烤进图，
+    //      训练中永不更新（静默错值），而且**不会**打印 [ADD1-NOBAKE]（因为判定为可烤）。
+    //      现有调用点（loss 的 eps、SE3 的 eps）都是字面量常量；新增调用点请对照本条 review。
+    {
+        float cval = 0.0f;
+        const char* why = "";
+        if (add1_bake_on() && add1_scalar_const_value(b, &cval, &why)) {
+            assert(b->numel() == 1);
+            reinterpret_cast<float&>(result->op_params[0]) = cval;
+            result->src[1] = nullptr;
+            return result;
+        }
+        if (add1_bake_on()) add1_bake_fallback_warn(b, why);
+    }
+
+    // 运行期标量（如反向里的标量梯度）：保留 src[1]，CUDA 端由 kernel 直接读 device 指针
     result->src[1] = b;
- 
+
     return result;
 }
 
@@ -136,7 +259,7 @@ TensorF32* neg(TensorF32* a) {
 //   result[i,j] = sum_k a[i,k]*b[j,k]
 // 修正：result.dims[0] 应为 b 的行数 N=b.dims[1]，而非 b.dims[0](=K)；
 //   原实现写 b.dims[0] 导致非方阵时输出形状错误。
-TensorF32* mul_mat(TensorF32* a, TensorF32* b) {
+TensorF32* mul_mat(TensorF32* a, TensorF32* b, TensorF32* bias) {
     // 形状契约检查（2026-09-11）：收缩维必须一致（a.dims[0] == b.dims[0]）。
     //   实测 le103 + MSA512 多样本出现畸形节点：a=[51,2097152] × b=[512,256,8,51]（51≠512）
     //   → dst=[256,2097152]=2GB；它不是立即崩溃，而是把 Gallocr 的 **CPU 峰值推到 150GB**
@@ -166,9 +289,27 @@ TensorF32* mul_mat(TensorF32* a, TensorF32* b) {
     int64_t ne[2] = {b->shape().dims[1], a->shape().dims[1]};
     TensorF32* result = context().new_tensor<float>(2, ne);
 
+    // GEMM epilogue 融合（2026-10-18）：bias 必须能沿 dims[1] 广播到 dst 的 dims[0]=N。
+    //   合法形状：bias=[N]（1D，最常见）或 [N,1]（等价）。长度不符 ⇒ 打印并忽略，
+    //   避免"静默少加 bias"这种最难查的错误。
+    if (bias) {
+        const int64_t N = ne[0];
+        if (bias->numel() != N) {
+            fprintf(stderr,
+                    "[MULMAT-BIAS] 长度不匹配：bias.numel=%lld != dst.dims[0]=%lld"
+                    "（numpy 广播语义为 bias[n] 加到每一列）⇒ **忽略 bias**，"
+                    "请修调用方（bias dims=[%lld,%lld,%lld,%lld]）\n",
+                    (long long)bias->numel(), (long long)N,
+                    (long long)bias->shape().dim(0), (long long)bias->shape().dim(1),
+                    (long long)bias->shape().dim(2), (long long)bias->shape().dim(3));
+            bias = nullptr;
+        }
+    }
+
     result->op     = OP_MUL_MAT;
     result->src[0] = a;
     result->src[1] = b;
+    result->src[2] = bias;          // 可为空 ⇒ 行为与旧版完全一致
     return result;
 }
 
@@ -1402,12 +1543,16 @@ static Shape broadcast_shape(TensorF32* a, TensorF32* b) {
 }
 
 // 创建常量标量节点
+//   2026-10-19：改为走 constant_scalar（const_data_ + TENSOR_FLAG_CONST），与
+//   add1_impl 的"常量烤入"判据统一 —— 带 CONST 标记才能被证明是常量（值不随迭代变化），
+//   否则 add1 只能退回"标量张量 + CUDA 端 D2H"。数值/形状/用法完全不变。
+//    风险①【语义变化】：返回值**不再 bind host 数据**（旧实现 `bind_leaf_data(...)[0]=v`），
+//      data() 恒为 nullptr，值只存在于 const_data_，由 Gallocr 分配 backend buffer 后回填。
+//      ⇒ **任何在 build 期直接读 `make_scalar(...)->data()[0]` 的代码都会拿到 nullptr**
+//        （段错误或静默 0）。需要这个 float 时：自己先存一份传入的 value，
+//        或读 `->const_data_[0]`（仅在本函数返回后、Gallocr 填充前有效）。
 static TensorF32* make_scalar(float value) {
-    int64_t ne[4] = {1, 1, 1, 1};
-    TensorF32* t = context().new_tensor<float>(1, ne);
-    // 标量数据直接写入
-    bind_leaf_data(context(), t)[0] = value;
-    return t;
+    return constant_scalar(value);
 }
 
 // sub(a, b) — a - b
@@ -1417,6 +1562,8 @@ TensorF32* sub(TensorF32* a, TensorF32* b) {
     result->op     = OP_SUB;
     result->src[0] = a;
     result->src[1] = b;
+    warn_unaligned_bcast("sub", result, a);
+    warn_unaligned_bcast("sub", result, b);
     return result;
 }
 
@@ -1427,6 +1574,8 @@ TensorF32* mul(TensorF32* a, TensorF32* b) {
     result->op     = OP_MUL;
     result->src[0] = a;
     result->src[1] = b;
+    warn_unaligned_bcast("mul", result, a);
+    warn_unaligned_bcast("mul", result, b);
     return result;
 }
 
@@ -1437,6 +1586,8 @@ TensorF32* div(TensorF32* a, TensorF32* b) {
     result->op     = OP_DIV;
     result->src[0] = a;
     result->src[1] = b;
+    warn_unaligned_bcast("div", result, a);
+    warn_unaligned_bcast("div", result, b);
     return result;
 }
 
@@ -1447,6 +1598,61 @@ TensorF32* sigmoid(TensorF32* a) {
     result->op     = OP_UNARY;
     set_unary_op(result, UNARY_OP_SIGMOID);
     result->src[0] = a;
+    return result;
+}
+
+// ============================================================
+// 门控融合 act_mul（2026-10-18）
+//   act_mul(x, g, kind): dst = act(x) * g（op_params[0] = act_kind）
+//   与 `mul(sigmoid(x), g)` 逐位等价，但：1 个节点 + 不物化 act(x) 中间态。
+//   g 允许比 x 小（kernel 内 i % g.numel()），与 OP_MUL 的广播语义一致。
+// ============================================================
+TensorF32* act_mul(TensorF32* x, TensorF32* g, act_kind kind) {
+    // A/B 逃生舱（仅诊断/量化收益用）：PPML_NO_ACT_MUL=1 ⇒ 退回 "unary 激活 + mul" 两节点，
+    //   用于同一二进制内对比峰值/耗时（默认关闭，生产路径恒为融合节点）。
+    if (const char* off = getenv("PPML_NO_ACT_MUL")) {
+        if (std::strcmp(off, "1") == 0) {
+            TensorF32* a = context().new_tensor<float>(x->shape().ndim(), x->shape().dims.data());
+            a->op     = OP_UNARY;
+            a->src[0] = x;
+            switch (kind) {
+                case ACT_SIGMOID: set_unary_op(a, UNARY_OP_SIGMOID); break;
+                case ACT_SILU:    set_unary_op(a, UNARY_OP_SILU);    break;
+                case ACT_GELU:    set_unary_op(a, UNARY_OP_GELU);    break;
+                case ACT_TANH:    set_unary_op(a, UNARY_OP_TANH);    break;
+                case ACT_RELU:    set_unary_op(a, UNARY_OP_RELU);    break;
+                default:          set_unary_op(a, UNARY_OP_SIGMOID); break;
+            }
+            return mul(a, g);
+        }
+    }
+    TensorF32* result = context().new_tensor<float>(x->shape().ndim(), x->shape().dims.data());
+    result->op           = OP_ACT_MUL;
+    result->src[0]       = x;
+    result->src[1]       = g;
+    result->op_params[0] = static_cast<int32_t>(kind);
+    warn_unaligned_bcast("act_mul", result, g);
+    return result;
+}
+
+// 反向：dx = grad * g * act'(x)（src[0]=grad, src[1]=x, src[2]=g）
+TensorF32* act_mul_back_x(TensorF32* grad, TensorF32* x, TensorF32* g, act_kind kind) {
+    TensorF32* result = context().new_tensor<float>(x->shape().ndim(), x->shape().dims.data());
+    result->op           = OP_ACT_MUL_BACK_X;
+    result->src[0]       = grad;
+    result->src[1]       = x;
+    result->src[2]       = g;
+    result->op_params[0] = static_cast<int32_t>(kind);
+    return result;
+}
+
+// 反向：dg = grad * act(x)（src[0]=grad, src[1]=x）
+TensorF32* act_mul_back_g(TensorF32* grad, TensorF32* x, act_kind kind) {
+    TensorF32* result = context().new_tensor<float>(x->shape().ndim(), x->shape().dims.data());
+    result->op           = OP_ACT_MUL_BACK_G;
+    result->src[0]       = grad;
+    result->src[1]       = x;
+    result->op_params[0] = static_cast<int32_t>(kind);
     return result;
 }
 

@@ -125,7 +125,11 @@ namespace ppml {
 
         // 统一 view 成 2D [D_in, M]（1D [D_in] 视为 M=1），再 mul_mat → [D_out, M]
         TensorF32* x_flat = (x_ndim == 2) ? x : view(x, Shape{in_features_, M});
-        TensorF32* y = mul_mat(x_flat, weight_);                  // [D_out, M] = W0 @ x
+        // GEMM epilogue 融合（2026-10-18）：bias 直接进 mul_mat 的 epilogue。
+        //   旧写法 `mul_mat → repeat(bias→[D_out,M]) → add` 每个 Linear 多 2 个节点，
+        //   且 repeat 会把 [D_out] 物化成整块 [D_out,M]（纯浪费的 4 遍张量读写）。
+        //   ⚠ LoRA 开启时加法顺序变为 (Wx+b)+lora（旧为 (Wx+lora)+b），仅浮点结合顺序差异。
+        TensorF32* y = mul_mat(x_flat, weight_, has_bias_ ? bias_ : nullptr);  // [D_out, M] = W0 @ x + b0
 
         // LoRA 低秩旁路: y += (alpha/rank) * B @ A @ x
         if (lora_A_ && lora_B_) {
@@ -136,13 +140,7 @@ namespace ppml {
             y = add_impl(y, ps, /*inplace=*/false);            // 并联相加
         }
 
-        if (has_bias_) {
-            // bias [D_out] 广播到 [D_out, M]（kernel_repeat 尾部对齐，1D→2D）
-            int64_t btgt[2] = {out_features_, M};
-            TensorF32* btarget = context().new_tensor<float>(2, btgt);
-            TensorF32* bias_br = repeat(bias_, btarget);
-            y = add_impl(y, bias_br, /*inplace=*/false);  // 逐元素（形状相同）
-        }
+        // 原 bias 广播 add 已融合进上面的 mul_mat epilogue（2026-10-18）。
 
         // 还原多维形状 [D_out, d1, d2, d3]
         if (x_ndim > 2) {
@@ -275,16 +273,19 @@ namespace ppml {
         TensorF32* normed = norm(x, eps_);  // or norm() for layernorm
         int D = (int)normed->shape().dims[0];
         int nd = normed->shape().ndim();
-        // gamma/beta [D] → view 成与 normed 同 ndim 的 [D,1,...,1]（尾部对齐 repeat 才正确）。
-        // 原固定 [D,1,1]（3D）对 4D 输入（如 pair [D,L,L,B]）跨 ndim 尾部对齐会把 D 对齐到 L，
-        // 导致 repeat 语义错乱（甚至巨大 shape）。
+        // gamma/beta [D] → view 成与 normed 同 ndim 的 [D,1,...,1]（覆盖最内维前缀）。
+        // 原固定 [D,1,1]（3D）对 4D 输入（如 pair [D,L,L,B]）会把 D 对到错误的维。
         TensorF32* gamma_v;
         TensorF32* beta_v;
         if (nd == 2)      { gamma_v = view(gamma_, Shape({D, 1}));       beta_v = view(beta_, Shape({D, 1})); }
         else if (nd == 3) { gamma_v = view(gamma_, Shape({D, 1, 1}));    beta_v = view(beta_, Shape({D, 1, 1})); }
         else              { gamma_v = view(gamma_, Shape({D, 1, 1, 1})); beta_v = view(beta_, Shape({D, 1, 1, 1})); }
-        TensorF32* scaled  = mul(normed, repeat(gamma_v, normed));
-        return add_impl(scaled, repeat(beta_v, scaled), /*inplace=*/false);
+        // 2026-10-18：gamma/beta 的最内维广播直接进逐元素 kernel 体内（src[i % D]），
+        //   不再物化 repeat 的整块 [D,M,...]（省 2 个节点 + 2 份全尺寸缓冲）。
+        //   前提：gamma_v/beta_v 是 normed 的**最内维前缀**（bcast_prefix_aligned ✓）；
+        //   反向 OP_MUL/OP_ADD 的 src1 分支在形状不同时走 repeat_back 回 [D,1,...] ✓。
+        TensorF32* scaled = mul(normed, gamma_v);
+        return add_impl(scaled, beta_v, /*inplace=*/false);
     }
     
     TensorF32 LayerNorm::forward_exec(const TensorF32& x) {

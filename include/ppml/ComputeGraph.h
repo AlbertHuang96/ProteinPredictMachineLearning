@@ -70,6 +70,21 @@ public:
     void graph_clear();
  
     int graph_size();
+
+    // ===== 张量使用计数 use-count（2026-10-18，融合 pass 的合法性判据）=====
+    //   零额外内存：use_counts 数组在 new_graph_custom 中**早已按 hash_size 分配**
+    //   （graph_nbytes 亦已计入，此前是 ggml 遗留的死字段），与 visited_hash_set 同槽位
+    //   ⇒ O(1) 查询、无任何新分配。
+    //   语义：t 被图中多少个节点作为 src 引用（同一节点 src[] 重复出现也各计一次）。
+    //   与 Gallocr::NodeInfo::n_children 的区别：本计数是非破坏性的（只由建图维护，
+    //   分配器不会递减），可重复查询 ⇒ 可用于"该中间态是否只有 1 个消费者"这类判定。
+    //   ⚠️ 槽位按图（ComputeGraph）索引，不是按 Tensor 索引 ⇒ 多样本多图并存时互不干扰。
+    // 重算（覆盖式）：建图后 / 图被原地改写后调用；O(n_nodes+GGML_MAX_SRC·n_nodes)
+    void build_use_counts();
+    // 查询：t 在本图中的消费者数量（t 不在图中 ⇒ 0）
+    int  use_count(const TensorF32* t);
+    // 是否存在恰好 1 个消费者（融合 / 中间态可消除的判据）
+    bool single_use(const TensorF32* t) { return use_count(t) == 1; }
     //error: deduced class type ‘Tensor’ in function return type
     // use void*
     // or TensorF32
@@ -156,6 +171,10 @@ private:
     TensorF32 ** grad_accs; // accumulators for node gradients
     TensorF32 ** leafs;
 
+    // use-count 数组（槽位与 visited_hash_set 一一对应；见 build_use_counts 注释）。
+    // 由 new_graph_custom 直接指向图对象内存中**既有**的那段 int32_t 数组 ⇒ 0 额外分配。
+    int32_t   * use_counts = nullptr;
+
     //一个图中存一个hash表，size的大小取决于图中nodes和leafs的数量之和
     struct HashSet visited_hash_set;
 
@@ -165,6 +184,16 @@ private:
 // ============================================================
 // 图节点构造函数（全局函数，公开 API）
 // ============================================================
+
+// bcast_prefix_aligned(dst, src) — 逐元素 kernel 的广播前提（2026-10-18）
+//   本仓库 CPU/CUDA 逐元素 kernel 都用扁平等长索引 `src[i % src_numel]`，只有当 src
+//   正好覆盖 dst 的**最内维前缀**（ggml 顺序从 dims[0] 起）时才等价于逐维广播：
+//     存在 k：src.dims[d] == dst.dims[d] (d <= k)，且 src.dims[d] == 1 (d > k)。
+//     （等价说法：src 去掉尾部 1 之后的形状 == dst 的内层前缀；numel 相等恒为 true）
+//   反例：[1,M] → [D,M]（外层维广播）不成立 ⇒ kernel 会读错元素（不崩、静默错值）。
+//   用途：① 调度器判断 CUDA 能否承接该广播节点（Backend.cpp）；② 构造期告警
+//   （ComputeGraphHelper.cpp 的 add_impl/mul/sub/div）。
+bool bcast_prefix_aligned(const TensorF32* dst, const TensorF32* src);
 
 // 1. 算术
 TensorF32* add_impl (TensorF32* a, TensorF32* b, bool inplace);
@@ -176,7 +205,11 @@ TensorF32* scale(TensorF32* a, float s);
 TensorF32* neg (TensorF32* a);
 
 // 2. 矩阵
-TensorF32* mul_mat  (TensorF32* a, TensorF32* b);
+// mul_mat(a, b, bias=nullptr) — GEMM epilogue 融合（2026-10-18）：
+//   bias 非空时 dst[n,m] = Σ_k a[k,m]·b[n,k] + bias[n]（bias 形如 [N]，沿 dims[1] 广播）。
+//   等价于旧的 `mul_mat(a,b) → repeat(bias,[N,M]) → add`，但省掉 repeat 物化 + 一次 add 的全量读写。
+//   反向：dA/dB 同旧；dbias = repeat_back(grad, bias)（沿 dims[1] 求和）。
+TensorF32* mul_mat  (TensorF32* a, TensorF32* b, TensorF32* bias = nullptr);
 TensorF32* out_prod (TensorF32* a, TensorF32* b);
 TensorF32* transpose(TensorF32* a);
 
@@ -210,6 +243,20 @@ TensorF32* relu_back(TensorF32* grad, TensorF32* x);
 TensorF32* exp    (TensorF32* a);
 TensorF32* leaky_relu(TensorF32* a, float alpha = 0.01f);
 TensorF32* sigmoid(TensorF32* a);
+
+// 3.6 门控融合 act_mul（2026-10-18）—— dst = act(x) * g（逐元素同形，g 可广播）
+//   替代 `mul(sigmoid(gv), merged)` 的 2 节点 + 1 份中间态（[H*D,L,N,B]）：
+//     原：OP_UNARY(SIGMOID) 写满块 → OP_MUL 再整块读 → 峰值多一份满尺寸中间态
+//     新：单节点边算激活边乘，中间态零物化（act_kind 见 Tensor.h）
+//   g 允许比 x 小（[i % g.numel()] 取模，与 OP_MUL 的 CPU/CUDA kernel 同语义）。
+//   反向见 compute_backward：dx = grad·g·act'(x)（OP_ACT_MUL_BACK_X）、
+//   dg = grad·act(x)（OP_ACT_MUL_BACK_G），各 1 个节点（不用基础 op 拼 4~6 个）。
+TensorF32* act_mul(TensorF32* x, TensorF32* g, act_kind kind);
+// 反向节点（由 compute_backward 内部构造，一般不直接调用）：
+//   act_mul_back_x(grad, x, g, kind) → grad * g * act'(x)
+//   act_mul_back_g(grad, x, kind)    → grad * act(x)
+TensorF32* act_mul_back_x(TensorF32* grad, TensorF32* x, TensorF32* g, act_kind kind);
+TensorF32* act_mul_back_g(TensorF32* grad, TensorF32* x, act_kind kind);
 
 // 4. 归一化
 TensorF32* rms_norm(TensorF32* a, float eps = 1e-6f);
