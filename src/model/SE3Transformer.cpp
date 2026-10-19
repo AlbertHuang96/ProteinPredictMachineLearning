@@ -6,6 +6,33 @@
 #include <algorithm>
 #include <vector>
 
+
+
+/*
+**Handling Backbone Cyclization:** In SE(3)-equivariant message-passing layers, 
+the adjacency matrix or $k$-NN graph is modified to include covalent bond edges connecting the C-terminus back to the N-terminus (or side-chain-to-backbone lactam/disulfide bridges). 
+This forces the SE(3) tensor product updates to circulate positional information around a closed loop, 
+correctly propagating geometric tension and local strain across the ring.
+
+To adapt SE(3)-equivariant message-passing networks and graph-based models to **cyclic peptides (macrocycles)**, several precise structural and topological modifications are made to handle ring closure:
+
+### 1. Hardcoding the Backbone-Closing Covalent Edge
+
+* **Linear vs. Cyclic Topology:** Linear proteins have open-ended chains with a distinct N-terminus and C-terminus. A cyclic peptide forms a closed loop via a peptide bond (or alternative cyclization chemistry like disulfides or lactams).
+* **The Structural Change:** The adjacency matrix or bond graph is explicitly modified to add a permanent covalent bond edge connecting the carbonyl carbon ($C^{\prime}$) of the final C-terminal residue directly back to the backbone nitrogen ($N$) of the first N-terminal residue.
+
+### 2. Protection from Dynamic $k$-NN Pruning
+
+* **The Problem:** In dynamic SE(3) architectures using $k$-nearest-neighbor ($k$-NN) graphs, edges are continuously evaluated and pruned based on spatial proximity thresholds.
+* **The Structural Change:** The backbone-closing cyclic bond is hardcoded as a **permanent topological constraint** (similar to standard intra-residue covalent bonds). It is masked and exempted from dynamic distance-based pruning, ensuring the ring never artificially "snaps open" during coordinate updates or structural relaxations.
+
+### 3. Circular Message Propagation in SE(3) Layers
+
+* **The Problem:** Standard message-passing graph neural networks pass messages linearly along a chain graph, where terminal nodes act as dead ends.
+* **The Structural Change:** With the adjacency loop closed, SE(3)-equivariant tensor product features (representing $l = 0, 1, 2$ geometric components like bond orientations and angular strain) can **propagate continuously in a circular topology**. This allows the network to correctly model cooperative dihedral constraints, ring strain, and rigid conformational locking across the entire macrocycle.
+
+*/
+
 namespace ppml {
 
 // ============================================================================
@@ -1396,11 +1423,15 @@ std::vector<TensorF32*> RadialFunc::parameters() {
 TensorF32* RadialFunc::forward_graph(TensorF32* x) {
     // ---- Layer 1: Linear → BN(affine) → ReLU ----
     TensorF32* h = linear1_->forward_graph(x);          // (E, 32)
-    h = add_impl(mul(h, repeat(bn1_gamma_, h)), repeat(bn1_beta_, h), /*inplace=*/false);
+    // 2026-10-18：gamma/beta 的最内维广播进 kernel 体内（省 2 次 repeat 物化）。
+    //   前提：view 成 [mid_dim,1]，覆盖 h 的最内维前缀（bcast_prefix_aligned ✓）。
+    h = add_impl(mul(h, view(bn1_gamma_, Shape({mid_dim_, 1}))),
+                 view(bn1_beta_,  Shape({mid_dim_, 1})), /*inplace=*/false);
     h = relu(h);
     // ---- Layer 2: Linear → BN(affine) → ReLU ----
     h = linear2_->forward_graph(h);                     // (E, 32)
-    h = add_impl(mul(h, repeat(bn2_gamma_, h)), repeat(bn2_beta_, h), /*inplace=*/false);
+    h = add_impl(mul(h, view(bn2_gamma_, Shape({mid_dim_, 1}))),
+                 view(bn2_beta_,  Shape({mid_dim_, 1})), /*inplace=*/false);
     h = relu(h);
     // ---- Layer 3: Linear → reshape (E, num_freq*in*out) → R dims=[num_freq, in, out, E] ----
     TensorF32* y = linear3_->forward_graph(h);          // (E, num_freq*in*out)
@@ -2041,17 +2072,17 @@ std::vector<TensorF32*> G1x1SE3::forward_graph(const std::vector<TensorF32*>& x_
         TensorF32* W_expanded = constant_tensor({in_F, out_F}, Wexp.data());
 
         // out = mul_mat(x_d, W_expanded) + bias
-        TensorF32* y = mul_mat(x_d, W_expanded);   // dims=[out_F, N]
+        //   GEMM epilogue 融合（2026-10-18）：bias 直接进 mul_mat，省掉 repeat 物化 + 一次 add。
+        TensorF32* b_node = nullptr;
         if (b_data) {
             // bias: (m_out,) → 沿 mo 扩展，每个 dd 相同 → (out_F,)
             std::vector<float> bexp(out_F);
             for (int mo = 0; mo < m_out; ++mo)
                 for (int dd = 0; dd < d_dim; ++dd)
                     bexp[mo * d_dim + dd] = b_data[mo];
-            TensorF32* b_node = constant_tensor({out_F, 1}, bexp.data());
-            TensorF32* b_bcast = repeat(b_node, y);   // dims=[out_F, N]
-            y = add_impl(y, b_bcast, /*inplace=*/false);
+            b_node = constant_tensor({out_F, 1}, bexp.data());   // numel == dst.dims[0] ✓
         }
+        TensorF32* y = mul_mat(x_d, W_expanded, b_node);   // dims=[out_F, N]
         out[j] = y;
     }
     return out;

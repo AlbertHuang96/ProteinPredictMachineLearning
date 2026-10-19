@@ -374,8 +374,8 @@ TensorF32* MSARowAttention::forward_graph(TensorF32* msa, TensorF32* pair_biased
     auto* bias = to_b_->forward_graph(pair_biased);
     bias = prepare_pair_bias(bias, /*Lq=*/L, /*Lk=*/L, /*B=*/B, /*fold=*/N);
     // gate: to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]
+    //   融合（2026-10-18）：不再单独做 sigmoid 节点，gated 处用 act_mul 边激活边乘
     auto* gv   = to_g_->forward_graph(msa);
-    auto* gate = sigmoid(gv);
 
     // self_attn: Q,K,V 均为 [L,D,H,B*N], 输出 [L,D,H,B*N] = 值 (B*N,H,D,L)
     auto* attn_out = self_attn_->forward_graph(Q, K, V, bias);
@@ -386,8 +386,8 @@ TensorF32* MSARowAttention::forward_graph(TensorF32* msa, TensorF32* pair_biased
     auto* merged = permute(attn_out, {1, 2, 0, 3}); // [D,H,L,B*N] = 值 (B*N,L,H,D)
     merged = view(merged, Shape{H * D, L, N, B});   // [H*D,L,N,B] = 值 (B,N,L,H*D)
 
-    // 门控: gate 与 merged 同为 [H*D,L,N,B]
-    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
+    // 门控: sigmoid(gv) * merged 融合为单节点（省掉 [H*D,L,N,B] 的 sigmoid 中间态）
+    auto* gated = act_mul(gv, merged, ACT_SIGMOID);
     // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
     return to_out_->forward_graph(gated);
 }
@@ -474,9 +474,8 @@ TensorF32* MSAColAttention::forward_graph(TensorF32* msa) {
     V = view(V, Shape{D, H, N, B * L});
     V = permute(V, {2, 0, 1, 3});
 
-    // gate: to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]
+    // gate: to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]（sigmoid 融合进 act_mul）
     auto* gv   = to_g_->forward_graph(msa);
-    auto* gate = sigmoid(gv);
 
     // self_attn: Q,K,V 均为 [N,D,H,B*L], 输出 [N,D,H,B*L] = 值 (B*L,H,D,N)
     auto* attn_out = self_attn_->forward_graph(Q, K, V);
@@ -489,8 +488,8 @@ TensorF32* MSAColAttention::forward_graph(TensorF32* msa) {
     merged = view(merged, Shape{H * D, N, L, B});   // [H*D,N,L,B] = 值 (B,L,N,H*D)
     merged = permute(merged, {0, 2, 1, 3});          // [H*D,L,N,B] = 值 (B,N,L,H*D)
 
-    // 门控: gate 与 merged 同为 [H*D,L,N,B]
-    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
+    // 门控: sigmoid(gv) * merged 融合为单节点（省掉满尺寸 sigmoid 中间态）
+    auto* gated = act_mul(gv, merged, ACT_SIGMOID);
     // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
     return to_out_->forward_graph(gated);
 }
@@ -616,9 +615,8 @@ TensorF32* MSAGlobalColAttention::forward_graph(TensorF32* msa) {
     V = permute(V, {2, 0, 1, 3});
 
     // ===== 4. gate =====
-    // to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]
+    // to_g_ D_MSA→H*D, 值 (B,N,L,H*D) = 图 [H*D,L,N,B]（sigmoid 融合进 act_mul）
     auto* gv   = to_g_->forward_graph(msa);
-    auto* gate = sigmoid(gv);
 
     // ===== 5. self_attn: Q=[1,D,H,B*L], K/V=[N,D,H,B*L] → [1,D,H,B*L] = 值 (B*L,H,D,1) =====
     auto* attn_out = self_attn_->forward_graph(Qh, K, V);
@@ -635,8 +633,8 @@ TensorF32* MSAGlobalColAttention::forward_graph(TensorF32* msa) {
     merged = repeat(merged, target);                      // [H*D,L,N,B] = 值 (B,N,L,H*D)
 
     // ===== 7. 门控 + 输出投影 =====
-    // gate 与 merged 同为 [H*D,L,N,B]
-    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
+    // sigmoid(gv) * merged 融合为单节点（省掉 [H*D,L,N,B] 的 sigmoid 中间态）
+    auto* gated = act_mul(gv, merged, ACT_SIGMOID);
     // 输出投影: H*D → D_MSA, 返回 [D_MSA,L,N,B] = 值 (B,N,L,D_MSA)
     return to_out_->forward_graph(gated);
 }
@@ -730,9 +728,9 @@ TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     // 前置不变量：pair 为方阵（Lr==Lc==L），实际网络里 str_bias 来自 rbf_proj (B,L,L,D_PAIR)。
     auto* bias = to_b_->forward_graph(str_bias);
     bias = prepare_pair_bias(bias, /*Lq=*/Lr, /*Lk=*/Lr, /*B=*/B, /*fold=*/Lc);
-    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]（gate 用原始 pair）
+    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]（gate 用原始 pair；
+    //   sigmoid 融合进下方 act_mul，省掉满尺寸中间态）
     auto* gv   = to_g_->forward_graph(pair);
-    auto* gate = sigmoid(gv);
 
     // self_attn: Q,K,V 均为 [Lr,D,H,B*Lc], 输出 [Lr,D,H,B*Lc] = 值 (B*Lc,H,D,Lr)
     auto* attn_out = self_attn_->forward_graph(Q, K, V, bias);
@@ -745,8 +743,8 @@ TensorF32* PairRowAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     merged = view(merged, Shape{H * D, Lr, Lc, B}); // [H*D,Lr,Lc,B] = 值 (B,Lc,Lr,H*D)
     merged = permute(merged, {0, 2, 1, 3});          // [H*D,Lc,Lr,B] = 值 (B,Lr,Lc,H*D)
 
-    // 门控: gate 与 merged 同为 [H*D,Lc,Lr,B]
-    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
+    // 门控: sigmoid(gv) * merged 融合为单节点（省掉满尺寸 sigmoid 中间态）
+    auto* gated = act_mul(gv, merged, ACT_SIGMOID);
     // 输出投影: H*D → D_PAIR, 返回 [D_PAIR,Lc,Lr,B] = 值 (B,Lr,Lc,D_PAIR)
     return to_out_->forward_graph(gated);
 }
@@ -850,9 +848,9 @@ TensorF32* PairColAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     // 前置不变量：pair 为方阵（Lr==Lc==L），实际网络里 str_bias 来自 rbf_proj (B,L,L,D_PAIR)。
     auto* bias = to_b_->forward_graph(str_bias);
     bias = prepare_pair_bias(bias, /*Lq=*/Lc, /*Lk=*/Lc, /*B=*/B, /*fold=*/Lr);
-    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]（gate 用原始 pair）
+    // gate: to_g_ D_PAIR→H*D, 值 (B,Lr,Lc,H*D) = 图 [H*D,Lc,Lr,B]（gate 用原始 pair；
+    //   sigmoid 融合进下方 act_mul，省掉满尺寸中间态）
     auto* gv   = to_g_->forward_graph(pair);
-    auto* gate = sigmoid(gv);
 
     // self_attn: Q,K,V 均为 [Lc,D,H,B*Lr], 输出 [Lc,D,H,B*Lr] = 值 (B*Lr,H,D,Lc)
     auto* attn_out = self_attn_->forward_graph(Q, K, V, bias);
@@ -863,8 +861,8 @@ TensorF32* PairColAttention::forward_graph(TensorF32* pair, TensorF32* str_bias)
     auto* merged = permute(attn_out, {1, 2, 0, 3}); // [D,H,Lc,B*Lr] = 值 (B*Lr,Lc,H,D)
     merged = view(merged, Shape{H * D, Lc, Lr, B}); // [H*D,Lc,Lr,B] = 值 (B,Lr,Lc,H*D)
 
-    // 门控: gate 与 merged 同为 [H*D,Lc,Lr,B]
-    auto* gated = mul(gate, merged);   // 门控逐元素（原误用 out_prod 外积，会产生错误形状）
+    // 门控: sigmoid(gv) * merged 融合为单节点（省掉满尺寸 sigmoid 中间态）
+    auto* gated = act_mul(gv, merged, ACT_SIGMOID);
     // 输出投影: H*D → D_PAIR, 返回 [D_PAIR,Lc,Lr,B] = 值 (B,Lr,Lc,D_PAIR)
     return to_out_->forward_graph(gated);
 }
@@ -1050,12 +1048,13 @@ TensorF32* TriangleMultiplication::forward_graph(TensorF32* pair, bool bOutgoing
     auto right      = right_proj_->forward_graph(pair_norm);
     auto lgv        = left_gate_->forward_graph(pair_norm);
     auto rgv        = right_gate_->forward_graph(pair_norm);
-    auto left_gate  = sigmoid(lgv);
-    auto right_gate = sigmoid(rgv);
-    // gate 应为逐元素缩放（AF2: left * left_gate），而非 out_prod 收缩（会把残基维缩掉，
-    // 使 tri_mul 收到非标准 [16,16,L,B]，导致维度不一致）。→ 改用逐元素 mul。
-    auto left_gated  = mul(left, left_gate);
-    auto right_gated = mul(right, right_gate);
+    // gate 应为逐元素缩放（AF2: left * sigmoid(left_gate)），而非 out_prod 收缩（会把残基维缩掉，
+    // 使 tri_mul 收到非标准 [16,16,L,B]，导致维度不一致）。
+    // 门控融合（2026-10-19）：sigmoid+mul → 单节点 act_mul，省掉 2 份
+    //   [D_HIDDEN_TRIMUL, L, L, B] 中间态（L=103 时每份约 5.4 MB），且 gate 支路梯度
+    //   不再断在 OP_UNARY(SIGMOID) 的空反向实现上。
+    auto left_gated  = act_mul(lgv, left,  ACT_SIGMOID);
+    auto right_gated = act_mul(rgv, right, ACT_SIGMOID);
 
     auto tri_mul_forward = triangle_mul(left_gated, right_gated, float(pair->shape().dims[1]), bOutgoing);
 
@@ -1063,8 +1062,8 @@ TensorF32* TriangleMultiplication::forward_graph(TensorF32* pair, bool bOutgoing
     auto tri_mul_forward_proj = out_proj_->forward_graph(tri_mul_forward_norm);
 
     auto gv = gate_->forward_graph(pair_norm);
-    auto gate_out = sigmoid(gv);
-    auto tri_mul_forward_gated = mul(gate_out, tri_mul_forward_proj);
+    // sigmoid(gv) * proj 融合为单节点（省掉一份满尺寸 sigmoid 中间态）
+    auto tri_mul_forward_gated = act_mul(gv, tri_mul_forward_proj, ACT_SIGMOID);
 
     return tri_mul_forward_gated;   // 返回图节点
 }

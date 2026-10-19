@@ -1,6 +1,7 @@
 #include "ppml/Backend.h"
 #include "ppml/ComputeGraph.h"
 #include "ppml/FlashAttn.h"     // 【Step ⑤】FlashAttnConfig + flash_attn_{forward,backward}_cuda 声明 ✓
+#include "ppml/QuantBlocks.h"   // block_q8_0 / block_q8_1（W8A8，2026-10-17）
 #include <cstring>
 #include <vector>
 
@@ -29,8 +30,11 @@ extern void bcast_elemwise_cuda(
     const float * a, const float * b, float * dst,
     int64_t n, int64_t an, int64_t bn, int eop);
 
-// OP_ADD1 前向（实现于 src/cuda/CUDAKernels.cu）：dst[i] = src[i] + b（b 标量，D2H 读取）
-extern void add1_cuda(const float * src, float * dst, float b, int64_t n);
+// OP_ADD1 前向（实现于 src/cuda/CUDAKernels.cu）：dst[i] = src[i] + b
+//   b_dev 非空 → device 上直接读 b_dev[0]（运行期标量，无 D2H）；空 → 用 host 常量 b_host
+//   （建图期常量已烤进 op_params[0]，见 add1_impl）。
+extern void add1_cuda(const float * src, const float * b_dev, float b_host,
+                      float * dst, int64_t n);
 
 // OP_DUP/OP_CPY/OP_CONT 整块拷贝（实现于 src/cuda/CUDAKernels.cu）：四分支 buffer-aware
 extern void copy_tensor_cuda(const float * src, float * dst, int64_t n,
@@ -64,7 +68,19 @@ extern void softmax_backward_cuda(
     const float * grad, const float * output, float * dst,
     int M, int N, int block_size, float scale);
 
-extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N);
+extern void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N,
+                         const float* bias = nullptr);
+
+// ===== int8 分块量化（W8A8，2026-10-17）=====
+//   量化/反量化 kernel 在 src/cuda/QuantKernels.cu；MMVQ（__dp4a）在 src/cuda/MulMatQ8Kernel.cu。
+//   数据流：src0 = int8 权重（原样读）→ src1 F32 即时量化成 Q8_1（scratch）→ dp4a → 每块乘 scale。
+extern int quantize_rows_q8_1_cuda(const float* x, block_q8_1* y, int64_t ne, cudaStream_t stream);
+extern int dequantize_q8_0_cuda(const block_q8_0* x, float* y, int64_t ne, cudaStream_t stream);
+extern int dequantize_q8_1_cuda(const block_q8_1* x, float* y, int64_t ne, cudaStream_t stream);
+//   W：量化权重 [M,K]（Q8_0/Q8_1 块）；X：F32 激活 [K,N]；path_out: 1=MMQ(mma.s8) 0=MMVQ(dp4a)
+//   c_trans：0 = C[m*N+n]（权重在 src0），1 = C[n*M+m]（权重在 src1，token 主序）
+extern int mul_mat_q8_cuda(const void* W, const float* X, float* C,
+                           int M, int N, int K, int wtype, int c_trans, int* path_out);
 
 // 【2026-09-22 Step ⑤】Flash Attention 融合算子（实现见 src/cuda/FlashAttnKernel.cu ✓）
 //   返回 0 = 已执行；1 = 不支持（无设备 / head_dim 超上限 / 参数非法）⇒ *st 上报 ✗
@@ -117,6 +133,16 @@ extern void sum_rows_cuda(const float * src, float * dst, int64_t ncols, int64_t
 
 // OP_RELU_BACK（实现于 src/cuda/CUDAKernels.cu）：dst[i] = (x[i]>0) ? grad[i] : 0
 extern void relu_back_cuda(const float * grad, const float * x, float * dst, int64_t n);
+
+// 门控融合 act_mul（实现于 src/cuda/CUDAKernels.cu）：
+//   kind 与 act_kind 对齐（0=SIGMOID 1=SILU 2=GELU 3=TANH 4=RELU）
+//   g 可小于 dst（gn != n 时 kernel 内 i % gn 广播）
+extern void act_mul_cuda(const float* x, const float* g, float* dst,
+                         long long n, long long gn, int kind);
+extern void act_mul_back_x_cuda(const float* grad, const float* x, const float* g, float* dst,
+                                long long n, long long gn, int kind);
+extern void act_mul_back_g_cuda(const float* grad, const float* x, float* dst,
+                                long long n, int kind);
 
 // OP_REPEAT_BACK 归约（实现于 src/cuda/CUDAKernels.cu）：src(大) → dst(小)，dst[j]=Σ src[j+k*dd]
 // 仅支持同 ndim（src 各维 = dst 各维 × 整数重复因子），跨 ndim 广播由 CPU 回落。
@@ -342,6 +368,17 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             kernel_relu_back_cuda(node, &st);
             break;
 
+        // 门控融合（2026-10-18）：fwd / dx / dg 三个 kernel
+        case OP_ACT_MUL:
+            kernel_act_mul_cuda(node, &st);
+            break;
+        case OP_ACT_MUL_BACK_X:
+            kernel_act_mul_back_x_cuda(node, &st);
+            break;
+        case OP_ACT_MUL_BACK_G:
+            kernel_act_mul_back_g_cuda(node, &st);
+            break;
+
         case OP_ADD1:
             kernel_add1_cuda(node, &st);
             break;
@@ -518,18 +555,76 @@ void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
     float * A = node->src[0]->data();
     float * B = node->src[1]->data();
     float * C = node->data();
+    // GEMM epilogue 融合（2026-10-18）：src[2]=bias（[N]，累加到每一列）。
+    //   ⚠ 仅 SIMT f32 主路径支持；量化 / F16 权重路径不支持（supports_op 已保证不会带 bias
+    //   调度到这两条路径；这里再兜一层，避免把错值算下去）。
+    const float * bias = node->src[2] ? node->src[2]->data() : nullptr;
 
-    // 防御（int8 量化准备，2026-09-10）：量化输入尚无 kernel（supports_op 已返回 false）；
-    //   万一到达则打印并返回，避免把块结构当 float 读。
+    // ===== int8 分块量化（W8A8，2026-10-17）=====
+    //   量化权重可以是 src0 或 src1（**一侧量化、另一侧 F32 激活**）：
+    //     · src0 量化：ggml 约定（mul_mat(W, x)）—— 单测/显式构图的写法；
+    //     · src1 量化：本仓库 LinearLayer::forward_graph 的写法 mul_mat(x_flat, weight_)
+    //       —— 权重天然是右操作数，故必须支持这一侧（否则 model 里永远走不到 int8 路径）。
+    //   kernel 内把 F32 激活即时量化成 Q8_1 到 scratch，dst 必须 F32；K 必须是 32 的倍数。
+    //   其余组合（双量化 / 量化激活 / dst 非 F32）打印并跳过，避免把块结构当 float 读。
     if (is_quantized_type(node->src[0]->type) || is_quantized_type(node->src[1]->type)) {
-        fprintf(stderr, "[MULMAT-QUANT] quantized input not implemented yet (src0=%d src1=%d), skip\n",
-                (int)node->src[0]->type, (int)node->src[1]->type);
+        if (bias) {   // 量化路径无 bias epilogue（supports_op 已拒绝 ⇒ 正常到不了这里）
+            fprintf(stderr, "[MULMAT-BIAS] quantized path has no bias epilogue, node skipped\n");
+            return;
+        }
+        const bool q0 = is_quantized_type(node->src[0]->type);
+        const bool q1 = is_quantized_type(node->src[1]->type);
+        TensorF32* wsrc = q0 ? node->src[0] : node->src[1];   // 量化权重
+        TensorF32* asrc = q0 ? node->src[1] : node->src[0];   // F32 激活
+        const bool ok = (q0 != q1) &&
+                        is_quantized_type_supported(wsrc->type) &&
+                        wsrc->quant_shape_valid() &&
+                        asrc && asrc->type == TENSOR_TYPE_F32 &&
+                        node->type == TENSOR_TYPE_F32 &&
+                        (K % QK8_0) == 0;
+        if (!ok) {
+            fprintf(stderr,
+                    "[MULMAT-QUANT] unsupported combo (src0=%d src1=%d dst=%d K=%d), skip\n",
+                    (int)node->src[0]->type, (int)node->src[1]->type, (int)node->type, K);
+            return;
+        }
+        // kernel 的 M/N 语义固定为「M = 权重行数（out features），N = 激活行数（tokens）」，
+        // 因为 mma 的 A 必须是量化权重。图约定 dst dims = {b.dims[1], a.dims[1]}：
+        //   · 权重在 src0：dst = {tokens, out} ⇒ M = dims[1], N = dims[0] ✓ 与图级一致
+        //   · 权重在 src1：dst = {out, tokens} ⇒ M = dims[0], N = dims[1]  ← 必须交换
+        const int Mq = q0 ? M : N;
+        const int Nq = q0 ? N : M;
+        mulmat_stats_cuda_begin(Mq, K, Nq);
+        // wtype: 0 = Q8_0（34B 块）, 1 = Q8_1（36B 块）—— .cu 侧不依赖 Tensor.h 的枚举
+        // 0 = Q8_0（34B 交错块）, 1 = Q8_1（36B 块）, 2 = Q8_0R（32B 对齐 repack）
+        const int wtype = (wsrc->type == TENSOR_TYPE_Q8_1) ? 1
+                        : (wsrc->type == TENSOR_TYPE_Q8_0R) ? 2 : 0;
+        int path = 0;   // 0 = MMVQ(dp4a)，1 = MMQ(mma.s8)
+        // 输出布局：权重在 src0 → C[m*N+n]（dst 内层是 tokens）；
+        //           权重在 src1 → C[n*M+m]（dst 内层是 out features）
+        const int c_trans = q0 ? 0 : 1;
+        const int rc = mul_mat_q8_cuda(reinterpret_cast<const void*>(wsrc->data()),
+                                       asrc->data(), C, Mq, Nq, K, wtype, c_trans, &path);
+        const char* pname = (path == 1) ? "mmq-q8-mma" : "mmvq-q8-dp4a";
+        mulmat_stats_cuda_end(rc == 0 ? pname : "mmvq-q8-failed");
+        if (rc != 0) {
+            fprintf(stderr, "[MULMAT-QUANT] %s failed rc=%d (M=%d N=%d K=%d wtype=%d)\n",
+                    pname, rc, Mq, Nq, K, wtype);
+        }
+        if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
+            fprintf(stderr, "[MMA] M=%d K=%d N=%d path=%s wside=%s trans=%d rc=%d\n",
+                    Mq, K, Nq, pname, q0 ? "src0" : "src1", c_trans, rc);
+        }
         return;
     }
     // 前期 fp16 支持（2026-09-10）：A/B 同为 F16 → half 输入 kernel（内部转 fp32 累加）。
     //   data() 返回 float*，但实际指向 16 位 half 数据（type_size_bytes()==2），按 void* 传递。
     //   优先 tensor-core（m16n8k16, fp32 累加）；硬件 < sm_80 时回落 SIMT half 版。
     if (node->src[0]->type == TENSOR_TYPE_F16 && node->src[1]->type == TENSOR_TYPE_F16) {
+        if (bias) {   // F16 路径无 bias epilogue（supports_op 已拒绝 ⇒ 正常到不了这里）
+            fprintf(stderr, "[MULMAT-BIAS] f16 path has no bias epilogue, node skipped\n");
+            return;
+        }
         const void* A16 = reinterpret_cast<const void*>(A);
         const void* B16 = reinterpret_cast<const void*>(B);
         // 优先级：流水版（smem+ldmatrix+cp.async）→ 简化 MMA → SIMT fp16
@@ -560,7 +655,8 @@ void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
         const char* e = std::getenv("PPML_MUL_MAT_TC");
         return e && e[0] && e[0] != '0';     // "0" = 关（默认）；其它值 = 开（TF32）
     }();
-    if (tc_on) {
+    // 带 bias 时走 SIMT 路径（tf32 流水版没有 epilogue；避免"静默丢 bias"）。
+    if (tc_on && !bias) {
         mulmat_stats_cuda_begin(M, K, N);
         const int rc_tc = mul_mat_mma_tf32_smem(A, B, C, M, K, N);
         mulmat_stats_cuda_end(rc_tc == 0 ? "tf32-smem" : "tf32-unavailable");
@@ -573,8 +669,8 @@ void CUDABackend::kernel_mul_mat_cuda(TensorF32 * node, ComputeParams * p) {
     }
 
     mulmat_stats_cuda_begin(M, K, N);
-    mul_mat_cuda(A, B, C, M, K, N);
-    mulmat_stats_cuda_end("simt-128x128");
+    mul_mat_cuda(A, B, C, M, K, N, bias);
+    mulmat_stats_cuda_end(bias ? "simt-128x128+bias" : "simt-128x128");
     if (getenv("GRAPH_DEBUG_MMA") && p && p->ith == 0) {
         fprintf(stderr, "[MMA] M=%d K=%d N=%d path=simt-128x128\n", M, K, N);
     }
@@ -753,15 +849,29 @@ void CUDABackend::kernel_clamp_cuda(TensorF32 * node, Status* st) {
 }
 
 void CUDABackend::kernel_add1_cuda(TensorF32 * node, Status* st) {
-    // OP_ADD1：dst = src + b（b 为 src[1] 标量张量，device 指针 → D2H 读 b[0]，
-    // 对齐 CPU kernel_add1 的 host 读取语义）。
-    if (!node->src[0] || !node->src[1] || !node->src[0]->data() || !node->src[1]->data()) {
+    // OP_ADD1：dst = src + b。b 的三种来源（2026-10-19，对齐 CPU kernel_add1）：
+    //   ① 无 src[1]      → 建图期常量已烤进 op_params[0]（同 OP_SCALE）⇒ 作 kernel 参数传入；
+    //   ② src[1] 在 device → 把 **device 指针**交给 kernel 读 b[0]，不做 D2H（省一次流 drain）；
+    //   ③ src[1] 在 host   → 该张量无 H2D cpy（少见），直接在 host 读值（不拷贝、不探测副作用）。
+    // 开关：PPML_ADD1_OPT=0 / PPML_ADD1_DEVSCALAR=0 → 退回旧的同步 D2H 路径（profile A/B 用）。
+    if (!node->src[0] || !node->src[0]->data() || !node->data()) {
         if (st) *st = Status::NOT_SUPPORTED;
         return;
     }
-    float b = 0.f;
-    cudaMemcpy(&b, node->src[1]->data(), sizeof(float), cudaMemcpyDeviceToHost);  // 同步小拷贝
-    add1_cuda(node->src[0]->data(), node->data(), b, node->numel());
+    const float  baked = reinterpret_cast<const float&>(node->op_params[0]);
+    const float* bs    = node->src[1] ? node->src[1]->data() : nullptr;
+
+    const float* b_dev  = nullptr;
+    float        b_host = baked;
+    if (bs) {
+        if (cuda_ptr_is_device(bs)) b_dev = bs;
+        else                        b_host = *bs;
+    }
+    if (b_dev && !add1_devscalar_on()) {          // 旧路径：同步回读（仅为对照）
+        cudaMemcpy(&b_host, b_dev, sizeof(float), cudaMemcpyDeviceToHost);
+        b_dev = nullptr;
+    }
+    add1_cuda(node->src[0]->data(), b_dev, b_host, node->data(), node->numel());
     if (st) *st = Status::SUCCESS;
 }
 
@@ -790,6 +900,46 @@ void CUDABackend::kernel_relu_back_cuda(TensorF32 * node, Status* st) {
     }
     relu_back_cuda(node->src[0]->data(), node->src[1]->data(),
                    node->data(), node->numel());
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_act_mul_cuda(TensorF32 * node, Status* st) {
+    // OP_ACT_MUL：dst = act(src0) * src1（src1 可小于 dst ⇒ kernel 内广播取模）
+    if (!node->src[0] || !node->src[1] ||
+        !node->src[0]->data() || !node->src[1]->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    act_mul_cuda(node->src[0]->data(), node->src[1]->data(), node->data(),
+                 (long long)node->numel(), (long long)node->src[1]->numel(),
+                 static_cast<int>(node->op_params[0]));
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_act_mul_back_x_cuda(TensorF32 * node, Status* st) {
+    // OP_ACT_MUL_BACK_X：dx = grad * g * act'(x)（src0=grad, src1=x, src2=g）
+    if (!node->src[0] || !node->src[1] || !node->src[2] ||
+        !node->src[0]->data() || !node->src[1]->data() || !node->src[2]->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    act_mul_back_x_cuda(node->src[0]->data(), node->src[1]->data(), node->src[2]->data(),
+                        node->data(), (long long)node->numel(),
+                        (long long)node->src[2]->numel(),
+                        static_cast<int>(node->op_params[0]));
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_act_mul_back_g_cuda(TensorF32 * node, Status* st) {
+    // OP_ACT_MUL_BACK_G：dg = grad * act(x)（src0=grad, src1=x）
+    if (!node->src[0] || !node->src[1] ||
+        !node->src[0]->data() || !node->src[1]->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    act_mul_back_g_cuda(node->src[0]->data(), node->src[1]->data(), node->data(),
+                        (long long)node->numel(),
+                        static_cast<int>(node->op_params[0]));
     if (st) *st = Status::SUCCESS;
 }
 

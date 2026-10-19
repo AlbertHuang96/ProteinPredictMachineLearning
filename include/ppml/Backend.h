@@ -32,6 +32,31 @@ using TensorF32 = Tensor<float>;
 // 用 4 字节 D2H 探测兜底。定义在 Backend.cpp，供 Backend/CPUKernels 共用。
 bool is_device_pointer(const TensorF32* src, const float* data);
 
+// ==================== ADD1 优化开关（2026-10-19，profile 用）====================
+// OP_ADD1（dst = src + b）原本无论如何都带一个 1 元素标量张量 src[1]，CUDA 端每个节点
+// 一次 `cudaMemcpy D2H` 把它读回 host（实测 +58 µs/节点，成本来自**流 drain**）。
+// 两条互补优化（详见 add1_impl / kernel_add1_cuda 注释）：
+//   (a) 运行期标量（如反向里的标量梯度，只存在于 device）→ kernel 直接吃 device 指针，
+//       不回读 host（连 memcpy 都不需要）。
+//   (b) 建图期常量（make_scalar/constant_scalar）→ 值烤进 op_params[0]（同 OP_SCALE），
+//       令 src[1]=nullptr，顺带省掉 host 标量叶子 + 调度器一条 H2D cpy 节点。
+// 开关（进程环境变量，每次读取不缓存，便于同一个二进制内 A/B）：
+//   PPML_ADD1_OPT=0       两条全关（回到"标量张量 + 每节点同步 D2H"旧行为）
+//   PPML_ADD1_BAKE=0      只关 (b) 常量烤入（(a) 仍生效）
+//   PPML_ADD1_DEVSCALAR=0 只关 (a) device 指针读取（运行期标量仍走 D2H；(b) 仍生效）
+inline bool add1_opt_on() {
+    const char* e = getenv("PPML_ADD1_OPT");
+    return !(e && *e && atoi(e) == 0);
+}
+inline bool add1_bake_on() {
+    const char* e = getenv("PPML_ADD1_BAKE");
+    return add1_opt_on() && !(e && *e && atoi(e) == 0);
+}
+inline bool add1_devscalar_on() {
+    const char* e = getenv("PPML_ADD1_DEVSCALAR");
+    return add1_opt_on() && !(e && *e && atoi(e) == 0);
+}
+
 // ==================== 状态码 ====================
 enum class Status {
     SUCCESS = 0,
@@ -740,6 +765,13 @@ private:
 
     static void kernel_sigmoid (TensorF32 * node, ComputeParams * p);
 
+    // ===== 门控融合 act_mul（2026-10-18）=====
+    //   前向 dst = act(src0) * src1；反向 dx = grad*src2*act'(src1) / dg = grad*act(src1)
+    //   act 种类在 op_params[0]（act_kind）。src1 可小于 dst（i % src1_numel 广播）。
+    static void kernel_act_mul       (TensorF32 * node, ComputeParams * p);
+    static void kernel_act_mul_back_x(TensorF32 * node, ComputeParams * p);
+    static void kernel_act_mul_back_g(TensorF32 * node, ComputeParams * p);
+
     // ===== 数据成员 =====
     int          n_threads_;
     ThreadPool * threadpool_ = nullptr;
@@ -835,6 +867,10 @@ private:
     static void kernel_permute_cuda  (TensorF32 * node, Status* st);
     static void kernel_transpose_cuda(TensorF32 * node, Status* st);
     static void kernel_relu_back_cuda(TensorF32 * node, Status* st);
+    // 门控融合 act_mul（2026-10-18）：前向 + 两个专用反向
+    static void kernel_act_mul_cuda        (TensorF32 * node, Status* st);
+    static void kernel_act_mul_back_x_cuda (TensorF32 * node, Status* st);
+    static void kernel_act_mul_back_g_cuda (TensorF32 * node, Status* st);
     static void kernel_concat_cuda   (TensorF32 * node, Status* st);
     static void kernel_repeat_back_cuda(TensorF32 * node, Status* st);
     static void kernel_repeat_cuda      (TensorF32 * node, Status* st);

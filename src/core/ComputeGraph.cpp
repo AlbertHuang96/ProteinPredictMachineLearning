@@ -5,9 +5,56 @@
 namespace ppml {
 
 void ComputeGraph::graph_clear() {
+    // use-count 清零（2026-10-18）：必须在 hash_set_reset **之前**按"已用槽位"清，
+    //   否则下一张图复用这些槽位时会读到上一张图的计数（静默错判 single_use）。
+    //   只遍历 nodes/leafs（O(n_nodes+n_leafs)）而非整表 memset（hash_size 可达 40 万）。
+    if (this->use_counts) {
+        for (int i = 0; i < this->n_nodes_; ++i) {
+            const size_t h = hash_find(&this->visited_hash_set, this->nodes[i]);
+            if (h != HASHSET_FULL) this->use_counts[h] = 0;
+        }
+        for (int i = 0; i < this->n_leafs_; ++i) {
+            const size_t h = hash_find(&this->visited_hash_set, this->leafs[i]);
+            if (h != HASHSET_FULL) this->use_counts[h] = 0;
+        }
+    }
     this->n_leafs_ = 0;
     this->n_nodes_ = 0;
     hash_set_reset(&this->visited_hash_set);
+}
+
+// ===== use-count（见 ComputeGraph.h 注释）=====
+//   ⚠️ 与 visit_parents_graph 一致：只统计**入图**的 src（未入图的 src 其 hash 槽位未置位
+//      ⇒ 跳过），避免把外部/临时节点算进来。
+void ComputeGraph::build_use_counts() {
+    if (!this->use_counts) return;
+    // 1) 清零已用槽位（覆盖式重算，可反复调用）
+    for (int i = 0; i < this->n_nodes_; ++i) {
+        const size_t h = hash_find(&this->visited_hash_set, this->nodes[i]);
+        if (h != HASHSET_FULL) this->use_counts[h] = 0;
+    }
+    for (int i = 0; i < this->n_leafs_; ++i) {
+        const size_t h = hash_find(&this->visited_hash_set, this->leafs[i]);
+        if (h != HASHSET_FULL) this->use_counts[h] = 0;
+    }
+    // 2) 按节点 src 累加
+    for (int i = 0; i < this->n_nodes_; ++i) {
+        TensorF32* node = this->nodes[i];
+        for (int s = 0; s < GGML_MAX_SRC; ++s) {
+            TensorF32* src = node->src[s];
+            if (!src) continue;
+            const size_t h = hash_find(&this->visited_hash_set, src);
+            if (h == HASHSET_FULL || !bitset_get(this->visited_hash_set.used, h)) continue;
+            this->use_counts[h]++;
+        }
+    }
+}
+
+int ComputeGraph::use_count(const TensorF32* t) {
+    if (!t || !this->use_counts) return 0;
+    const size_t h = hash_find(&this->visited_hash_set, const_cast<TensorF32*>(t));
+    if (h == HASHSET_FULL || !bitset_get(this->visited_hash_set.used, h)) return 0;
+    return this->use_counts[h];
 }
  
 int ComputeGraph::graph_size() {
@@ -64,6 +111,10 @@ ComputeGraph * ComputeGraph::new_graph_custom(struct PPMLContext * ctx, size_t s
     cgraph->grads    = grads_ptr;
     cgraph->grad_accs = grad_accs_ptr;
     cgraph->leafs    = leafs_ptr;
+    // use-count（2026-10-18）：复用上面**已分配**的 use_counts_ptr（0 额外内存）；
+    //   首次使用前清零（new_object 的缓冲区不保证为 0）。
+    cgraph->use_counts = use_counts_ptr;
+    memset(use_counts_ptr, 0, hash_size * sizeof(int32_t));
     cgraph->order    = CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT;
     cgraph->visited_hash_set.size = hash_size;
     cgraph->visited_hash_set.used = hash_used;
@@ -175,10 +226,49 @@ void ComputeGraph::build_forward_impl(TensorF32 * tensor, bool expand, bool comp
  
     const int n_new = this->n_nodes_ - n_old;
     //GGML_PRINT_DEBUG("%s: visited %d new nodes\n", __func__, n_new);
- 
+
+    // use-count 增量维护（2026-10-18）：只统计本段**新增**节点对其 src 的引用。
+    //   expand=false 时 graph_clear 已清零且 n_old==0 ⇒ 等价全量统计；
+    //   expand=true 时累加（同一 src 被多段引用会被计多次 ✓）。O(n_new·GGML_MAX_SRC)。
+    if (this->use_counts) {
+        for (int i = n_old; i < this->n_nodes_; ++i) {
+            TensorF32* nd = this->nodes[i];
+            for (int s = 0; s < GGML_MAX_SRC; ++s) {
+                TensorF32* src = nd->src[s];
+                if (!src) continue;
+                const size_t h = hash_find(&this->visited_hash_set, src);
+                if (h == HASHSET_FULL || !bitset_get(this->visited_hash_set.used, h)) continue;
+                this->use_counts[h]++;
+            }
+        }
+    }
+
     if (n_new > 0) {
         // the last added node should always be starting point
         assert(this->nodes[this->n_nodes_ - 1] == tensor);
+    }
+
+    // 诊断（GRAPH_DEBUG_OPHIST=1）：打印本段新增节点的 op 直方图（按数量降序）。
+    //   用途：定位"某个 op 在图里出现多少次"（融合/同步/回落的收益估算）。
+    if (getenv("GRAPH_DEBUG_OPHIST") && n_new > 0) {
+        int cnt[512] = {0};
+        int add1_baked = 0, add1_tensor = 0;   // ADD1 两种形态（src[1]==nullptr = 常量烤入）
+        for (int i = n_old; i < this->n_nodes_; ++i) {
+            const int op = static_cast<int>(this->nodes[i]->op);
+            if (op >= 0 && op < 512) cnt[op]++;
+            if (op == static_cast<int>(OP_ADD1)) {
+                if (this->nodes[i]->src[1]) add1_tensor++; else add1_baked++;
+            }
+        }
+        if (add1_baked || add1_tensor) {
+            std::fprintf(stderr, "[ophist] ADD1 baked=%d tensor(src[1])=%d\n",
+                         add1_baked, add1_tensor);
+        }
+        std::fprintf(stderr, "[ophist] +%d nodes (total %d):", n_new, this->n_nodes_);
+        for (int op = 0; op < 512; ++op) {   // 全部非零（按 op id 升序，便于 grep 单个 op）
+            if (cnt[op] > 0) std::fprintf(stderr, " op%d=%d", op, cnt[op]);
+        }
+        std::fprintf(stderr, "\n");
     }
 }
 
@@ -424,7 +514,13 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                sub_or_set(ctx, cgraph, isrc1, grad);
+                // 广播时 src1 比 dst 小 ⇒ 必须先把 grad 归约回 src1 的形状（对齐 OP_ADD 的写法，
+                // 2026-10-18）。此前直接 sub_or_set 一个满尺寸 grad ⇒ numel 不符（断言/静默错值）。
+                TensorF32* tmp = grad;
+                if (!src0->same_shape(*src1)) {
+                    tmp = repeat_back(tmp, src1);
+                }
+                sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case OP_MUL: {
@@ -444,7 +540,13 @@ void ComputeGraph::compute_backward(
                 add_or_set(ctx, cgraph, isrc0, div(grad, src1));
             }
             if (src1_needs_grads) {
-                sub_or_set(ctx, cgraph, isrc1, mul(grad, div(tensor, src1)));
+                // d/db (a/b) = -a/b² ⇒ -grad·(a/b)/b。广播时同样要 repeat_back 回 src1 形状
+                //（2026-10-18，与 OP_ADD/OP_MUL 的 src1 分支对齐）。
+                TensorF32* tmp = mul(grad, div(tensor, src1));
+                if (!tmp->same_shape(*src1)) {
+                    tmp = repeat_back(tmp, src1);
+                }
+                sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case OP_SQR: {
@@ -537,6 +639,27 @@ void ComputeGraph::compute_backward(
         case OP_RELU_BACK: {
             // 反向 op 本身：其输入已是梯度，无需继续求导。
         } break;
+        case OP_ACT_MUL: {
+            // 门控融合（2026-10-18）：dst = act(src0) * src1
+            //   dx = grad * src1 * act'(src0)      → OP_ACT_MUL_BACK_X（1 节点）
+            //   dg = grad * act(src0)              → OP_ACT_MUL_BACK_G（1 节点）
+            //   不用 4~6 个基础 op 拼（sigmoid→mul→add→repeat_back…），节点数与中间态都更少。
+            const act_kind ak = static_cast<act_kind>(tensor->op_params[0]);
+            if (src0_needs_grads) {
+                add_or_set(ctx, cgraph, isrc0, act_mul_back_x(grad, src0, src1, ak));
+            }
+            if (src1_needs_grads) {
+                TensorF32* tmp = act_mul_back_g(grad, src0, ak);
+                if (!tmp->same_shape(*src1)) {
+                    tmp = repeat_back(tmp, src1);   // g 广播（比 x 小）时归约回 g 的形状
+                }
+                add_or_set(ctx, cgraph, isrc1, tmp);
+            }
+        } break;
+        case OP_ACT_MUL_BACK_X:
+        case OP_ACT_MUL_BACK_G: {
+            // 反向 op 本身：其输入已是梯度，无需继续求导。
+        } break;
         case OP_RMS_NORM: {
             if (src0_needs_grads) {
                 // float eps;
@@ -595,6 +718,12 @@ void ComputeGraph::compute_backward(
                         mul_mat(
                             mat_transpose(grad),      // 2026-09-11：同上，4D 需交换 dims[0]/dims[1]
                             mat_transpose(src0)));
+            }
+            if (src2_needs_grads) {
+                // GEMM epilogue 融合（2026-10-18）：dst[n,m] = Σ_k ... + bias[n]
+                //   ⇒ dbias[n] = Σ_m grad[n,m]，正是 repeat_back 沿广播维求和
+                //   （与旧 "repeat(bias)→add" 路径里 OP_ADD 的 src1 反向同一条节点 ⇒ 反向零额外成本）。
+                add_or_set(ctx, cgraph, isrc2, repeat_back(grad, src2));
             }
         } break;
         case OP_OUT_PROD: {
@@ -1246,10 +1375,13 @@ void ComputeGraph::graph_cpy(struct ComputeGraph * src, struct ComputeGraph * ds
         // copy all hashset keys (tensors) that are in use
         if (bitset_get(src->visited_hash_set.used, i)) {
             size_t new_hash_pos = hash_insert(&dst->visited_hash_set, src->visited_hash_set.keys[i]);
-            // dst->use_counts not available; skip
-            //(void)new_hash_pos;
+            // use-count：槽位可能不同（线性探测顺序不同）⇒ 不做逐槽拷贝，末尾整表重算
+            (void)new_hash_pos;
         }
     }
+
+    // 副本的 use-count 与源图语义相同（节点/边一致）⇒ 重算一次即可（覆盖式）
+    dst->build_use_counts();
  
     if (dst->grads) {
         memset(dst->grads,     0, dst->visited_hash_set.size*sizeof(TensorF32 *));

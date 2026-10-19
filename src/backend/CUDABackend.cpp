@@ -122,6 +122,12 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             // 前期 fp16 支持（2026-09-10）：A/B 同为 F16 可调度到 GPU（kernel 内转 fp32 累加），
             //   输出仍 F32。混合类型或输出非 F32 一律回落 CPU。
             if (!src1) return true;
+            // GEMM epilogue 融合（2026-10-18）：bias 只在 SIMT f32 路径实现 ⇒ 带 bias 时
+            //   禁止量化/F16 权重走 GPU（否则 kernel 会跳过 bias，静默错值）→ 回落 CPU。
+            if (node->src[2] &&
+                ((src0 && src0->type != TENSOR_TYPE_F32) || src1->type != TENSOR_TYPE_F32)) {
+                return false;
+            }
             // int8 分块量化（2026-09-10 准备）：kernel 未就绪 → 不参与 GPU 调度（回落 CPU，
             //   而 CPU 侧同样返回 false → 该节点整体不被任何后端支持，需等 kernel 落地）。
             if (is_quantized_type(src1->type) || (src0 && is_quantized_type(src0->type))) {
@@ -130,8 +136,17 @@ bool CUDABackend::supports_op(TensorF32* node) const {
                     (src0 != nullptr) &&
                     (!is_quantized_type(src0->type) || src0->quant_shape_valid()) &&
                     (!is_quantized_type(src1->type) || src1->quant_shape_valid());
-                return QUANT_MUL_MAT_KERNELS_READY && shape_ok &&
-                       quant_mul_mat_combo_supported(src0->type, src1->type) &&
+                // W8A8（2026-10-17）：只支持「量化权重 × F32 激活」，且**只允许一侧量化**。
+                //   量化权重在 src0（ggml 约定 mul_mat(W,x)）或 src1（本仓库 LinearLayer 的
+                //   mul_mat(x,W)）都接受 —— 激活由 kernel 内即时量化成 Q8_1。
+                const bool q0 = is_quantized_type(src0->type);
+                const bool q1 = is_quantized_type(src1->type);
+                if (q0 == q1) return false;                      // 两侧都量化 / 都不量化（前已处理）
+                const TensorF32* wsrc = q0 ? src0 : src1;        // 量化权重
+                const TensorF32* asrc = q0 ? src1 : src0;        // F32 激活
+                return QUANT_MUL_MAT_CUDA_READY && shape_ok &&
+                       is_quantized_type_supported(wsrc->type) &&
+                       asrc->type == TENSOR_TYPE_F32 &&
                        node->type == TENSOR_TYPE_F32;
             }
             const bool ok_f32 = (src0 && src0->type == TENSOR_TYPE_F32 &&
@@ -266,12 +281,15 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
 
         case OP_ADD1:
-            // 2026-08-31: OP_ADD1 CUDA kernel（dst = src + b，b 为 src[1] 标量，D2H 读取）。
-            // 前置: F32 + src0/src1 存在 + src1 为标量。
-            if (!src0 || !src1) return false;
-            if (src0->type != TENSOR_TYPE_F32 || src1->type != TENSOR_TYPE_F32 ||
-                node->type != TENSOR_TYPE_F32) return false;
-            return src1->numel() == 1;
+            // OP_ADD1 CUDA kernel（dst = src + b）。
+            // 2026-10-19: b 有两种形态 ——
+            //   ① src[1]==nullptr：建图期常量已烤进 op_params[0]（add1_impl），kernel 作参数收；
+            //   ② src[1] 为 1 元素标量张量：kernel 直接读其 device 指针（不再 D2H 回读）。
+            // 前置: F32 + src0 存在。
+            if (!src0) return false;
+            if (src0->type != TENSOR_TYPE_F32 || node->type != TENSOR_TYPE_F32) return false;
+            if (!src1) return true;                       // 烤入常量
+            return src1->type == TENSOR_TYPE_F32 && src1->numel() == 1;
 
         case OP_MAX_ALL:
             // 2026-08-31: OP_MAX_ALL CUDA kernel（全元素归约 max → 标量，跳 NaN）。
@@ -288,6 +306,15 @@ bool CUDABackend::supports_op(TensorF32* node) const {
         case OP_RELU_BACK:
             // 2026-08-31: OP_RELU_BACK CUDA kernel（relu 梯度：x>0 透传 grad，否则 0）。
             // 前置: F32 + src0/src1 存在。
+            if (!src0 || !src1) return false;
+            return src0->type == TENSOR_TYPE_F32 && src1->type == TENSOR_TYPE_F32 &&
+                   node->type == TENSOR_TYPE_F32;
+
+        case OP_ACT_MUL:
+        case OP_ACT_MUL_BACK_X:
+        case OP_ACT_MUL_BACK_G:
+            // 门控融合（2026-10-18）：F32 逐元素；src1(src2) 可小于 dst（kernel 内 i % n 广播，
+            //   语义与 OP_MUL 的 CUDA 广播核一致）。act 种类在 op_params[0]。
             if (!src0 || !src1) return false;
             return src0->type == TENSOR_TYPE_F32 && src1->type == TENSOR_TYPE_F32 &&
                    node->type == TENSOR_TYPE_F32;
@@ -550,7 +577,11 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
             // 否则 kernel 越界写 -> 段错误。这能区分"gallocr 分配过小"与"shape 不匹配"。
             auto fits = [](const TensorF32* t, int* bad_dim) -> bool {
                 if (!t || !t->buffer_) return true;  // 无 buffer（叶子外部内存）跳过
-                size_t need = (size_t)t->numel() * sizeof(float);
+                // 2026-10-17：改为按实际字节数 nbytes()（量化张量 = 块数×块字节，远小于 numel*4）。
+                //   原来一律 numel*4：int8 权重/量化叶子会被判 "buffer OVERFLOW"（误报），
+                //   因为它的 alloc_size 只有 34/32 B/元素。
+                size_t need = t->nbytes();
+                if (need == 0) need = (size_t)t->numel() * sizeof(float);   // 形状非法时保守估计
                 size_t avail = t->buffer_->size() - t->buffer_offs_;
                 if (need > avail) {
                     if (bad_dim) *bad_dim = (int)t->numel();

@@ -529,23 +529,29 @@ void bcast_elemwise_cuda(
 
 // ============================================================
 // OP_ADD1 前向（加标量）：dst[i] = src[i] + b
-// 对齐 CPU kernel_add1 (CPUKernels.cpp:1503)；b 为 src[1] 标量张量（D2H 读取）。
+// 对齐 CPU kernel_add1 (CPUKernels.cpp)；b 两种来源（2026-10-19）：
+//   ① b_dev != nullptr → 运行期标量（如反向里的标量梯度）：**在 device 上直接读 b_dev[0]**，
+//      不再 cudaMemcpy D2H 回读（原实现每节点一次阻塞回读，实测 +58 µs 的流 drain）。
+//      全部线程读同一个 4 字节地址 ⇒ L1/L2 广播，几乎零成本。
+//   ② b_dev == nullptr → 建图期常量，值由 host 以 kernel 参数传入（常量 bank，零访存）。
 // 结构：一维 grid-stride。标量天然广播，无需逐维取模。
 // ============================================================
 __global__ void add1_f32_kernel(
-    const float * __restrict__ src, float * __restrict__ dst,
-    const float b, const int64_t n) {
+    const float * __restrict__ src, const float * __restrict__ b_dev,
+    const float b_host, float * __restrict__ dst, const int64_t n) {
+    const float b = (b_dev != nullptr) ? b_dev[0] : b_host;
     for (int64_t i = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
          i < n; i += int64_t(gridDim.x) * blockDim.x) {
         dst[i] = src[i] + b;
     }
 }
 
-void add1_cuda(const float * src, float * dst, float b, int64_t n) {
+void add1_cuda(const float * src, const float * b_dev, float b_host,
+               float * dst, int64_t n) {
     if (n <= 0) return;
     constexpr int BLOCK = 256;
     const int64_t grid = (n + BLOCK - 1) / BLOCK;
-    add1_f32_kernel<<<(unsigned)grid, BLOCK>>>(src, dst, b, n);
+    add1_f32_kernel<<<(unsigned)grid, BLOCK>>>(src, b_dev, b_host, dst, n);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1072,9 +1078,13 @@ void softmax_backward_cuda(
 __device__ __forceinline__ float to_float(float x)  { return x; }
 __device__ __forceinline__ float to_float(__half x) { return __half2float(x); }
 
+//   bias（2026-10-18，GEMM epilogue 融合）：非空时 C[r][c] += bias[c]（c<N），
+//     与"mul_mat → repeat(bias) → add"数值等价，但省掉整块 bias 物化和一次全量读改写。
+//     传 nullptr ⇒ 逐位退化为旧行为。
 template<int Bm = 128, int Bn = 128, int Bk = 8, int blockSize = 256, int A_BLOCK_X = 8,
          int B_BLOCK_X = 32, int C_BLOCK_X = 16, typename TA, typename TB>
-__global__ void blockTileGEMM(const TA* A, const TB* B, float* C, const int M, const int K, const int N) {
+__global__ void blockTileGEMM(const TA* A, const TB* B, float* C, const int M, const int K, const int N,
+                              const float* bias = nullptr) {
   __shared__ float As[Bm][Bk];  // tileA
   __shared__ float Bs[Bk][Bn];  // tileB
 
@@ -1154,18 +1164,18 @@ __global__ void blockTileGEMM(const TA* A, const TB* B, float* C, const int M, c
 #pragma unroll
     for (int j = 0; j < Tn; ++j) {
       int c = c0 + C_THREAD_X + j * C_BLOCK_X;
-      if (r < M && c < N) { C[r * N + c] = Ct[i][j]; }
+      if (r < M && c < N) { C[r * N + c] = bias ? (Ct[i][j] + bias[c]) : Ct[i][j]; }
     }
   }
 }
 
-void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N) {
+void mul_mat_cuda(float* A, float* B, float* C, int M, int K, int N, const float* bias) {
     // 使用 blockTileGEMM kernel，blockSize=256, shared memory ~8KB
     constexpr int Bm = 128, Bn = 128;
     dim3 block(256);
     dim3 grid((N + Bn - 1) / Bn, (M + Bm - 1) / Bm);
 
-    blockTileGEMM<Bm, Bn, 8, 256, 8, 32, 16, float, float><<<grid, block>>>(A, B, C, M, K, N);
+    blockTileGEMM<Bm, Bn, 8, 256, 8, 32, 16, float, float><<<grid, block>>>(A, B, C, M, K, N, bias);
     cudaCheck(cudaGetLastError());
 }
 
@@ -1847,6 +1857,105 @@ void unary_cuda(const float * src, float * dst, int N, int uop, int block_size) 
 }
 
 // ============================================================
+// 门控融合 act_mul（2026-10-18）
+//   kind 与 act_kind 对齐（Tensor.h）：0=SIGMOID 1=SILU 2=GELU 3=TANH 4=RELU
+//   公式与 CPU act_fwd_scalar / act_grad_scalar 逐字一致（含 GELU tanh 近似）
+// ============================================================
+__device__ __forceinline__ float act_fwd_dev(int kind, float x) {
+    switch (kind) {
+        case 0: return 1.0f / (1.0f + expf(-x));                              // SIGMOID
+        case 1: return x / (1.0f + expf(-x));                                 // SILU
+        case 2: {                                                             // GELU(tanh)
+            const float C1 = 0.044715f;
+            const float C2 = 0.7978845608028654f;      // sqrt(2/pi)
+            return 0.5f * x * (1.0f + tanhf(C2 * (x + C1 * x * x * x)));
+        }
+        case 3: return tanhf(x);                                              // TANH
+        case 4: return (x > 0.0f) ? x : 0.0f;                                 // RELU
+        default: return x;
+    }
+}
+
+__device__ __forceinline__ float act_grad_dev(int kind, float x) {
+    switch (kind) {
+        case 0: { const float s = 1.0f / (1.0f + expf(-x)); return s * (1.0f - s); }
+        case 1: { const float s = 1.0f / (1.0f + expf(-x)); return s * (1.0f + x * (1.0f - s)); }
+        case 2: {
+            const float C1 = 0.044715f;
+            const float C2 = 0.7978845608028654f;
+            const float u  = C2 * (x + C1 * x * x * x);
+            const float t  = tanhf(u);
+            const float du = C2 * (1.0f + 3.0f * C1 * x * x);
+            return 0.5f * (1.0f + t) + 0.5f * x * (1.0f - t * t) * du;
+        }
+        case 3: { const float t = tanhf(x); return 1.0f - t * t; }
+        case 4: return (x > 0.0f) ? 1.0f : 0.0f;
+        default: return 1.0f;
+    }
+}
+
+// 前向：dst[i] = act(x[i]) * g[i % gn]（gn == n 时 gn_full=1 免取模）
+__global__ void act_mul_kernel(const float * __restrict__ x, const float * __restrict__ g,
+                               float * __restrict__ dst, long long n, long long gn,
+                               int kind, int gn_full) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const float gv = gn_full ? g[i] : g[i % gn];
+        dst[i] = act_fwd_dev(kind, x[i]) * gv;
+    }
+}
+
+// 反向 wrt x：dx = grad * g * act'(x)
+__global__ void act_mul_back_x_kernel(const float * __restrict__ grad, const float * __restrict__ x,
+                                      const float * __restrict__ g, float * __restrict__ dst,
+                                      long long n, long long gn, int kind, int gn_full) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const float gv = gn_full ? g[i] : g[i % gn];
+        dst[i] = grad[i] * gv * act_grad_dev(kind, x[i]);
+    }
+}
+
+// 反向 wrt g：dg = grad * act(x)
+__global__ void act_mul_back_g_kernel(const float * __restrict__ grad, const float * __restrict__ x,
+                                      float * __restrict__ dst, long long n, int kind) {
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        dst[i] = grad[i] * act_fwd_dev(kind, x[i]);
+    }
+}
+
+void act_mul_cuda(const float * x, const float * g, float * dst,
+                  long long n, long long gn, int kind) {
+    if (n <= 0 || gn <= 0) return;
+    const int block = 256;
+    const long long want = (n + block - 1) / block;
+    const int grid = (int)(want > 65535 ? 65535 : want);   // 大张量靠 grid-stride 覆盖
+    act_mul_kernel<<<grid, block>>>(x, g, dst, n, gn, kind, (gn == n) ? 1 : 0);
+    cudaCheck(cudaGetLastError());
+}
+
+void act_mul_back_x_cuda(const float * grad, const float * x, const float * g, float * dst,
+                         long long n, long long gn, int kind) {
+    if (n <= 0 || gn <= 0) return;
+    const int block = 256;
+    const long long want = (n + block - 1) / block;
+    const int grid = (int)(want > 65535 ? 65535 : want);
+    act_mul_back_x_kernel<<<grid, block>>>(grad, x, g, dst, n, gn, kind, (gn == n) ? 1 : 0);
+    cudaCheck(cudaGetLastError());
+}
+
+void act_mul_back_g_cuda(const float * grad, const float * x, float * dst,
+                         long long n, int kind) {
+    if (n <= 0) return;
+    const int block = 256;
+    const long long want = (n + block - 1) / block;
+    const int grid = (int)(want > 65535 ? 65535 : want);
+    act_mul_back_g_kernel<<<grid, block>>>(grad, x, dst, n, kind);
+    cudaCheck(cudaGetLastError());
+}
+
+// ============================================================
 // OP_CLAMP: 逐元素值裁剪 dst = clamp(src, lo, hi)
 //   lo/hi 由宿主侧从 op_params[0]/[1]（float 位模式）读出后传入。
 //   NaN 透传（与 CPU kernel_clamp 一致）；范围外取 lo/hi。
@@ -2165,11 +2274,14 @@ __global__ void repeat_f32_kernel(
     const int64_t total = ne0 * ne1 * ne2 * ne3;
     for (int64_t idx = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
          idx < total; idx += int64_t(gridDim.x) * blockDim.x) {
+        // ggml 布局：dims[0] 为最内（连续）维 ⇒ 按 dim0 最快分解（2026-10-18 与 CPU
+        // kernel_repeat 同步修正；原按 dim3 最快分解会把 src 的 dim0 映射到 dst 最外层维，
+        // 与 OP_REPEAT_BACK 的 ggml 分解互不逆）。
         int64_t t = idx;
-        const int64_t i3 = t % ne3; t /= ne3;
-        const int64_t i2 = t % ne2; t /= ne2;
+        const int64_t i0 = t % ne0; t /= ne0;
         const int64_t i1 = t % ne1; t /= ne1;
-        const int64_t i0 = t;
+        const int64_t i2 = t % ne2; t /= ne2;
+        const int64_t i3 = t;
         const int64_t s0 = i0 % ne00;
         const int64_t s1 = i1 % ne01;
         const int64_t s2 = i2 % ne02;

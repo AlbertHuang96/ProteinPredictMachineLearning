@@ -445,6 +445,15 @@ private:
     friend class PPMLModel;  // PPMLModel 直接注入 non-owning pointers
 };
 
+// ===== int8 开关的选择规则（2026-10-17；供 PPMLModel 与单测复用）=====
+//   env_list = nullptr / 空串 → 不选任何张量（开关关闭）
+//   env_list = "1"           → 用默认集合（见下）
+//   其它                      → 逗号分隔的名字子串表
+// 默认集合 = 「最大的那批」：attention 的 QKV/O 投影（msa_row/msa_col/pair_row/pair_col）
+//            + outer product 相关（msa2pair_left/right/out_proj、pair2pair_gate_proj）。
+const char* ppml_int8_bigop_default_list();
+bool ppml_int8_bigop_selected(const std::string& name, const char* env_list);
+
 // PPML 主模型
 class PPMLModel {
 public:
@@ -853,6 +862,14 @@ private:
 
     void ensure_backend_ready();
     void transfer_params_to_backend();
+
+    // ===== int8 开关（2026-10-17）：只把「最大的那批」权重转成 Q8_0 =====
+    //   env PPML_INT8_BIGOPS：未设置 = 关；"1" = 默认集合；否则为逗号分隔子串表
+    //   （见 ppml_int8_bigop_selected）。转换后这些权重张量的 type 变 Q8_0，
+    //   nbytes 降为 34/32 B/元素，mul_mat 走 CUDA MMQ/MMVQ 的 int8 路径。
+    //   ⚠️ 只在推理（!is_training()）下生效：量化后权重不再是 f32，反向/优化器/存档
+    //      都会按 float 读 ⇒ 训练模式下直接跳过并打印原因。
+    void quantize_big_weight_matrices();
 
     // 收集所有参数 tensor 到指定容器 (weight/bias/gamma/beta), 顺序固定
     void collect_all_params(std::vector<TensorF32*>& param_tensors);
