@@ -2898,6 +2898,31 @@ GNormBias::GNormBias(const Fiber& fiber)
     }
 }
 
+// ============================================================================
+// GNorm 除法 `t / (norm + eps)` 的分母下限 / 增益上限 —— **唯一来源**（值版与图版共用）
+// ============================================================================
+//   动机（2026-10-20 实测，seed=1 混合 CUDA）：子树里出现 `7.6e13 = 2.37e12 / 0.031` 型放大，
+//   而同一算子的分母下限在图版里由 `clamp(denom, 1e-2, 1e30)` 提供、值版却只有
+//   `sqrt(max(norm_sq, eps_=1e-5))` ⇒ 两条路对同一算子给出**不同的增益上界**（100× vs 1e5×）。
+//   这里把两个旋钮收敛为同一对 env，值版/图版都走它，避免"一处有闸另一处没有"。
+//     PPML_SE3_GNORM_FLOOR（默认 1e-2）：分母 norm+eps 的逐元素下限（= 增益 ≤ 100×）
+//     PPML_SE3_GNORM_MAX  （默认 10）  ：scale = t/(norm+eps) 的逐元素幅值上限
+float se3_gnorm_floor() {
+    static const float v = [] {
+        const char* e = std::getenv("PPML_SE3_GNORM_FLOOR");
+        return e ? static_cast<float>(std::atof(e)) : 1e-2f;
+    }();
+    return v;
+}
+
+float se3_gnorm_gain() {
+    static const float v = [] {
+        const char* e = std::getenv("PPML_SE3_GNORM_MAX");
+        return e ? static_cast<float>(std::atof(e)) : 10.0f;
+    }();
+    return v;
+}
+
 SE3Features GNormBias::forward(const SE3Features& x) {
     // Python:
     //   for k, v in features.items():
@@ -2936,7 +2961,11 @@ SE3Features GNormBias::forward(const SE3Features& x) {
                     float val = v_data[(n * m + ch) * d_dim + dd];
                     norm_sq += val * val;
                 }
+                // 【2026-10-20】下限与图版同源（PPML_SE3_GNORM_FLOOR，默认 1e-2）：
+                //   原来只有 sqrt(eps_=1e-5) ⇒ 分母可小到 1e-5，t/(norm+eps) 增益高达 1e5×，
+                //   而图版 clamp(denom, 1e-2) 只允许 100×。值版/图版现在一致。
                 float norm = std::sqrt(std::max(norm_sq, eps_));  // clamp_min(eps)
+                if (norm < se3_gnorm_floor()) norm = se3_gnorm_floor();
 
                 // ============================================
                 // Step 2: 标量非线性 (仅作用在 norm 上)
@@ -2952,7 +2981,11 @@ SE3Features GNormBias::forward(const SE3Features& x) {
                 // 合并: scale = transformed / norm, out = v * scale
                 // 这样避免了显式除法和重建
                 // ============================================
-                float scale = (norm > eps_) ? (norm_transformed / norm) : 0.0f;
+                // 增益上限与图版同源（PPML_SE3_GNORM_MAX，默认 10）
+                float scale = (norm > 0.0f) ? (norm_transformed / norm) : 0.0f;
+                const float gcap = se3_gnorm_gain();
+                if (scale >  gcap) scale =  gcap;
+                if (scale < -gcap) scale = -gcap;
                 for (int dd = 0; dd < d_dim; ++dd) {
                     int64_t idx = (n * m + ch) * d_dim + dd;
                     out_data[idx] = v_data[idx] * scale;
@@ -3032,14 +3065,9 @@ std::vector<TensorF32*> GNormBias::forward_graph(
         //   原注释"norm=0 ⇒ v 全 0 ⇒ out=0"只在 bias ≤ 0 时成立，bias 是学出来的、可为正。
         //   两道闸：① 分母地板取**特征量级**（默认 1e-2，env PPML_SE3_GNORM_FLOOR）；
         //           ② 直接夹门控增益 ±C（默认 10，env PPML_SE3_GNORM_MAX），保证 out 与 v 同量级。
-        static const float gnorm_floor = [] {
-            const char* e = std::getenv("PPML_SE3_GNORM_FLOOR");
-            return e ? static_cast<float>(std::atof(e)) : 1e-2f;
-        }();
-        static const float gnorm_gain = [] {
-            const char* e = std::getenv("PPML_SE3_GNORM_MAX");
-            return e ? static_cast<float>(std::atof(e)) : 10.0f;
-        }();
+        // 【2026-10-20】旋钮收敛到 se3_gnorm_floor()/se3_gnorm_gain()（值版与图版同一来源）
+        const float gnorm_floor = se3_gnorm_floor();
+        const float gnorm_gain  = se3_gnorm_gain();
         TensorF32* denom_s  = clamp(denom, gnorm_floor, 1e30f);                 // [1,m,N] 地板=特征量级
         TensorF32* scale3   = clamp(div(t, denom_s), -gnorm_gain, gnorm_gain);  // [1,m,N] 增益有界
         // scale3 [1,m,N] → [d_dim,m,N]（每通道 d_dim 个 Wigner 分量共享同一 scale）→ view 回 [m*d_dim,N]

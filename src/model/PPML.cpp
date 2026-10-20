@@ -8,6 +8,7 @@
 
 #include "ppml/Dropout.h"
 #include "ppml/Context.h"
+#include "ppml/AliasGuard.h"   // 假别名断言（PPML_ALIAS_GUARD=1）
 #include "ppml/RemoteBackend.h"   // 双机：远端后端注册（PPML_REMOTE_HOST 时启用，2026-09-14）
 #include <cuda_runtime.h>   // cudaGetDeviceCount / cudaMemGetInfo 用于 GPU/显存探测
 
@@ -4328,6 +4329,10 @@ void PPMLModel::transfer_params_to_backend() {
 
         // 对标 ggml_backend_tensor_set：将旧数据拷贝到新 buffer
         param_buf->set_tensor(t, old_data, t->buffer_offs_, old_nbytes);
+
+        // 【2026-10-20】假别名断言：参数区间登记（pool="param"，生命周期与 param_buffers_ 一致）。
+        //   参数常驻、绝不参与复用；若中间激活的 arena 与参数区重叠，这里就会报 [ALIAS]。
+        aliasguard::register_range(t, t->data(), GGML_PAD(t->nbytes(), alignment), "param");
 
         // 旧数据在 context arena 中，无法释放，但 data_ 已指向新 buffer
         // 后续可通过 t->buffer_ 和 t->buffer_offs_ 访问

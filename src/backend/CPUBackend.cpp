@@ -61,6 +61,16 @@ std::unique_ptr<CPUBackend> CPUBackend::create(int n_threads) {
     return std::make_unique<CPUBackend>(n_threads);
 }
 
+// 诊断桥：供 exec_ab_check 在 CPU 上重算单个节点（与正常 dispatch 完全同一路径）
+Status CPUBackend::ab_dispatch_node(TensorF32* node, ComputeParams* p) {
+    return dispatch_node(node, p);
+}
+
+// 单节点 work buffer 需求（供 AB 诊断按节点精确分配，覆盖 mul_mat / softmax / concat 等）
+size_t CPUBackend::ab_estimate_work_size(TensorF32* node) {
+    return estimate_work_size(node, 1);
+}
+
 bool CPUBackend::supports_op(TensorF32* node) const {
     const TensorF32* src0 = node->src[0];
     const TensorF32* src1 = node->src[1];
@@ -165,6 +175,10 @@ ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
 
 // ===== graph_compute (Backend 接口) =====
 Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
+    // 生产者代际断言（PPML_STALE_CHECK=1）：每轮执行起一个新代际，并登记本图 node/leaf。
+    //   scheduler 驱动 split 时 sched_depth>0 ⇒ 此处不另起代际（由 scheduler 统一起）。
+    exec_stale_pass_begin(cgraph);
+
     // ---- no_alloc 延迟分配：对 data_==nullptr 的中间节点分配 backend buffer ----
     // 混训时 scheduler 已通过 reserve_graph_memory 预分配了全部张量，置 skip_alloc_=true，
     // 这里跳过本端自己的 gallocr，避免两套 gallocr 反复 re-bind 张量导致跨 split 读到错位 buffer。
@@ -560,7 +574,10 @@ void CPUBackend::compute_thread(ThreadState * state) {
             snap1 = take(node->src[1]);
         }
 
+        // 生产者代际断言（PPML_STALE_CHECK=1）：消费前校验 src 是否本代际写过
+        if (ith == 0) exec_stale_check(node, "CPU", node_n);
         dispatch_node(node, &params);
+        if (ith == 0) exec_stale_mark(node);   // 本节点算完 ⇒ 记为"本代际已写"（只由 0 号线程写表）
 
         if (ith == 0 && cplan->abort_callback &&
             cplan->abort_callback(cplan->abort_callback_data)) {
@@ -570,6 +587,17 @@ void CPUBackend::compute_thread(ThreadState * state) {
         if (node_n + 1 < cgraph->n_nodes()) {
             tp->barrier_wait();
         }
+
+        // 执行期 NaN/爆炸检查（PPML_EXEC_NAN_CHECK=1）：与下面的 [NH] 指纹同位置
+        //   （barrier 之后 ⇒ 读到的是"刚算完、未被复用"的真值），按执行顺序报告第一个坏节点。
+        //   ⚠️ 最后一个节点在本轮**没有 barrier**（`node_n+1 < n_nodes` 为假）⇒ 若在此处检查，
+        //   多线程下会读到"别的线程还在写"的部分数据（实测 src0 被误报为 nan=804/inf=268，
+        //   单线程同一位置是干净的 6.3e5）✗。故最后一个节点挪到循环后的公共 barrier 之后再查。
+        if (ith == 0 && node_n + 1 < cgraph->n_nodes()) exec_nan_check(node, "CPU", node_n);
+        // 定点算子探针（PPML_PROBE_OP=8,51,...）：按 op 对齐 CPU/CUDA 两条路径的量级
+        if (ith == 0) exec_probe_op(node, "CPU", node_n);
+        // view 别名消费探针（PPML_EXEC_VIEW_PROBE=1，2026-10-20）
+        if (ith == 0) exec_view_probe(node, "CPU", node_n);
 
         // ---- 产出时刻指纹（PPML_HASH_NODES=1，2026-09-14 加）----
         //   为什么必须在这里：任何"split 结束后再读"的指纹都可能读到已被 gallocr 复用的 buffer；
@@ -730,6 +758,10 @@ void CPUBackend::compute_thread(ThreadState * state) {
 
     tp->barrier_wait();
     // 最后一个节点没有"下一轮 barrier"，在这里补一次（此时全体线程已 barrier，读值是安全/新鲜的）
+    // 执行期 NaN 检查的最后一个节点也在这里做（见循环内注释：循环内检查会读到半写数据）。
+    if (ith == 0 && cgraph->n_nodes() > 0) {
+        exec_nan_check(cgraph->graph_node(cgraph->n_nodes() - 1), "CPU", cgraph->n_nodes() - 1);
+    }
     if (ith == 0 && hash_nodes && cgraph->n_nodes() > 0) {
         nh(cgraph->graph_node(cgraph->n_nodes() - 1), nh_seq);
     }

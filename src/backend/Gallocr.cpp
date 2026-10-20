@@ -1,6 +1,7 @@
 #include "ppml/Gallocr.h"
 #include "ppml/ComputeGraph.h"
 #include "ppml/Backend.h"   // alloc_buffer, Buffer, BufferType
+#include "ppml/AliasGuard.h" // 假别名断言（PPML_ALIAS_GUARD=1）
 
 #include <algorithm>
 #include <cstdlib>
@@ -129,6 +130,28 @@ void Gallocr::compute_refcounts(
                     (const void*)t->buffer_, t->nbytes());
         }
         node_map_[t]  = &li;
+    }
+
+    // 【2026-10-20】诊断开关 PPML_GALLOCR_PIN_ALL=1：把 host(CPU) 侧的 managed 张量全部
+    //   标 is_output ⇒ 不释放、不复用 ⇒ 每个张量独占一段内存。
+    //   用途：判定"执行期 NaN 是否由缓冲复用/liveness 引起"——开启后第一个 NaN 消失或后移
+    //   ⇒ 复用是根因 ✓；否则可排除复用。只对 host 生效（GPU 显存小，全量独占会 OOM），
+    //   内存 = CPU 激活总量，仅小配置可用；默认关。
+    {
+        static const bool pin_all = [] {
+            const char* e = std::getenv("PPML_GALLOCR_PIN_ALL");
+            return e && *e && std::atoi(e) != 0;
+        }();
+        if (pin_all) {
+            auto is_host_bk = [&](int bk) {
+                return bk >= 0 && bk < (int)backends_.size() && backends_[bk].buft &&
+                       backends_[bk].buft->is_host();
+            };
+            for (auto& ni : nodes_)
+                if (ni.managed && is_host_bk(ni.backend_id)) ni.is_output = true;
+            for (auto& li : leaves_)
+                if (li.managed && is_host_bk(li.backend_id)) li.is_output = true;
+        }
     }
 
     // 统计 refcount：遍历 nodes，对每个 src 若为 managed 则 +1
@@ -311,6 +334,11 @@ bool Gallocr::allocate_node(NodeInfo* ni) {
 void Gallocr::free_node(NodeInfo* ni) {
     if (!ni->allocated) return;
     if (ni->is_output) return;  // OUTPUT 永不复用（本实现保守：也不释放）
+    // 【2026-10-20】诊断开关见 compute_refcounts 的 PPML_GALLOCR_PIN_ALL（统一走 is_output
+    //   的"永不释放"路径，避免在 free_node 里单边跳过导致两阶段布局不一致 ✗）。
+
+    // 【2026-10-20】区间归还 ⇒ 撤销假别名登记（否则复用同一段地址会被误报为重叠）。
+    aliasguard::unregister(ni->tensor);
 
     BackendAlloc& ba = backends_[ni->backend_id];
     if (recording_phase1_) {
@@ -351,6 +379,7 @@ bool Gallocr::reserve(
             t->bind_data(nullptr);
             t->buffer_      = nullptr;
             t->buffer_offs_ = 0;
+            aliasguard::unregister(t);   // 解绑 ⇒ 撤销假别名登记（本轮将重新 alloc/bind）
         }
     };
     for (int i = 0; i < graph->n_nodes(); ++i) reset_tensor(graph->graph_node(i));
@@ -754,6 +783,15 @@ void Gallocr::bind_tensor(NodeInfo* ni) {
     t->buffer_      = b;
     t->buffer_offs_ = off;
 
+    // 【2026-10-20】假别名断言：登记本次分配的真实地址区间。
+    //   若与任何**仍存活**的张量区间重叠 ⇒ 两个活张量共享物理内存（不该发生），
+    //   打印 [ALIAS]（PPML_ALIAS_ABORT=1 时 abort 便于 gdb 抓栈）。
+    //   用 alloc_size（含对齐）而非 nbytes，检出更严格。
+    {
+        const size_t reg_bytes = (ni->alloc_size > 0) ? ni->alloc_size : t->nbytes();
+        aliasguard::register_range(t, t->data(), reg_bytes, "gallocr");
+    }
+
     // 常量叶子：分配完成后从 const_data_ 填充数据。
     //   TENSOR_FLAG_CONST 置位 → 静态可复用（保留 const_data_，图可复用）；
     //   不置位 → 动态一次性（填充后清空+shrink，避免宿主内存累积）。
@@ -824,6 +862,15 @@ void Gallocr::check_live_overlap(BackendAlloc& ba, const NodeInfo* ni) {
             const bool r_out   = (rn != nullptr) && rn->is_output;
             ++n_live_overlap_seen_;
             if (r_alive) ++n_live_overlap_real_; else ++n_live_overlap_stale_;
+            // 【2026-10-20】真共存 = 同一地址被两个**活**张量占用 ⇒ 断言（PPML_ALIAS_ABORT=1 时 abort）
+            if (r_alive && std::getenv("PPML_ALIAS_ABORT")) {
+                fprintf(stderr,
+                        "[ALIAS][gallocr] Phase2 真实共存：new t=%p op=%d [off=%zu,+%zu) | live t=%p op=%d\n",
+                        (void*)ni->tensor, ni->tensor ? (int)ni->tensor->op : -1, off, size,
+                        (void*)(r.t), (r.t) ? (int)r.t->op : -1);
+                fflush(stderr);
+                std::abort();
+            }
             // 明细只打前 20 条（长训练可达数万条 ✗），其余靠 release 汇总 ✓
             if (n_live_overlap_seen_ <= 20) {
                 // 【2026-09-20】附带上两侧的节点身份：idx（在 nodes_/leaves_ 里的下标）/refcount/是否 leaf ✓
@@ -881,6 +928,7 @@ void Gallocr::release() {
                 ni.tensor->buffer_      = nullptr;
                 ni.tensor->buffer_offs_ = 0;
                 ni.allocated = false;
+                aliasguard::unregister(ni.tensor);   // 解绑 ⇒ 撤销假别名登记
             }
         }
     };
@@ -906,6 +954,10 @@ void Gallocr::release() {
         n_live_overlap_seen_ = n_live_overlap_real_ = n_live_overlap_stale_ = 0;
         n_remove_live_miss_  = 0;
     }
+    // buffer 已 delete ⇒ 该 pool 的地址全部失效（假别名登记一并清空 + 汇总）
+    aliasguard::drop_pool("gallocr");
+    aliasguard::report("gallocr::release");
+
     node_map_.clear();
     nodes_.clear();
     leaves_.clear();
