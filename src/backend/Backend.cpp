@@ -1405,6 +1405,15 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             TensorF32* src = node->src[j];
             if (!src) continue;
+            // 【2026-10-20】诊断：进入 3c 时 src 已经是 OP_DUP ⇒ 说明它不是本 pass 刚建的，
+            //   而是上一轮 split（或被模型代码）留下的 cpy。这种情况下 target 可能属于别的后端。
+            static const bool dbg_cpy_src = (std::getenv("PPML_DEBUG_CPY_SRC") != nullptr);
+            if (dbg_cpy_src && src->op == OP_DUP) {
+                fprintf(stderr, "[cpy-src] node=%d op=%d j=%d cur_bk=%d src=%p src0=%p src0_op=%d src_buf_host=%d\n",
+                        i, (int)node->op, j, cur_backend_id, (void*)src, (void*)src->src[0],
+                        src->src[0] ? (int)src->src[0]->op : -1,
+                        (src->buffer_ ? (int)src->buffer_->is_host() : -1));
+            }
 
             // 解析 src 的后端：view op 节点在 pass 中被跳过(backend_map_=-1)，
             // 需沿 src 链解析到底层非 view 节点的 backend。
@@ -1445,6 +1454,11 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
                     // dup() 返回 OP_DUP 节点，data_=nullptr，由 allocator 后续分配
                     TensorF32* cpy = dup(src);
                     copy_tensor_map_[key] = cpy;
+                    if (dbg_cpy_src) {
+                        fprintf(stderr, "[cpy-new] node=%d op=%d j=%d cur_bk=%d src=%p src_op=%d src_bk=%d cpy=%p\n",
+                                i, (int)node->op, j, cur_backend_id, (void*)src, (int)src->op,
+                                src_backend_id, (void*)cpy);
+                    }
 
                     // 记录为 split 的输入（执行时需跨后端拷贝）
                     if (split->n_inputs < MAX_SPLIT_INPUTS) {
@@ -1731,7 +1745,15 @@ Status BackendScheduler::graph_compute() {
             if (guard_on) {
                 static long guard_hits = 0;
                 TensorF32* bad_t = nullptr;
-                for (int k = sp.i_start; k < sp.i_end && !bad_t; ++k) {
+                int bad_k = -1, bad_j = -1;
+                // 【2026-10-20 修复】此守卫运行时 current_graph_->nodes 已被改成
+                //   `saved_nodes + sp.i_start`（见上面"临时替换为子图范围"），
+                //   n_nodes_ = 子图长度 ⇒ 这里必须用**相对下标** [0, n_nodes_)。
+                //   原实现用绝对 [i_start, i_end) 会二次偏移，实际扫的是
+                //   saved_nodes[2*i_start .. 2*i_start+len)（别的 split，常是 CPU 段），
+                //   一旦扫到 CPU 节点的 host 输入就误判"本 GPU split 有 host 输入"并
+                //   ABORTED 整图 ⇒ 全图回退 CPU（长样本 "CUDA" 跑的其实是 CPU 的根因）。
+                for (int k = 0; k < current_graph_->n_nodes_ && !bad_t; ++k) {
                     TensorF32* nd = current_graph_->graph_node(k);
                     if (!nd || is_view_op(nd->op) || nd->op == OP_NONE) continue;   // 无 kernel ✓
                     for (int j = 0; j < GGML_MAX_SRC; ++j) {
@@ -1739,16 +1761,58 @@ Status BackendScheduler::graph_compute() {
                         if (!s || !s->data()) continue;        // 未计算 ✓
                         if (is_device_pointer(s, s->data())) continue;
                         bad_t = s;
+                        bad_k = sp.i_start + k;   // 相对 → 绝对，便于对回整图
+                        bad_j = j;
                         break;
                     }
                 }
                 if (bad_t) {
                     if (guard_hits++ < 20) {
+                        // 【2026-10-20】归因信息：bad_t 是"谁"、来自哪条 cpy、为什么没被 Step 1 拷到 device。
+                        //   Step 1 的跳过条件是 src_bid==backend 或 tensor_buffer_compatible(src,backend)；
+                        //   这两条都以 backend_map_（构建期）为准，运行期数据在 host 时就会漏拷。
+                        const TensorF32* bs = (bad_t->op == OP_DUP) ? bad_t->src[0] : nullptr;
+                        bool in_copy_map = false;
+                        int  map_target  = -1;
+                        const TensorF32* map_src = nullptr;
+                        for (auto& kv : copy_tensor_map_) {
+                            if (kv.second == bad_t) {
+                                in_copy_map = true;
+                                map_target  = kv.first.second;
+                                map_src     = kv.first.first;
+                                break;
+                            }
+                        }
+                        TensorF32* consumer = current_graph_->graph_node(bad_k);
                         fprintf(stderr,
                                 "[CUDA-GUARD] split=%d backend=%d i=[%d,%d) 输入 op=%d numel=%lld data=%p 在 host ⇒ "
                                 "放弃本 split（避免裸读 host ✗，转 CPU 回退 ✓）\n",
                                 si, sp.backend_id, sp.i_start, sp.i_end, (int)bad_t->op,
                                 (long long)bad_t->numel(), (const void*)bad_t->data());
+                        fprintf(stderr,
+                                "[CUDA-GUARD]   消费节点 k=%d op=%d src_idx=%d | bad: buf=%p host=%d view_src=%p\n",
+                                bad_k, consumer ? (int)consumer->op : -1, bad_j,
+                                (void*)bad_t->buffer_,
+                                (bad_t->buffer_ ? (int)bad_t->buffer_->is_host() : -1),
+                                (void*)bad_t->view_src);
+                        if (bs) {
+                            fprintf(stderr,
+                                    "[CUDA-GUARD]   bad 是 cpy(OP_DUP): src0 op=%d numel=%lld data=%p buf=%p host=%d "
+                                    "device_ptr=%d backend_id=%d\n",
+                                    (int)bs->op, (long long)bs->numel(), (const void*)bs->data(),
+                                    (void*)bs->buffer_,
+                                    (bs->buffer_ ? (int)bs->buffer_->is_host() : -1),
+                                    (bs->data() ? (int)is_device_pointer(bs, bs->data()) : -1),
+                                    tensor_backend_id(const_cast<TensorF32*>(bs), -1));
+                        }
+                        fprintf(stderr,
+                                "[CUDA-GUARD]   copy_map: entry=%d target=%d src=%p(%s) | compatible(bad,backend)=%d "
+                                "backend_map(bad)=%d sched_host(bad)=%d\n",
+                                (int)in_copy_map, map_target, (const void*)map_src,
+                                (map_src == bs ? "same_as_src0" : "DIFF"),
+                                (int)tensor_buffer_compatible(bad_t, sp.backend_id),
+                                tensor_backend_id(bad_t, -1),
+                                (int)sched_data_is_host(bad_t));
                     }
                     if (saved_nodes) current_graph_->nodes = saved_nodes;
                     current_graph_->n_nodes_ = saved_n_nodes;

@@ -580,11 +580,24 @@ void CPUBackend::compute_thread(ThreadState * state) {
         // ---- 开发诊断：找第一个输出含巨大值(爆炸源)的节点（GRAPH_DEBUG_NAN=1）----
         // 在 NaN 之前抓真正的爆炸起点：max|v| > EXPLODE_THRESH 即报（不放过已是 NaN 的）。
         if (ith == 0 && getenv("GRAPH_DEBUG_NAN") && node->data() && node->op != OP_NONE) {
-            const float EXPLODE_THRESH = 1e4f;
+            // 【2026-10-20】阈值改为 PPML_EXPLODE_THRESH（默认 1e4）：
+            //   1e4 只能看到"已经放大后"的节点；降到 1e2/1e3 后，第一个越线的节点才是
+            //   梯度/激活的真实起点（用于追溯上游，而不是只看到 div 这类放大下游）。
+            //   打印上限仍是 8 条（explode_count<8）；阈值过低时会先被前向大值占满。
+            static const float EXPLODE_THRESH = [] {
+                const char* e = std::getenv("PPML_EXPLODE_THRESH");
+                return e ? static_cast<float>(std::atof(e)) : 1e4f;
+            }();
             const int64_t ne_e = node->numel();
             const float* nde = node->data();
+            // 打印条数上限（PPML_EXPLODE_MAX，默认 8）：阈值调低时前向大值会占满名额，
+            // 调大后可以看到更靠后的反向节点。
+            static const long long explode_max = [] {
+                const char* e = std::getenv("PPML_EXPLODE_MAX");
+                return e ? static_cast<long long>(std::atoll(e)) : 8LL;
+            }();
             static long long explode_count = 0;
-            for (int64_t q = 0; q < ne_e && explode_count < 8; ++q) {
+            for (int64_t q = 0; q < ne_e && explode_count < explode_max; ++q) {
                 float v = nde[q];
                 if (std::isfinite(v) && (v > EXPLODE_THRESH || v < -EXPLODE_THRESH)) {
                     auto opname = [](TensorF32* t)->int { return t ? (int)t->op : -1; };

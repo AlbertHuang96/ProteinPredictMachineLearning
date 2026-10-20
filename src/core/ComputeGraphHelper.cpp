@@ -768,6 +768,26 @@ TensorF32* concat_ptr(const std::vector<TensorF32*>& tensors, int dim) {
     int ndim = tensors[0]->shape().ndim();
     if (dim < 0) dim += ndim;
 
+    // 【2026-10-20 修复】源数 > GGML_MAX_SRC(10) 时必须**链式拼接**。
+    //   原实现：ne[dim] 按全部 tensors 求和，但 src[] 只挂前 10 个 ⇒ dst 的拼接维
+    //   大于所有 src 之和 ⇒ kernel 里 gd 落进 [sum(len), dst_dim) 时越界读：
+    //   CPU 静默读垃圾（loss 看不出）、CUDA 直接 illegal memory access
+    //   （实测 SE3 kernel 生成：kernel_rows 有 32 个 [32,1,2550] 块，只挂了 10 个）。
+    if (tensors.size() > static_cast<size_t>(GGML_MAX_SRC)) {
+        std::vector<TensorF32*> level;
+        level.reserve((tensors.size() + GGML_MAX_SRC - 1) / GGML_MAX_SRC);
+        for (size_t i = 0; i < tensors.size(); i += GGML_MAX_SRC) {
+            const size_t j = std::min(tensors.size(), i + static_cast<size_t>(GGML_MAX_SRC));
+            if (j - i == 1) {
+                level.push_back(tensors[i]);
+            } else {
+                std::vector<TensorF32*> chunk(tensors.begin() + i, tensors.begin() + j);
+                level.push_back(concat_ptr(chunk, dim));
+            }
+        }
+        return concat_ptr(level, dim);
+    }
+
     int64_t ne[4] = {1, 1, 1, 1};
     for (int i = 0; i < ndim; i++) {
         ne[i] = tensors[0]->shape().dims[i];
