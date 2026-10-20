@@ -768,6 +768,26 @@ TensorF32* concat_ptr(const std::vector<TensorF32*>& tensors, int dim) {
     int ndim = tensors[0]->shape().ndim();
     if (dim < 0) dim += ndim;
 
+    // 【2026-10-20 修复】源数 > GGML_MAX_SRC(10) 时必须**链式拼接**。
+    //   原实现：ne[dim] 按全部 tensors 求和，但 src[] 只挂前 10 个 ⇒ dst 的拼接维
+    //   大于所有 src 之和 ⇒ kernel 里 gd 落进 [sum(len), dst_dim) 时越界读：
+    //   CPU 静默读垃圾（loss 看不出）、CUDA 直接 illegal memory access
+    //   （实测 SE3 kernel 生成：kernel_rows 有 32 个 [32,1,2550] 块，只挂了 10 个）。
+    if (tensors.size() > static_cast<size_t>(GGML_MAX_SRC)) {
+        std::vector<TensorF32*> level;
+        level.reserve((tensors.size() + GGML_MAX_SRC - 1) / GGML_MAX_SRC);
+        for (size_t i = 0; i < tensors.size(); i += GGML_MAX_SRC) {
+            const size_t j = std::min(tensors.size(), i + static_cast<size_t>(GGML_MAX_SRC));
+            if (j - i == 1) {
+                level.push_back(tensors[i]);
+            } else {
+                std::vector<TensorF32*> chunk(tensors.begin() + i, tensors.begin() + j);
+                level.push_back(concat_ptr(chunk, dim));
+            }
+        }
+        return concat_ptr(level, dim);
+    }
+
     int64_t ne[4] = {1, 1, 1, 1};
     for (int i = 0; i < ndim; i++) {
         ne[i] = tensors[0]->shape().dims[i];
@@ -1074,9 +1094,13 @@ TensorF32* torsion_angle_loss(TensorF32* pred, TensorF32* gt, TensorF32* chi_mas
     float eps = 1e-8f;
 
     // Step 1: normalize pred to unit circle: pred_n = pred / sqrt(sum(pred², dim=-1))
-    auto sq_sum = sum_rows(sqr(pred));       // [N, 7]
-    auto r      = sqrt(add1_impl(sq_sum, make_scalar(eps), false)); // [N, 7] 加 eps 防除零
-    auto pred_n = div(pred, r);              // [N, 7, 2] broadcast
+    auto sq_sum = sum_rows(sqr(pred));       // dims={1,7,N}
+    auto r      = sqrt(add1_impl(sq_sum, make_scalar(eps), false)); // dims={1,7,N} 加 eps 防除零
+    // r 是 {1,7,N}、pred 是 {2,7,N}：逐元素 kernel 用 src[i % src_numel] 取源，
+    // 只在“src 覆盖最内维前缀”时才等价于广播；这里要沿 dim0（最内维）复制，
+    // 直接 div 会按 i%numel 错位取值（pred[d0,d1,d2] 会除以 r 的另一个残基/角）。
+    // 故先 repeat 物化到 pred 的完整形状（714 个 float，开销可忽略）。
+    auto pred_n = div(pred, repeat(r, pred)); // dims={2,7,N}
 
     // Step 2: squared difference in (sin,cos) space
     auto diff    = sub(pred_n, gt);           // [N, 7, 2]
@@ -1103,7 +1127,13 @@ TensorF32* angle_norm_loss(TensorF32* unnormed, TensorF32* seq_mask, float eps) 
     auto err    = abs(sub(norm, ones));        // [N, 7]
 
     // Step 3: masked mean
-    auto masked = mul(err, seq_mask);          // [N, 7] broadcast
+    // seq_mask 是 {1,N}、err 是 {1,7,N}：要沿 dim1（7 个 chi）复制 mask，
+    // 而 kernel 的 src[i % numel] 只在最内维前缀对齐时成立，
+    // 直接 mul 会让每条数据按 i%N 取到别的残基的 mask。
+    // 先把 mask 挪到最外维 {1,1,N} 再 repeat 成 {1,7,N}。
+    const int64_t nmask = seq_mask->shape().dim(1);
+    auto mask_rep = repeat(view(seq_mask, Shape({1, 1, nmask})), err);
+    auto masked = mul(err, mask_rep);          // dims={1,7,N}
     auto loss   = div(sum(masked), add1_impl(sum(seq_mask), make_scalar(eps), false));
 
     return loss;

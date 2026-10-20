@@ -399,6 +399,10 @@ void CUDABackend::synchronize() {
 Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
     cudaSetDevice(device_id_);
 
+    // 生产者代际断言（PPML_STALE_CHECK=1）：每轮执行起一个新代际，并登记本图 node/leaf。
+    //   scheduler 驱动 split 时 sched_depth>0 ⇒ 此处不另起代际（由 scheduler 统一起）。
+    exec_stale_pass_begin(cgraph);
+
     // ---- no_alloc 延迟分配：对 data_==nullptr 的中间节点分配 GPU buffer ----
     // 混训时 scheduler 已预分配，置 skip_alloc_=true 跳过，避免两套 gallocr 冲突。
     if (!skip_alloc_) {
@@ -643,13 +647,22 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
                     (node->src[3]?(int)node->src[3]->op:-1), (void*)(node->src[3]?node->src[3]->data():nullptr),
                     (node->src[4]?(int)node->src[4]->op:-1), (void*)(node->src[4]?node->src[4]->data():nullptr));
         }
+        // 生产者代际断言（PPML_STALE_CHECK=1）：消费前校验 src 是否本代际写过
+        exec_stale_check(node, "CUDA", node_n);
         Status st = dispatch_node(node, &params);
+        exec_stale_mark(node);   // 本节点算完 ⇒ 记为"本代际已写"（CUDA 单线程，无需 ith 门控）
         if (getenv("GRAPH_DEBUG_CUDA_OP")) {
             fprintf(stderr, "[cuda-dispatch] op=%d st=%d\n", (int)node->op, (int)st);
         }
         if (st != Status::SUCCESS) {
             return st;
         }
+        // 执行期 NaN/爆炸检查（PPML_EXEC_NAN_CHECK=1）：紧跟本节点 kernel，按执行顺序
+        //   报告第一个坏节点 ⇒ 直接定位"第一个产生 NaN/Inf 的 CUDA kernel"。
+        exec_nan_check(node, "CUDA", node_n);
+        exec_probe_op(node, "CUDA", node_n);   // 定点算子探针（PPML_PROBE_OP=...）
+        exec_view_probe(node, "CUDA", node_n);   // view 别名消费探针（PPML_EXEC_VIEW_PROBE=1）
+        exec_ab_check(node, "CUDA", node_n);     // 单节点 CPU/GPU 数值 A/B（PPML_AB_CHECK=1）
         // 捕获异步 CUDA 错误（如 kernel 拿到 host 指针当 device 读 -> illegal address）。
         // 先查 launch 错误（廉价的 cudaGetLastError 始终做）；执行错误需同步才能捕获，
         // 用 GRAPH_DEBUG_CUDA 控制（每 kernel 同步很慢，仅定位段错误时开）。

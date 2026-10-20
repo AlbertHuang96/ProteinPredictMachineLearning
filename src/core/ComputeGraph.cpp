@@ -1,6 +1,7 @@
 #include "ppml/ComputeGraph.h"
 #include "ppml/Context.h"
 #include <cassert>
+#include <cstdlib>  // std::getenv / std::atof（PPML_SQRT_BACK_EPS 等反向开关）
 
 namespace ppml {
 
@@ -558,7 +559,22 @@ void ComputeGraph::compute_backward(
         case OP_SQRT: {
             if (src0_needs_grads) {
                 // d(sqrt(x))/dx = grad / (2 * sqrt(x)) = 0.5 * grad / tensor
-                add_or_set(ctx, cgraph, isrc0, scale(div(grad, tensor), 0.5f));
+                //
+                // 【2026-10-20 修复：sqrt 反向除零 ⇒ NaN 污染参数梯度（1e19 原始梯度的起点）】
+                //   实测链（单线程 PPML_EXEC_NAN_CHECK=1，GNormBias 的极坐标分解）：
+                //     DIV(op=8) src1 = DUP ← SQRT ← SUM_ROWS(沿 d_dim) ← SQR ← VIEW
+                //     src1 统计 max=2.684e-07、**1429/1632 元素恰为 0**（全零行/零范数）
+                //   ⇒ 原式 `0.5*grad/tensor` 命中 1/0 = inf，0*inf ⇒ NaN；NaN 扩散到 635 个
+                //     参数梯度（clipper 整张清零），下一轮有限部分达 1e18。
+                //   数学上 x=0 处导数无定义；这里取**次梯度 0**：denom = clamp(tensor, eps, ∞)
+                //   （clamp 反向在 x≤eps 处掩码为 0），且 denom 有正下限，不会再产生 inf。
+                //   eps 默认 1e-6（=sqrt(1e-12)），tensor≥eps 的常规元素**逐位不变**。
+                static const float sqrt_back_eps = [] {
+                    const char* e = std::getenv("PPML_SQRT_BACK_EPS");
+                    return e ? static_cast<float>(std::atof(e)) : 1e-6f;
+                }();
+                TensorF32* denom = clamp(tensor, sqrt_back_eps, 1e30f);
+                add_or_set(ctx, cgraph, isrc0, scale(div(grad, denom), 0.5f));
             }
         } break;
         case OP_LOG: {

@@ -1,9 +1,13 @@
 
 #include "ppml/Backend.h"
 #include "ppml/Context.h"
+#include "ppml/AliasGuard.h"   // 假别名断言（PPML_ALIAS_GUARD=1）
 #include <algorithm>
 #include <cstring>
 #include <cstdio>
+#include <cmath>            // exec_ab_check 的相对误差
+#include <vector>           // exec_ab_check 的 host 影子缓冲
+#include <unordered_map>    // exec_nan_check 的"缓冲最后写入者"登记表
 #include <cuda_runtime.h>   // cudaMemGetInfo 用于 GPU 显存预算
 
 namespace ppml {
@@ -645,10 +649,760 @@ bool is_device_pointer(const TensorF32* src, const float* data) {
 }
 
 // ============================================================
+// exec_nan_check — 执行期逐节点 NaN/爆炸检查（诊断，2026-10-20）
+// ============================================================
+//   动机：`[FWD-NAN]` 是"整图跑完后**按节点索引**扫描"，会把本次**没有执行**的
+//   陈旧/未算节点也算进来（实测混合模式 epoch2 第一个命中是未算的反向节点），
+//   真正的"第一个产生 NaN 的 kernel"被掩盖 ✗。
+//   本函数在**每个节点 kernel 刚执行完**时调用，按**执行顺序**报告 ⇒ 第一次命中
+//   就是源头算子 ✓。读值：host 直接读；device 分块 cudaMemcpy D2H（同流有序 ⇒
+//   读到的是该 kernel 的结果）。
+namespace {
+
+// 扫描单张量：坏 = 含 NaN / ±Inf / max|v| > thr。
+//   返回 false 表示无法扫描（data 为空 / D2H 失败）。
+bool exec_scan_tensor(const TensorF32* t, float thr,
+                      long long* n_nan, long long* n_inf, double* maxabs,
+                      float* first_bad, long long* first_idx,
+                      long long* n_zero = nullptr, double* minv = nullptr,
+                      double* minpos = nullptr) {
+    if (!t || !t->data() || t->numel() <= 0) return false;
+    const int64_t n = t->numel();
+    const float* dptr = static_cast<const float*>(t->data());
+    const bool dev = is_device_pointer(t, dptr);
+
+    static thread_local std::vector<float> chunk;
+    constexpr int64_t kChunk = 1 << 20;   // 1M float = 4 MB / 块
+
+    for (int64_t off = 0; off < n; off += kChunk) {
+        const int64_t m = (off + kChunk <= n) ? kChunk : (n - off);
+        const float* p = nullptr;
+        if (dev) {
+            chunk.resize(static_cast<size_t>(m));
+            if (cudaMemcpy(chunk.data(), dptr + off, static_cast<size_t>(m) * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                cudaGetLastError();   // 清掉残留错误，避免污染后续 kernel 判定
+                return false;
+            }
+            p = chunk.data();
+        } else {
+            p = dptr + off;
+        }
+        for (int64_t k = 0; k < m; ++k) {
+            const float v = p[k];
+            if (std::isnan(v)) { ++(*n_nan); }
+            else if (!std::isfinite(v)) { ++(*n_inf); }
+            else {
+                const double a = std::fabs(static_cast<double>(v));
+                if (a > *maxabs) *maxabs = a;
+                if (minv && static_cast<double>(v) < *minv) *minv = static_cast<double>(v);
+                if (minpos && v != 0.0f && a < *minpos) *minpos = a;   // 最小非零幅值（看分母下限用）
+                if (n_zero && v == 0.0f) ++(*n_zero);
+                if (a > static_cast<double>(thr) && *first_idx < 0) {
+                    *first_bad = v;
+                    *first_idx = off + k;
+                }
+            }
+            if (*first_idx < 0 && (std::isnan(v) || std::isinf(v))) {
+                *first_bad = v;      // NaN/Inf 也算"第一个坏值"，便于看首次出现位置
+                *first_idx = off + k;
+            }
+        }
+    }
+    return true;
+}
+
+// 生产记录（生产者校验和）：{ 张量对象 → 写入时的地址+统计 } 与 { 地址 → 最后写入者 }。
+//   下游读到坏值时据此区分三种情形：
+//     (a) REBIND —— 张量对象当前 data 地址 ≠ 写入时地址 ⇒ 指针被中途重绑；
+//     (b) 内容被覆盖 —— 地址未变、生产者记录为干净、现在脏 ⇒ 别名/复用写坏；
+//     (c) 上游本就脏 —— 生产者记录也脏（真正上游问题）。
+// 【2026-10-20】从 exec_nan_check 的函数级 static 提到 TU 级：exec_view_probe 需要复用同一份
+//   记录来判定"消费 view 的 kernel 读到的到底是不是生产者的内容"。
+struct ExecWRec {
+    const TensorF32* tensor = nullptr;
+    uintptr_t addr = 0;
+    int node_idx = -1;
+    int op = -1;
+    long long nan = 0;
+    long long inf = 0;
+    double maxabs = 0.0;
+};
+std::unordered_map<uintptr_t, ExecWRec>        g_exec_by_addr;
+std::unordered_map<const TensorF32*, ExecWRec> g_exec_by_tensor;
+
+}  // namespace
+
+void exec_nan_check(const TensorF32* node, const char* backend_name, int node_idx) {
+    static const bool  on = (std::getenv("PPML_EXEC_NAN_CHECK") != nullptr);
+    if (!on || !node) return;
+    static const float thr = [] {
+        const char* e = std::getenv("PPML_EXEC_NAN");
+        return e ? static_cast<float>(std::atof(e)) : 1e6f;
+    }();
+    static const int max_print = [] {
+        const char* e = std::getenv("PPML_EXEC_NAN_MAX");
+        return e ? std::atoi(e) : 8;
+    }();
+    // 追踪模式：把每个 split 前 N 个节点（无论好坏）都打印出来，用于判断
+    //   "某节点执行时是干净的、被消费者读到却已经是 NaN" ⇒ 缓冲被复用抵消（aliasing）。
+    static const int trace_max = [] {
+        const char* e = std::getenv("PPML_EXEC_TRACE");
+        return e ? std::atoi(e) : 0;
+    }();
+    // 起始下标（PPML_EXEC_TRACE_FROM，默认 0）：配合 TRACE 只看 [FROM, MAX) 区间——
+    //   子图规模上千节点时，只看前 40 个抓不到真正的放大点，必须能滑窗。
+    static const int trace_from = [] {
+        const char* e = std::getenv("PPML_EXEC_TRACE_FROM");
+        return e ? std::atoi(e) : 0;
+    }();
+    auto traced = [&](int idx) {
+        return trace_max > 0 && idx < trace_max && idx >= trace_from;
+    };
+    static int printed = 0;
+    if (node->op == OP_NONE || node->numel() <= 0 || !node->data()) return;
+    if (printed >= max_print && !traced(node_idx)) return;
+
+    long long nn = 0, ni = 0, fi = -1;
+    double mx = 0.0; float fb = 0.0f;
+    if (!exec_scan_tensor(node, thr, &nn, &ni, &mx, &fb, &fi)) return;
+
+    if (traced(node_idx)) {
+        fprintf(stderr,
+                "[EXEC-TRACE] backend=%s node=%d op=%d self=%p data=%p numel=%lld nan=%lld inf=%lld maxabs=%.4e "
+                "dims=[%lld,%lld,%lld,%lld]\n",
+                backend_name ? backend_name : "?", node_idx, (int)node->op,
+                (const void*)node, (const void*)node->data(), (long long)node->numel(), nn, ni, mx,
+                (long long)(node->shape().ndim() > 0 ? node->shape().dims[0] : -1),
+                (long long)(node->shape().ndim() > 1 ? node->shape().dims[1] : -1),
+                (long long)(node->shape().ndim() > 2 ? node->shape().dims[2] : -1),
+                (long long)(node->shape().ndim() > 3 ? node->shape().dims[3] : -1));
+        fflush(stderr);
+    }
+
+    // 本节点 dst 刚写完 ⇒ 登记生产记录（对象级 + 地址级）
+    {
+        ExecWRec rec{node, reinterpret_cast<uintptr_t>(node->data()), node_idx, (int)node->op, nn, ni, mx};
+        g_exec_by_addr[rec.addr]   = rec;
+        g_exec_by_tensor[node]     = rec;
+    }
+
+    if (nn == 0 && ni == 0 && fi < 0) return;   // 干净
+    if (printed >= max_print) return;
+    ++printed;
+    // 各 src 一并统计：区分"本算子引入"还是"上游已经坏"（多 src 时逐一看，
+    //   例如 DIV 的坏值往往来自分母 src1，只看 src0 会误判为 ADD 的问题）
+    char srcbuf[3][320];
+    srcbuf[0][0] = srcbuf[1][0] = srcbuf[2][0] = '\0';
+    for (int i = 0; i < 3 && node->src[i]; ++i) {
+        long long snn = 0, sni = 0, sfi = -1, szero = 0;
+        double smx = 0.0, smin = 1e30; float sfb = 0.0f;
+        const TensorF32* s = node->src[i];
+        if (!exec_scan_tensor(s, thr, &snn, &sni, &smx, &sfb, &sfi, &szero, &smin)) continue;
+
+        // 生产者记录（对象级）：判 REBIND —— 写入时的地址与当前 data 是否一致
+        ExecWRec pr{};
+        bool has_prod = false, rebind = false;
+        uintptr_t old_addr = 0;
+        auto tit = g_exec_by_tensor.find(s);
+        if (tit != g_exec_by_tensor.end()) {
+            pr = tit->second;
+            has_prod = true;
+            if (s->data() && pr.addr != reinterpret_cast<uintptr_t>(s->data())) {
+                rebind = true;
+                old_addr = pr.addr;
+            }
+        }
+        // 地址级：这块内存最后被谁写（可能是另一个张量 ⇒ 别名/复用）
+        ExecWRec aw{};
+        bool has_aw = false;
+        if (s->data()) {
+            auto ait = g_exec_by_addr.find(reinterpret_cast<uintptr_t>(s->data()));
+            if (ait != g_exec_by_addr.end()) { aw = ait->second; has_aw = true; }
+        }
+        snprintf(srcbuf[i], sizeof(srcbuf[i]),
+                 " src%d=(op=%d,data=%p,now[nan=%lld,inf=%lld,max=%.3e,min=%.3e,zero=%lld],"
+                 "rebind=%d,was=%p,"
+                 "prod=%s(op%d@n%d,nan=%lld,inf=%lld,max=%.3e),"
+                 "addr_last_writer=%s(op%d@n%d))",
+                 i, (int)s->op, (const void*)s->data(), snn, sni, smx, smin, szero,
+                 rebind ? 1 : 0, (const void*)old_addr,
+                 has_prod ? "" : "NONE", pr.op, pr.node_idx, pr.nan, pr.inf, pr.maxabs,
+                 has_aw ? "" : "NONE", aw.op, aw.node_idx);
+    }
+
+    // DIV 分母溯源：src1 往往是 DUP/clamp/div 链的输出，沿 src[0] 上溯 6 层打印 op/numel/零值数，
+    //   用于把"分母大面积 0"对回源码表达式（单线程跑一次即可定位，不必逐层加日志）。
+    char divchain[640];
+    divchain[0] = '\0';
+    if ((int)node->op == 8 /*OP_DIV*/ && node->src[1]) {
+        size_t used = 0;
+        const TensorF32* c = node->src[1];
+        for (int lv = 0; c && lv < 6 && used + 96 < sizeof(divchain); ++lv) {
+            long long cn = 0, ci = 0, cz = 0, cf = -1;
+            double cmx = 0.0, cmn = 1e30;
+            float cfb = 0.f;
+            const bool ok = exec_scan_tensor(c, thr, &cn, &ci, &cmx, &cfb, &cf, &cz, &cmn);
+            used += static_cast<size_t>(snprintf(divchain + used, sizeof(divchain) - used,
+                                                "%slv%d(op=%d,numel=%lld%s,nan=%lld,zero=%lld,max=%.3e)",
+                                                lv ? " <- " : "", lv, (int)c->op,
+                                                (long long)c->numel(), ok ? "" : "/no-data",
+                                                cn, cz, cmx));
+            c = c->src[0];
+        }
+    }
+
+    // 缓冲重叠检查：dst 与某个 src 落在同一段内存（或部分重叠）⇒ 读写同一块内存，
+    //   kernel 边写边读会自我污染（内存规划/别名 bug 的典型症状）。
+    auto overlap = [](const TensorF32* a, const TensorF32* b) -> int {
+        if (!a || !b || !a->data() || !b->data()) return 0;
+        const uintptr_t a0 = (uintptr_t)a->data(), a1 = a0 + (uintptr_t)a->nbytes();
+        const uintptr_t b0 = (uintptr_t)b->data(), b1 = b0 + (uintptr_t)b->nbytes();
+        return (a0 < b1 && b0 < a1) ? 1 : 0;
+    };
+    const int al0 = overlap(node, node->src[0]);
+    const int al1 = overlap(node, node->src[1]);
+
+    fprintf(stderr,
+            "[EXEC-NAN] #%d backend=%s node=%d op=%d self=%p data=%p src0=%p src1=%p numel=%lld nan=%lld inf=%lld "
+            "maxabs=%.4e first_bad=%.6g @%lld dims=[%lld,%lld,%lld,%lld] alias0=%d alias1=%d%s%s%s%s\n",
+            printed, backend_name ? backend_name : "?", node_idx, (int)node->op,
+            (const void*)node, (const void*)node->data(),
+            (const void*)node->src[0], (const void*)node->src[1],
+            (long long)node->numel(), nn, ni, mx, (double)fb, fi,
+            (long long)(node->shape().ndim() > 0 ? node->shape().dims[0] : -1),
+            (long long)(node->shape().ndim() > 1 ? node->shape().dims[1] : -1),
+            (long long)(node->shape().ndim() > 2 ? node->shape().dims[2] : -1),
+            (long long)(node->shape().ndim() > 3 ? node->shape().dims[3] : -1),
+            al0, al1, srcbuf[0], srcbuf[1], srcbuf[2],
+            divchain[0] ? " | div-chain:↓" : "");
+    if (divchain[0]) fprintf(stderr, "           div-chain:%s\n", divchain);
+    fflush(stderr);
+}
+
+// ============================================================
+// exec_view_probe — view 别名消费探针（诊断，默认关；2026-10-20）
+// ============================================================
+//   动机（实测证据，CUDA 混合调度、单 split 内相邻节点）：
+//     node0 op=30 MUL_MAT dims=[32,51] max=1.8493e+02   ← GNormBias 的输入 x
+//     node2 op=9  SQR      dims=[1,32,51] max=1.9303e-07 ← sqr(x) 本应 ~3.4e4
+//   而 SQR 的输入是 `view(x)`（零拷贝别名）。后续 SUM_ROWS/SQRT 与该错误输入自洽
+//   （sqrt(1.93e-7)=4.39e-4 ✓）⇒ 错在"消费 view 读到的内容"，不在算子本身。
+//   本探针在**消费者 kernel 刚执行完**时，对每个 view 型 src 判定：
+//     ① same_addr —— view 解析出的 data 是否等于 view 链根（真实载体）的 data；
+//     ② 该地址当前内容 vs 根张量**写入时**的生产记录（maxabs/nan/inf）；
+//   二者任一不符即打印 —— 直接区分"view 解析错(①)"与"根被提前释放/复用(②)"。
+//   开关：PPML_EXEC_VIEW_PROBE=1；PPML_EXEC_VIEW_PROBE_MAX=12 限制打印条数。
+void exec_view_probe(const TensorF32* node, const char* backend_name, int node_idx) {
+    static const bool on = (std::getenv("PPML_EXEC_VIEW_PROBE") != nullptr);
+    if (!on || !node) return;
+    static const int max_print = [] {
+        const char* e = std::getenv("PPML_EXEC_VIEW_PROBE_MAX");
+        return e ? std::atoi(e) : 12;
+    }();
+    // 可选：只探测某些消费者算子（逗号分隔 op 编号），如 PPML_EXEC_VIEW_PROBE_OPS=9,15,10
+    //   用途：全图前几十条命中往往被无关算子（如 gather）占满，需要聚焦数值敏感链。
+    static const bool op_filter = (std::getenv("PPML_EXEC_VIEW_PROBE_OPS") != nullptr);
+    static bool op_want[512] = {false};
+    static const bool op_want_init = [] {
+        const char* e = std::getenv("PPML_EXEC_VIEW_PROBE_OPS");
+        if (!e) return true;
+        const char* p = e;
+        while (*p) {
+            while (*p == ',' || *p == ' ') ++p;
+            if (!*p) break;
+            const int v = std::atoi(p);
+            if (v >= 0 && v < 512) op_want[v] = true;
+            while (*p && *p != ',') ++p;
+        }
+        return true;
+    }();
+    (void)op_want_init;
+    static int printed = 0;
+
+    // ---- (0) GET_ROWS 专项：确认 src0(W)/src1(idx) 的居住地 ----
+    //   动机：CUDA kernel 直接读 `W->data()`/`idx->data()`（不做 H2D），若 idx 仍是 host
+    //   指针而节点被派到 GPU，kernel 会读到无效内存（越界钳制后取值"看似正常但错"）。
+    //   这也是 PPML_CUDA_DISABLE_OPS=41 能消除 1e16 梯度爆炸的最可能机理。
+    if (node->op == OP_GET_ROWS && (!op_filter || op_want[(int)node->op]) && printed < max_print) {
+        ++printed;
+        auto resid = [](const TensorF32* t) -> const char* {
+            if (!t) return "none";
+            const TensorF32* b = t;
+            int g = 0;
+            while (b->view_src && g++ < 64) b = b->view_src;
+            if (!b->buffer_) return "no-buffer";
+            return b->buffer_->is_host() ? "HOST" : "DEVICE";
+        };
+        const TensorF32* W = node->src[0];
+        const TensorF32* I = node->src[1];
+        fprintf(stderr,
+                "[VIEW-PROBE][GET_ROWS] backend=%s node=%d W(op=%d numel=%lld %s) idx(op=%d numel=%lld %s)",
+                backend_name ? backend_name : "?", node_idx,
+                W ? (int)W->op : -1, W ? (long long)W->numel() : -1, resid(W),
+                I ? (int)I->op : -1, I ? (long long)I->numel() : -1, resid(I));
+        // 若索引张量在 host，顺便打印前 3 个索引值（判断内容是否合理）
+        if (I && I->data()) {
+            const TensorF32* b = I;
+            int g = 0;
+            while (b->view_src && g++ < 64) b = b->view_src;
+            if (!b->buffer_ || b->buffer_->is_host()) {
+                const float* p = static_cast<const float*>(I->data());
+                fprintf(stderr, " idx0..2=[%.1f %.1f %.1f]", p[0], p[1], p[2]);
+            }
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
+
+    // ---- (1) 先查本节点的 view 型 src（必须在登记本节点之前，才能读到生产者的记录）----
+    for (int s = 0; s < 3 && node->src[s]; ++s) {
+        const TensorF32* v = node->src[s];
+        if (!v->view_src) continue;                      // 非 view：不涉及别名
+        const TensorF32* root = v;
+        int guard = 0;
+        while (root->view_src && guard++ < 64) root = root->view_src;
+
+        const void* vd = v->data();
+        const void* rd = root->data();
+        // 当前内容（阈 0 ⇒ 只统计 nan/inf/maxabs）
+        long long vn = 0, vi = 0, vf = -1;
+        double vmx = 0.0; float vfb = 0.0f;
+        const bool vok = exec_scan_tensor(v, 0.0f, &vn, &vi, &vmx, &vfb, &vf);
+        // 根的写入记录
+        auto it = g_exec_by_tensor.find(root);
+        const bool has_rec = (it != g_exec_by_tensor.end());
+        const ExecWRec rec = has_rec ? it->second : ExecWRec{};
+
+        const bool addr_bad  = (vd != rd);                       // ① view 解析 ≠ 根载体
+        const bool alias_bad = has_rec && rec.addr != (uintptr_t)vd;  // ② 读到的是别的地址
+        const bool content_bad = has_rec && vok && rec.maxabs > 0.0 &&
+                                 (vmx > rec.maxabs * 4.0 || vmx * 4.0 < rec.maxabs);
+        // 聚焦算子（PPML_EXEC_VIEW_PROBE_OPS）⇒ 无条件打印（不做"坏"判定），便于看健康样本对照
+        const bool focus = op_filter && op_want[(int)node->op];
+        if (!focus && (!addr_bad && !alias_bad && !content_bad)) continue;
+        if (printed >= max_print) return;
+        ++printed;
+        fprintf(stderr,
+                "[VIEW-PROBE] #%d backend=%s node=%d op=%d src%d view(op=%d numel=%lld data=%p) "
+                "root(op=%d numel=%lld data=%p) same_addr=%d "
+                "rec=%s(op=%d@n%d addr=%p nan=%lld inf=%lld max=%.4e) now[nan=%lld inf=%lld max=%.4e]%s%s%s\n",
+                printed, backend_name ? backend_name : "?", node_idx, (int)node->op, s,
+                (int)v->op, (long long)v->numel(), vd,
+                (int)root->op, (long long)root->numel(), rd, addr_bad ? 0 : 1,
+                has_rec ? "" : "NONE", rec.op, rec.node_idx, (const void*)rec.addr,
+                rec.nan, rec.inf, rec.maxabs, vn, vi, vmx,
+                addr_bad ? " [BAD:view!=root]" : "",
+                alias_bad ? " [BAD:addr-mismatch]" : "",
+                content_bad ? " [BAD:content-changed]" : "");
+        fflush(stderr);
+    }
+
+    // ---- (2) 登记本节点的写入记录（供后续消费者比对）----
+    if (node->op == OP_NONE || node->numel() <= 0 || !node->data()) return;
+    long long nn = 0, ni = 0, fi = -1;
+    double mx = 0.0; float fb = 0.0f;
+    if (!exec_scan_tensor(node, 0.0f, &nn, &ni, &mx, &fb, &fi)) return;
+    ExecWRec rec{node, reinterpret_cast<uintptr_t>(node->data()), node_idx, (int)node->op, nn, ni, mx};
+    g_exec_by_addr[rec.addr] = rec;
+    g_exec_by_tensor[node]   = rec;
+}
+
+// ============================================================
+// exec_ab_check — 单节点 CPU/GPU 数值 A/B（诊断，默认关；2026-10-20）
+// ============================================================
+//   见 Backend.h 注释。要点：GPU kernel 是异步的 ⇒ 先 cudaDeviceSynchronize；
+//   然后把 node/src 的 data_ 临时指向 host 缓冲（buffer_ 置空），用 CPUBackend
+//   走**同一条 dispatch 路径**重算，逐元素比对后恢复指针。
+namespace {
+
+struct ABAliasSave {
+    TensorF32* t    = nullptr;
+    void*      data = nullptr;
+    Buffer*    buf  = nullptr;
+    size_t     offs = 0;
+};
+
+inline void ab_copy_to_host(const TensorF32* t, void* dst) {
+    if (!t || !t->data() || !dst) return;
+    if (t->buffer_) t->buffer_->get_tensor(t, dst, t->buffer_offs_, t->nbytes());
+    else            std::memcpy(dst, t->data(), t->nbytes());
+}
+
+// CPU kernel 不需要 work buffer、语义单纯的 op（其余可用 PPML_AB_OPS 显式放开）
+inline bool ab_op_ok(int op) {
+    switch (op) {
+        case OP_ADD:  case OP_SUB:  case OP_MUL:   case OP_DIV:
+        case OP_SQR:  case OP_SQRT: case OP_SUM_ROWS: case OP_REPEAT:
+        case OP_ADD1: case OP_CLAMP:  case OP_UNARY:
+        case OP_SCALE:  case OP_DUP:  case OP_CPY:
+        case OP_MUL_MAT: case OP_SOFT_MAX: case OP_CONCAT:   // 依赖 work buffer（按节点精确分配）
+        case OP_GET_ROWS: case OP_EDGE_GATHER_ROWS: case OP_PER_EDGE_MATMUL:
+        case OP_SCATTER_ADD: case OP_VIEW: case OP_RESHAPE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+void exec_ab_check(const TensorF32* node_c, const char* backend_name, int node_idx) {
+    static const bool on = (std::getenv("PPML_AB_CHECK") != nullptr);
+    if (!on || !node_c) return;
+    // 只对照 GPU 侧算出来的节点（CPU 节点本身没有分歧可言）
+    if (backend_name && std::strcmp(backend_name, "CPU") == 0) return;
+
+    TensorF32* node = const_cast<TensorF32*>(node_c);
+    if (node->op == OP_NONE || node->numel() <= 0 || !node->data()) return;
+
+    static const int    max_print = [] { const char* e = std::getenv("PPML_AB_MAX"); return e ? std::atoi(e) : 20; }();
+    static const double tol       = [] { const char* e = std::getenv("PPML_AB_TOL"); return e ? std::atof(e) : 1e-3; }();
+    static const bool   abort_on  = (std::getenv("PPML_AB_ABORT") != nullptr);
+    static const long long ab_start = [] { const char* e = std::getenv("PPML_AB_START"); return e ? std::atoll(e) : -1; }();
+    static const long long ab_stop  = [] { const char* e = std::getenv("PPML_AB_STOP");  return e ? std::atoll(e) : -1; }();
+    static const bool   op_filter = (std::getenv("PPML_AB_OPS") != nullptr);
+    static bool op_want[512] = {false};
+    static const bool op_init = [] {
+        const char* e = std::getenv("PPML_AB_OPS");
+        if (!e) return true;
+        const char* p = e;
+        while (*p) {
+            while (*p == ',' || *p == ' ') ++p;
+            if (!*p) break;
+            const int v = std::atoi(p);
+            if (v >= 0 && v < 512) op_want[v] = true;
+            while (*p && *p != ',') ++p;
+        }
+        return true;
+    }();
+    (void)op_init;
+    static int printed = 0;
+
+    if (ab_start >= 0 && node_idx < (int)ab_start) return;
+    if (ab_stop  >= 0 && node_idx > (int)ab_stop)  return;
+    if (!op_filter && !ab_op_ok((int)node->op)) return;
+    if (op_filter && !op_want[(int)node->op]) return;
+    if (printed >= max_print) return;
+
+    // GPU kernel 可能仍在跑 ⇒ 必须同步后才能读结果
+    cudaDeviceSynchronize();
+
+    const int64_t n = node->numel();
+    const size_t  bytes = static_cast<size_t>(n) * sizeof(float);
+
+    // ① GPU 结果
+    std::vector<float> gpu(static_cast<size_t>(n), 0.f);
+    ab_copy_to_host(node, gpu.data());
+
+    // ② src → host 影子
+    ABAliasSave saved_node;
+    saved_node = {node, node->data(), node->buffer_, node->buffer_offs_};
+
+    std::vector<ABAliasSave> saved_srcs;
+    std::vector<std::vector<float>> src_bufs;
+    // 注意：CONCAT 等 n-ary op 会用满 GGML_MAX_SRC 个 src；只换前 3 个会让 CPU 侧读到
+    //   device 指针（或干脆不写）⇒ 假分歧（实测 cpu_max=0）。
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        TensorF32* s = node->src[j];
+        if (!s) continue;
+        saved_srcs.push_back({s, s->data(), s->buffer_, s->buffer_offs_});
+        src_bufs.emplace_back(static_cast<size_t>(s->numel()) + 4, 0.f);
+        ab_copy_to_host(s, src_bufs.back().data());
+        s->bind_data(src_bufs.back().data());
+        s->buffer_      = nullptr;
+        s->buffer_offs_ = 0;
+    }
+
+    // ③ CPU 重算（dst 用独立 host 缓冲，先清零）
+    std::vector<float> cpu(static_cast<size_t>(n), 0.f);
+    node->bind_data(cpu.data());
+    node->buffer_      = nullptr;
+    node->buffer_offs_ = 0;
+
+    static CPUBackend* ab_cpu = new CPUBackend(1);   // 故意不析构（避免静态析构顺序问题）
+    // work buffer 按节点实际需求分配（mul_mat / softmax / concat 等都依赖它；
+    //   给固定 4MB 时 concat 会走"work 不足 ⇒ 不写 dst"的分支 ⇒ cpu_max=0 的假分歧）。
+    static std::vector<uint8_t> ab_work;
+    const size_t need = CPUBackend::ab_estimate_work_size(node);
+    if (ab_work.size() < need + 64) ab_work.resize(need + 64, 0);
+    ComputeParams p_ab;
+    p_ab.ith        = 0;
+    p_ab.nth        = 1;
+    p_ab.wsize      = ab_work.size();
+    p_ab.wdata      = ab_work.empty() ? nullptr : ab_work.data();
+    p_ab.threadpool = ab_cpu->ab_threadpool();
+    const Status st = CPUBackend::ab_dispatch_node(node, &p_ab);
+
+    // ④ 恢复指针（无论比对结果如何都必须恢复）
+    node->bind_data(saved_node.data);
+    node->buffer_      = saved_node.buf;
+    node->buffer_offs_ = saved_node.offs;
+    for (auto& sv : saved_srcs) {
+        sv.t->bind_data(sv.data);
+        sv.t->buffer_      = sv.buf;
+        sv.t->buffer_offs_ = sv.offs;
+    }
+    if (st != Status::SUCCESS) return;
+
+    // ⑤ 比对
+    long long n_diff = 0, n_nan = 0;
+    double max_rel = 0.0, gpu_max = 0.0, cpu_max = 0.0;
+    long long first_i = -1;
+    float first_g = 0.f, first_c = 0.f;
+    for (int64_t i = 0; i < n; ++i) {
+        const float g = gpu[i], c = cpu[i];
+        const double ag = std::fabs((double)g), ac = std::fabs((double)c);
+        if (ag > gpu_max) gpu_max = ag;
+        if (ac > cpu_max) cpu_max = ac;
+        bool bad;
+        double rel = 0.0;
+        if (std::isnan(g) || std::isnan(c)) { bad = true; ++n_nan; }
+        else if (std::isinf(g) || std::isinf(c)) { bad = (ag != ac); ++n_nan; }
+        else {
+            const double denom = std::max(std::max(ag, ac), 1e-12);
+            rel = std::fabs((double)g - (double)c) / denom;
+            bad = (rel > tol);
+        }
+        if (bad) {
+            ++n_diff;
+            if (rel > max_rel) max_rel = rel;
+            if (first_i < 0) { first_i = i; first_g = g; first_c = c; }
+        }
+    }
+    if (n_diff == 0) return;
+
+    ++printed;
+    std::fprintf(stderr,
+                 "[AB] #%d backend=%s node=%d op=%d numel=%lld dims=[%lld,%lld,%lld,%lld] "
+                 "diff=%lld nan=%lld max_rel=%.3e gpu_max=%.4e cpu_max=%.4e "
+                 "first[i=%lld gpu=%.6e cpu=%.6e]\n",
+                 printed, backend_name ? backend_name : "?", node_idx, (int)node->op,
+                 (long long)n,
+                 (long long)node->shape().dim(0), (long long)node->shape().dim(1),
+                 (long long)node->shape().dim(2), (long long)node->shape().dim(3),
+                 n_diff, n_nan, max_rel, gpu_max, cpu_max, first_i, first_g, first_c);
+    std::fflush(stderr);
+    if (abort_on) std::abort();
+}
+
+// ============================================================
+// exec_stale_* — "生产者代际"断言（诊断，默认关；2026-10-20）
+// ============================================================
+namespace {
+
+struct StaleState {
+    bool      on        = false;
+    bool      abort_on  = false;
+    int       max_print = 20;
+    int       printed   = 0;
+    long long hits      = 0;     // [STALE]：普通 node 输入的陈旧读
+    long long leaf_hits = 0;     // [STALE-LEAF]：leaf 本身是"别的图的 node"且本代际未写
+    long long pass      = 0;     // 当前 graph_compute 的代际
+    int       sched_depth = 0;   // scheduler 正在驱动 split ⇒ 子 graph_compute 不另起代际
+    std::unordered_map<const TensorF32*, long long>  written;   // 张量 → 最近写入代际
+    std::unordered_set<const TensorF32*>             node_set;  // 本 pass 图里的 node
+    std::unordered_set<const TensorF32*>             leaf_set;  // 本 pass 图里的 leaf（图输入）
+    // 故障注入（PPML_STALE_SKIP_MARK=<node 下标>|all）：故意不登记该节点 ⇒ 用于自检
+    //   "断言真的会报 [STALE]"（0 命中既可能真干净，也可能断言根本没生效）。
+    int               skip_idx  = -1;
+    const TensorF32*  skip_ptr  = nullptr;
+    bool              skip_all  = false;
+    long long         checks    = 0;   // 已执行过的"输入校验"次数（自检：为 0 ⇒ 断言没跑到）
+};
+
+StaleState& stale_state() {
+    static StaleState s = [] {
+        StaleState t;
+        t.on       = (std::getenv("PPML_STALE_CHECK") != nullptr);
+        t.abort_on = (std::getenv("PPML_STALE_ABORT") != nullptr);
+        const char* e = std::getenv("PPML_STALE_MAX");
+        t.max_print = e ? std::atoi(e) : 20;
+        const char* k = std::getenv("PPML_STALE_SKIP_MARK");
+        if (k && std::strcmp(k, "all") == 0) t.skip_all = true;
+        else t.skip_idx = k ? std::atoi(k) : -1;
+        if (t.on) {
+            std::fprintf(stderr,
+                         "[STALE] 启用：max_print=%d skip_mark=%s\n", t.max_print,
+                         t.skip_all ? "all" : (t.skip_idx >= 0 ? "idx" : "off"));
+            std::fflush(stderr);
+            // 退出汇总：checks=0 ⇒ 断言根本没跑到（接线问题）；hits>0 ⇒ 有命中
+            std::atexit([] {
+                StaleState& s2 = stale_state();
+                std::fprintf(stderr,
+                             "[STALE] 退出汇总：pass=%lld checks=%lld hits=%lld leaf_hits=%lld\n",
+                             s2.pass, s2.checks, s2.hits, s2.leaf_hits);
+                std::fflush(stderr);
+            });
+        }
+        return t;
+    }();
+    return s;
+}
+
+// scheduler 驱动 split 期间抑制"子 graph_compute 切代际"（异常/提前 return 亦自动复位）。
+struct StaleSchedGuard {
+    const bool active = stale_state().on;
+    StaleSchedGuard()  { if (active) ++stale_state().sched_depth; }
+    ~StaleSchedGuard() { if (active) --stale_state().sched_depth; }
+};
+
+}  // namespace
+
+void exec_stale_pass_begin(const ComputeGraph* cgraph) {
+    StaleState& st = stale_state();
+    if (!st.on || !cgraph) return;
+    if (st.sched_depth > 0) return;   // scheduler 内部逐 split 调后端 graph_compute ⇒ 不另起代际
+    ++st.pass;
+    st.node_set.clear();
+    st.leaf_set.clear();
+    // graph_node/graph_leaf 只有非 const 版本（返回可写 TensorF32*）⇒ 这里只读地取指针。
+    ComputeGraph* g = const_cast<ComputeGraph*>(cgraph);
+    for (int i = 0; i < g->n_nodes(); ++i) st.node_set.insert(g->graph_node(i));
+    for (int i = 0; i < g->n_leafs(); ++i) st.leaf_set.insert(g->graph_leaf(i));
+    st.skip_ptr = (st.skip_idx >= 0 && st.skip_idx < g->n_nodes())
+                      ? g->graph_node(st.skip_idx) : nullptr;
+    if (std::getenv("PPML_STALE_VERBOSE") && st.pass <= 5) {
+        std::fprintf(stderr, "[STALE] pass=%lld nodes=%d leafs=%d skip_ptr=%p\n",
+                     st.pass, g->n_nodes(), g->n_leafs(), (void*)st.skip_ptr);
+        std::fflush(stderr);
+    }
+}
+
+void exec_stale_mark(const TensorF32* t) {
+    StaleState& st = stale_state();
+    if (!st.on || !t) return;
+    if (st.skip_all || t == st.skip_ptr) return;   // 故障注入自检：故意不登记
+    st.written[t] = st.pass;
+}
+
+void exec_stale_check(const TensorF32* node, const char* backend_name, int node_idx) {
+    StaleState& st = stale_state();
+    if (!st.on || !node) return;
+    ++st.checks;
+    // 本节点的 src 必须在本代际被写过（常量/view/cpy/参数 例外）
+    //   【2026-10-20 补充 STALE-LEAF】原来"本图 leaf"整类免检 ⇒ 漏掉一种真实形态：
+    //   compute_and_read 子图的 leaf 恰恰是**主图尚未计算的图节点**（op != OP_NONE），
+    //   子图会拿上一代际的 buffer 当输入算（实测混合 CUDA 的 SE3 per-block 子图即如此）。
+    //   现在：只有"真外部输入"（op == OP_NONE，见上面的 continue）才免检；
+    //   leaf 若本身是别的图的 node，则与普通 node 同标准 ⇒ 命中打 [STALE-LEAF]。
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        const TensorF32* s = node->src[j];
+        if (!s) continue;
+        if (s->op == OP_NONE) continue;                 // 参数/常量/外部输入
+        if (s->view_src) continue;                      // 零拷贝别名：由根负责
+        if (s->flag & TENSOR_FLAG_PARAM) continue;      // 参数
+        auto it = st.written.find(s);
+        const long long w = (it == st.written.end()) ? -1 : it->second;
+        if (w == st.pass) continue;
+        const bool is_leaf = st.leaf_set.count(s) != 0;
+        if (is_leaf) ++st.leaf_hits; else ++st.hits;
+        if (st.printed < st.max_print) {
+            ++st.printed;
+            std::fprintf(stderr,
+                         "%s backend=%s node=%d op=%d src%d(op=%d numel=%lld flag=%d) "
+                         "最近写入代际=%lld 当前=%lld dims=[%lld,%lld,%lld,%lld]%s\n",
+                         is_leaf ? "[STALE-LEAF]" : "[STALE]",
+                         backend_name ? backend_name : "?", node_idx, (int)node->op, j,
+                         (int)s->op, (long long)s->numel(), (int)s->flag, w, st.pass,
+                         (long long)s->shape().dim(0), (long long)s->shape().dim(1),
+                         (long long)s->shape().dim(2), (long long)s->shape().dim(3),
+                         is_leaf ? "（本图 leaf，但它是别的图的 node 且本代际未写）" : "");
+            std::fflush(stderr);
+        }
+        if (st.abort_on) std::abort();
+    }
+}
+
+void exec_stale_report(const char* where) {
+    StaleState& st = stale_state();
+    if (!st.on || (st.hits == 0 && st.leaf_hits == 0)) return;
+    std::fprintf(stderr, "[STALE] 汇总(%s)：命中=%lld（其中 leaf=%lld，明细仅前 %d 条）\n",
+                 where ? where : "?", st.hits + st.leaf_hits, st.leaf_hits, st.max_print);
+    std::fflush(stderr);
+}
+
+// ============================================================
+// exec_probe_op — 定点算子探针（诊断，默认关；2026-10-20）
+// ============================================================
+//   动机：CPU 与混合 CUDA 路径**图构型不同**（混合模式下 SE3 per_block 走独立子图，
+//   节点编号完全对不上），无法用"同一 node_idx"逐节点对比。本探针按 **op** 对齐：
+//   每执行一个指定 op 的节点，就打印它的 src[0..2]/dst 的 maxabs ⇒ 同一逻辑算子在两条
+//   路径上的**输入/输出量级**可直接并排比。
+//   开关：PPML_PROBE_OP=8,51,33（逗号分隔 op 编号）；PPML_PROBE_MAX=40（打印上限）。
+namespace {
+struct ProbeCfg {
+    bool on = false;
+    bool ops[512] = {false};
+    int  max_print = 40;
+    int  printed   = 0;
+};
+
+ProbeCfg& probe_cfg() {
+    static ProbeCfg c = [] {
+        ProbeCfg t;
+        const char* e = std::getenv("PPML_PROBE_OP");
+        if (!e || !*e) return t;
+        t.on = true;
+        const char* p = e;
+        while (*p) {
+            char* end = nullptr;
+            long v = std::strtol(p, &end, 10);
+            if (end == p) { ++p; continue; }
+            if (v >= 0 && v < 512) t.ops[v] = true;
+            p = (*end == ',') ? end + 1 : end;
+        }
+        const char* m = std::getenv("PPML_PROBE_MAX");
+        t.max_print = m ? std::atoi(m) : 40;
+        return t;
+    }();
+    return c;
+}
+
+// 单张量 maxabs / 最小非零幅值（device 走分块 D2H，复用 exec_scan_tensor）
+double probe_maxabs(const TensorF32* t, double* minpos = nullptr) {
+    if (minpos) *minpos = 0.0;
+    if (!t) return -1.0;
+    long long nn = 0, ni = 0, fi = -1;
+    double mx = 0.0, mp = 1e300;
+    float fb = 0.0f;
+    if (!exec_scan_tensor(t, 1e30f, &nn, &ni, &mx, &fb, &fi, nullptr, nullptr, &mp)) return -1.0;
+    if (minpos) *minpos = (mp < 1e299) ? mp : 0.0;
+    return mx;
+}
+}  // namespace
+
+void exec_probe_op(const TensorF32* node, const char* backend_name, int node_idx) {
+    ProbeCfg& c = probe_cfg();
+    if (!c.on || !node) return;
+    const int op = static_cast<int>(node->op);
+    if (op < 0 || op >= 512 || !c.ops[op]) return;
+    if (c.max_print >= 0 && c.printed >= c.max_print) return;
+    ++c.printed;
+    double min0 = 0.0, min1 = 0.0;
+    const double max0 = probe_maxabs(node->src[0], &min0);
+    const double max1 = probe_maxabs(node->src[1], &min1);
+    std::fprintf(stderr,
+                 "[PROBE] #%d backend=%s node=%d op=%d numel=%lld dims=[%lld,%lld,%lld,%lld] "
+                 "dst_max=%.4e | src0(op=%d,numel=%lld,max=%.4e) "
+                 "src1(op=%d,numel=%lld,max=%.4e,min_nonzero=%.4e)\n",
+                 c.printed, backend_name ? backend_name : "?", node_idx, op,
+                 (long long)node->numel(),
+                 (long long)node->shape().dim(0), (long long)node->shape().dim(1),
+                 (long long)node->shape().dim(2), (long long)node->shape().dim(3),
+                 probe_maxabs(node),
+                 node->src[0] ? (int)node->src[0]->op : -1,
+                 node->src[0] ? (long long)node->src[0]->numel() : -1, max0,
+                 node->src[1] ? (int)node->src[1]->op : -1,
+                 node->src[1] ? (long long)node->src[1]->numel() : -1, max1, min1);
+    std::fflush(stderr);
+}
+
+// ============================================================
 // backend_tensor_copy — 对标 ggml_backend_tensor_copy
 // 将 src tensor 的数据拷贝到 dst tensor（跨后端自动处理 CPU↔GPU）
 // ============================================================
-bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
+static bool backend_tensor_copy_impl(const TensorF32* src, TensorF32* dst) {
     if (src == dst) return true;
 
     // view 零拷贝共享源数据：src 本身 data() 为 null（数据在 view_src 链底层）。
@@ -763,6 +1517,15 @@ bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
     return true;
 }
 
+// 公开入口：包一层以便在**成功拷贝**后登记"该张量本代际已写"（生产者代际断言用）。
+//   cpy（OP_DUP 跨后端拷贝）不入图 nodes，不经 dispatch ⇒ 必须在这里补登记，
+//   否则它的消费者会被 [STALE] 误报。
+bool backend_tensor_copy(const TensorF32* src, TensorF32* dst) {
+    const bool ok = backend_tensor_copy_impl(src, dst);
+    if (ok) exec_stale_mark(dst);
+    return ok;
+}
+
 // ===== 辅助：根据 backend assignment 预留各后端内存 =====
 // 改用 Gallocr 做延迟分配 + 空间复用：每个后端 buffer 只开峰值大小，
 // 张量沿拓扑序"借/还"复用，替代原来的全量常驻 + bump 分配。
@@ -789,13 +1552,68 @@ bool BackendScheduler::reserve_graph_memory() {
         return true;
     }
 
-    // 释放上次分配的 buffer
+    // 【2026-10-20 修复：reserved_buffers_ 释放前先解绑 cpy 张量 —— 悬垂指针 / 假别名根因】
+    //   reserved_buffers_ 是 vector<unique_ptr<Buffer>> ⇒ clear() 会 **delete** Buffer 对象，
+    //   但 copy_tensor_map_ 里的 cpy 张量仍持有指向它们的 data_/buffer_ ✗。后果有二：
+    //     ① 下一次 pass_assign_leafs 里 `leaf->buffer_->is_host()` 是 use-after-free 的虚调用
+    //        （实测 SIGSEGV，rip=0x400，栈 pass_assign_leafs ← split_graph）✗；
+    //     ② 步骤 7 的重分配条件是 `cpy->data() == nullptr` —— data_ 悬垂非空 ⇒ **不会重分配**
+    //        ⇒ cpy 继续写已释放的内存，而新图的新 Buffer 可能拿到同一段地址 ⇒ 两个张量共享
+    //        物理内存，表现为"某节点写完后，下游读到的却是更靠后节点的值"（执行期 NaN 的形态）✗。
+    //   修法：清表之前把所有 cpy 张量的绑定复位（参数除外——参数由 param_buffers_ 持有）。
+    {
+        int unbound = 0;
+        for (auto& kv : copy_tensor_map_) {
+            TensorF32* cpy = kv.second;
+            if (!cpy || (cpy->flag & TENSOR_FLAG_PARAM)) continue;
+            if (cpy->buffer_ != nullptr || cpy->data() != nullptr) {
+                cpy->bind_data(nullptr);
+                cpy->buffer_      = nullptr;
+                cpy->buffer_offs_ = 0;
+                aliasguard::unregister(cpy);   // 解绑 ⇒ 撤销假别名登记
+                ++unbound;
+            }
+        }
+        if (unbound > 0 && getenv("GRAPH_DEBUG_GALLOCR")) {
+            fprintf(stderr, "[sched] reserved 释放前解绑 cpy 张量 %d 个（防悬垂/假别名）\n", unbound);
+        }
+    }
     reserved_buffers_.clear();
+    // 【刻意不 drop_pool("cpy")】
+    //   上面已把**正常** cpy 全部解绑并逐条 unregister；仍留在 "cpy" pool 里的登记 =
+    //   data_ 悬垂非空、没被解绑的 cpy（即 2026-10-20 注释里那种"两个张量共享物理内存"的隐患）。
+    //   保留它们，等后续 gallocr/新 cpy 绑到同一地址时立刻触发 [ALIAS]，并指出是哪条陈旧登记。
+    aliasguard::report("sched::reserved_clear");
     // 必须先 release 上一轮 gallocr buffer：Gallocr::alloc 每次 push 新 buffer 到
     //    ba.buffers（只有 release() 才 delete）。混合多样本下每个样本都走 reserve+alloc，
     //    若不先释放，旧 buffer 永不回收 → RSS 每样本 +5~6GB 单调增长直至 OOM。
     //    实测（2026-08-25）：纯 CPU 多样本 RSS 稳定 ~4.9GB；混合模式每样本 +5GB。
     gallocr_.release();
+
+    // 【2026-10-20 修复】release() 之后，图里仍可能有张量持有**已 delete 的 Buffer**：
+    //   release 只按自己快照（nodes_/leaves_）里的 ni.buffer 复位，且**跳过 PARAM**；
+    //   一旦某叶子/节点不在快照内（如新图新增、或由 run_path 绑到 persistent buffer），
+    //   它的 buffer_ 就悬垂 ✗。下一次 pass_assign_leafs 里 `leaf->buffer_->is_host()`
+    //   是 use-after-free 虚调用（实测 SIGSEGV，rip=0x400）。
+    //   这里按【图本身】兜底复位：非 PARAM 且 buffer_ 非空 → 解绑（reserve/alloc 会重绑）。
+    if (current_graph_) {
+        int fixed = 0;
+        auto reset_dangling = [&](TensorF32* t) {
+            if (!t || (t->flag & TENSOR_FLAG_PARAM)) return;
+            if (t->buffer_ != nullptr) {
+                t->bind_data(nullptr);
+                t->buffer_      = nullptr;
+                t->buffer_offs_ = 0;
+                aliasguard::unregister(t);   // 解绑 ⇒ 撤销假别名登记
+                ++fixed;
+            }
+        };
+        for (int i = 0; i < current_graph_->n_nodes(); ++i) reset_dangling(current_graph_->graph_node(i));
+        for (int i = 0; i < current_graph_->n_leafs(); ++i) reset_dangling(current_graph_->graph_leaf(i));
+        if (fixed > 0 && getenv("GRAPH_DEBUG_GALLOCR")) {
+            fprintf(stderr, "[sched] release 后兜底解绑 %d 个悬垂张量\n", fixed);
+        }
+    }
 
     // 1. 更新 node_backend_id_ / leaf_backend_id_
     //  2026-08-24 修复：默认值必须与 build_splits 一致（n_backends_-1=CPU），不能用 0(GPU)。
@@ -885,6 +1703,13 @@ bool BackendScheduler::reserve_graph_memory() {
             if (cpy_backend_id == b &&
                 cpy->data() == nullptr && cpy->view_src == nullptr) {
                 if (!tallocr.alloc(cpy)) return false;
+                // 【2026-10-20】假别名断言：cpy 张量的分配区间单独登记（pool="cpy"）。
+                //   本步分配的 Buffer 与 gallocr arena 是两个独立 Buffer，正常不重叠；
+                //   若这里报 [ALIAS]，说明某条**陈旧登记**（未被解绑的旧 cpy / 悬垂指针）
+                //   仍占着这段地址 —— 正是"下游读到更靠后节点内容"的假别名形态。
+                aliasguard::register_range(cpy, cpy->data(),
+                                           GGML_PAD(buft->get_alloc_size(cpy), buft->get_alignment()),
+                                           "cpy");
             }
         }
     }
@@ -1405,6 +2230,15 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
         for (int j = 0; j < GGML_MAX_SRC; j++) {
             TensorF32* src = node->src[j];
             if (!src) continue;
+            // 【2026-10-20】诊断：进入 3c 时 src 已经是 OP_DUP ⇒ 说明它不是本 pass 刚建的，
+            //   而是上一轮 split（或被模型代码）留下的 cpy。这种情况下 target 可能属于别的后端。
+            static const bool dbg_cpy_src = (std::getenv("PPML_DEBUG_CPY_SRC") != nullptr);
+            if (dbg_cpy_src && src->op == OP_DUP) {
+                fprintf(stderr, "[cpy-src] node=%d op=%d j=%d cur_bk=%d src=%p src0=%p src0_op=%d src_buf_host=%d\n",
+                        i, (int)node->op, j, cur_backend_id, (void*)src, (void*)src->src[0],
+                        src->src[0] ? (int)src->src[0]->op : -1,
+                        (src->buffer_ ? (int)src->buffer_->is_host() : -1));
+            }
 
             // 解析 src 的后端：view op 节点在 pass 中被跳过(backend_map_=-1)，
             // 需沿 src 链解析到底层非 view 节点的 backend。
@@ -1445,6 +2279,11 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
                     // dup() 返回 OP_DUP 节点，data_=nullptr，由 allocator 后续分配
                     TensorF32* cpy = dup(src);
                     copy_tensor_map_[key] = cpy;
+                    if (dbg_cpy_src) {
+                        fprintf(stderr, "[cpy-new] node=%d op=%d j=%d cur_bk=%d src=%p src_op=%d src_bk=%d cpy=%p\n",
+                                i, (int)node->op, j, cur_backend_id, (void*)src, (int)src->op,
+                                src_backend_id, (void*)cpy);
+                    }
 
                     // 记录为 split 的输入（执行时需跨后端拷贝）
                     if (split->n_inputs < MAX_SPLIT_INPUTS) {
@@ -1533,6 +2372,10 @@ Status BackendScheduler::graph_compute() {
         fprintf(stderr, "[sched] graph_compute: n_splits_=%d splits_size=%zu\n",
                 n_splits_, splits_.size());
     }
+
+    // 生产者代际断言：整张图（全部 split）共用一个代际；子 graph_compute 被 sched_depth 抑制。
+    exec_stale_pass_begin(current_graph_);
+    StaleSchedGuard stale_guard;
 
     for (int si = 0; si < n_splits_; si++) {
         SplitInfo& sp = splits_[si];
@@ -1731,7 +2574,15 @@ Status BackendScheduler::graph_compute() {
             if (guard_on) {
                 static long guard_hits = 0;
                 TensorF32* bad_t = nullptr;
-                for (int k = sp.i_start; k < sp.i_end && !bad_t; ++k) {
+                int bad_k = -1, bad_j = -1;
+                // 【2026-10-20 修复】此守卫运行时 current_graph_->nodes 已被改成
+                //   `saved_nodes + sp.i_start`（见上面"临时替换为子图范围"），
+                //   n_nodes_ = 子图长度 ⇒ 这里必须用**相对下标** [0, n_nodes_)。
+                //   原实现用绝对 [i_start, i_end) 会二次偏移，实际扫的是
+                //   saved_nodes[2*i_start .. 2*i_start+len)（别的 split，常是 CPU 段），
+                //   一旦扫到 CPU 节点的 host 输入就误判"本 GPU split 有 host 输入"并
+                //   ABORTED 整图 ⇒ 全图回退 CPU（长样本 "CUDA" 跑的其实是 CPU 的根因）。
+                for (int k = 0; k < current_graph_->n_nodes_ && !bad_t; ++k) {
                     TensorF32* nd = current_graph_->graph_node(k);
                     if (!nd || is_view_op(nd->op) || nd->op == OP_NONE) continue;   // 无 kernel ✓
                     for (int j = 0; j < GGML_MAX_SRC; ++j) {
@@ -1739,16 +2590,58 @@ Status BackendScheduler::graph_compute() {
                         if (!s || !s->data()) continue;        // 未计算 ✓
                         if (is_device_pointer(s, s->data())) continue;
                         bad_t = s;
+                        bad_k = sp.i_start + k;   // 相对 → 绝对，便于对回整图
+                        bad_j = j;
                         break;
                     }
                 }
                 if (bad_t) {
                     if (guard_hits++ < 20) {
+                        // 【2026-10-20】归因信息：bad_t 是"谁"、来自哪条 cpy、为什么没被 Step 1 拷到 device。
+                        //   Step 1 的跳过条件是 src_bid==backend 或 tensor_buffer_compatible(src,backend)；
+                        //   这两条都以 backend_map_（构建期）为准，运行期数据在 host 时就会漏拷。
+                        const TensorF32* bs = (bad_t->op == OP_DUP) ? bad_t->src[0] : nullptr;
+                        bool in_copy_map = false;
+                        int  map_target  = -1;
+                        const TensorF32* map_src = nullptr;
+                        for (auto& kv : copy_tensor_map_) {
+                            if (kv.second == bad_t) {
+                                in_copy_map = true;
+                                map_target  = kv.first.second;
+                                map_src     = kv.first.first;
+                                break;
+                            }
+                        }
+                        TensorF32* consumer = current_graph_->graph_node(bad_k);
                         fprintf(stderr,
                                 "[CUDA-GUARD] split=%d backend=%d i=[%d,%d) 输入 op=%d numel=%lld data=%p 在 host ⇒ "
                                 "放弃本 split（避免裸读 host ✗，转 CPU 回退 ✓）\n",
                                 si, sp.backend_id, sp.i_start, sp.i_end, (int)bad_t->op,
                                 (long long)bad_t->numel(), (const void*)bad_t->data());
+                        fprintf(stderr,
+                                "[CUDA-GUARD]   消费节点 k=%d op=%d src_idx=%d | bad: buf=%p host=%d view_src=%p\n",
+                                bad_k, consumer ? (int)consumer->op : -1, bad_j,
+                                (void*)bad_t->buffer_,
+                                (bad_t->buffer_ ? (int)bad_t->buffer_->is_host() : -1),
+                                (void*)bad_t->view_src);
+                        if (bs) {
+                            fprintf(stderr,
+                                    "[CUDA-GUARD]   bad 是 cpy(OP_DUP): src0 op=%d numel=%lld data=%p buf=%p host=%d "
+                                    "device_ptr=%d backend_id=%d\n",
+                                    (int)bs->op, (long long)bs->numel(), (const void*)bs->data(),
+                                    (void*)bs->buffer_,
+                                    (bs->buffer_ ? (int)bs->buffer_->is_host() : -1),
+                                    (bs->data() ? (int)is_device_pointer(bs, bs->data()) : -1),
+                                    tensor_backend_id(const_cast<TensorF32*>(bs), -1));
+                        }
+                        fprintf(stderr,
+                                "[CUDA-GUARD]   copy_map: entry=%d target=%d src=%p(%s) | compatible(bad,backend)=%d "
+                                "backend_map(bad)=%d sched_host(bad)=%d\n",
+                                (int)in_copy_map, map_target, (const void*)map_src,
+                                (map_src == bs ? "same_as_src0" : "DIFF"),
+                                (int)tensor_buffer_compatible(bad_t, sp.backend_id),
+                                tensor_backend_id(bad_t, -1),
+                                (int)sched_data_is_host(bad_t));
                     }
                     if (saved_nodes) current_graph_->nodes = saved_nodes;
                     current_graph_->n_nodes_ = saved_n_nodes;

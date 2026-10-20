@@ -32,6 +32,79 @@ using TensorF32 = Tensor<float>;
 // 用 4 字节 D2H 探测兜底。定义在 Backend.cpp，供 Backend/CPUKernels 共用。
 bool is_device_pointer(const TensorF32* src, const float* data);
 
+// 执行期逐节点 NaN/爆炸检查（诊断，默认关）。
+//   在各后端"每个节点 kernel 刚执行完"处调用，按**执行顺序**报告第一个坏节点，
+//   因此第一次命中即为产生 NaN/Inf 的源头算子（区别于 train.cpp 里整图跑完后按
+//   节点索引扫描的 [FWD-NAN]：后者会扫到本次未执行的陈旧节点 ✗）。
+//   开关：PPML_EXEC_NAN_CHECK=1 启用；PPML_EXEC_NAN=1e6 阈值；PPML_EXEC_NAN_MAX=8 打印条数。
+void exec_nan_check(const TensorF32* node, const char* backend_name, int node_idx);
+
+// view 别名消费探针（诊断，默认关，2026-10-20）。
+//   消费 view（零拷贝别名）的 kernel 读到的内容若与"根张量写入时的内容"不符，
+//   打印 [VIEW-PROBE]，区分 ①view 解析地址错 ②根被提前释放/复用（假别名）。
+//   用途：定位 "MUL_MAT max=185 → SQR max=1.9e-7" 这类"算子没错、输入被换掉"的现象。
+//   开关：PPML_EXEC_VIEW_PROBE=1；PPML_EXEC_VIEW_PROBE_MAX=12（打印条数上限）。
+void exec_view_probe(const TensorF32* node, const char* backend_name, int node_idx);
+
+// ============================================================
+// exec_ab_check — 单节点 CPU/GPU 数值 A/B（诊断，默认关；2026-10-20）
+// ============================================================
+//   动机：混合调度下原始梯度 1e16~1e19（纯 CPU 1e4），但
+//     · GET_ROWS / SE3 三件套 kernel 单测都对；
+//     · AliasGuard 的分配级假别名断言 0 命中；
+//     · 而同一配置下前向 loss 已有实质差异（distogram 14.14 vs 18.51）
+//   ⇒ 需要在**同一进程、同一时刻、同一份输入**上把 GPU 节点的结果与 CPU 重算结果对比，
+//     一次性锁死"哪个节点开始分叉"，排除跨 run 的布局/随机性干扰。
+//
+//   做法：GPU kernel 执行完（先 cudaDeviceSynchronize）后，
+//     ① 把 node 及其各 src 的内容拷到 host 缓冲；
+//     ② 临时把 node/src 的 data_ 指向 host 缓冲（buffer_ 置空 ⇒ CPU 侧按 host 处理）；
+//     ③ 用 CPUBackend 的 dispatch 重算同一节点；
+//     ④ 逐元素比对（相对误差），打印 [AB] 行，然后恢复所有指针。
+//
+//   开关：PPML_AB_CHECK=1
+//         PPML_AB_MAX=N      明细条数上限（默认 20）
+//         PPML_AB_TOL=1e-3   相对误差阈值（默认 1e-3）
+//         PPML_AB_OPS=9,15   只查这些 op（逗号分隔）
+//         PPML_AB_START/STOP=<node_idx> 只看某个执行序号区间
+//         PPML_AB_ABORT=1    首个不一致即 abort（gdb 抓栈）
+// ============================================================
+void exec_ab_check(const TensorF32* node, const char* backend_name, int node_idx);
+
+// ============================================================
+// exec_stale_* — "生产者代际"断言（诊断，默认关；2026-10-20）
+// ============================================================
+//   动机：单节点 CPU/GPU A/B（exec_ab_check）证明**每个算子在给定输入下都算得对**，
+//   但整体 loss/梯度仍有 1e16 级分歧且每次运行量级不同 ⇒ 怀疑消费者拿到的是
+//   "本轮根本没写过"的输入（该写的没写 / 写晚了 / 写到别处）。
+//   本断言给每次 graph_compute 分配一个递增代际 pass_id：
+//     · 节点 kernel 执行完 → exec_stale_mark(node) 记为「本代际已写」；
+//     · 消费某 src 时 → 若该 src 既不是 leaf/常量、也不是 view（别名）、
+//       且其最近写入代际 != 当前 pass_id ⇒ 打印 [STALE]。
+//   白名单：本次 graph_compute 的 **leaf**（图输入）+ OP_NONE（参数/常量）+ view（由根负责）
+//          + 经 backend_tensor_copy 拷贝过的 cpy 张量（跨后端/跨 split 的正常数据流）。
+//   代际粒度：单后端直调（CPU/CUDA graph_compute）各起一代；**scheduler 驱动 split 时
+//          整张图共用一代**（sched_depth 抑制子调用切代际），否则跨 split 的同后端依赖
+//          会被误判为 [STALE]。
+//   开关：PPML_STALE_CHECK=1；PPML_STALE_MAX=N（明细上限，默认 20）；
+//         PPML_STALE_ABORT=1（命中即 abort）；
+//         PPML_STALE_SKIP_MARK=<node 下标>（故障注入自检：故意漏登记该节点，
+//           期望看到 [STALE] —— 用来证明 0 命中是"真干净"而不是"断言没生效"）。
+// ============================================================
+void exec_stale_pass_begin(const ComputeGraph* cgraph);   // 每个 graph_compute 开头
+void exec_stale_mark(const TensorF32* t);                 // 某个张量"本轮已写"
+void exec_stale_check(const TensorF32* node, const char* backend_name, int node_idx);
+void exec_stale_report(const char* where);                 // 汇总（epoch 末/析构时）
+
+// ============================================================
+// exec_probe_op — 定点算子探针（诊断，默认关；2026-10-20）
+// ============================================================
+//   按 **op 编号**（而不是 node 下标）对齐 CPU / CUDA 两条路径：混合模式下 SE3 per_block
+//   走独立子图、节点编号对不上，只有 op + 形状可比。每次执行到该 op 就打印
+//   `dst/src0/src1 的 maxabs` ⇒ 同一逻辑算子在两条路径上的输入/输出量级可直接并排。
+//   开关：PPML_PROBE_OP=8,51,33（逗号分隔）；PPML_PROBE_MAX=40（打印上限）。
+void exec_probe_op(const TensorF32* node, const char* backend_name, int node_idx);
+
 // ==================== ADD1 优化开关（2026-10-19，profile 用）====================
 // OP_ADD1（dst = src + b）原本无论如何都带一个 1 元素标量张量 src[1]，CUDA 端每个节点
 // 一次 `cudaMemcpy D2H` 把它读回 host（实测 +58 µs/节点，成本来自**流 drain**）。
@@ -689,6 +762,12 @@ public:
 
     // ===== 公开（图规划，可以被外部调用预估算资源）=====
     ComputePlan  graph_plan(ComputeGraph * cgraph) const;
+
+    // ===== 诊断桥（2026-10-20）：CPU 上重算单个节点，供 exec_ab_check 做 GPU/CPU 数值 A/B =====
+    //   node 及其 src 的 data_ 必须已指向 host 缓冲、buffer_==nullptr（调用方临时替换后恢复）。
+    static Status ab_dispatch_node(TensorF32* node, ComputeParams* p);
+    static size_t ab_estimate_work_size(TensorF32* node);   // 单个节点的 work buffer 需求
+    ThreadPool*   ab_threadpool() const { return threadpool_; }
 
     // 延迟分配器访问（诊断 buffer 复用 / aliasing 用）
     Gallocr& gallocr() override { return gallocr_; }

@@ -61,6 +61,16 @@ std::unique_ptr<CPUBackend> CPUBackend::create(int n_threads) {
     return std::make_unique<CPUBackend>(n_threads);
 }
 
+// 诊断桥：供 exec_ab_check 在 CPU 上重算单个节点（与正常 dispatch 完全同一路径）
+Status CPUBackend::ab_dispatch_node(TensorF32* node, ComputeParams* p) {
+    return dispatch_node(node, p);
+}
+
+// 单节点 work buffer 需求（供 AB 诊断按节点精确分配，覆盖 mul_mat / softmax / concat 等）
+size_t CPUBackend::ab_estimate_work_size(TensorF32* node) {
+    return estimate_work_size(node, 1);
+}
+
 bool CPUBackend::supports_op(TensorF32* node) const {
     const TensorF32* src0 = node->src[0];
     const TensorF32* src1 = node->src[1];
@@ -165,6 +175,10 @@ ComputePlan CPUBackend::graph_plan(ComputeGraph * cgraph) const {
 
 // ===== graph_compute (Backend 接口) =====
 Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
+    // 生产者代际断言（PPML_STALE_CHECK=1）：每轮执行起一个新代际，并登记本图 node/leaf。
+    //   scheduler 驱动 split 时 sched_depth>0 ⇒ 此处不另起代际（由 scheduler 统一起）。
+    exec_stale_pass_begin(cgraph);
+
     // ---- no_alloc 延迟分配：对 data_==nullptr 的中间节点分配 backend buffer ----
     // 混训时 scheduler 已通过 reserve_graph_memory 预分配了全部张量，置 skip_alloc_=true，
     // 这里跳过本端自己的 gallocr，避免两套 gallocr 反复 re-bind 张量导致跨 split 读到错位 buffer。
@@ -503,7 +517,67 @@ void CPUBackend::compute_thread(ThreadState * state) {
             }
         }
 
+        // ---- 开发诊断：src 的 min/max 采样必须放在 dispatch **之前**（2026-10-19）----
+        //   为什么：dispatch + barrier 之后，ith=1..n-1 已经在算下一个节点，而 gallocr 可能把
+        //   刚释放的 src buffer 复用给那个节点的输出 ⇒ 事后统计会读到被覆盖的字节。
+        //   实测 node 8752：事后打出 denom min=-1101，而同一 buffer 在执行前（[NHP]）是
+        //   1e-6（clamp 地板）⇒ 事后读数是假警报。这里只在"本节点还没执行"时采样一次。
+        //   仅对 explode 打印需要的 op 采样（DIV / PER_EDGE_MATMUL），开销受限。
+        struct SrcSnap {
+            bool    valid = false;
+            int64_t numel = 0;
+            float   mn = 0.f, mx = 0.f;
+            // 仅当本张量是 CLAMP：地板/上限 + 其输入（未裁剪的 s_edge+eps）的统计
+            bool    is_clamp = false;
+            float   clo = 0.f, chi = 0.f;
+            bool    in_valid = false;
+            float   imn = 0.f, imx = 0.f;
+            int64_t i_zero = 0;      // 输入 <= 0 的元素数（无入边 / 全部下溢）
+            int64_t i_at_floor = 0;  // 输入 <= 地板 的元素数（s_edge 被 floor 吞掉，含恰好 0）
+        };
+        SrcSnap snap0, snap1;
+        if (ith == 0 && std::getenv("GRAPH_DEBUG_NAN") &&
+            (node->op == OP_DIV || node->op == OP_PER_EDGE_MATMUL)) {
+            auto take = [](TensorF32* t) {
+                SrcSnap s;
+                if (!t || !t->data() || t->numel() <= 0) return s;
+                const float* p = t->data();
+                s.valid = true;
+                s.numel = t->numel();
+                s.mn = s.mx = p[0];
+                for (int64_t k = 1; k < s.numel; ++k) {
+                    float v = p[k];
+                    if (v < s.mn) s.mn = v;
+                    if (v > s.mx) s.mx = v;
+                }
+                if ((int)t->op == 51 /*OP_CLAMP*/) {
+                    s.is_clamp = true;
+                    memcpy(&s.clo, t->op_params,     sizeof(float));
+                    memcpy(&s.chi, t->op_params + 1, sizeof(float));
+                    TensorF32* in = t->src[0];
+                    if (in && in->data() && in->numel() > 0) {
+                        const float* q = in->data();
+                        s.in_valid = true;
+                        s.imn = s.imx = q[0];
+                        for (int64_t k = 0; k < in->numel(); ++k) {
+                            float v = q[k];
+                            if (v < s.imn) s.imn = v;
+                            if (v > s.imx) s.imx = v;
+                            if (v <= 0.f)    ++s.i_zero;
+                            if (v <= s.clo)  ++s.i_at_floor;
+                        }
+                    }
+                }
+                return s;
+            };
+            snap0 = take(node->src[0]);
+            snap1 = take(node->src[1]);
+        }
+
+        // 生产者代际断言（PPML_STALE_CHECK=1）：消费前校验 src 是否本代际写过
+        if (ith == 0) exec_stale_check(node, "CPU", node_n);
         dispatch_node(node, &params);
+        if (ith == 0) exec_stale_mark(node);   // 本节点算完 ⇒ 记为"本代际已写"（只由 0 号线程写表）
 
         if (ith == 0 && cplan->abort_callback &&
             cplan->abort_callback(cplan->abort_callback_data)) {
@@ -514,6 +588,17 @@ void CPUBackend::compute_thread(ThreadState * state) {
             tp->barrier_wait();
         }
 
+        // 执行期 NaN/爆炸检查（PPML_EXEC_NAN_CHECK=1）：与下面的 [NH] 指纹同位置
+        //   （barrier 之后 ⇒ 读到的是"刚算完、未被复用"的真值），按执行顺序报告第一个坏节点。
+        //   ⚠️ 最后一个节点在本轮**没有 barrier**（`node_n+1 < n_nodes` 为假）⇒ 若在此处检查，
+        //   多线程下会读到"别的线程还在写"的部分数据（实测 src0 被误报为 nan=804/inf=268，
+        //   单线程同一位置是干净的 6.3e5）✗。故最后一个节点挪到循环后的公共 barrier 之后再查。
+        if (ith == 0 && node_n + 1 < cgraph->n_nodes()) exec_nan_check(node, "CPU", node_n);
+        // 定点算子探针（PPML_PROBE_OP=8,51,...）：按 op 对齐 CPU/CUDA 两条路径的量级
+        if (ith == 0) exec_probe_op(node, "CPU", node_n);
+        // view 别名消费探针（PPML_EXEC_VIEW_PROBE=1，2026-10-20）
+        if (ith == 0) exec_view_probe(node, "CPU", node_n);
+
         // ---- 产出时刻指纹（PPML_HASH_NODES=1，2026-09-14 加）----
         //   为什么必须在这里：任何"split 结束后再读"的指纹都可能读到已被 gallocr 复用的 buffer；
         //   此处紧跟 barrier（含最后一个节点见循环后同款代码）⇒ 读到的就是"刚算完、未被复用"的真值。
@@ -523,11 +608,24 @@ void CPUBackend::compute_thread(ThreadState * state) {
         // ---- 开发诊断：找第一个输出含巨大值(爆炸源)的节点（GRAPH_DEBUG_NAN=1）----
         // 在 NaN 之前抓真正的爆炸起点：max|v| > EXPLODE_THRESH 即报（不放过已是 NaN 的）。
         if (ith == 0 && getenv("GRAPH_DEBUG_NAN") && node->data() && node->op != OP_NONE) {
-            const float EXPLODE_THRESH = 1e4f;
+            // 【2026-10-20】阈值改为 PPML_EXPLODE_THRESH（默认 1e4）：
+            //   1e4 只能看到"已经放大后"的节点；降到 1e2/1e3 后，第一个越线的节点才是
+            //   梯度/激活的真实起点（用于追溯上游，而不是只看到 div 这类放大下游）。
+            //   打印上限仍是 8 条（explode_count<8）；阈值过低时会先被前向大值占满。
+            static const float EXPLODE_THRESH = [] {
+                const char* e = std::getenv("PPML_EXPLODE_THRESH");
+                return e ? static_cast<float>(std::atof(e)) : 1e4f;
+            }();
             const int64_t ne_e = node->numel();
             const float* nde = node->data();
+            // 打印条数上限（PPML_EXPLODE_MAX，默认 8）：阈值调低时前向大值会占满名额，
+            // 调大后可以看到更靠后的反向节点。
+            static const long long explode_max = [] {
+                const char* e = std::getenv("PPML_EXPLODE_MAX");
+                return e ? static_cast<long long>(std::atoll(e)) : 8LL;
+            }();
             static long long explode_count = 0;
-            for (int64_t q = 0; q < ne_e && explode_count < 8; ++q) {
+            for (int64_t q = 0; q < ne_e && explode_count < explode_max; ++q) {
                 float v = nde[q];
                 if (std::isfinite(v) && (v > EXPLODE_THRESH || v < -EXPLODE_THRESH)) {
                     auto opname = [](TensorF32* t)->int { return t ? (int)t->op : -1; };
@@ -555,59 +653,64 @@ void CPUBackend::compute_thread(ThreadState * state) {
                             (long long)(s1&&s1->shape().ndim()>2?s1->shape().dims[2]:-1),
                             (long long)(s1&&s1->shape().ndim()>3?s1->shape().dims[3]:-1),
                             opname(s1?s1->src[0]:nullptr));
-                    //    denom(src1=norm+eps) 统计。若 t≈norm 但 norm 巨大而输入 x 正常 → 布局错位。
-                    if ((int)node->op == 8 /*OP_DIV*/ && node->shape().ndim() >= 3) {
-                        const float* td = s0 ? s0->data() : nullptr;
-                        const float* dd_ = s1 ? s1->data() : nullptr;
-                        if (td && s0->numel() > 0) {
-                            float tmin = td[0], tmax = td[0];
-                            for (int64_t kk = 1; kk < s0->numel(); ++kk) { float tv = td[kk]; if (tv<tmin)tmin=tv; if (tv>tmax)tmax=tv; }
-                            fprintf(stderr, "  [div-gnorm] t(src0=relu) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
-                                    (long long)(s0->shape().ndim()>0?s0->shape().dims[0]:-1),
-                                    (long long)(s0->shape().ndim()>1?s0->shape().dims[1]:-1),
-                                    (long long)(s0->shape().ndim()>2?s0->shape().dims[2]:-1),
-                                    (double)tmin, (double)tmax, (long long)s0->numel());
+                    //    祖先链（沿 src[0] 上溯 5 层）：用于把这个节点对回源码里的表达式
+                    {
+                        TensorF32* anc = node;
+                        for (int lv = 0; lv < 5 && anc; ++lv) {
+                            const int ndv = anc->shape().ndim();
+                            fprintf(stderr, "    anc lv%d op=%d dims=[%lld,%lld,%lld,%lld] numel=%lld s0op=%d s1op=%d\n",
+                                    lv, (int)anc->op,
+                                    (long long)(ndv>0?anc->shape().dims[0]:-1),
+                                    (long long)(ndv>1?anc->shape().dims[1]:-1),
+                                    (long long)(ndv>2?anc->shape().dims[2]:-1),
+                                    (long long)(ndv>3?anc->shape().dims[3]:-1),
+                                    (long long)anc->numel(),
+                                    opname(anc->src[0]), opname(anc->src[1]));
+                            anc = anc->src[0];
                         }
-                        if (dd_ && s1->numel() > 0) {
-                            float dmin = dd_[0], dmax = dd_[0];
-                            for (int64_t kk = 1; kk < s1->numel(); ++kk) { float dv = dd_[kk]; if (dv<dmin)dmin=dv; if (dv>dmax)dmax=dv; }
-                            fprintf(stderr, "  [div-gnorm] denom(src1=norm+eps) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
-                                    (long long)(s1->shape().ndim()>0?s1->shape().dims[0]:-1),
-                                    (long long)(s1->shape().ndim()>1?s1->shape().dims[1]:-1),
-                                    (long long)(s1->shape().ndim()>2?s1->shape().dims[2]:-1),
-                                    (double)dmin, (double)dmax, (long long)s1->numel());
+                    }
+                    //    denom 统计用 dispatch 前的快照（snap0/snap1）⇒ 不会被下一个节点的 buffer 复用污染。
+                    if ((int)node->op == 8 /*OP_DIV*/ && node->shape().ndim() >= 2) {
+                        if (snap0.valid) {
+                            fprintf(stderr, "  [div-gnorm] t(src0) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld (pre-dispatch)\n",
+                                    (long long)(node->shape().ndim()>0?node->shape().dims[0]:-1),
+                                    (long long)(s0&&s0->shape().ndim()>1?s0->shape().dims[1]:-1),
+                                    (long long)(s0&&s0->shape().ndim()>2?s0->shape().dims[2]:-1),
+                                    (double)snap0.mn, (double)snap0.mx, (long long)snap0.numel);
+                        }
+                        if (snap1.valid) {
+                            // 分母若是 CLAMP：[lo,hi] + 其输入（未裁剪的 s_edge+eps）分布
+                            // ⇒ 可直接判断"真放大(命中地板)"还是"脏数据(越界)"，并量化 s_edge==0 的比例。
+                            if (snap1.is_clamp) {
+                                fprintf(stderr, "  [div-clamp] src1 lo=%g hi=%g | input(s_edge+eps) min=%g max=%g zero=%lld at_floor=%lld/%lld\n",
+                                        (double)snap1.clo, (double)snap1.chi,
+                                        (double)snap1.imn, (double)snap1.imx,
+                                        (long long)snap1.i_zero, (long long)snap1.i_at_floor,
+                                        (long long)snap1.numel);
+                            }
+                            fprintf(stderr, "  [div-gnorm] denom(src1) dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld (pre-dispatch)\n",
+                                    (long long)(node->shape().ndim()>0?node->shape().dims[0]:-1),
+                                    (long long)(s1&&s1->shape().ndim()>1?s1->shape().dims[1]:-1),
+                                    (long long)(s1&&s1->shape().ndim()>2?s1->shape().dims[2]:-1),
+                                    (double)snap1.mn, (double)snap1.mx, (long long)snap1.numel);
                         }
                     }
                     //    定位 SE3 核生成爆炸是 kernel 值异常还是 gathered(节点特征) 异常。
                     if ((int)node->op == 107 /*OP_PER_EDGE_MATMUL*/) {
-                        const float* kd = s0 ? s0->data() : nullptr;
-                        const float* gd = s1 ? s1->data() : nullptr;
-                        if (kd && s0->numel() > 0) {
-                            float kmin = kd[0], kmax = kd[0];
-                            for (int64_t kk = 1; kk < s0->numel(); ++kk) {
-                                float kv = kd[kk];
-                                if (kv < kmin) kmin = kv;
-                                if (kv > kmax) kmax = kv;
-                            }
-                            fprintf(stderr, "  [per-edge] KERNEL dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld\n",
-                                    (long long)(s0->shape().ndim()>0?s0->shape().dims[0]:-1),
-                                    (long long)(s0->shape().ndim()>1?s0->shape().dims[1]:-1),
-                                    (long long)(s0->shape().ndim()>2?s0->shape().dims[2]:-1),
-                                    (double)kmin, (double)kmax, (long long)s0->numel());
+                        if (snap0.valid) {
+                            fprintf(stderr, "  [per-edge] KERNEL dims=[%lld,%lld,%lld] min=%g max=%g numel=%lld (pre-dispatch)\n",
+                                    (long long)(s0&&s0->shape().ndim()>0?s0->shape().dims[0]:-1),
+                                    (long long)(s0&&s0->shape().ndim()>1?s0->shape().dims[1]:-1),
+                                    (long long)(s0&&s0->shape().ndim()>2?s0->shape().dims[2]:-1),
+                                    (double)snap0.mn, (double)snap0.mx, (long long)snap0.numel);
                         } else {
                             fprintf(stderr, "  [per-edge] KERNEL data=null\n");
                         }
-                        if (gd && s1->numel() > 0) {
-                            float gmin = gd[0], gmax = gd[0];
-                            for (int64_t kk = 1; kk < s1->numel(); ++kk) {
-                                float gv = gd[kk];
-                                if (gv < gmin) gmin = gv;
-                                if (gv > gmax) gmax = gv;
-                            }
-                            fprintf(stderr, "  [per-edge] GATHERED dims=[%lld,%lld] min=%g max=%g numel=%lld\n",
-                                    (long long)(s1->shape().ndim()>0?s1->shape().dims[0]:-1),
-                                    (long long)(s1->shape().ndim()>1?s1->shape().dims[1]:-1),
-                                    (double)gmin, (double)gmax, (long long)s1->numel());
+                        if (snap1.valid) {
+                            fprintf(stderr, "  [per-edge] GATHERED dims=[%lld,%lld] min=%g max=%g numel=%lld (pre-dispatch)\n",
+                                    (long long)(s1&&s1->shape().ndim()>0?s1->shape().dims[0]:-1),
+                                    (long long)(s1&&s1->shape().ndim()>1?s1->shape().dims[1]:-1),
+                                    (double)snap1.mn, (double)snap1.mx, (long long)snap1.numel);
                         } else {
                             fprintf(stderr, "  [per-edge] GATHERED data=null\n");
                         }
@@ -655,6 +758,10 @@ void CPUBackend::compute_thread(ThreadState * state) {
 
     tp->barrier_wait();
     // 最后一个节点没有"下一轮 barrier"，在这里补一次（此时全体线程已 barrier，读值是安全/新鲜的）
+    // 执行期 NaN 检查的最后一个节点也在这里做（见循环内注释：循环内检查会读到半写数据）。
+    if (ith == 0 && cgraph->n_nodes() > 0) {
+        exec_nan_check(cgraph->graph_node(cgraph->n_nodes() - 1), "CPU", cgraph->n_nodes() - 1);
+    }
     if (ith == 0 && hash_nodes && cgraph->n_nodes() > 0) {
         nh(cgraph->graph_node(cgraph->n_nodes() - 1), nh_seq);
     }

@@ -1328,18 +1328,93 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, Status* st) {
     std::vector<int64_t>    len(n_src), start(n_src, 0);
     std::vector<const float*> srcs(n_src);
     for (int s = 0; s < n_src; s++) {
-        len[s]   = srcs_tmp[s]->shape().dims[dim];
-        srcs[s]  = srcs_tmp[s]->data();
+        const int64_t sd = srcs_tmp[s]->shape().ndim();
+        len[s]  = (dim < sd) ? srcs_tmp[s]->shape().dims[dim] : 1;
+        srcs[s] = srcs_tmp[s]->data();
+        // 【2026-10-20】防御：src 为空或在 host 时直接回落 CPU。
+        //   kernel 里 `srcs[s]` 会被当 device 指针解引用；若拿到 host 指针会触发
+        //   "illegal memory access"（实测 split=314 的 CONCAT 就是这样整图回退的）。
+        if (!srcs[s] || !cuda_ptr_is_device(srcs[s])) {
+            static long concat_guard_hits = 0;
+            if (concat_guard_hits++ < 10) {
+                const int64_t d0 = node->shape().ndim() > 0 ? node->shape().dims[0] : 1;
+                const int64_t d1 = node->shape().ndim() > 1 ? node->shape().dims[1] : 1;
+                const int64_t d2 = node->shape().ndim() > 2 ? node->shape().dims[2] : 1;
+                const int64_t d3 = node->shape().ndim() > 3 ? node->shape().dims[3] : 1;
+                fprintf(stderr,
+                        "[concat-guard] src[%d/%d] op=%d ndim=%lld numel=%lld data=%p buffer=%p buf_host=%d "
+                        "| dim=%d dst_dims=[%lld,%lld,%lld,%lld] dst_numel=%lld → NOT_SUPPORTED\n",
+                        s, n_src, (int)srcs_tmp[s]->op, (long long)sd,
+                        (long long)srcs_tmp[s]->numel(), (const void*)srcs[s],
+                        (void*)srcs_tmp[s]->buffer_,
+                        (srcs_tmp[s]->buffer_ ? (int)srcs_tmp[s]->buffer_->is_host() : -1),
+                        dim, (long long)d0, (long long)d1, (long long)d2, (long long)d3,
+                        (long long)node->numel());
+            }
+            if (st) *st = Status::NOT_SUPPORTED;
+            return;
+        }
     }
     for (int s = 1; s < n_src; s++) start[s] = start[s - 1] + len[s - 1];
+
+    // 【2026-10-20】拼接维长度必须等于 dst 的对应维：否则 kernel 里 local = gd - start[s]
+    //   会越出 src 的分配范围 → illegal memory access（实测 split=314 CONCAT）。
+    {
+        int64_t sum_len = 0;
+        for (int s = 0; s < n_src; s++) sum_len += len[s];
+        const int64_t dst_dim_len = (dim < nd) ? node->shape().dims[dim] : 1;
+        if (sum_len != dst_dim_len) {
+            static long concat_len_hits = 0;
+            if (concat_len_hits++ < 10) {
+                fprintf(stderr,
+                        "[concat-len] MISMATCH dim=%d n_src=%d sum(len)=%lld dst_dim=%lld dst_numel=%lld "
+                        "len=[", dim, n_src, (long long)sum_len, (long long)dst_dim_len,
+                        (long long)node->numel());
+                for (int s = 0; s < n_src; s++) {
+                    const auto& sh = srcs_tmp[s]->shape();
+                    fprintf(stderr, "%s%lld(op=%d,nd=%d,d=[%lld,%lld,%lld,%lld],num=%lld)",
+                            s ? "," : "", (long long)len[s], (int)srcs_tmp[s]->op,
+                            (int)sh.ndim(),
+                            (long long)(sh.ndim() > 0 ? sh.dims[0] : -1),
+                            (long long)(sh.ndim() > 1 ? sh.dims[1] : -1),
+                            (long long)(sh.ndim() > 2 ? sh.dims[2] : -1),
+                            (long long)(sh.ndim() > 3 ? sh.dims[3] : -1),
+                            (long long)srcs_tmp[s]->numel());
+                }
+                const auto& dsh = node->shape();
+                fprintf(stderr, "] dst(nd=%d,d=[%lld,%lld,%lld,%lld]) → NOT_SUPPORTED\n",
+                        (int)dsh.ndim(),
+                        (long long)(dsh.ndim() > 0 ? dsh.dims[0] : -1),
+                        (long long)(dsh.ndim() > 1 ? dsh.dims[1] : -1),
+                        (long long)(dsh.ndim() > 2 ? dsh.dims[2] : -1),
+                        (long long)(dsh.ndim() > 3 ? dsh.dims[3] : -1));
+            }
+            if (st) *st = Status::NOT_SUPPORTED;
+            return;
+        }
+    }
 
     // 拷贝到 device
     const float** d_srcs  = nullptr;
     int64_t*      d_start = nullptr;
     int64_t*      d_len   = nullptr;
-    cudaMalloc(&d_srcs,  sizeof(float*)   * n_src);
-    cudaMalloc(&d_start, sizeof(int64_t)  * n_src);
-    cudaMalloc(&d_len,   sizeof(int64_t)  * n_src);
+    cudaError_t e0 = cudaMalloc(&d_srcs,  sizeof(float*)   * n_src);
+    cudaError_t e1 = cudaMalloc(&d_start, sizeof(int64_t)  * n_src);
+    cudaError_t e2 = cudaMalloc(&d_len,   sizeof(int64_t)  * n_src);
+    if (e0 != cudaSuccess || e1 != cudaSuccess || e2 != cudaSuccess ||
+        !d_srcs || !d_start || !d_len) {
+        static long concat_alloc_hits = 0;
+        if (concat_alloc_hits++ < 10) {
+            fprintf(stderr, "[concat-alloc] FAILED n_src=%d dst_numel=%lld: %s\n",
+                    n_src, (long long)node->numel(), cudaGetErrorString(e0));
+        }
+        if (d_srcs)  cudaFree(d_srcs);
+        if (d_start) cudaFree(d_start);
+        if (d_len)   cudaFree(d_len);
+        cudaGetLastError();
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
     cudaMemcpy(d_srcs,  srcs.data(),  sizeof(float*)  * n_src, cudaMemcpyHostToDevice);
     cudaMemcpy(d_start, start.data(), sizeof(int64_t) * n_src, cudaMemcpyHostToDevice);
     cudaMemcpy(d_len,   len.data(),   sizeof(int64_t) * n_src, cudaMemcpyHostToDevice);
