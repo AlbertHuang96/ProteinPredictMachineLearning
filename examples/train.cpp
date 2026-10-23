@@ -25,7 +25,9 @@
 #include <unordered_set>
 #include <thread>          // 阶段 A：peer 模式后台服务线程（rank0 既训练又服务对端）
 #if defined(__linux__)
-#include <unistd.h>        // sysconf 用于页大小/物理页数 (内存)
+#include <unistd.h>        // sysconf 用于页大小/物理页数 (内存)；pipe/fork/dup2 用于日志 tee
+#include <fcntl.h>         // open()：PPML_LOG_FILE 日志 tee 子进程
+#include <sys/wait.h>      // waitpid()：退出前等 tee 子进程收尾
 #include <sys/sysinfo.h>   // sysinfo 用于总/可用内存
 #include <sys/resource.h>  // getrusage 用于 RSS 峰值
 #endif
@@ -100,6 +102,141 @@ struct StdoutLineBuffered {
     StdoutLineBuffered() { std::setvbuf(stdout, nullptr, _IOLBF, 0); }
 } g_stdout_line_buffered;
 }   // namespace
+
+#if defined(__linux__)
+static pid_t g_log_child = -1;      // tee 子进程 pid（-1 = 未启用日志文件）
+static void finish_log_file();
+#endif
+
+// ============================================================================
+// 日志落盘（2026-10-22）：PPML_LOG_FILE=<path> ⇒ stdout/stderr **同时**写到终端与该文件。
+//   用途：服务器跑完把单个文件拉回本地判读，同时终端照常能看进度（不做静默重定向）。
+//   实现：fork 一个 tee 子进程 —— 父进程 stdout/stderr 接进 pipe，子进程 read 后
+//         同时 write 到原终端与文件。比 C++ stream 层 tee 更彻底：
+//         CUDA device 侧 printf 由 runtime 转发到 C stdout，也一并被 tee 到 ✓。
+//   行缓冲（见上方 StdoutLineBuffered）+ stderr 无缓冲 ⇒ 崩溃时已打印的行不丢。
+// ============================================================================
+static void setup_log_file() {
+    const char* p = std::getenv("PPML_LOG_FILE");
+    if (!p || !*p) return;
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path fp(p);
+    if (fp.has_parent_path()) fs::create_directories(fp.parent_path(), ec);
+    std::cout.flush();
+    std::cerr.flush();
+
+#if defined(__linux__)
+    // 先打开日志文件：失败就只走终端 —— 绝不为了写文件把终端静默掉，
+    //   也绝不带着"没人读的 pipe"继续跑（否则写满 64KB 管道缓冲后程序会挂住）。
+    const int log_fd = open(p, O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (log_fd < 0) {
+        std::cerr << "[LOG] 无法打开日志文件: " << p << "（仅输出到终端）" << std::endl;
+        return;
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+        close(log_fd);
+        std::cerr << "[LOG] pipe() 失败（仅输出到终端）" << std::endl;
+        return;
+    }
+    const pid_t pid = fork();          // 此刻尚未建 CUDA 上下文/线程，fork 安全
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        close(log_fd);
+        std::cerr << "[LOG] fork() 失败（仅输出到终端）" << std::endl;
+        return;
+    }
+    if (pid == 0) {
+        // ---- 子进程：只用 read/write，不碰 stdio、CUDA 与 C++ 运行时 ----
+        close(fds[1]);
+        static char buf[1 << 16];
+        ssize_t n;
+        while ((n = read(fds[0], buf, sizeof(buf))) > 0) {
+            ssize_t off = 0;
+            while (off < n) {
+                const ssize_t w = write(log_fd, buf + off, static_cast<size_t>(n - off));
+                if (w <= 0) break;
+                off += w;
+            }
+            off = 0;
+            // fork 发生在 dup2 之前 ⇒ 本进程的 STDOUT_FILENO 仍是原终端（或用户的 > 重定向）
+            while (off < n) {
+                const ssize_t w = write(STDOUT_FILENO, buf + off, static_cast<size_t>(n - off));
+                if (w <= 0) break;
+                off += w;
+            }
+        }
+        close(log_fd);
+        _exit(0);
+    }
+    close(log_fd);                     // 父进程不再需要；子进程持有自己的副本
+    // ---- 父进程：把 stdout/stderr 接到 pipe 写端 ----
+    close(fds[0]);
+    dup2(fds[1], STDOUT_FILENO);
+    dup2(fds[1], STDERR_FILENO);
+    if (fds[1] != STDOUT_FILENO && fds[1] != STDERR_FILENO) close(fds[1]);
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);   // pipe 默认块缓冲 ⇒ 改行缓冲，保证实时可见
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+    g_log_child = pid;
+    std::atexit(finish_log_file);   // 退出前等 tee 子进程写完，避免"跑完立刻下载拿到半个文件"
+#else
+    if (!std::freopen(p, "a", stdout)) {
+        std::cerr << "[LOG] freopen(stdout) 失败: " << p << std::endl;
+        return;
+    }
+    std::freopen(p, "a", stderr);
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+#endif
+    std::cout << "===== log file: " << p << " （终端同时可见）=====" << std::endl;
+}
+
+#if defined(__linux__)
+// setup_log_file 的配对收尾（atexit）：flush → 关写端 → 等 tee 子进程把剩余内容写完。
+//   最多等 2s（WNOHANG 轮询 50ms × 40）：终端若被挂起导致子进程 write 阻塞，不能把退出挂死。
+static void finish_log_file() {
+    if (g_log_child <= 0) return;
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(nullptr);
+    close(STDOUT_FILENO);
+    close(STDERR_FILENO);
+    for (int i = 0; i < 40; ++i) {
+        if (waitpid(g_log_child, nullptr, WNOHANG) == g_log_child) return;
+        usleep(50 * 1000);
+    }
+}
+#endif
+
+// ============================================================================
+// 诊断开关（2026-10-22）：PPML_NO_CPU_FALLBACK=1
+//   CUDA scheduler 计算失败（ALLOC_FAILED / NOT_SUPPORTED / ABORTED）时**不再回落 CPU
+//   全图重算**，改为打印失败现场后以退出码 3 结束。
+//   动机：回退会把 status 吞成 SUCCESS（日志里只剩一行 [WARN] falling back），
+//         真实失败点被掩盖 ⇒ 关掉回退后第一个失败点即根因（配合 CUDA_LAUNCH_BLOCKING=1）。
+// ============================================================================
+static bool no_cpu_fallback() {
+    static const bool on = [] {
+        const char* v = std::getenv("PPML_NO_CPU_FALLBACK");
+        return v && *v && std::atoi(v) != 0;
+    }();
+    return on;
+}
+
+// 回退被禁用时的统一处置：打印现场 → flush → 退出码 3。
+//   不用 SIGSEGV 等异步崩溃兜底：图停在半算状态时后续读 loss/梯度会段错误，
+//   那样日志最后几行会丢，反而看不出失败点。
+[[noreturn]] static void die_on_cuda_failure(Status st, const char* where) {
+    std::cerr << "[NO-FALLBACK] " << where << " CUDA 计算失败 status="
+              << static_cast<int>(st)
+              << "（PPML_NO_CPU_FALLBACK=1，按要求不回落 CPU）" << std::endl;
+    std::cout.flush();
+    std::cerr.flush();
+    std::fflush(nullptr);      // 连带 flush CUDA 端 printf 转发到 C stdout 的缓冲
+    std::_Exit(3);
+}
 
 // ============================================================================
 // 阶段 A（数据并行参数分片）门闩：本 rank 只更新 owner 的参数，AdamW 只建 1/world 的 m/v。
@@ -360,6 +497,63 @@ void load_checkpoint(PPMLModel& model, const std::string& path,
 }
 
 // ============================================================================
+// 图内独有参数（2026-10-23）
+//   FULL_TRAIN 图路径中存在一批 PARAM 张量，它们不在
+//   model.collect_params_with_names 的注册表里（实测 6 blocks：1526 个 PARAM 中
+//   962 个属于此类）。这些参数被 AdamW 正常更新，但旧 save_checkpoint 只遍历
+//   注册表 ⇒ 它们从未写入 checkpoint，续训时退回随机初值
+//   （已用 PPML_PARAM_DUMP 逐张量验证：962/962 未被恢复）。
+//   这里在首次反向建图后登记它们，save 时作为 extra 张量（扁平 1-D）追加落盘。
+//   注意：AdamW 的 m/v 动量暂不持久化（图内参数无稳定语义名, import_momentum 按名匹配）。
+// ============================================================================
+static std::vector<TensorF32*> g_graph_only_params;
+
+static inline void write_tensor_from_cpu(TensorF32* t, const std::vector<float>& v) {
+    if (!t || v.empty()) return;
+    const size_t bytes = v.size() * sizeof(float);
+    if (t->buffer_) {
+        t->buffer_->set_tensor(t, v.data(), t->buffer_offs_, bytes);
+    } else if (t->data()) {
+        std::memcpy(t->data(), v.data(), bytes);
+    }
+}
+
+// 图内独有参数的落盘名：索引 + numel 双重校验（索引保证同序，numel 兜住错配）
+static std::vector<std::string> graph_only_names() {
+    std::vector<std::string> ns;
+    ns.reserve(g_graph_only_params.size());
+    for (size_t i = 0; i < g_graph_only_params.size(); ++i) {
+        TensorF32* t = g_graph_only_params[i];
+        char nm[64];
+        std::snprintf(nm, sizeof(nm), "__g.%04zu.n%lld", i,
+                      (long long)(t ? t->numel() : 0));
+        ns.emplace_back(nm);
+    }
+    return ns;
+}
+
+// 续训：把 checkpoint 里的 __g.* 写回图内参数（首次建图后调用一次）
+static void apply_graph_only_params(const std::map<std::string, std::vector<float>>& ck) {
+    int applied = 0, missed = 0, bad = 0, readback_bad = 0;
+    const std::vector<std::string> names = graph_only_names();
+    for (size_t i = 0; i < g_graph_only_params.size(); ++i) {
+        TensorF32* t = g_graph_only_params[i];
+        if (!t) continue;
+        auto it = ck.find(names[i]);
+        if (it == ck.end()) { ++missed; continue; }
+        if ((int64_t)it->second.size() != t->numel()) { ++bad; continue; }
+        write_tensor_from_cpu(t, it->second);
+        // 回读校验：写入后立刻读第一个元素，判断写入是否真正落到 data()
+        const float* d = t->data();
+        if (!d || d[0] != it->second[0]) ++readback_bad;
+        ++applied;
+    }
+    std::cout << "[Load-CKPT] 图内独有参数回填: applied=" << applied
+              << " missed=" << missed << " shape_mismatch=" << bad
+              << " readback_bad=" << readback_bad << std::endl;
+}
+
+// ============================================================================
 // 保存 checkpoint (方案 b): 先把所有参数临时拷贝到 CPU, 再写入 GGUF
 //   path: 输出 gguf 文件路径
 //   epoch: 当前已完成 epoch (0-based), total_epochs, loss, elapsed_sec
@@ -424,6 +618,44 @@ void save_checkpoint(PPMLModel& model, const std::string& path,
         // 顺带把 step 次数写入 meta, 供恢复偏差校正 (bias correction 依赖 t)
         fm.emplace_back("opt_step", float(opt->step_count()));
     }
+
+    // 5b. 图内独有参数（不在注册表）也落盘 —— 否则续训丢失（见上方说明）。
+    //     扁平 1-D 写入 extra 张量，名字自带 numel 便于加载侧校验；
+    //     extra 不参与 layout_hash，故不影响与旧 checkpoint 的兼容。
+    if (g_graph_only_params.empty()) {
+        std::cerr << "  [CKPT] WARN: 图内独有参数未登记 → 本次不会写入 __g.*"
+                  << "（正常应在首次反向之后登记）" << std::endl;
+    }
+    const std::vector<std::string> gnames = graph_only_names();
+    for (size_t i = 0; i < g_graph_only_params.size(); ++i) {
+        TensorF32* t = g_graph_only_params[i];
+        if (!t || t->numel() <= 0) continue;
+        std::vector<float> flat = read_tensor_cpu(t);
+        opt_tensors.push_back({gnames[i], std::move(flat)});
+    }
+    // 5c. 图内独有参数的 AdamW m/v 同样落盘（2026-10-23）：
+    //     只存值不存动量 ⇒ 续训后这些参数的动量从 0 起，首个 step 的更新量与
+    //     连续训练不同（实测续训 epoch loss 14.13 vs 连续 14.19）。
+    //     命名沿用 __g.<i>.n<numel>，键前缀仍是 opt.m./opt.v.，加载侧按名匹配。
+    if (opt && opt->param_count() > 0 && !g_graph_only_params.empty()) {
+        std::vector<std::vector<float>> gms, gvs;
+        opt->export_momentum(g_graph_only_params, gnames, gms, gvs);
+        size_t n_added = 0;
+        for (size_t i = 0; i < g_graph_only_params.size(); ++i) {
+            if (i < gms.size() && !gms[i].empty()) {
+                opt_tensors.push_back({"opt.m." + gnames[i], gms[i]});
+                ++n_added;
+            }
+            if (i < gvs.size() && !gvs[i].empty()) {
+                opt_tensors.push_back({"opt.v." + gnames[i], gvs[i]});
+                ++n_added;
+            }
+        }
+        std::cout << "  [CKPT] 图内独有参数动量 " << n_added << " 个已并入 extra 张量"
+                  << std::endl;
+    }
+    std::cout << "  [CKPT] 图内独有参数 " << g_graph_only_params.size()
+              << " 个已并入 extra 张量" << std::endl;
 
     save_gguf(gguf_params, path, fm,
               {
@@ -1018,7 +1250,9 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
                 //   回退条件 → 图停在半算状态，程序继续读 loss/梯度 → SIGSEGV(139)。
                 if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED ||
                     compute_st == Status::ABORTED) {
-                    // ⚠️ 2026-09-01：回退必须用真 CPU 后端——active_backend() 在 CUDA 模式
+                    // PPML_NO_CPU_FALLBACK=1：不回退，直接终止并保留真实 status（诊断用）
+                    if (no_cpu_fallback()) die_on_cuda_failure(compute_st, "[multi-sample] scheduler");
+                    //  2026-09-01：回退必须用真 CPU 后端——active_backend() 在 CUDA 模式
                     //   返回 CUDABackend，其单后端全图算不出 loss 链（TRANSPOSE 被 skip、
                     //   host 输入）→ loss 恒 0。改用 active_cpu_backend()。
                     std::cerr << "[WARN] CUDA scheduler compute failed; falling back to CPU." << std::endl;
@@ -1203,6 +1437,24 @@ int run_multi_sample_training(PPMLModel& model, bool full_train, bool dev_se3) {
 }
 
 int main(int argc, char* argv[]) {
+    // 0. 日志落盘 + 环境快照（PPML_LOG_FILE 未设时无副作用）
+    setup_log_file();
+    if (std::getenv("PPML_LOG_FILE")) {
+        std::cout << "[cmd]";
+        for (int i = 0; i < argc; ++i) std::cout << ' ' << argv[i];
+        std::cout << std::endl;
+        static const char* kKeys[] = {
+            "PPML_USE_CUDA", "PPML_CONCAT_ASSERT", "PPML_NO_CPU_FALLBACK",
+            "PPML_CUDA_DISABLE_OPS", "PPML_CUDA_NO_SCATTER", "PPML_CUDA_SCHED",
+            "PPML_CUDA_UNARY", "FULL_TRAIN", "PPML_MULTI_SAMPLE", "PPML_SE3_TOPO",
+            "PPML_DEV_SE3", "PPML_SE3_VALUE_DRIVE", "CUDA_LAUNCH_BLOCKING",
+            "PPML_NUM_EPOCHS", "PPML_MSA_DEPTH"};
+        for (const char* k : kKeys) {
+            const char* v = std::getenv(k);
+            std::cout << "[env] " << k << '=' << (v ? v : "(unset)") << std::endl;
+        }
+    }
+
     // 1. 不再初始化 Python 桥接：当前训练流程为纯 C++（DataLoader 加载数据、ComputeGraph 前向/反向），
     //    全程未调用 PythonBridge 的 run_string/call_function 等。此前无条件 Py_Initialize()+Py_Finalize()
     //    会在退出时触发 Python GC 清理崩溃（Py_XDECREF 损坏对象，gdb 已确认 PythonBridge::finalize）。
@@ -1987,6 +2239,8 @@ int main(int argc, char* argv[]) {
             }
             if (compute_st == Status::ALLOC_FAILED || compute_st == Status::NOT_SUPPORTED ||
                 compute_st == Status::ABORTED) {   // 2026-09-11：ABORTED 也回退（见前文说明）
+                // PPML_NO_CPU_FALLBACK=1：不回退，直接终止并保留真实 status（诊断用）
+                if (no_cpu_fallback()) die_on_cuda_failure(compute_st, "[single-sample] scheduler");
                 // 显存不足/分配失败/节点含 host 指针（GPU kernel 无法执行）→
                 // 回退到单后端 CPU 全图计算（保证训练不中断）。CPU kernel 对 device 输入
                 // 有 stage_device_src 兜底（D2H 暂存），不会裸读 device 指针。
@@ -2370,6 +2624,142 @@ int main(int argc, char* argv[]) {
             grad_norm = clip_grad_norm(cgraph, clip_norm);
         }
 
+        // ---- 图内独有参数登记 + checkpoint 回填（2026-10-23）----
+        // 首次反向后图已完整：枚举所有 PARAM 张量，挑出 model 注册表之外的，
+        // 供 save_checkpoint 落盘；若本次是续训，立刻把 ckpt 里的 __g.* 写回。
+        static bool graph_params_registered = false;
+        if (!graph_params_registered) {
+            std::vector<TensorF32*> mps_r; std::vector<std::string> mns_r;
+            model.collect_params_with_names(mps_r, mns_r);
+            std::unordered_set<TensorF32*> reg(mps_r.begin(), mps_r.end());
+            g_graph_only_params.clear();
+            for (int i = 0; i < cgraph->n_nodes(); ++i) {
+                TensorF32* t = cgraph->graph_node(i);
+                if (t && (t->flag & TENSOR_FLAG_PARAM) && !reg.count(t)) g_graph_only_params.push_back(t);
+            }
+            for (int i = 0; i < cgraph->n_leafs(); ++i) {
+                TensorF32* t = cgraph->graph_leaf(i);
+                if (t && (t->flag & TENSOR_FLAG_PARAM) && !reg.count(t)) g_graph_only_params.push_back(t);
+            }
+            graph_params_registered = true;
+            std::cout << "[CKPT] 图内独有参数登记: n=" << g_graph_only_params.size()
+                      << " (注册表 " << mps_r.size() << ")" << std::endl;
+            if (!ckpt_opt_tensors.empty()) apply_graph_only_params(ckpt_opt_tensors);
+        }
+
+        // ---- 梯度/参数收集诊断（2026-10-23，PPML_GRAD_DIAG=1）----
+        // 区分 AdamW params=0 的两种成因：
+        //   param_*_n == 0            → 参数根本没进 cgraph（构图/叶子归类问题）
+        //   param_*_n > 0, with_grad=0 → 参数在图上但反向没连上（build_backward_expand）
+        if (getenv("PPML_GRAD_DIAG")) {
+            int pn_n = 0, pn_g = 0, pl_n = 0, pl_g = 0;
+            std::unordered_set<TensorF32*> gparams;     // 图里所有 PARAM 张量（node + leaf）
+            for (int i = 0; i < cgraph->n_nodes(); ++i) {
+                TensorF32* t = cgraph->graph_node(i);
+                if (!t || !(t->flag & TENSOR_FLAG_PARAM)) continue;
+                ++pn_n; if (cgraph->graph_get_grad(t)) ++pn_g;
+                gparams.insert(t);
+            }
+            for (int i = 0; i < cgraph->n_leafs(); ++i) {
+                TensorF32* t = cgraph->graph_leaf(i);
+                if (!t || !(t->flag & TENSOR_FLAG_PARAM)) continue;
+                ++pl_n; if (cgraph->graph_get_grad(t)) ++pl_g;
+                gparams.insert(t);
+            }
+            std::cerr << "[GRAD-DIAG] n_nodes=" << cgraph->n_nodes()
+                      << " n_leafs=" << cgraph->n_leafs()
+                      << " node_params=" << pn_n << "(with_grad=" << pn_g << ")"
+                      << " leaf_params=" << pl_n << "(with_grad=" << pl_g << ")"
+                      << " grad_norm=" << grad_norm << std::endl;
+
+            // ---- 图 PARAM 集合 vs model 参数表（2026-10-23）----
+            //   graph_only>0 → 图里有 model 不知道的参数张量（副本？）
+            //     shared_storage>0 → 副本与某个 model 参数**共享存储** ⇒ 同一块内存被更新多份
+            //     shared_storage=0 → 副本有独立存储 ⇒ 真参数可能根本没拿到梯度 + 存盘会漏
+            //   model_only>0 → model 里有参数没进图（不会被训练）
+            std::vector<TensorF32*> mps; std::vector<std::string> mns;
+            model.collect_params_with_names(mps, mns);
+            std::unordered_set<TensorF32*> mset(mps.begin(), mps.end());
+            // 存储键：buffer_ 非空用 (buffer_, offs_)，否则用 data()
+            std::map<std::pair<void*, size_t>, TensorF32*> store;
+            for (TensorF32* t : mps) {
+                if (!t) continue;
+                store[{ t->buffer_ ? (void*)t->buffer_ : (void*)t->data(),
+                        t->buffer_ ? (size_t)t->buffer_offs_ : (size_t)0 }] = t;
+            }
+            int g_only = 0, g_shared = 0, m_only = 0;
+            std::vector<TensorF32*> g_only_list;
+            std::map<int, int> op_hist;       // graph_only 按 op 的直方图
+            for (TensorF32* t : gparams) {
+                if (mset.count(t)) continue;
+                ++g_only;
+                ++op_hist[(int)t->op];
+                auto it = store.find({ t->buffer_ ? (void*)t->buffer_ : (void*)t->data(),
+                                       t->buffer_ ? (size_t)t->buffer_offs_ : (size_t)0 });
+                if (it != store.end()) ++g_shared;
+                if (g_only_list.size() < 5) g_only_list.push_back(t);
+            }
+            for (TensorF32* t : mps) if (t && !gparams.count(t)) ++m_only;
+            std::cerr << "[GRAD-DIAG] model_params=" << mps.size()
+                      << " graph_only=" << g_only << "(shared_storage=" << g_shared << ")"
+                      << " model_only=" << m_only << std::endl;
+            std::cerr << "[GRAD-DIAG] graph_only op-hist:";
+            for (auto& kv : op_hist) std::cerr << " op" << kv.first << "=" << kv.second;
+            std::cerr << std::endl;
+            for (size_t i = 0; i < g_only_list.size(); ++i) {
+                TensorF32* t = g_only_list[i];
+                std::cerr << "[GRAD-DIAG]   graph_only[" << i << "] ptr=" << (void*)t
+                          << " op=" << (int)t->op
+                          << " flag=0x" << std::hex << (unsigned)t->flag << std::dec
+                          << " dims=[";
+                for (int d = 0; d < t->shape().ndim(); ++d)
+                    std::cerr << (d ? "," : "") << (long long)t->shape().dims[d];
+                std::cerr << "] data=" << (void*)t->data()
+                          << " buffer=" << (void*)t->buffer_
+                          << " offs=" << (size_t)t->buffer_offs_
+                          << " grad=" << (cgraph->graph_get_grad(t) ? 1 : 0) << std::endl;
+            }
+        }
+
+        // ---- 参数快照（2026-10-23，PPML_PARAM_DUMP=<file>）----
+        // 每个 step 追加一段：`# epoch=..` 头 + 每个图内 PARAM 张量一行
+        //   格式: idx in_model numel first sum abs_sum nbad
+        // 用于验证 checkpoint round-trip：存盘只序列化 model 注册表，
+        // 图内其余 PARAM 不会被写入 → 加载后应保持"本进程随机初值"。
+        if (const char* pd = std::getenv("PPML_PARAM_DUMP")) {
+            static FILE* pf = nullptr;
+            if (!pf) pf = std::fopen(pd, "w");
+            if (pf) {
+                std::vector<TensorF32*> mps2; std::vector<std::string> mns2;
+                model.collect_params_with_names(mps2, mns2);
+                std::unordered_set<TensorF32*> mset2(mps2.begin(), mps2.end());
+                fprintf(pf, "# epoch=%d n_nodes=%d\n", epoch, cgraph->n_nodes());
+                int idx = 0;
+                auto dump_one = [&](TensorF32* t) {
+                    if (!t || !(t->flag & TENSOR_FLAG_PARAM)) return;
+                    const float* p = t->data();
+                    const int64_t n = t->numel();
+                    double s = 0.0, a = 0.0;
+                    int nbad = 0;
+                    if (p) {
+                        for (int64_t i = 0; i < n; ++i) {
+                            const float v = p[i];
+                            if (!(v == v)) { ++nbad; continue; }
+                            s += v; a += (v < 0 ? -v : v);
+                        }
+                    }
+                    fprintf(pf, "%d %d %lld %.9g %.9g %.9g %d\n", idx,
+                            mset2.count(t) ? 1 : 0, (long long)n,
+                            p ? (double)p[0] : 0.0, s, a, nbad);
+                    ++idx;
+                };
+                for (int i = 0; i < cgraph->n_nodes(); ++i) dump_one(cgraph->graph_node(i));
+                for (int i = 0; i < cgraph->n_leafs(); ++i) dump_one(cgraph->graph_leaf(i));
+                fprintf(pf, "# end n=%d\n", idx);
+                fflush(pf);
+            }
+        }
+
         // 梯度爆炸自动报告（无需 env）：在 clip_grad_norm 之后 grad 已被缩小，
         // 真正的原始爆炸源已由 GradientClipper.cpp 的 [GRAD-NORM]（scale 之前）打印。
         // 此处仅保留一个轻量确认（读已裁剪的 grad 仅用于报告，不作为定位依据）。
@@ -2388,6 +2778,18 @@ int main(int argc, char* argv[]) {
                 std::vector<std::string> ns;
                 model.collect_params_with_names(ps, ns);
                 optimizer.import_momentum(ps, ns, ckpt_opt_tensors);
+                // 图内独有参数的动量（名字与 __g.* 值同序；缺失则保持 0 初始化）
+                if (!g_graph_only_params.empty()) {
+                    const std::vector<std::string> gnames = graph_only_names();
+                    optimizer.import_momentum(g_graph_only_params, gnames, ckpt_opt_tensors);
+                    // 回读校验：确认 m 真的进到 states_（而非按名查不到而保持 0）
+                    std::vector<std::vector<float>> gms, gvs;
+                    optimizer.export_momentum(g_graph_only_params, gnames, gms, gvs);
+                    int nz = 0;
+                    for (auto& m : gms) if (!m.empty() && m[0] != 0.0f) ++nz;
+                    std::cout << "  [resume] 图内参数动量 非零 m=" << nz
+                              << "/" << gms.size() << std::endl;
+                }
                 if (ckpt_opt_step >= 0) optimizer.set_step_count(ckpt_opt_step);
                 std::cout << "  [resume] 已恢复优化器状态 (opt tensors="
                           << ckpt_opt_tensors.size() << ", step="

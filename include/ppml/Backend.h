@@ -39,6 +39,29 @@ bool is_device_pointer(const TensorF32* src, const float* data);
 //   开关：PPML_EXEC_NAN_CHECK=1 启用；PPML_EXEC_NAN=1e6 阈值；PPML_EXEC_NAN_MAX=8 打印条数。
 void exec_nan_check(const TensorF32* node, const char* backend_name, int node_idx);
 
+// 设置"当前正在计算的图"（各 backend 的 graph_compute 入口调用）。
+//   作用：每次 forward_graph 重建，节点编号都从 0 开始 ⇒ 日志里 `op107@n16` 会同时
+//   指向"主图 n16"和"SE3 子图 n16"，跨子图追因会串台。设置后所有生产者记录都带
+//   一个按首次出现顺序分配的短编号（g0、g1、…），打印为 `g1:op107@n16`。
+void exec_set_current_graph(const ComputeGraph* g);
+
+// 输入侧爆炸检查（诊断，默认关；2026-10-23）。
+//   在 **dispatch 之前**扫本节点的 src：命中阈值即打印 [EXEC-NAN-IN]（含"谁写了这块显存"
+//   的生产者记录）⇒ 把爆炸点从"kernel 输出"前移到"kernel 输入"，首个命中直接指向
+//   产出该值的上游 kernel（比输出侧早一个节点）。
+//   开关：PPML_EXEC_NAN_IN=1；阈值复用 PPML_EXEC_NAN（默认 1e6）；上限 PPML_EXEC_NAN_MAX。
+void exec_nan_check_in(const TensorF32* node, const char* backend_name, int node_idx);
+
+// per_edge_matmul 三件套（EDGE_GATHER_ROWS / PER_EDGE_MATMUL / 两个反向）的诊断。
+//   ① exec_pem_shape_check：比对 kernel launch 用的 E（取自 src 最后一维）与 dst 要求的
+//      E（dst 最后一维）。E_launch < E_required ⇒ dst 尾部若干行**从未被写过**（残留
+//      gallocr 复用前的旧值）⇒ "半写 kernel"的直接判据。
+//   ② exec_pem_stat(stage="in"/"out")：打印 dst/src0/src1 的零占比 + 非零均值 + max。
+//      同一节点 in/out 对比 ⇒ 看出实际写了多少、尾部是否保持旧值。
+//   开关：PPML_PEM_STAT=1（统计，默认上限 48 条）；PPML_PEM_SHAPE_CHECK=1（只做形状比对）。
+void exec_pem_shape_check(const TensorF32* node, const char* backend_name, int node_idx);
+void exec_pem_stat(const TensorF32* node, const char* backend_name, int node_idx, const char* stage);
+
 // view 别名消费探针（诊断，默认关，2026-10-20）。
 //   消费 view（零拷贝别名）的 kernel 读到的内容若与"根张量写入时的内容"不符，
 //   打印 [VIEW-PROBE]，区分 ①view 解析地址错 ②根被提前释放/复用（假别名）。
@@ -972,6 +995,28 @@ private:
 
     // 统一 unary dispatch（2026-08-23 提速）：按 unary_op 子类型走 unary_cuda kernel
     static void kernel_unary_cuda(TensorF32 * node, unary_op uop, ComputeParams * p);
+
+    // ---- 单后端全 GPU：host 输入的设备影子（2026-10-23）----
+    //   背景：scheduler 模式下 build_splits 会为"host 生产者 → GPU 消费者"建 H2D cpy
+    //   节点（Backend.cpp 3c 分支）；单后端全 GPU 路径**没有 scheduler**，没人做这次
+    //   搬运 ⇒ 图内独有的 host 叶子（如 GET_ROWS 的权重 W、常量 mask）保持 host 指针
+    //   ⇒ 守卫判 HOST/INVALID 直接 NOT_SUPPORTED（实测 loss 从 ~13.6 变 -3.00 的静默错值）。
+    //   语义：叶子内容在**一次 graph_compute 内**不变 ⇒ 每次 compute 开头按张量缓存一份
+    //   设备影子，compute 结束统一释放（cudaFree + 恢复原 data_/buffer_）。
+    //   为什么每次重新上载：主机侧权重被优化器更新后必须重新搬运，绝不复用陈旧影子。
+    struct HostShadowSaved {
+        TensorF32* t    = nullptr;
+        float*     data = nullptr;
+        Buffer*    buf  = nullptr;
+        size_t     offs = 0;
+    };
+    std::unordered_map<const TensorF32*, void*> host_shadow_;   // 张量 → 设备影子指针
+    std::vector<HostShadowSaved>                host_shadow_saved_;
+
+    // 为一个 host 张量准备设备影子并临时把该张量重绑到影子；已是 device 则直接返回 true。
+    bool ensure_host_shadow(TensorF32* t);
+    // 释放全部影子并恢复张量原字段（graph_compute 出口，含异常/失败路径）。
+    void release_host_shadows();
 };
 
 } // namespace ppml

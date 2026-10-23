@@ -417,9 +417,12 @@ void load_gguf(const std::string& path,
             size_t bytes = t->numel() * sizeof(float);
             ifs.read(reinterpret_cast<char*>(t->data()), bytes);
         } else {
-            // 优化器状态：仅收集 "opt." 前缀的 1D 张量 (AdamW m/v)；其他忽略
+            // 额外张量：收集 "opt." (AdamW m/v) 与 "__g." (图内独有参数，2026-10-23)；
+            //   其他前缀忽略。二者都必须是 1D（save_gguf 的 extra_tensors 约定）。
             if (!raw_tensors_out) continue;
-            if (tinfos[i].name.rfind("opt.", 0) != 0) continue;
+            const bool is_opt = (tinfos[i].name.rfind("opt.", 0) == 0);
+            const bool is_g   = (tinfos[i].name.rfind("__g.", 0) == 0);
+            if (!is_opt && !is_g) continue;
             if (tinfos[i].dims.size() != 1) continue;
             std::vector<float> data(static_cast<size_t>(tinfos[i].dims[0]));
             ifs.seekg(tinfos[i].offset, std::ios::beg);

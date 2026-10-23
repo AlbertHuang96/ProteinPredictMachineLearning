@@ -707,31 +707,83 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
     }
     st.calls++;
 
-    // ---------- L3：构造**阻尼 + 信任域投影**基准 B = x⁰ + clamp(γ(x−x⁰), ±κ) ✓ ----------
+    // ---------- L3：构造**阻尼 + 信任域投影**基准 B = x⁰ + rclip_κ(γ(x−x⁰)) ✓ ----------
     //   数学（TopoPassRefinement.md §6.3 / 附录 A.2.2–A.2.3 ✓）：
     //     · γ 是最小方差线性组合（BLUE）⇒ 在"冻结(先验)"与"活坐标(预测)"之间做最优加权 ✓
-    //     · clamp 是 ℓ∞ 信任域投影（firmly nonexpansive ✓）⇒ 把基准限制在 margin 可证有效的区域内 ✓
+    //     · rclip 是**逐节点 ℓ2 球**信任域投影 Π_κ（凸集投影 ⇒ firmly nonexpansive ✓）
+    //       ⇒ 把基准限制在 margin 可证有效的区域内（σ<1/2 时 ‖B_i−x⁰_i‖₂<κ_i 可证不翻边 ✓）
+    //       2026-10-24：由逐坐标 ±κ（ℓ∞ 盒）改为径向缩放，与 Ω 的欧氏半径判定统一几何 ✓
     //     · 极限：γ=1 且 κ=∞ ⇒ B ≡ x ⇒ **退化为 per_block**（神谕锚点 ✓）；γ=0 ⇒ B ≡ x⁰（纯冻结 ✓）
     //    只有 CA（原子轴 1）参与几何与门控 ⇒ 只改 CA 通道即可（其余通道下游不读基准 ✓）
     std::vector<float> basis;
+    // L3：逐节点"是否被球投影截断"（r ≥ κ）——Ω 判定用它而不是重算 ‖B−x⁰‖ ✓
+    //   ⚠ 必须用投影**前**的 γ‖Δ‖：球投影把被截断节点正好放在球面上（‖B−x⁰‖ = κ），
+    //     于是 `‖B−x⁰‖ ≥ κ` 只剩浮点舍入决定成败（实测 70 个全截断的用例只判出 17/42 个 ✗）。
+    std::vector<char> clipped;
     const float* xg = xyz.data();                          // 默认：几何/门控用**活坐标**（L1/L2 ✓）
     if (cfg.l3) {
         basis.assign(xyz.numel(), 0.f);
         std::memcpy(basis.data(), xyz.data(), basis.size() * sizeof(float));
+        clipped.assign(static_cast<size_t>(B) * L, 0);
         for (int b = 0; b < B; ++b) {
             for (int l = 0; l < L; ++l) {
                 const size_t gi   = static_cast<size_t>(b) * L + l;
                 const size_t base = ((static_cast<size_t>(b) * L + l) * 3 + 1) * 3;   // CA ✓
                 const float  kap  = st.kappa[gi];
+                // (5) 的逐节点 ℓ2 球投影 Π_κ：rclip_κ(w) = w / max{1, ‖w‖₂/κ} ✓
+                //   · 与下方 Ω 判定（:748 起的欧氏半径 ‖B_i−x⁰_i‖₂）现在是**同一几何** ✓
+                //     （此前逐坐标 ±κ 是 ℓ∞ 盒、Ω 用 ℓ2 半径 ⇒ 实现里混用两种几何，§4.1 已记录偏离）
+                //   · 凸集投影 ⇒ 仍 firmly non-expansive ⇒ prop:fne 的论证不变 ✓
+                //   · 证书临界由 σ < 1/(2√3)（盒，角点 √3 倍）变为 σ < 1/2（球，端点各移动 κ）✓
+                //   · 极限不变：γ=0 ⇒ w=0 ⇒ B=x⁰；γ=1 且 κ→∞ ⇒ max{1,·}=1 ⇒ B=x（退化为 per_block）；
+                //     关闭 L3 ⇒ 不进本分支 ⇒ B=x（与旧实现一致 ✓）
+                //   · κ=0、w≠0 ⇒ 缩放到 0（等价旧盒的 clamp 到 0 ✓）；w=0 时 r=0 不做除法 ✓
+                //   · κ=+inf（k≥L−1 ⇒ m_i=+inf）⇒ r>κ 恒假 ⇒ s=1（无截断，与旧实现一致 ✓）
+                float w[3];
+                float r2 = 0.f;
                 for (int c = 0; c < 3; ++c) {
-                    float dv = cfg.gamma * (xyz.data()[base + c] - st.x0[base + c]);
-                    if (dv >  kap) dv =  kap;                  // ±κ 逐坐标截断（ℓ∞ 盒投影 ✓）
-                    if (dv < -kap) dv = -kap;
-                    basis[base + c] = st.x0[base + c] + dv;
+                    w[c] = cfg.gamma * (xyz.data()[base + c] - st.x0[base + c]);
+                    r2 += w[c] * w[c];
                 }
+                const float r = std::sqrt(r2);
+                const float s = (r > kap) ? (kap / r) : 1.f;    // r>κ>0 ⇒ 除法安全 ✓
+                clipped[gi] = (r >= kap) ? 1 : 0;               // Ω 判定的权威标志（同一次比较 ✓）
+                for (int c = 0; c < 3; ++c) basis[base + c] = st.x0[base + c] + s * w[c];
+                // ---- 旧实现（ℓ∞ 盒投影，2026-10-24 停用，保留备查）：仅当需要复现 2026-10-23 及更早的
+                //      L3 记录时取消下面注释并注释掉上面的球投影（两者不可同时生效 ✓）----
+                // for (int c = 0; c < 3; ++c) {
+                //     float dv = cfg.gamma * (xyz.data()[base + c] - st.x0[base + c]);
+                //     if (dv >  kap) dv =  kap;                // ±κ 逐坐标截断（ℓ∞ 盒投影 ✓）
+                //     if (dv < -kap) dv = -kap;
+                //     basis[base + c] = st.x0[base + c] + dv;
+                // }
             }
         }
         xg = basis.data();
+
+        if (cfg.debug) {
+            // 自检（不变量）：球投影后必须 ‖B_i−x⁰_i‖₂ ≤ κ_i（旧 ℓ∞ 盒在角点可达 √3·κ_i ✗）
+            //   clipped 用投影前的 r≥κ（权威）；这里的 rr 只用于报告"超出量"，被截断节点本应恰在球面上 ⇒
+            //   允许 float 级正残差（|rr−κ| ≤ ~1e-6·κ），超过 1e-4·κ 才说明投影本身写错 ✗
+            float viol = 0.f;
+            int64_t n_clip = 0, n_ball = 0;
+            for (int b = 0; b < B; ++b) {
+                for (int l = 0; l < L; ++l) {
+                    const size_t gi   = static_cast<size_t>(b) * L + l;
+                    const size_t base = ((static_cast<size_t>(b) * L + l) * 3 + 1) * 3;
+                    const float dx = basis[base]     - st.x0[base];
+                    const float dy = basis[base + 1] - st.x0[base + 1];
+                    const float dz = basis[base + 2] - st.x0[base + 2];
+                    const float rr = std::sqrt(dx * dx + dy * dy + dz * dz);
+                    viol = std::max(viol, rr - st.kappa[gi]);
+                    n_clip += clipped[gi] ? 1 : 0;
+                    n_ball += (rr >= st.kappa[gi]) ? 1 : 0;
+                }
+            }
+            std::fprintf(stderr, "[TOPO-L3] ball rclip: max(‖B−x⁰‖₂−κ)=%.3e clipped=%lld/%d "
+                                 "(r≥κ 复算=%lld) gamma=%.3f\n",
+                         viol, (long long)n_clip, B * L, (long long)n_ball, cfg.gamma);
+        }
     }
 
     // ---------- 之后每次：边集 = 冻结 E(x⁰)（L2 时按 Ω 局部替换）+ 基准几何（L3 ⇒ B ✓） ----------
@@ -749,7 +801,11 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                 const float dy = xg[base + 1] - st.x0[base + 1];
                 const float dz = xg[base + 2] - st.x0[base + 2];
                 const float disp = std::sqrt(dx * dx + dy * dy + dz * dz);
-                if (disp >= st.kappa[gi]) om[gi] = 1;
+                // L3（球投影）：被截断 ⇔ ‖B−x⁰‖ = κ（正好在球面）⇒ 用裁剪标志，避免舍入决定的刀口 ✓
+                // L1/L2：直接比欧氏位移（未投影 ✓，与旧实现逐位一致 ✓）
+                const bool over = clipped.empty() ? (disp >= st.kappa[gi])
+                                                  : (clipped[gi] != 0);
+                if (over) om[gi] = 1;
             }
         }
         // 2) Ω 邻居封闭（默认 ✓）：Ω ← Ω ∪ N(E(x⁰), Ω) —— 否则"邻居移动导致自己翻边"会被漏掉 ✗
