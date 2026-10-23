@@ -727,14 +727,52 @@ struct ExecWRec {
     long long nan = 0;
     long long inf = 0;
     double maxabs = 0.0;
+    int graph_id = -1;   // 所属图（子图）的短编号：每次 forward_graph 重建都会重新从 0 编号
+                         // 节点 ⇒ 只打印 @n16 会在"主图 n16"和"SE3 子图 n16"之间串台。
+    int graph_nnodes = 0;  // 该图节点数：编号只在进程内有序，跨运行对齐靠 (nnodes, op@n)
 };
 std::unordered_map<uintptr_t, ExecWRec>        g_exec_by_addr;
 std::unordered_map<const TensorF32*, ExecWRec> g_exec_by_tensor;
 
+// 当前正在计算的图（由各 backend 的 graph_compute 入口设置）+ 图→短编号映射。
+//   编号按首次出现顺序分配（g0、g1、…）。 编号只在本进程内稳定：CPU-only 与混合
+//   CUDA 两种运行的构图顺序不同（SE3 子图按需构建），同一个 g4 可能指不同的图。
+//   因此标签同时带上 **节点数**（`g4#2523`）：跨运行对齐应比较 (n_nodes, 首节点 op)，
+//   而不是编号本身。n_nodes 相同 + 同号节点 op 相同 ⇒ 基本可判定为同一张子图。
+uintptr_t g_exec_cur_graph = 0;
+int       g_exec_cur_nnodes = 0;
+// key = (图指针, 节点数)：子图每轮 rebuild 会把同一块地址归还再分配，
+//   只按指针做 key ⇒ 几十张不同子图全部显示成 g4（本机实测 16 张都挤在 g4）。
+//   带上 n_nodes 后，"同地址 + 同规模"（结构不变的重建）仍复用同一编号，
+//   结构变了就自动换新号。
+std::map<std::pair<uintptr_t, int>, int> g_exec_graph_ids;
+
+int exec_graph_id(uintptr_t g, int nnodes) {
+    if (!g) return -1;
+    const std::pair<uintptr_t, int> key(g, nnodes);
+    auto it = g_exec_graph_ids.find(key);
+    if (it != g_exec_graph_ids.end()) return it->second;
+    const int id = static_cast<int>(g_exec_graph_ids.size());
+    g_exec_graph_ids[key] = id;
+    return id;
+}
+
+int exec_graph_nnodes(uintptr_t /*g*/) { return g_exec_cur_nnodes; }
+
 }  // namespace
 
+// 对外接口必须留在匿名 namespace 之外（否则内部链接 ⇒ 其它 TU 链接失败）
+void exec_set_current_graph(const ComputeGraph* g) {
+    g_exec_cur_graph = reinterpret_cast<uintptr_t>(g);
+    g_exec_cur_nnodes = g ? static_cast<int>(g->n_nodes()) : 0;   // 供跨运行对齐（g4#26622）
+    if (g) exec_graph_id(g_exec_cur_graph, g_exec_cur_nnodes);    // 首次出现即分配编号
+}
+
 void exec_nan_check(const TensorF32* node, const char* backend_name, int node_idx) {
-    static const bool  on = (std::getenv("PPML_EXEC_NAN_CHECK") != nullptr);
+    // PPML_EXEC_TRACE 也在这里生效（2026-10-23）：以前只设 TRACE 不设 CHECK 时
+    //   整个函数直接 return，CPU 侧 trace 一行不出——排查时极易误判成"CPU 门控坏了"。
+    static const bool  on = (std::getenv("PPML_EXEC_NAN_CHECK") != nullptr) ||
+                            (std::getenv("PPML_EXEC_TRACE") != nullptr);
     if (!on || !node) return;
     static const float thr = [] {
         const char* e = std::getenv("PPML_EXEC_NAN");
@@ -769,8 +807,9 @@ void exec_nan_check(const TensorF32* node, const char* backend_name, int node_id
 
     if (traced(node_idx)) {
         fprintf(stderr,
-                "[EXEC-TRACE] backend=%s node=%d op=%d self=%p data=%p numel=%lld nan=%lld inf=%lld maxabs=%.4e "
+                "[EXEC-TRACE] g=%d#%d backend=%s node=%d op=%d self=%p data=%p numel=%lld nan=%lld inf=%lld maxabs=%.4e "
                 "dims=[%lld,%lld,%lld,%lld]\n",
+                exec_graph_id(g_exec_cur_graph, g_exec_cur_nnodes), g_exec_cur_nnodes,
                 backend_name ? backend_name : "?", node_idx, (int)node->op,
                 (const void*)node, (const void*)node->data(), (long long)node->numel(), nn, ni, mx,
                 (long long)(node->shape().ndim() > 0 ? node->shape().dims[0] : -1),
@@ -782,7 +821,8 @@ void exec_nan_check(const TensorF32* node, const char* backend_name, int node_id
 
     // 本节点 dst 刚写完 ⇒ 登记生产记录（对象级 + 地址级）
     {
-        ExecWRec rec{node, reinterpret_cast<uintptr_t>(node->data()), node_idx, (int)node->op, nn, ni, mx};
+        ExecWRec rec{node, reinterpret_cast<uintptr_t>(node->data()), node_idx, (int)node->op, nn, ni, mx,
+                     exec_graph_id(g_exec_cur_graph, g_exec_cur_nnodes), g_exec_cur_nnodes};
         g_exec_by_addr[rec.addr]   = rec;
         g_exec_by_tensor[node]     = rec;
     }
@@ -823,12 +863,13 @@ void exec_nan_check(const TensorF32* node, const char* backend_name, int node_id
         snprintf(srcbuf[i], sizeof(srcbuf[i]),
                  " src%d=(op=%d,data=%p,now[nan=%lld,inf=%lld,max=%.3e,min=%.3e,zero=%lld],"
                  "rebind=%d,was=%p,"
-                 "prod=%s(op%d@n%d,nan=%lld,inf=%lld,max=%.3e),"
-                 "addr_last_writer=%s(op%d@n%d))",
+                 "prod=%s(g%d#%d:op%d@n%d,nan=%lld,inf=%lld,max=%.3e),"
+                 "addr_last_writer=%s(g%d#%d:op%d@n%d))",
                  i, (int)s->op, (const void*)s->data(), snn, sni, smx, smin, szero,
                  rebind ? 1 : 0, (const void*)old_addr,
-                 has_prod ? "" : "NONE", pr.op, pr.node_idx, pr.nan, pr.inf, pr.maxabs,
-                 has_aw ? "" : "NONE", aw.op, aw.node_idx);
+                 has_prod ? "" : "NONE", pr.graph_id, pr.graph_nnodes, pr.op, pr.node_idx,
+                 pr.nan, pr.inf, pr.maxabs,
+                 has_aw ? "" : "NONE", aw.graph_id, aw.graph_nnodes, aw.op, aw.node_idx);
     }
 
     // DIV 分母溯源：src1 往往是 DUP/clamp/div 链的输出，沿 src[0] 上溯 6 层打印 op/numel/零值数，
@@ -877,6 +918,202 @@ void exec_nan_check(const TensorF32* node, const char* backend_name, int node_id
             al0, al1, srcbuf[0], srcbuf[1], srcbuf[2],
             divchain[0] ? " | div-chain:↓" : "");
     if (divchain[0]) fprintf(stderr, "           div-chain:%s\n", divchain);
+    fflush(stderr);
+}
+
+// ============================================================
+// exec_tensor_stat / exec_nan_check_in / exec_pem_*（诊断，默认关；2026-10-23）
+// ============================================================
+//   动机（本轮排查的两点）：
+//   ① "爆炸点前移"：PPML_EXEC_NAN 只在**kernel 输出**上判，命中时值已在某个 kernel
+//      内部生成 ⇒ 只知道"这个节点的输出大"，不知道输入是否已经大。exec_nan_check_in
+//      在 **dispatch 之前**扫输入，命中即报"该节点的输入已越线" + 生产者（谁写的这块
+//      显存）⇒ 首个命中直接指向**产出该值的 kernel**（比输出侧早一个节点）。
+//   ② "半写 kernel"：per_edge_matmul 三件套的 launch 参数 E 取的是 src 的最后一维，
+//      而 dst 的最后一维才是"应写多少行"。二者不等 ⇒ 尾部若干行**根本没被写过**，
+//      残留 gallocr 复用前的旧值（既不是 0 也不是本次结果）⇒ 下游爆量。
+//      exec_pem_shape_check 比对 E_launch vs E_required（半写的直接判据）；
+//      exec_pem_stat 打印输入/输出（同一个 dst 在 in 阶段看到的是**旧内容**）的
+//      零占比 + 非零均值，用于验证"尾部保持旧值 ⇒ 整体零占比/均值异常"。
+namespace {
+
+struct ExecTensorStat {
+    long long n = 0, nzero = 0, nnan = 0, ninf = 0;
+    double sum_abs = 0.0, maxabs = 0.0;
+};
+
+// 单张量统计（host 直读 / device 分块 D2H，同流有序 ⇒ 读到的是上一次 kernel 的结果）
+bool exec_tensor_stat(const TensorF32* t, ExecTensorStat* st) {
+    if (!t || !t->data() || t->numel() <= 0) return false;
+    const int64_t n = t->numel();
+    const float* dptr = static_cast<const float*>(t->data());
+    const bool dev = is_device_pointer(t, dptr);
+    static thread_local std::vector<float> chunk;
+    constexpr int64_t kChunk = 1 << 20;
+    for (int64_t off = 0; off < n; off += kChunk) {
+        const int64_t m = (off + kChunk <= n) ? kChunk : (n - off);
+        const float* p = nullptr;
+        if (dev) {
+            chunk.resize(static_cast<size_t>(m));
+            if (cudaMemcpy(chunk.data(), dptr + off, static_cast<size_t>(m) * sizeof(float),
+                           cudaMemcpyDeviceToHost) != cudaSuccess) {
+                cudaGetLastError();
+                return false;
+            }
+            p = chunk.data();
+        } else {
+            p = dptr + off;
+        }
+        for (int64_t k = 0; k < m; ++k) {
+            const float v = p[k];
+            st->n++;
+            if (std::isnan(v)) { st->nnan++; continue; }
+            if (!std::isfinite(v)) { st->ninf++; continue; }
+            const double a = std::fabs(static_cast<double>(v));
+            if (v == 0.0f) st->nzero++;
+            st->sum_abs += a;
+            if (a > st->maxabs) st->maxabs = a;
+        }
+    }
+    return st->n > 0;
+}
+
+void exec_fmt_stat(const TensorF32* t, char* buf, size_t sz) {
+    if (!t) { snprintf(buf, sz, "null"); return; }
+    ExecTensorStat s;
+    if (!exec_tensor_stat(t, &s)) {
+        snprintf(buf, sz, "op=%d numel=%lld no-data", (int)t->op, (long long)t->numel());
+        return;
+    }
+    const long long nz = s.n - s.nzero - s.nnan - s.ninf;
+    const double mean_nz = nz > 0 ? s.sum_abs / static_cast<double>(nz) : 0.0;
+    snprintf(buf, sz,
+             "op=%d numel=%lld zero=%.2f%% nz_mean_abs=%.4e max=%.4e nan=%lld inf=%lld",
+             (int)t->op, (long long)s.n,
+             100.0 * static_cast<double>(s.nzero) / static_cast<double>(s.n > 0 ? s.n : 1),
+             mean_nz, s.maxabs, s.nnan, s.ninf);
+}
+
+}  // namespace
+
+// 输入侧爆炸检查（PPML_EXEC_NAN_IN=1）：dispatch 之前扫 src，命中即报"输入已越线"。
+void exec_nan_check_in(const TensorF32* node, const char* backend_name, int node_idx) {
+    static const bool on = (std::getenv("PPML_EXEC_NAN_IN") != nullptr);
+    if (!on || !node || node->op == OP_NONE) return;
+    static const float thr = [] {
+        const char* e = std::getenv("PPML_EXEC_NAN");
+        return e ? static_cast<float>(std::atof(e)) : 1e6f;
+    }();
+    static const int max_print = [] {
+        const char* e = std::getenv("PPML_EXEC_NAN_MAX");
+        return e ? std::atoi(e) : 8;
+    }();
+    static int printed = 0;
+    if (printed >= max_print) return;
+    for (int i = 0; i < 3 && node->src[i]; ++i) {
+        const TensorF32* s = node->src[i];
+        long long nn = 0, ni = 0, fi = -1, nz = 0;
+        double mx = 0.0; float fb = 0.0f;
+        if (!exec_scan_tensor(s, thr, &nn, &ni, &mx, &fb, &fi, &nz)) continue;
+        if (nn == 0 && ni == 0 && fi < 0) continue;
+        ++printed;
+        ExecWRec pr{};
+        bool has = false;
+        auto it = g_exec_by_tensor.find(s);
+        if (it != g_exec_by_tensor.end()) { pr = it->second; has = true; }
+        fprintf(stderr,
+                "[EXEC-NAN-IN] #%d g=%d#%d backend=%s node=%d op=%d src%d: nan=%lld inf=%lld maxabs=%.4e "
+                "first_bad@%lld zero=%lld producer=%s(g%d#%d:op=%d@n%d,max=%.4e)\n",
+                printed, exec_graph_id(g_exec_cur_graph, g_exec_cur_nnodes), g_exec_cur_nnodes,
+                backend_name ? backend_name : "?", node_idx, (int)node->op, i,
+                nn, ni, mx, fi, nz,
+                has ? "" : "NONE", has ? pr.graph_id : -1, has ? pr.graph_nnodes : 0,
+                has ? pr.op : -1, has ? pr.node_idx : -1,
+                has ? pr.maxabs : 0.0);
+        fflush(stderr);
+        if (printed >= max_print) return;
+    }
+}
+
+// per_edge_matmul 三件套：E_launch vs E_required（半写判据）
+void exec_pem_shape_check(const TensorF32* node, const char* backend_name, int node_idx) {
+    static const bool on = (std::getenv("PPML_PEM_STAT") != nullptr ||
+                            std::getenv("PPML_PEM_SHAPE_CHECK") != nullptr);
+    if (!on || !node) return;
+    const int op = static_cast<int>(node->op);
+    const bool is_gather = (node->op == OP_EDGE_GATHER_ROWS);
+    if (!is_gather && node->op != OP_PER_EDGE_MATMUL &&
+        node->op != OP_PER_EDGE_MATMUL_BACK_KERNEL &&
+        node->op != OP_PER_EDGE_MATMUL_BACK_GATHERED) return;
+
+    const TensorF32* s0 = node->src[0];
+    const TensorF32* s1 = node->src[1];
+    const int nd = node->shape().ndim();
+    const int64_t E_req = (nd > 0) ? static_cast<int64_t>(node->shape().dims[nd - 1]) : -1;
+
+    int64_t E_launch = -1;
+    if (is_gather) {
+        // src_idx: (E,) → launch E = dims[0]
+        if (s1 && s1->shape().ndim() > 0) E_launch = s1->shape().dims[0];
+    } else if (node->op == OP_PER_EDGE_MATMUL) {
+        // kernel: [K,M,E] → launch E = dims[2]
+        if (s0 && s0->shape().ndim() > 2) E_launch = s0->shape().dims[2];
+    } else {
+        // 反向：grad: [M,E] → launch E = dims[1]
+        if (s0 && s0->shape().ndim() > 1) E_launch = s0->shape().dims[1];
+    }
+    if (E_launch == E_req) return;
+
+    // 半写：E_launch < E_req ⇒ dst 尾部 (E_req-E_launch) 行没被写过（残留旧值）
+    fprintf(stderr,
+            "[PEM-SHAPE] %s backend=%s node=%d op=%d E_launch=%lld E_required=%lld %s "
+            "dst{dims=[%lld,%lld,%lld,%lld] numel=%lld} src0{op=%d dims=[%lld,%lld,%lld,%lld] numel=%lld} "
+            "src1{op=%d dims=[%lld,%lld,%lld,%lld] numel=%lld}\n",
+            (E_launch < E_req) ? "HALF-WRITE" : "OVER-WRITE",
+            backend_name ? backend_name : "?", node_idx, op, (long long)E_launch, (long long)E_req,
+            (E_launch < E_req) ? "⇒ 尾部行未写(gallocr 复用旧值)" : "⇒ 越界写风险",
+            (long long)(nd > 0 ? node->shape().dims[0] : -1),
+            (long long)(nd > 1 ? node->shape().dims[1] : -1),
+            (long long)(nd > 2 ? node->shape().dims[2] : -1),
+            (long long)(nd > 3 ? node->shape().dims[3] : -1), (long long)node->numel(),
+            s0 ? (int)s0->op : -1,
+            (long long)(s0 && s0->shape().ndim() > 0 ? s0->shape().dims[0] : -1),
+            (long long)(s0 && s0->shape().ndim() > 1 ? s0->shape().dims[1] : -1),
+            (long long)(s0 && s0->shape().ndim() > 2 ? s0->shape().dims[2] : -1),
+            (long long)(s0 && s0->shape().ndim() > 3 ? s0->shape().dims[3] : -1),
+            (long long)(s0 ? s0->numel() : -1),
+            s1 ? (int)s1->op : -1,
+            (long long)(s1 && s1->shape().ndim() > 0 ? s1->shape().dims[0] : -1),
+            (long long)(s1 && s1->shape().ndim() > 1 ? s1->shape().dims[1] : -1),
+            (long long)(s1 && s1->shape().ndim() > 2 ? s1->shape().dims[2] : -1),
+            (long long)(s1 && s1->shape().ndim() > 3 ? s1->shape().dims[3] : -1),
+            (long long)(s1 ? s1->numel() : -1));
+    fflush(stderr);
+}
+
+// per_edge_matmul 三件套：输入/输出统计（PPML_PEM_STAT=1）
+//   stage="in"：dst 还是**上一轮内容**（未被本 kernel 覆盖的部分就是旧值）
+//   stage="out"：dst 已是本 kernel 结果 ⇒ 与 in 对比可看出"写了多少 / 是否半写"
+void exec_pem_stat(const TensorF32* node, const char* backend_name, int node_idx, const char* stage) {
+    static const bool on = (std::getenv("PPML_PEM_STAT") != nullptr);
+    if (!on || !node) return;
+    if (node->op != OP_EDGE_GATHER_ROWS && node->op != OP_PER_EDGE_MATMUL &&
+        node->op != OP_PER_EDGE_MATMUL_BACK_KERNEL &&
+        node->op != OP_PER_EDGE_MATMUL_BACK_GATHERED) return;
+    static const int max_print = [] {
+        const char* e = std::getenv("PPML_PEM_STAT_MAX");
+        return e ? std::atoi(e) : 48;
+    }();
+    static int printed = 0;
+    if (printed >= max_print) return;
+    ++printed;
+    char bd[256], b0[256], b1[256];
+    exec_fmt_stat(node, bd, sizeof(bd));
+    exec_fmt_stat(node->src[0], b0, sizeof(b0));
+    exec_fmt_stat(node->src[1], b1, sizeof(b1));
+    fprintf(stderr, "[PEM-STAT] %-3s backend=%s node=%d op=%d | dst{%s} | src0{%s} | src1{%s}\n",
+            stage, backend_name ? backend_name : "?", node_idx, static_cast<int>(node->op),
+            bd, b0, b1);
     fflush(stderr);
 }
 
@@ -1377,11 +1614,18 @@ void exec_probe_op(const TensorF32* node, const char* backend_name, int node_idx
     if (!c.on || !node) return;
     const int op = static_cast<int>(node->op);
     if (op < 0 || op >= 512 || !c.ops[op]) return;
-    if (c.max_print >= 0 && c.printed >= c.max_print) return;
-    ++c.printed;
+    // PPML_PROBE_ZERO=1（2026-10-23）：只报 dst 全零的节点。零值链的取证需要
+    //   看"零是继承来的还是写出来的"，但普通探针的打印预算会被前段正常节点耗尽
+    //   （g11#2 这类全零 leaf 拷贝出现在中后段），故加此过滤，不占 max_print 名额。
+    static const bool zero_only = (std::getenv("PPML_PROBE_ZERO") != nullptr);
+    if (!zero_only && c.max_print >= 0 && c.printed >= c.max_print) return;
     double min0 = 0.0, min1 = 0.0;
     const double max0 = probe_maxabs(node->src[0], &min0);
     const double max1 = probe_maxabs(node->src[1], &min1);
+    const double dst_max = probe_maxabs(node);
+    if (zero_only && dst_max != 0.0) return;
+    if (c.max_print >= 0 && c.printed >= c.max_print) return;
+    ++c.printed;
     std::fprintf(stderr,
                  "[PROBE] #%d backend=%s node=%d op=%d numel=%lld dims=[%lld,%lld,%lld,%lld] "
                  "dst_max=%.4e | src0(op=%d,numel=%lld,max=%.4e) "
@@ -1390,7 +1634,7 @@ void exec_probe_op(const TensorF32* node, const char* backend_name, int node_idx
                  (long long)node->numel(),
                  (long long)node->shape().dim(0), (long long)node->shape().dim(1),
                  (long long)node->shape().dim(2), (long long)node->shape().dim(3),
-                 probe_maxabs(node),
+                 dst_max,
                  node->src[0] ? (int)node->src[0]->op : -1,
                  node->src[0] ? (long long)node->src[0]->numel() : -1, max0,
                  node->src[1] ? (int)node->src[1]->op : -1,
@@ -2418,6 +2662,79 @@ Status BackendScheduler::graph_compute() {
                         (int)node->op);
                 }
                 backend_tensor_copy(src, cpy);
+
+                // ---- [XBK-STAT] 边界拷贝内容统计（PPML_XBK_STAT=1，2026-10-23）----
+                //   动机：混合 CUDA 里 `[EXEC-NAN] node=16 op=107(PER_EDGE_MATMUL) maxabs=4.37e6`
+                //   的 src0 是 op=1(OP_DUP) 边界拷贝张量，zero=237795 —— 而 CPU 侧同一逻辑
+                //   张量是稠密的。这里在**拷贝刚完成**时同时打印 src 与 cpy 的
+                //   零占比/非零均值/max ⇒ 直接区分：
+                //     (a) cpy 零占比 ≫ src  ⇒ 拷贝只写了一部分（nbytes/offs/staging 问题）；
+                //     (b) src 本身已是零/坏     ⇒ 问题在生产者，与跨端无关。
+                //   view_src/offs 一并打印：view 解析到 root 后再拷，最容易漏掉偏移。
+                if (getenv("PPML_XBK_STAT")) {
+                    static const int xbk_max = [] {
+                        const char* e = std::getenv("PPML_XBK_STAT_MAX");
+                        return e ? std::atoi(e) : 64;
+                    }();
+                    static int xbk_printed = 0;
+                    // 可选过滤：PPML_XBK_STAT_NUMEL=<n> 只看该 numel 的边界（大图避免刷屏）
+                    static const long long xbk_numel = [] () -> long long {
+                        const char* e = std::getenv("PPML_XBK_STAT_NUMEL");
+                        return e ? std::atoll(e) : -1;
+                    }();
+                    if (xbk_printed < xbk_max &&
+                        (xbk_numel < 0 || cpy->numel() == xbk_numel)) {
+                        ++xbk_printed;
+                        // 关键：backend_tensor_copy 内部会把 view 沿 view_src 解析到 root 再拷，
+                        // 且用的是 **root 的 nbytes**（Backend.cpp:1604-1613）。所以必须同时
+                        // 打印"真正被拷的那一份"（real = root）：
+                        //   real 与 cpy 一致 ⇒ 拷贝正确，问题在生产侧；
+                        //   real 稠密 / cpy 全零 ⇒ 拷贝没落地（staging/set_tensor 失败）；
+                        //   real_nbytes > cpy_nbytes ⇒ 目标 buffer 越界写（会污染邻居张量）。
+                        const TensorF32* rsrc = src;
+                        for (int g = 0; rsrc && rsrc->view_src && g < 64; ++g) rsrc = rsrc->view_src;
+                        char bs[256], bc[256], br[256];
+                        exec_fmt_stat(src, bs, sizeof(bs));
+                        exec_fmt_stat(rsrc, br, sizeof(br));
+                        exec_fmt_stat(cpy, bc, sizeof(bc));
+                        const size_t rn = rsrc ? static_cast<size_t>(rsrc->nbytes()) : 0;
+                        const size_t cn = static_cast<size_t>(cpy->nbytes());
+                        fprintf(stderr,
+                                "[XBK-STAT] #%d split=%d bk=%d src_op=%d view=%d src_buf_host=%d "
+                                "src_offs=%zu | src{%s} | real{op=%d nbytes=%zu %s} -> "
+                                "cpy{op=%d nbytes=%zu %s}%s\n",
+                                xbk_printed, si, sp.backend_id, (int)src->op,
+                                src->view_src ? 1 : 0,
+                                src->buffer_ ? (int)src->buffer_->is_host() : -1,
+                                static_cast<size_t>(src->buffer_offs_),
+                                bs, rsrc ? (int)rsrc->op : -1, rn, br,
+                                (int)cpy->op, cn, bc,
+                                (rn > cn) ? "  <<OVERRUN-RISK(real_nbytes>cpy_nbytes)" : "");
+                        fflush(stderr);
+                    }
+                }
+
+                // ---- 边界 cpy 登记生产者（2026-10-23）----
+                //   目的：让下游的 [EXEC-NAN-IN] 能顺着 cpy 追到**原始生产者**。
+                //   之前 cpy 张量不在 g_exec_by_tensor 里 ⇒ 报告 producer=NONE，
+                //   跨 split 的链路在边界处断掉（只能看到"值很大"，看不到"谁算的"）。
+                //   只在启用 exec 诊断时登记，避免无谓的哈希表增长。
+                if (std::getenv("PPML_EXEC_NAN_IN") || std::getenv("PPML_EXEC_NAN_CHECK")) {
+                    auto pit = g_exec_by_tensor.find(src);
+                    ExecWRec rec;
+                    if (pit != g_exec_by_tensor.end()) {
+                        rec = pit->second;          // 继承原生产者（op / node_idx / maxabs）
+                    } else {
+                        rec.op       = static_cast<int>(src->op);
+                        rec.node_idx = -1;          // 无记录 ⇒ 标源算子，但不谎报节点号
+                        rec.graph_id     = exec_graph_id(g_exec_cur_graph, g_exec_cur_nnodes);
+                        rec.graph_nnodes = g_exec_cur_nnodes;
+                    }
+                    rec.tensor = cpy;
+                    rec.addr   = reinterpret_cast<uintptr_t>(cpy->data());
+                    g_exec_by_tensor[cpy] = rec;
+                    if (rec.addr) g_exec_by_addr[rec.addr] = rec;
+                }
             }
         }
 

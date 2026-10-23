@@ -166,13 +166,17 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             // N-ary concat：遍历所有 src。
             // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致，
             // 该约束在 kernel_concat_cuda 内强制校验。
+            //   ⚠ none 槽（src[2..GGML_MAX_SRC-1] 默认 nullptr）必须跳过：早期写成
+            //     `if (!s || s->type != F32) return false`，任何 n-ary 节点（空槽存在）
+            //     都被判成不支持 ⇒ CONCAT 永远回落 CPU + 单后端模式刷 [CUDA-UNSUPPORTED]
+            //     误报（2026-10-24 修）。
             int n_src = 0;
-            for (const auto* s : node->src) if (s) n_src++;
-            if (n_src < 2) return false;
             for (const auto* s : node->src) {
-                if (!s || s->type != TENSOR_TYPE_F32) return false;
+                if (!s) continue;
+                if (s->type != TENSOR_TYPE_F32) return false;
+                ++n_src;
             }
-            return node->type == TENSOR_TYPE_F32;
+            return n_src >= 2 && node->type == TENSOR_TYPE_F32;
         }
 
         case OP_SOFT_MAX:
@@ -396,8 +400,103 @@ void CUDABackend::synchronize() {
 }
 
 // ===== graph_compute =====
+// ============================================================
+// 单后端全 GPU：host 输入的设备影子（2026-10-23）
+// ============================================================
+//   scheduler 模式下，build_splits 的 3c 分支会为"host 生产者 → GPU 消费者"建
+//   H2D cpy 节点（Backend.cpp:2449-2490）；**单后端全 GPU 路径没有 scheduler**，
+//   没有人做这次搬运 ⇒ 图内独有的 host 叶子（GET_ROWS 的权重 W、常量 mask 等）
+//   在 kernel 里是 host 指针 ⇒ 守卫判 HOST/INVALID 直接 NOT_SUPPORTED，
+//   上层把该节点算作"未执行"，loss 变成垃圾（实测 13.6 → -3.00，无任何报错）。
+//   这里补上这次搬运：每个 host 输入建一份设备影子，compute 结束释放并恢复原字段。
+bool CUDABackend::ensure_host_shadow(TensorF32* t) {
+    if (!t || !t->data()) return false;
+    // 已是 device ⇒ 无需影子（有 buffer 看 is_host；无 buffer 用属性探测兜底）
+    if (t->buffer_) {
+        if (!t->buffer_->is_host()) return true;
+    } else {
+        cudaPointerAttributes attr{};
+        const bool probe_ok =
+            (cudaPointerGetAttributes(&attr, t->data()) == cudaSuccess) &&
+            (attr.type == cudaMemoryTypeDevice || attr.type == cudaMemoryTypeManaged);
+        if (probe_ok) return true;
+        cudaGetLastError();   // 清掉探测产生的错误，避免污染后续 kernel 检查
+        // 探测失败 = host 指针（叶子 data_ 由 bind_leaf_data 绑到 host，buffer_ 为空）
+        // ⇒ **继续往下建影子**（不能 return false：op=41 的 src1 索引张量正是这种形态）
+    }
+
+    auto it = host_shadow_.find(t);
+    if (it == host_shadow_.end()) {
+        size_t bytes = static_cast<size_t>(t->nbytes());
+        if (bytes == 0) bytes = static_cast<size_t>(t->numel()) * sizeof(float);
+        if (bytes == 0) return false;
+        void* dev = nullptr;
+        if (cudaMalloc(&dev, bytes) != cudaSuccess) { cudaGetLastError(); return false; }
+        if (cudaMemcpy(dev, t->data(), bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaGetLastError();
+            cudaFree(dev);
+            return false;
+        }
+        host_shadow_[t] = dev;
+        host_shadow_saved_.push_back(HostShadowSaved{t, t->data(), t->buffer_, t->buffer_offs_});
+        if (getenv("GRAPH_DEBUG_CUDA_SHADOW")) {
+            fprintf(stderr, "[cuda-shadow] tensor=%p op=%d numel=%lld bytes=%zu → dev=%p\n",
+                    (void*)t, (int)t->op, (long long)t->numel(), bytes, dev);
+        }
+        it = host_shadow_.find(t);
+    }
+    // 重绑到影子：buffer_ 必须清空 —— 否则守卫的 INCONSISTENT 判定
+    // （"data 是 device 但 buffer_->is_host()==true"）会把这份影子误报成 view 错位。
+    t->bind_data(it->second);
+    t->buffer_      = nullptr;
+    t->buffer_offs_ = 0;
+    return true;
+}
+
+void CUDABackend::release_host_shadows() {
+    for (auto& s : host_shadow_saved_) {
+        if (!s.t) continue;
+        s.t->bind_data(s.data);
+        s.t->buffer_      = s.buf;
+        s.t->buffer_offs_ = s.offs;
+    }
+    for (auto& kv : host_shadow_) {
+        if (kv.second) cudaFree(kv.second);
+    }
+    host_shadow_.clear();
+    host_shadow_saved_.clear();
+}
+
+// 少数"CUDA 无 kernel"的算子名（只用于把 [CUDA-UNSUPPORTED] 日志从数字变成可读名字；
+//   其余算子返回 "?"：日志里同时打印 op 编号，仍可在枚举里查到）
+static const char* cuda_op_name(int op) {
+    switch (op) {
+        case OP_CONCAT:                  return "CONCAT";
+        case OP_GET_ROWS:                return "GET_ROWS";
+        case OP_TRI_MUL:                 return "TRI_MUL";
+        case OP_TRI_MUL_BACK:            return "TRI_MUL_BACK";
+        case OP_OUTER_PROD_MEAN:         return "OUTER_PROD_MEAN";
+        case OP_OUTER_PROD_MEAN_BACK:    return "OUTER_PROD_MEAN_BACK";
+        case OP_OUTER_PROD:              return "OUTER_PROD";
+        case OP_OUTER_PROD_BACK:         return "OUTER_PROD_BACK";
+        case OP_FAPE:                    return "FAPE";
+        case OP_FAPE_BACK:               return "FAPE_BACK";
+        case OP_EDGE_GATHER_ROWS:        return "EDGE_GATHER_ROWS";
+        case OP_PER_EDGE_MATMUL:         return "PER_EDGE_MATMUL";
+        case OP_SCATTER_ADD:             return "SCATTER_ADD";
+        case OP_PER_EDGE_MATMUL_BACK_KERNEL:   return "PER_EDGE_MATMUL_BACK_KERNEL";
+        case OP_PER_EDGE_MATMUL_BACK_GATHERED: return "PER_EDGE_MATMUL_BACK_GATHERED";
+        case OP_CONCAT_BACK:             return "CONCAT_BACK";
+        case OP_RELU_BACK:               return "RELU_BACK";
+        case OP_ACT_MUL:                 return "ACT_MUL";
+        default:                         return "?";
+    }
+}
+
 Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
     cudaSetDevice(device_id_);
+    // 诊断：标记"当前图"（子图编号见 exec_set_current_graph 注释）
+    exec_set_current_graph(cgraph);
 
     // 生产者代际断言（PPML_STALE_CHECK=1）：每轮执行起一个新代际，并登记本图 node/leaf。
     //   scheduler 驱动 split 时 sched_depth>0 ⇒ 此处不另起代际（由 scheduler 统一起）。
@@ -444,6 +543,12 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
         }
     }
 
+    // 设备影子作用域：任何返回路径（含 NOT_SUPPORTED / ALLOC 失败）都会恢复张量原字段
+    struct HostShadowScope {
+        CUDABackend* self;
+        ~HostShadowScope() { self->release_host_shadows(); }
+    } host_shadow_scope{this};
+
     int cuda_dispatch_cnt = 0;
     int cuda_dispatch_op = -1;
     for (int node_n = 0; node_n < cgraph->n_nodes(); node_n++) {
@@ -483,6 +588,34 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
                 src->bind_data(base->data());
                 src->buffer_      = base->buffer_;
                 src->buffer_offs_ = base->buffer_offs_;
+            }
+        }
+
+        // ---- host 叶子 → 设备影子（仅单后端全 GPU；scheduler 由 build_splits 建 H2D cpy）----
+        //   skip_alloc_=true 表示由 scheduler 驱动 ⇒ 跨端搬运已由图中的 cpy 节点负责，
+        //   这里再补一次会变成双份搬运（且掩盖 cpy 漏建的问题）⇒ 只在单后端模式生效。
+        if (!skip_alloc_) {
+            for (int s = 0; s < GGML_MAX_SRC; s++) {
+                TensorF32* src = node->src[s];
+                if (!src || !src->data()) continue;
+                ensure_host_shadow(src);   // 失败 ⇒ 保持原样，由下面的守卫给出明确报错
+            }
+        }
+
+        // ---- 单后端模式：无 CPU 回落的显式护栏（2026-10-23）----
+        //   实测（PPML_CUDA_SCHED=0 + PPML_CUDA_MIN_FREE_MB=1024）：op=102 (OP_TRI_MUL_BACK)
+        //   在 CUDA 后端**没有 kernel**，dispatch 返回 NOT_SUPPORTED ⇒ 该节点不执行、
+        //   图被静默截断 ⇒ loss 从 13.6 变 -3.00（无任何报错）。scheduler 模式靠
+        //   supports_op 把它派给 CPU 所以不会暴露；单后端模式必须显式说明。
+        if (!skip_alloc_ && node->op != OP_NONE && !supports_op(node)) {
+            static int n_warn = 0;
+            if (n_warn++ < 8) {
+                fprintf(stderr,
+                        "[CUDA-UNSUPPORTED] op=%d(%s) (node %d) 无 CUDA kernel —— 单后端全 GPU 模式"
+                        "**没有 CPU 回落**，该节点不会被执行（后续 loss 不可信）。"
+                        "改用 PPML_CUDA_SCHED=1 让调度器把它派给 CPU。\n",
+                        (int)node->op, cuda_op_name((int)node->op), node_n);
+                fflush(stderr);
             }
         }
 
@@ -649,6 +782,11 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
         }
         // 生产者代际断言（PPML_STALE_CHECK=1）：消费前校验 src 是否本代际写过
         exec_stale_check(node, "CUDA", node_n);
+        // 输入侧爆炸检查（PPML_EXEC_NAN_IN=1）：爆炸点前移到 kernel 之前
+        exec_nan_check_in(node, "CUDA", node_n);
+        // per_edge_matmul 三件套：半写判据 + 输入/输出统计（PPML_PEM_STAT=1）
+        exec_pem_shape_check(node, "CUDA", node_n);
+        exec_pem_stat(node, "CUDA", node_n, "in");
         Status st = dispatch_node(node, &params);
         exec_stale_mark(node);   // 本节点算完 ⇒ 记为"本代际已写"（CUDA 单线程，无需 ith 门控）
         if (getenv("GRAPH_DEBUG_CUDA_OP")) {
@@ -660,6 +798,7 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
         // 执行期 NaN/爆炸检查（PPML_EXEC_NAN_CHECK=1）：紧跟本节点 kernel，按执行顺序
         //   报告第一个坏节点 ⇒ 直接定位"第一个产生 NaN/Inf 的 CUDA kernel"。
         exec_nan_check(node, "CUDA", node_n);
+        exec_pem_stat(node, "CUDA", node_n, "out");   // per_edge_matmul 实际写出内容（PPML_PEM_STAT=1）
         exec_probe_op(node, "CUDA", node_n);   // 定点算子探针（PPML_PROBE_OP=...）
         exec_view_probe(node, "CUDA", node_n);   // view 别名消费探针（PPML_EXEC_VIEW_PROBE=1）
         exec_ab_check(node, "CUDA", node_n);     // 单节点 CPU/GPU 数值 A/B（PPML_AB_CHECK=1）

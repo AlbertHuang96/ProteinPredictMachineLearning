@@ -157,10 +157,10 @@ GraphData make_graph(const TensorF32& xyz,
 struct TopoRefineCfg {
     bool  l1      = false;   // 冻结边索引 + 实时几何 ✓
     bool  l2      = false;   // margin 门控局部重算 ✓
-    bool  l3      = false;   // ★ 阻尼 + 信任域基准 B = x⁰ + clamp(γ(x−x⁰), ±κ) ✓（见下 ✓）
+    bool  l3      = false;   // ★ 阻尼 + 信任域基准 B = x⁰ + rclip_κ(γ(x−x⁰)) ✓（逐节点 ℓ2 球，见下 ✓）
     bool  closure = true;    // L2 的 Ω 邻居封闭（默认开 ✓，附录 A.4.3 推论 3 ✓）
     float sigma   = 0.5f;    // κ_i = σ·m_i/2 ✓（σ≤1/2 = "可证不翻边"；σ≈2~4 = "追踪真值" ✓）
-    float gamma   = 1.0f;    // L3 的回放阻尼 ✓（γ=1 纯 clamp；γ<1 滞后跟踪 ✓；γ=0 ⇒ 冻结基准 ✓）
+    float gamma   = 1.0f;    // L3 的回放阻尼 ✓（γ=1 纯球投影；γ<1 滞后跟踪 ✓；γ=0 ⇒ 冻结基准 ✓）
     bool  debug   = false;   // 打印 [TOPO-L1/L2/L3] 统计 ✓
 };
 

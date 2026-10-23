@@ -7,6 +7,93 @@
 
 namespace ppml {
 
+// ============================================================
+// 索引合法性统计（PPML_IDX_CHECK=1，2026-10-23）
+// ============================================================
+//   动机：edge_gather_rows_kernel / scatter_add_kernel 对 idx **没有任何范围检查**
+//   （kernel 里 `int i = (int)idx[e]` 直接用）。坏索引（NaN / 负数 / ≥N / 未初始化全零）
+//   会造成两种现象，正好覆盖我们观测到的两条：
+//     ① 越界读落到"干净"区域 ⇒ 取出 0 ⇒ 下游 PEM 输入 100% 零（XBK-STAT 已证实
+//        边界拷贝是忠实的，零是生产者产出的）；
+//     ② 越界读落到别的张量 ⇒ 取出 4e6 量级的垃圾 ⇒ 偶发巨大值。
+//   统计：nan / neg / geN / min / max + 前 8 个非法位置。
+//   PPML_IDX_FIX=1：把非法索引夹到 [0,N-1] 后写回（仅诊断，用于验证"修好索引后
+//   现象是否消失"）。上限 PPML_IDX_CHECK_MAX（默认 32 条）。
+static void idx_check_cuda(const TensorF32* idx_t, int N, const char* tag, const void* node) {
+    static const bool on = (std::getenv("PPML_IDX_CHECK") != nullptr);
+    if (!on || !idx_t || !idx_t->data()) return;
+    const int E = static_cast<int>(idx_t->shape().dims[0]);
+    if (E <= 0) return;
+    static const int max_print = [] {
+        const char* e = std::getenv("PPML_IDX_CHECK_MAX");
+        return e ? std::atoi(e) : 32;
+    }();
+    static int printed = 0;
+    if (printed >= max_print) return;
+
+    std::vector<float> h(static_cast<size_t>(E));
+    cudaPointerAttributes pa{};
+    const bool dev = (cudaPointerGetAttributes(&pa, idx_t->data()) == cudaSuccess) &&
+                     (pa.type == cudaMemoryTypeDevice || pa.type == cudaMemoryTypeManaged);
+    if (dev) {
+        if (cudaMemcpy(h.data(), idx_t->data(), sizeof(float) * static_cast<size_t>(E),
+                       cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaGetLastError();
+            return;
+        }
+    } else {
+        cudaGetLastError();
+        std::memcpy(h.data(), idx_t->data(), sizeof(float) * static_cast<size_t>(E));
+    }
+
+    long long n_nan = 0, n_neg = 0, n_ge = 0;
+    double mn = 1e300, mx = -1e300;
+    std::vector<int>   bad_pos;
+    std::vector<float> bad_val;
+    const bool fix = (std::getenv("PPML_IDX_FIX") != nullptr);
+    int n_fixed = 0;
+    for (int e = 0; e < E; ++e) {
+        const float v = h[e];
+        bool bad = false;
+        if (std::isnan(v)) {
+            ++n_nan;
+            bad = true;
+        } else {
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            if (v < 0.0f) { ++n_neg; bad = true; }
+            else if (v >= static_cast<float>(N)) { ++n_ge; bad = true; }
+        }
+        if (bad && static_cast<int>(bad_pos.size()) < 8) {
+            bad_pos.push_back(e);
+            bad_val.push_back(v);
+        }
+        if (bad && fix) {
+            h[e] = std::isnan(v) ? 0.0f : (v < 0.0f ? 0.0f
+                        : static_cast<float>(N > 0 ? N - 1 : 0));
+            ++n_fixed;
+        }
+    }
+    ++printed;
+    fprintf(stderr, "[IDX-STAT] %-11s node=%p E=%d N=%d nan=%lld neg=%lld geN=%lld min=%.0f max=%.0f%s",
+            tag, node, E, N, n_nan, n_neg, n_ge,
+            (mn < 1e299 ? mn : 0.0), (mx > -1e299 ? mx : 0.0), fix ? " (FIX ON)" : "");
+    for (size_t i = 0; i < bad_pos.size(); ++i) {
+        fprintf(stderr, " bad[%d]=%.0f", bad_pos[i], bad_val[i]);
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
+    if (fix && n_fixed > 0) {
+        if (dev) {
+            cudaMemcpy(const_cast<float*>(idx_t->data()), h.data(),
+                       sizeof(float) * static_cast<size_t>(E), cudaMemcpyHostToDevice);
+        } else {
+            std::memcpy(const_cast<float*>(idx_t->data()), h.data(),
+                        sizeof(float) * static_cast<size_t>(E));
+        }
+    }
+}
+
 // ===== CUDA kernel forward declarations (implemented in src/cuda/CUDAKernels.cu) =====
 extern void layernorm_forward_cuda(
     float * out,   float * mean,  float * rstd,
@@ -1199,6 +1286,7 @@ void CUDABackend::kernel_edge_gather_rows_cuda(TensorF32 * node, ComputeParams *
     const int C = static_cast<int>(node_feat->shape().dims[0]);
     const int N = static_cast<int>(node_feat->shape().dims[1]);
     const int E = static_cast<int>(src_idx->shape().dims[0]);
+    idx_check_cuda(src_idx, N, "edge_gather", node);   // PPML_IDX_CHECK=1（越界读 = 零/垃圾两条链的源头）
     edge_gather_rows_cuda(node_feat->data(), src_idx->data(), node->data(), N, C, E);
 }
 
@@ -1219,6 +1307,7 @@ void CUDABackend::kernel_scatter_add_cuda(TensorF32 * node, ComputeParams * p) {
     const int N = node->op_params[0];
     const int M = static_cast<int>(msg->shape().dims[0]);
     const int E = static_cast<int>(msg->shape().dims[1]);
+    idx_check_cuda(tgt_idx, N, "scatter_add", node);   // PPML_IDX_CHECK=1（越界 atomicAdd 会写坏邻居张量）
     //  诊断（GRAPH_DEBUG_CUDA_SCATTER=1）：打印 scatter_add 实际 launch 参数与指针状态，
     //    定位 [CUDA-ERR] op=108(OP_SCATTER_ADD) invalid argument 根因（grid 超限 / 指针非法）。
     if (getenv("GRAPH_DEBUG_CUDA_SCATTER")) {

@@ -25,6 +25,26 @@ namespace {
 // 只 memcpy dims[1] 个 float），而目标 query 行在 dims[2]（N 序列维），无法正确
 // 4D 切片。改为掩码广播，全部复用已验证 kernel：
 //   unsqueeze / view / repeat / mul / add_impl。
+// [SE3WIRE] PPML_SE3_WIRE=1（2026-10-23）：打印 SE3 edge_w 构图链的指针/op/numel。
+//   用途：判定"图里消费的张量是不是值 leaf 本身"。若 self 与 [VLEAF] 打印的 leaf 指针
+//   相同，说明接线正确、问题在下游 dispatch；若不同（或链路中出现 op=1 的 DUP 且其
+//   src0 另有所指），说明 leaf 被跨代张量顶替。
+void se3_wire_dbg(const char* tag, const TensorF32* t) {
+    static const bool on = (std::getenv("PPML_SE3_WIRE") != nullptr);
+    if (!on) return;
+    char d0[128] = "nil";
+    if (t && t->src[0]) {
+        const TensorF32* s = t->src[0];
+        std::snprintf(d0, sizeof(d0), "op%d/numel%lld/self%p/src0=%p",
+                      (int)s->op, (long long)s->numel(), (const void*)s, (const void*)s->src[0]);
+    }
+    std::fprintf(stderr, "[SE3WIRE] %-12s self=%p op=%d numel=%lld src0[%s] src1=%p\n",
+                 tag, (const void*)t, t ? (int)t->op : -1,
+                 t ? (long long)t->numel() : -1LL, d0,
+                 (t && t->src[1]) ? (const void*)t->src[1] : nullptr);
+    std::fflush(stderr);
+}
+
 TensorF32* query_row_add_graph(TensorF32* msa, TensorF32* proj_state) {
     const int64_t D = msa->shape().dims[0];  // D_MSA
     const int64_t L = msa->shape().dims[1];
@@ -153,6 +173,14 @@ void compute_and_read(TensorF32* node, TensorF32& dst,
         fprintf(stderr, "[CAR] op=%d numel=%lld -> build_forward_expand\n",
                 (int)node->op, (long long)node->numel());
     }
+    // 【方案 a，2026-10-23】每次值回落都用"从零重建"的子图。
+    //   原先是 build_forward_expand(expand=true) 在图对象上增量累积 nodes[]/visited；
+    //   值版 SE3（PPML_SE3_VALUE_DRIVE=1）下同一 cgraph 被多次复用，已访问节点不再入图，
+    //   而 gallocr 每轮 graph_compute 都会 release → 这类节点既不在 nodes[]（不执行）
+    //   也拿不到新 buffer，消费者读到零页（实测：MUL_MAT 的 DUP 输入恒为 0 ⇒
+    //   pair→edge_w 全零 ⇒ op=106/107 全零的门控支路）。
+    //   graph_clear() 等价 build_forward_impl(expand=false)：清 nodes/leafs + visited 复位。
+    cgraph->graph_clear();
     cgraph->build_forward_expand(node);
     if (getenv("GRAPH_DEBUG_DISPATCH")) {
         fprintf(stderr, "[CAR] op=%d numel=%lld -> graph_compute (n_nodes=%d)\n",
@@ -1054,8 +1082,13 @@ std::vector<TensorF32*> IterBlock::run_se3_graph(TensorF32*& msa, TensorF32*& pa
     // edge_pair_idx[e] = b*L*L + i*L + j（b=src/L, i=src%L, j=tgt%L，与 make_graph 的
     // pair[b,i,j,:] 索引 (b*L+i)*L+j 一致）。
     const int64_t LLB   = static_cast<int64_t>(L) * L * B;     // 节点空间 L*L*B
-    TensorF32* edge_feat_g = norm_edge_3d_->forward(
-        embed_e_->forward_graph(norm_pair_3d_->forward(pair))); // [ITER_EDGE_3D_OUT,L,L,B]
+    se3_wire_dbg("iter/pair", pair);
+    TensorF32* pair_n3_g = norm_pair_3d_->forward(pair);
+    se3_wire_dbg("iter/normpair", pair_n3_g);
+    TensorF32* e_g = embed_e_->forward_graph(pair_n3_g);
+    se3_wire_dbg("iter/embed_e", e_g);
+    TensorF32* edge_feat_g = norm_edge_3d_->forward(e_g);      // [ITER_EDGE_3D_OUT,L,L,B]
+    se3_wire_dbg("iter/normedge", edge_feat_g);
     TensorF32* edge_feat_flat = view(edge_feat_g,
         Shape({edge_feat_g->shape().dims[0], LLB}));            // [ITER_EDGE_3D_OUT, L*L*B]
     // 边索引常量（host 值：b*L*L + src%L*L + tgt%L）
@@ -1984,8 +2017,13 @@ std::vector<TensorF32*> RefineBlock::run_se3_graph_refine(TensorF32*& msa, Tenso
     // 暂不注入 rbf/neighbor 增强特征，阶段2 补全）。pair [D_PAIR,L,L,B] → [N_EDGE_FEATS,L,L,B]
     // → view [N_EDGE_FEATS, L*L*B] → edge_gather_rows → [N_EDGE_FEATS, E]。
     const int64_t LLB   = static_cast<int64_t>(L) * L * B;     // 节点空间 L*L*B
-    TensorF32* edge_feat_g = norm_edge1_->forward(
-        embed_e1_->forward_graph(norm_pair_->forward(pair)));  // [N_EDGE_FEATS,L,L,B]
+    se3_wire_dbg("ref/pair", pair);
+    TensorF32* pair_n_g = norm_pair_->forward(pair);
+    se3_wire_dbg("ref/normpair", pair_n_g);
+    TensorF32* e1_g = embed_e1_->forward_graph(pair_n_g);
+    se3_wire_dbg("ref/embed_e1", e1_g);
+    TensorF32* edge_feat_g = norm_edge1_->forward(e1_g);       // [N_EDGE_FEATS,L,L,B]
+    se3_wire_dbg("ref/normedge1", edge_feat_g);
     TensorF32* edge_feat_flat = view(edge_feat_g,
         Shape({edge_feat_g->shape().dims[0], LLB}));           // [N_EDGE_FEATS, L*L*B]
     // 边索引常量（host 值：b*L*L + src%L*L + tgt%L）
@@ -3216,12 +3254,46 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     TensorF32 vmsa, vpair, vstate;          // 值版主干 msa/pair/state（值 row-major 布局）
     TensorF32 vmsa_full;                    // extra(FullBlock) 用 msa_full 值
     // 值 → 图 leaf（值 dims 逆序即图 ggml dims：值 (B,N,L,D) = 图 [D,L,N,B]）
-    auto val_to_graph_leaf = [&](const TensorF32& v) -> TensorF32* {
+    // PPML_VLEAF_STAT=1（2026-10-23）：打印送入 leaf 的值张量统计。用于区分两种
+    //   全零成因：值版本体就是零（上游 pair/msa 链），还是 leaf bind 接错（值非零但
+    //   图里读到零）。零值链取证的决定性一行。
+    auto val_to_graph_leaf = [&](const TensorF32& v, const char* tag = nullptr) -> TensorF32* {
+        static const bool vstat = (std::getenv("PPML_VLEAF_STAT") != nullptr);
+        if (vstat && tag) {
+            const float* vp = static_cast<const float*>(v.data());
+            const int64_t nv = v.numel();
+            long long nz = 0;
+            float vmn = 0.0f, vmx = 0.0f;
+            for (int64_t i = 0; vp && i < nv; ++i) {
+                const float x = vp[i];
+                if (x == 0.0f) { ++nz; continue; }
+                if (x < vmn) vmn = x;
+                if (x > vmx) vmx = x;
+            }
+            const double amax = (vmx > -vmn) ? (double)vmx : -(double)vmn;
+            const int nd = (int)v.shape().ndim();
+            std::fprintf(stderr,
+                         "[VLEAF] %s numel=%lld ndim=%d dims=[%lld,%lld,%lld,%lld] maxabs=%.4e zero=%.2f%%\n",
+                         tag, (long long)nv, nd,
+                         (long long)(nd > 0 ? v.shape().dims[0] : -1),
+                         (long long)(nd > 1 ? v.shape().dims[1] : -1),
+                         (long long)(nd > 2 ? v.shape().dims[2] : -1),
+                         (long long)(nd > 3 ? v.shape().dims[3] : -1),
+                         amax, nv > 0 ? 100.0 * (double)nz / (double)nv : 0.0);
+            std::fflush(stderr);
+        }
         if (v.numel() == 0 || !v.data()) return nullptr;
         std::vector<int64_t> gd;
         const Shape& s = v.shape();
         for (int i = (int)s.ndim() - 1; i >= 0; --i) gd.push_back(s.dims[i]);
-        return wrap_input_as_leaf(v, gd);
+        TensorF32* leaf = wrap_input_as_leaf(v, gd);
+        if (vstat && tag) {
+            std::fprintf(stderr, "[VLEAF] %s leaf=%p value_data=%p first=%.6g\n",
+                         tag, (const void*)leaf, (const void*)v.data(),
+                         static_cast<const float*>(v.data())[0]);
+            std::fflush(stderr);
+        }
+        return leaf;
     };
     if (kValDrive) {
         // ---- 初始值：物化主图 msa/pair/state 初始 embedding 图节点（与图版同源同权重）----
@@ -3275,8 +3347,8 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         TensorF32* vleaf_pair = nullptr;
         if (kValDrive) {
             // [方案A] SE3 构图输入改用值 leaf（值版主干 vmsa/vpair）→ 子图不再重算 backbone
-            vleaf_msa  = val_to_graph_leaf(vmsa);
-            vleaf_pair = val_to_graph_leaf(vpair);
+            vleaf_msa  = val_to_graph_leaf(vmsa, "vmsa");
+            vleaf_pair = val_to_graph_leaf(vpair, "vpair");
             se3_out = (vleaf_msa && vleaf_pair) ? blk->run_se3_structural(
                 vleaf_msa, vleaf_pair, rbf, state, current_coords, input.residx, seq1hot,
                 &topo_cfg, &topo_st)                                   // 【L1/L2】✓（关时零变化 ✓）
@@ -3392,8 +3464,8 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
         TensorF32* vleaf_pair = nullptr;
         if (kValDrive) {
             // [方案A] SE3 构图输入改用值 leaf（值版主干 vmsa/vpair）→ 子图不再重算 backbone
-            vleaf_msa  = val_to_graph_leaf(vmsa);
-            vleaf_pair = val_to_graph_leaf(vpair);
+            vleaf_msa  = val_to_graph_leaf(vmsa, "vmsa");
+            vleaf_pair = val_to_graph_leaf(vpair, "vpair");
             se3_out = (vleaf_msa && vleaf_pair) ? blk->run_se3_structural_refine(
                 vleaf_msa, vleaf_pair, rbf, state, current_coords, input.residx, seq1hot,
                 &topo_cfg, &topo_st)                                   // 【L1/L2】✓（与 iter 共用状态 ✓）

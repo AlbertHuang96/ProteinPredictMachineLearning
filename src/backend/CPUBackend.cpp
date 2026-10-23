@@ -178,6 +178,8 @@ Status CPUBackend::graph_compute(ComputeGraph * cgraph) {
     // 生产者代际断言（PPML_STALE_CHECK=1）：每轮执行起一个新代际，并登记本图 node/leaf。
     //   scheduler 驱动 split 时 sched_depth>0 ⇒ 此处不另起代际（由 scheduler 统一起）。
     exec_stale_pass_begin(cgraph);
+    // 诊断：标记"当前图"，让 [EXEC-NAN]/[EXEC-NAN-IN] 的 prod=(g?@n?) 不再跨子图串台
+    exec_set_current_graph(cgraph);
 
     // ---- no_alloc 延迟分配：对 data_==nullptr 的中间节点分配 backend buffer ----
     // 混训时 scheduler 已通过 reserve_graph_memory 预分配了全部张量，置 skip_alloc_=true，
@@ -576,6 +578,12 @@ void CPUBackend::compute_thread(ThreadState * state) {
 
         // 生产者代际断言（PPML_STALE_CHECK=1）：消费前校验 src 是否本代际写过
         if (ith == 0) exec_stale_check(node, "CPU", node_n);
+        // 输入侧爆炸检查 + per_edge_matmul 诊断（2026-10-23；退化到 CPU 的节点也要能对照）
+        if (ith == 0) {
+            exec_nan_check_in(node, "CPU", node_n);
+            exec_pem_shape_check(node, "CPU", node_n);
+            exec_pem_stat(node, "CPU", node_n, "in");
+        }
         dispatch_node(node, &params);
         if (ith == 0) exec_stale_mark(node);   // 本节点算完 ⇒ 记为"本代际已写"（只由 0 号线程写表）
 
@@ -594,6 +602,7 @@ void CPUBackend::compute_thread(ThreadState * state) {
         //   多线程下会读到"别的线程还在写"的部分数据（实测 src0 被误报为 nan=804/inf=268，
         //   单线程同一位置是干净的 6.3e5）✗。故最后一个节点挪到循环后的公共 barrier 之后再查。
         if (ith == 0 && node_n + 1 < cgraph->n_nodes()) exec_nan_check(node, "CPU", node_n);
+        if (ith == 0) exec_pem_stat(node, "CPU", node_n, "out");   // PPML_PEM_STAT=1
         // 定点算子探针（PPML_PROBE_OP=8,51,...）：按 op 对齐 CPU/CUDA 两条路径的量级
         if (ith == 0) exec_probe_op(node, "CPU", node_n);
         // view 别名消费探针（PPML_EXEC_VIEW_PROBE=1，2026-10-20）
