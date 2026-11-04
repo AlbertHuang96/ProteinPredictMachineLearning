@@ -677,6 +677,15 @@ TensorF32* reshape(TensorF32* a, const Shape& new_shape) {
         ne[i] = new_shape.dims[i];
     }
     TensorF32* result = context().new_tensor<float>(static_cast<int>(new_shape.dims.size()), ne);
+    // 【2026-10-24 方案 A】这里**刻意不置 view_src**（与 view() 不同，别再"顺手补齐"）：
+    //   置了会连带改掉 CPU 侧语义 —— kernel_cpy 走零拷贝绑定分支后，reshape 的消费者改读
+    //   "根在**消费时刻**的值"，而现状读的是"reshape 执行时刻的**拷贝快照**"。本机实测两者
+    //   系统性不同（L=51 / seed=1：chi 6.09→4.18、distogram 16.21→17.22、loss 14.25→13.59）
+    //   ⇒ 整条 CPU 基线作废。
+    //   混合 CUDA 的真问题是"CUDA 消费者拿不到根的设备指针"（reshape 的私有 buffer 是 host，
+    //   CUDA 内核裸读 ⇒ [CUDA-GUARD] 整图 ABORTED，1AKE L=214 的 exit 3）。该问题改为在
+    //   **解析侧**修：CUDABackend::graph_compute 的 view 解析循环 / backend_tensor_copy /
+    //   CUDA-GUARD 均支持 view_src==nullptr 的 OP_VIEW/OP_RESHAPE 沿 src[0] 解析到根。
     result->op     = OP_RESHAPE;
     result->src[0] = a;
     return result;
@@ -733,7 +742,7 @@ TensorF32* unsqueeze(TensorF32* a, int dim) {
         }
     }
     TensorF32* result = context().new_tensor<float>(ndim + 1, ne);
-    result->op     = OP_RESHAPE;  // unsqueeze 本质是 reshape
+    result->op     = OP_RESHAPE;  // unsqueeze 本质是 reshape（不置 view_src，理由见 reshape()）
     result->src[0] = a;
     return result;
 }

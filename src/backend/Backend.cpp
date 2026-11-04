@@ -135,15 +135,20 @@ bool BackendScheduler::node_is_host_producer(TensorF32* node) const {
 //     · 其它 op：仍按当次构建的真实 buffer 状态判定（其生命周期由 gallocr 管理，稳定 ✓）。
 bool BackendScheduler::sched_data_is_host(const TensorF32* t) {
     if (!t) return true;
-    const bool cur_host = (t->buffer_ == nullptr) || t->buffer_->is_host();
-    if (t->op != OP_NONE) return cur_host;
+    // 【2026-10-24】view 不持有自己的数据 ⇒ 居住地看 view 链根（原先只看 t->buffer_，
+    //   而 view 在 build_splits 阶段常常尚未分配 buffer ⇒ 被误判成 host）。
+    const TensorF32* base = t;
+    int guard = 0;
+    while (base->view_src && guard++ < 64) base = base->view_src;
+    const bool cur_host = (base->buffer_ == nullptr) || base->buffer_->is_host();
+    if (base->op != OP_NONE) return cur_host;
 
-    unsigned char& rec = residence_fix_[t];   // 0 = 未记录
+    unsigned char& rec = residence_fix_[base];   // 0 = 未记录
     if (rec == 0) {
         rec = cur_host ? 1u : 2u;
         if (getenv("GRAPH_DEBUG_SCHED")) {
             fprintf(stderr, "[sched] residence fix: op=0 %p numel=%lld bytes=%zu → %s（钉死 ✓）\n",
-                    (const void*)t, (long long)t->numel(), t->nbytes(), cur_host ? "host" : "device");
+                    (const void*)base, (long long)base->numel(), base->nbytes(), cur_host ? "host" : "device");
         }
         return cur_host;
     }
@@ -648,6 +653,14 @@ bool is_device_pointer(const TensorF32* src, const float* data) {
     return (err == cudaSuccess);
 }
 
+// 【2026-10-24】零页探针的外部入口：实现放在下面的匿名 namespace 里（依赖 ExecWRec /
+//   g_exec_by_tensor 等内部符号），这里只做转发 ⇒ 保证 ppml::exec_zeropage_check 有外部
+//   链接（CPUBackend.cpp / CUDABackend.cpp 的调用点需要）。
+namespace { void exec_zeropage_check_impl(const TensorF32* node, const char* backend_name, int node_idx); }
+void exec_zeropage_check(const TensorF32* node, const char* backend_name, int node_idx) {
+    exec_zeropage_check_impl(node, backend_name, node_idx);
+}
+
 // ============================================================
 // exec_nan_check — 执行期逐节点 NaN/爆炸检查（诊断，2026-10-20）
 // ============================================================
@@ -733,6 +746,70 @@ struct ExecWRec {
 };
 std::unordered_map<uintptr_t, ExecWRec>        g_exec_by_addr;
 std::unordered_map<const TensorF32*, ExecWRec> g_exec_by_tensor;
+
+// ============================================================
+// exec_zeropage_check — "CUDA split 读到零页"探针（诊断，默认关；2026-10-24）
+// ============================================================
+//   定位目标（实测现象）：混合调度某个 74 节点 CUDA split 里 op=41(GET_ROWS)
+//   numel=81600/dims=[81600,1] 输出恒 0，CPU 侧同形状同 numel 是 45.6/36.9/… ；
+//   全日志统计 CUDA 侧 op=41 有 164 次全零、CPU 侧 0 次；op=107→op=22 整链随之归零，
+//   loss 13.88→14.58。算子本身已被 PPML_AB_CHECK 证明逐元素一致 ⇒ 零值来自 src 那份
+//   **未写过的零页**（生产者本轮没写），而 [CUDA-GUARD] 只拦 host 指针、拦不住零页。
+//   本探针只在"本节点输出全零"时触发，打印 src0 的现状 + 生产者记录 + 是否经 cpy 中转
+//   ⇒ 直接区分三种情形：①上游本就零（合法）；②cpy 把零页搬了过来；③生产者写过但被覆盖。
+//   开关：PPML_ZEROPAGE_CHECK=1；PPML_ZEROPAGE_MAX=16（打印上限）。
+//   ⚠ 生产者记录由 PPML_EXEC_NAN_CHECK=1 登记；未同时开则打印 prod=NONE。
+//   ⚠ 本函数依赖 exec_scan_tensor / ExecWRec / g_exec_by_tensor ⇒ 必须定义在它们之后
+//     （2026-10-24 修正：原放在 is_device_pointer 之后会编译失败）。
+void exec_zeropage_check_impl(const TensorF32* node, const char* backend_name, int node_idx) {
+    static const bool on = (std::getenv("PPML_ZEROPAGE_CHECK") != nullptr);
+    if (!on) return;
+    static const int max_print = [] {
+        const char* e = std::getenv("PPML_ZEROPAGE_MAX");
+        return (e && *e) ? std::atoi(e) : 16;
+    }();
+    static int printed = 0;
+    if (printed >= max_print) return;
+    if (!node || !node->data() || node->numel() <= 0) return;
+    const int op = (int)node->op;
+    // 只盯"有 input 语义、能零就静默"的三件套（其余算子零值多半合法）
+    if (op != OP_GET_ROWS && op != OP_PER_EDGE_MATMUL && op != OP_EDGE_GATHER_ROWS) return;
+
+    long long nn = 0, ni = 0, fi = -1, nz = 0;
+    double mx = 0.0, mn = 1e30;
+    float fb = 0.0f;
+    if (!exec_scan_tensor(node, 1e30f, &nn, &ni, &mx, &fb, &fi, &nz, &mn)) return;
+    if (mx != 0.0 || nn || ni) return;                 // 输出非全零 ⇒ 正常，不打
+
+    const TensorF32* s = node->src[0];
+    long long snn = 0, sni = 0, sfi = -1, snz = 0;
+    double smx = 0.0, smn = 1e30;
+    float sfb = 0.0f;
+    const bool sc = s && exec_scan_tensor(s, 1e30f, &snn, &sni, &smx, &sfb, &sfi, &snz, &smn);
+
+    ExecWRec pr{};
+    bool has = false;
+    if (s) { auto it = g_exec_by_tensor.find(s); if (it != g_exec_by_tensor.end()) { pr = it->second; has = true; } }
+    ++printed;
+    fprintf(stderr,
+            "[ZEROPAGE] %s node=%d op=%d numel=%lld 输出全零 | src0(op=%d,numel=%lld,is_cpy=%d,"
+            "cpy_of_op=%d,now_max=%.3e,zero=%s,host=%d) | 生产者记录=%s(g%d#%d:op=%d@n%d,nan=%lld,"
+            "inf=%lld,max=%.3e)\n",
+            backend_name ? backend_name : "?", node_idx, op, (long long)node->numel(),
+            s ? (int)s->op : -1, s ? (long long)s->numel() : -1LL,
+            (s && s->op == OP_DUP) ? 1 : 0,
+            (s && s->op == OP_DUP && s->src[0]) ? (int)s->src[0]->op : -1,
+            smx, (sc && s && s->numel() > 0) ? "see_nz" : "no-data",
+            (s && s->buffer_) ? (int)s->buffer_->is_host() : -1,
+            has ? "" : "NONE", has ? pr.graph_id : -1, has ? pr.graph_nnodes : 0,
+            has ? pr.op : -1, has ? pr.node_idx : -1, has ? pr.nan : 0LL, has ? pr.inf : 0LL,
+            has ? pr.maxabs : 0.0);
+    if (sc && s && s->numel() > 0) {
+        fprintf(stderr, "[ZEROPAGE]   ↑ src0 非零占比 = %.2f%%（0%% ⇒ 整块零页；>0%% ⇒ 部分写）\n",
+                100.0 * (double)(s->numel() - snz) / (double)s->numel());
+    }
+    fflush(stderr);
+}
 
 // 当前正在计算的图（由各 backend 的 graph_compute 入口设置）+ 图→短编号映射。
 //   编号按首次出现顺序分配（g0、g1、…）。 编号只在本进程内稳定：CPU-only 与混合
@@ -1655,7 +1732,15 @@ static bool backend_tensor_copy_impl(const TensorF32* src, TensorF32* dst) {
     {
         const TensorF32* cur = src;
         int guard = 0;
-        while (cur && cur->view_src && guard++ < 64) cur = cur->view_src;
+        while (cur && guard++ < 64) {
+            const TensorF32* nxt = cur->view_src;
+            // 【2026-10-24 方案 A】兼容"只置 src[0]、没置 view_src"的 OP_VIEW/OP_RESHAPE：
+            //   这类节点的私有 buffer 只是 CPU split 里 kernel_cpy 写的 host 快照，真正的数据源
+            //   是根。不解析会去拷那份快照（在纯 CUDA 生产链上甚至是没写过的内存）。
+            if (!nxt && (cur->op == OP_VIEW || cur->op == OP_RESHAPE)) nxt = cur->src[0];
+            if (!nxt) break;
+            cur = nxt;
+        }
         real_src = cur;  // 底层数据载体
     }
     src = real_src;
@@ -2379,6 +2464,15 @@ void BackendScheduler::pass_fill_unassigned(ComputeGraph * graph) {
 void BackendScheduler::build_splits(ComputeGraph* graph) {
     int n_nodes = graph->n_nodes();
 
+    // 【2026-10-24】节点下标索引：判定 "src 的 view 链根是否与本消费者处于同一 split"。
+    //   仅在 Step 3c 用来**避免为同 split 内的生产者建 cpy**（见下方 SKIP-SAME-SPLIT）。
+    std::unordered_map<const TensorF32*, int> node_idx_of;
+    node_idx_of.reserve(static_cast<size_t>(n_nodes) * 2);
+    for (int gi = 0; gi < n_nodes; ++gi) {
+        TensorF32* gn = graph->graph_node(gi);
+        if (gn) node_idx_of.emplace(gn, gi);
+    }
+
     // ===== Step 1: 跳过开头的 view op / op=0，确定第一个 split 的 backend =====
     //   【2026-09-19 ①-A】op=0（参数/常量/输入，无 kernel）与 view 一样**不参与 backend 选择** ✗：
     //   否则"开头一串 op=0"会先起一个只装 no-op 的 split ✗（实测有 824 个 1 节点孤岛 ✓）。
@@ -2505,6 +2599,58 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
             //     → graph_compute 中断 → loss 链从未执行。）
             //   【2026-09-22 改造】判据改为**构建期冻结**的 sched_data_is_host ✓（原先用运行期
             //   `src->buffer_` 状态 ⇒ 同配置两次 run 判据不同 ⇒ 偶发漏建 cpy ⇒ GPU 裸读 host ✗）。
+            // ---- SKIP-SAME-SPLIT（2026-10-24）----
+            //   背景：view 节点在 build_splits 阶段通常尚未分配 buffer ⇒ sched_data_is_host
+            //   按 "buffer_==nullptr ⇒ host" 判成 host ⇒ 为 GPU 消费者建 H2D cpy。若该 view 的
+            //   **根生产者就在本 split 内且更靠前**，这个 cpy 会在 split 的 Step 1 统一执行、
+            //   早于生产者 ⇒ 拷到未初始化显存（新 cudaMalloc 页全零）⇒ 消费者读到全零。
+            //   实测症状：混合 CUDA(SCHED=1) 下 distogram 四个 head 输入全零、[LOSS5] distogram
+            //   恒为均匀基线 14.14（ln60+2·ln36+ln18=14.15），而纯 CPU / 纯 CUDA 均为 18.15。
+            //   同 split 内生产者与消费者同后端 ⇒ 直接消费 view（dispatch 经 view_src 解析根）即可。
+            if (is_view_op(src->op)) {
+                // 沿 view 链解析到真正的数据载体：view_src 优先，兼容只置 src[0] 未置 view_src 的视图。
+                const TensorF32* root = src;
+                int rg = 0;
+                while (root && rg++ < 64) {
+                    const TensorF32* nxt = root->view_src;
+                    if (!nxt && is_view_op(root->op)) nxt = root->src[0];
+                    if (!nxt) break;
+                    root = nxt;
+                }
+                // 生产者是本 split 内更靠前的图节点 ⇒ 该 split 的 backend 会算它，直接消费视图即可。
+                auto rit = root ? node_idx_of.find(root) : node_idx_of.end();
+                const bool root_in_split = (root && rit != node_idx_of.end() && root->op != OP_NONE &&
+                                            rit->second >= split->i_start && rit->second < i);
+                // 【2026-10-24 诊断 PPML_DEBUG_SKIP_SAME=1】这条快捷路径的前提是
+                //   "view 由本 split 的后端算出来、buffer 落在该后端"。但 view 节点在 pass 里被跳过
+                //   （backend_map_=-1）⇒ 分配可能给 host buffer；此时 GPU 消费者会裸读 host，
+                //   触发 [CUDA-GUARD] 整图回落 CPU。打印出来即可判定前提是否成立。
+                static const bool dbg_skip_same = (std::getenv("PPML_DEBUG_SKIP_SAME") != nullptr);
+                if (dbg_skip_same) {
+                    static int skip_dbg_n = 0;
+                    if (skip_dbg_n < 40) {
+                        ++skip_dbg_n;
+                        fprintf(stderr,
+                                "[skip-same] node=%d op=%d j=%d bk=%d view_op=%d view_src=%s "
+                                "root_op=%d root_idx=%d root_bm=%d root_in_split=%d sched_host(root)=%d "
+                                "sched_host(src)=%d ⇒ %s\n",
+                                i, (int)node->op, j, cur_backend_id, (int)src->op,
+                                src->view_src ? "set" : "null",
+                                root ? (int)root->op : -1,
+                                (root && rit != node_idx_of.end()) ? rit->second : -1,
+                                root ? tensor_backend_id(const_cast<TensorF32*>(root), -1) : -2,
+                                root_in_split ? 1 : 0,
+                                root ? (int)sched_data_is_host(root) : -1,
+                                (src->buffer_ ? (int)src->buffer_->is_host() : -1),
+                                root_in_split ? "跳过 cpy（直接消费 view）" : "照常建 cpy");
+                        fflush(stderr);
+                    }
+                }
+                if (root_in_split) {
+                    continue;   // 不建 cpy、不改写 src
+                }
+            }
+
             bool src_data_host = sched_data_is_host(src);
             bool cur_is_gpu    = !backends_[cur_backend_id]->buffer_type()->is_host();
             if (src_data_host && cur_is_gpu) {
@@ -2612,6 +2758,9 @@ void BackendScheduler::build_splits(ComputeGraph* graph) {
 // ============================================================
 Status BackendScheduler::graph_compute() {
     if (!current_graph_ || n_splits_ == 0) return Status::SUCCESS;
+    // 【2026-10-24】每次图执行的统计从零起算（否则跨 iter 累加，无法判断"本次"GPU 是否参与）。
+    gpu_nodes_ = 0;
+    cpu_nodes_ = 0;
     if (getenv("GRAPH_DEBUG_SCHED")) {
         fprintf(stderr, "[sched] graph_compute: n_splits_=%d splits_size=%zu\n",
                 n_splits_, splits_.size());
@@ -2620,6 +2769,16 @@ Status BackendScheduler::graph_compute() {
     // 生产者代际断言：整张图（全部 split）共用一个代际；子 graph_compute 被 sched_depth 抑制。
     exec_stale_pass_begin(current_graph_);
     StaleSchedGuard stale_guard;
+
+    // 【2026-10-24】真实执行量报表（成功路径与失败中止路径共用；suffix 说明中止原因）。
+    auto print_usage = [this](const char* suffix) {
+        if (!getenv("GRAPH_DEBUG_SCHED") && !getenv("PPML_SCHED_USAGE")) return;
+        fprintf(stderr, "[sched] 本图执行统计：CUDA 节点=%lld / CPU 节点=%lld%s%s\n",
+                gpu_nodes_, cpu_nodes_,
+                (gpu_nodes_ == 0) ? " ⚠ GPU 完全未参与（这一跑不能当 GPU 验证）" : "",
+                suffix ? suffix : "");
+        fflush(stderr);
+    };
 
     for (int si = 0; si < n_splits_; si++) {
         SplitInfo& sp = splits_[si];
@@ -2699,11 +2858,22 @@ Status BackendScheduler::graph_compute() {
                         exec_fmt_stat(cpy, bc, sizeof(bc));
                         const size_t rn = rsrc ? static_cast<size_t>(rsrc->nbytes()) : 0;
                         const size_t cn = static_cast<size_t>(cpy->nbytes());
+                        // 【2026-10-24】顺序判据：生产节点在图中的下标 vs 本 split 范围。
+                        //   prod_i >= sp.i_start ⇒ 拷贝发生在生产节点执行**之前** ⇒ 读到的是
+                        //   尚未写入的（新 cudaMalloc 页 = 全零）内容 —— 混合模式"下游全零"的直接解释。
+                        int prod_i = -1;
+                        if (rsrc) {
+                            for (int gi = 0; gi < current_graph_->n_nodes(); ++gi) {
+                                if (current_graph_->graph_node(gi) == rsrc) { prod_i = gi; break; }
+                            }
+                        }
                         fprintf(stderr,
-                                "[XBK-STAT] #%d split=%d bk=%d src_op=%d view=%d src_buf_host=%d "
+                                "[XBK-STAT] #%d split=%d bk=%d sp=[%d,%d) prod_i=%d%s src_op=%d view=%d src_buf_host=%d "
                                 "src_offs=%zu | src{%s} | real{op=%d nbytes=%zu %s} -> "
                                 "cpy{op=%d nbytes=%zu %s}%s\n",
-                                xbk_printed, si, sp.backend_id, (int)src->op,
+                                xbk_printed, si, sp.backend_id, sp.i_start, sp.i_end, prod_i,
+                                (prod_i >= sp.i_start) ? "(AFTER-SPLIT)" : "",
+                                (int)src->op,
                                 src->view_src ? 1 : 0,
                                 src->buffer_ ? (int)src->buffer_->is_host() : -1,
                                 static_cast<size_t>(src->buffer_offs_),
@@ -2734,6 +2904,123 @@ Status BackendScheduler::graph_compute() {
                     rec.addr   = reinterpret_cast<uintptr_t>(cpy->data());
                     g_exec_by_tensor[cpy] = rec;
                     if (rec.addr) g_exec_by_addr[rec.addr] = rec;
+                }
+            }
+        }
+
+        // ---- [XBK-VERIFY] 边界拷贝逐元素校验（PPML_XBK_VERIFY=<最多检查的节点数>，2026-10-24）----
+        //   动机：XBK-STAT 只看 max/zero/mean —— **平移/错位**的拷贝统计量与正确拷贝几乎一样，
+        //   因此查不出来。这里把「cpy 上实际落地的那份」与「原件」都取到 host 再逐元素比，两个方向都覆盖：
+        //     · cpy 在 host（CPU split 消费）⇒ 验 D2H；
+        //     · cpy 在 device（GPU split 消费）⇒ 验 H2D（CPU 产物喂 GPU 走这条，同样要验）。
+        //   不限 op、全部 split ⇒ 混合调度「算子落 CPU 数值漂移」是否由边界数据错引起，一次定性。
+        {
+            static const int xv_max = [] {
+                const char* e = std::getenv("PPML_XBK_VERIFY");
+                return e ? std::atoi(e) : 0;
+            }();
+            static int       xv_shown = 0;
+            static long long xv_copies = 0, xv_bad = 0, xv_shape = 0;
+            static long long xv_rec = 0, xv_clobber = 0;   // 有生产记录的原件数 / 其中内容变了的
+            static bool      xv_summary_done = false;
+            if (xv_max > 0 && !xv_summary_done) {
+                // 统一口径：不管 buffer 在 host 还是 device，都读成 host 向量再比 ✓
+                auto to_host = [](const TensorF32* t, std::vector<float>& out) -> bool {
+                    if (!t || !t->data() || t->numel() <= 0) return false;
+                    const size_t n = static_cast<size_t>(t->numel());
+                    out.assign(n, 0.f);
+                    if (t->buffer_ && !t->buffer_->is_host()) {
+                        t->buffer_->get_tensor(t, out.data(), t->buffer_offs_, n * sizeof(float));
+                    } else {
+                        std::memcpy(out.data(), t->data(), n * sizeof(float));
+                    }
+                    return true;
+                };
+                for (int i = sp.i_start; i < sp.i_end && xv_shown < xv_max; ++i) {
+                    TensorF32* node = current_graph_->graph_node(i);
+                    if (!node) continue;
+                    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                        TensorF32* cpy = node->src[j];
+                        // ⚠ 必须限定 OP_DUP：cpy 节点就是 build_splits 里 dup(src) 建的 OP_DUP。
+                        //   漏掉这个过滤会把普通 src（view/上游算子）当成 cpy，拿它的 src[0] 当
+                        //   "原件" 比 ⇒ 满屏假 SHAPE-MISMATCH / 假 diff（第一版踩过）。
+                        if (!cpy || cpy->op != OP_DUP || !cpy->src[0]) continue;
+                        const TensorF32* orig = cpy->src[0];
+                        if (orig->numel() != cpy->numel()) {
+                            ++xv_shape;
+                            fprintf(stderr,
+                                    "[XBK-VERIFY] split=%d node=%d(op=%d) j=%d SHAPE-MISMATCH cpy=%lld orig=%lld\n",
+                                    si, i, (int)node->op, j, (long long)cpy->numel(),
+                                    (long long)orig->numel());
+                            fflush(stderr);
+                            continue;
+                        }
+                        std::vector<float> a, b;
+                        if (!to_host(cpy, a) || !to_host(orig, b)) continue;
+                        ++xv_copies;
+                        // ② 源是否已被"偷换"（本探针的盲区补丁）：cpy 与原件逐元素一致只能说明
+                        //   **拷贝忠实**；若原件自己在上游算完后被 gallocr 复用/别的 kernel 覆盖，
+                        //   两边会一起错。故这里再拿"生产时的记录"（exec_nan_check 登记，需
+                        //   PPML_EXEC_NAN_CHECK=1）与现在的内容比 maxabs。
+                        {
+                            auto rit = g_exec_by_tensor.find(orig);
+                            if (rit != g_exec_by_tensor.end() && rit->second.maxabs > 0.0) {
+                                ++xv_rec;
+                                const double now_mx = probe_maxabs(orig);
+                                if (now_mx > rit->second.maxabs * 4.0 ||
+                                    now_mx * 4.0 < rit->second.maxabs) {
+                                    ++xv_clobber;
+                                    static int cloaked = 0;
+                                    if (cloaked++ < 20) {
+                                        fprintf(stderr,
+                                                "[XBK-CLOBBER] split=%d bk=%d node=%d(op=%d) j=%d "
+                                                "orig_op=%d@n%d n=%lld 生产时max=%.4e 现在max=%.4e "
+                                                "（源在生产后被改/被复用）\n",
+                                                si, sp.backend_id, i, (int)node->op, j,
+                                                (int)orig->op, rit->second.node_idx,
+                                                (long long)orig->numel(), rit->second.maxabs, now_mx);
+                                        fflush(stderr);
+                                    }
+                                }
+                            }
+                        }
+                        const size_t n = a.size();
+                        long long nd = 0, first = -1;
+                        double mx = 0.0;
+                        for (size_t k = 0; k < n; ++k) {
+                            if (a[k] == b[k]) continue;
+                            ++nd;
+                            if (first < 0) first = static_cast<long long>(k);
+                            const double d = std::fabs((double)a[k] - (double)b[k]);
+                            if (d > mx) mx = d;
+                        }
+                        if (nd == 0) continue;
+                        ++xv_bad;
+                        fprintf(stderr,
+                                "[XBK-VERIFY] split=%d bk=%d node=%d(op=%d) j=%d cpy_host=%d n=%zu "
+                                "diff=%lld maxdiff=%.3e first[k=%lld cpy=%.6e orig=%.6e] orig_op=%d\n",
+                                si, sp.backend_id, i, (int)node->op, j,
+                                (cpy->buffer_ ? (int)cpy->buffer_->is_host() : 1),
+                                n, nd, mx, first,
+                                (double)a[static_cast<size_t>(first)],
+                                (double)b[static_cast<size_t>(first)], (int)orig->op);
+                        fflush(stderr);
+                    }
+                    // 进度：每 2000 个节点打一行累计量（否则只有触顶才出汇总，看不出"检查过什么"）
+                    if (++xv_shown % 2000 == 0) {
+                        fprintf(stderr,
+                                "[XBK-VERIFY] 进度：节点=%d copy=%lld 有差异=%lld 形状不符=%lld "
+                                "有生产记录=%lld 源被改=%lld\n",
+                                xv_shown, xv_copies, xv_bad, xv_shape, xv_rec, xv_clobber);
+                        fflush(stderr);
+                    }
+                }
+                if (xv_shown >= xv_max) {
+                    xv_summary_done = true;
+                    fprintf(stderr,
+                            "[XBK-VERIFY] 汇总：节点=%d copy=%lld 有差异=%lld 形状不符=%lld 有生产记录=%lld 源被改=%lld\n",
+                            xv_shown, xv_copies, xv_bad, xv_shape, xv_rec, xv_clobber);
+                    fflush(stderr);
                 }
             }
         }
@@ -2899,14 +3186,30 @@ Status BackendScheduler::graph_compute() {
                 //   saved_nodes[2*i_start .. 2*i_start+len)（别的 split，常是 CPU 段），
                 //   一旦扫到 CPU 节点的 host 输入就误判"本 GPU split 有 host 输入"并
                 //   ABORTED 整图 ⇒ 全图回退 CPU（长样本 "CUDA" 跑的其实是 CPU 的根因）。
+                // 【2026-10-24】判 device 之前必须把 view（OP_VIEW/OP_RESHAPE）解析到**根**：
+                //   view 节点自己不是 managed（gallocr 不分配、不 bind），其 data_ 可能仍是上一轮
+                //   留下的 host 指针，而 kernel 实际读到的是后端 dispatch 前 bind 的根指针
+                //   （CUDABackend 的 view 解析循环）。不解析会把"其实读 device"的 view 误判成 host
+                //   ⇒ 整图 ABORTED。实测 1AKE(L=214)：k=557 op=22(CONCAT) 的 src[9]=op=37 即此形态。
+                auto view_root_of = [this](TensorF32* t) -> TensorF32* {
+                    TensorF32* r = t;
+                    int g = 0;
+                    while (r && g++ < 64) {
+                        TensorF32* nx = r->view_src;
+                        if (!nx && is_view_op(r->op)) nx = r->src[0];   // 兼容只置 src0 的视图
+                        if (!nx) break;
+                        r = nx;
+                    }
+                    return r;
+                };
                 for (int k = 0; k < current_graph_->n_nodes_ && !bad_t; ++k) {
                     TensorF32* nd = current_graph_->graph_node(k);
                     if (!nd || is_view_op(nd->op) || nd->op == OP_NONE) continue;   // 无 kernel ✓
                     for (int j = 0; j < GGML_MAX_SRC; ++j) {
-                        TensorF32* s = nd->src[j];
+                        TensorF32* s = view_root_of(nd->src[j]);
                         if (!s || !s->data()) continue;        // 未计算 ✓
                         if (is_device_pointer(s, s->data())) continue;
-                        bad_t = s;
+                        bad_t = s;                // 报"真正会被裸读"的根张量
                         bad_k = sp.i_start + k;   // 相对 → 绝对，便于对回整图
                         bad_j = j;
                         break;
@@ -2935,6 +3238,20 @@ Status BackendScheduler::graph_compute() {
                                 "放弃本 split（避免裸读 host ✗，转 CPU 回退 ✓）\n",
                                 si, sp.backend_id, sp.i_start, sp.i_end, (int)bad_t->op,
                                 (long long)bad_t->numel(), (const void*)bad_t->data());
+                        // 【2026-10-24】把"后果"喊出来一次：这条分支返回 ABORTED ⇒ 调用方整图回落 CPU。
+                        //   实测（本机 4GB 卡）A 配置下唯一的 5314 节点 CUDA split 就被这里放弃，
+                        //   于是"混合 CUDA"跑其实是纯 CPU，与纯 CPU 逐项同值 ⇒ 长期掩盖了 GPU 侧问题。
+                        //   不做自动下沉的原因：buffer 安置在计划期就按 backend_map_ 定好了，
+                        //   运行期把节点改派 CPU 会拿到 GPU buffer（CPU kernel 写显存 ⇒ 崩/脏写）。
+                        static int whole_fb_warned = 0;
+                        if (whole_fb_warned++ == 0) {
+                            fprintf(stderr,
+                                    "[CUDA-GUARD] ⚠ 本 split 放弃 = 返回 ABORTED = **整图回落 CPU**：本次运行 "
+                                    "CUDA 实际未参与计算 ⇒ 任何\"GPU 与 CPU 数值一致\"的结论都不成立。\n"
+                                    "[CUDA-GUARD]   这是\"计划期 cpy 决策 ≠ 运行期数据居住地\"的信号，不是正常路径；"
+                                    "追因用 PPML_DEBUG_SKIP_SAME=1（看 view 快捷路径）/ PPML_XBK_STAT=1（看边界拷贝）。\n");
+                            fflush(stderr);
+                        }
                         fprintf(stderr,
                                 "[CUDA-GUARD]   消费节点 k=%d op=%d src_idx=%d | bad: buf=%p host=%d view_src=%p\n",
                                 bad_k, consumer ? (int)consumer->op : -1, bad_j,
@@ -2963,6 +3280,9 @@ Status BackendScheduler::graph_compute() {
                     if (saved_nodes) current_graph_->nodes = saved_nodes;
                     current_graph_->n_nodes_ = saved_n_nodes;
                     restore_graph_nodes();
+                    // 【2026-10-24】这条直接 return 绕过了下面的 st!=SUCCESS 分支 ⇒ 必须单独报统计，
+                    //   否则"整图回落 CPU"的运行在日志里完全看不到 GPU 参与度为 0。
+                    print_usage("（CUDA-GUARD 放弃 split ⇒ 本图整图回落 CPU，GPU 未参与）");
                     return Status::ABORTED;
                 }
             }
@@ -3063,12 +3383,20 @@ Status BackendScheduler::graph_compute() {
         if (st != Status::SUCCESS) {
             fprintf(stderr, "[sched] split=%d backend=%d i=[%d,%d) FAILED st=%d\n",
                     si, sp.backend_id, sp.i_start, sp.i_end, (int)st);
+            print_usage("（本图在中途失败，统计只含已完成的 split）");
             // 2026-09-01：回退 CPU 前恢复原图（撤销 build_splits 的 src 替换/bind 污染），
             // 否则 train.cpp 的 CPU 回退全图会读被替换的未分配 cpy 节点 → loss=0。
             restore_graph_nodes();
             return st;
         }
+        // 【2026-10-24】按后端统计真实执行量：GPU 参与度必须可见。
+        //   动机：构建期把节点分到 GPU ≠ 运行期真在 GPU 上算（[CUDA-GUARD]/ABORTED/回落都会改写事实）。
+        //   实测 A 配置下 gpu_nodes=0，而日志外观上仍是"混合 CUDA 训练"⇒ 结论被误导。
+        if (sp.backend_id != n_backends_ - 1) gpu_nodes_ += (sp.i_end - sp.i_start);
+        else                                  cpu_nodes_ += (sp.i_end - sp.i_start);
     }
+
+    print_usage("");
 
     return Status::SUCCESS;
 }

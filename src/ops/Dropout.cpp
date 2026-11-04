@@ -89,6 +89,17 @@ TensorF32* Dropout::forward_graph(TensorF32* x) {
     if (!training_) {
         return x;
     }
+    // 【2026-10-24】诊断开关 PPML_DROPOUT_OFF=1：直接透传（不抽掩码、不建 mul 节点）。
+    //   动机：本函数**每次构图都新抽一次掩码**，所以"同一份权重 + 不同执行/构图次数"的两条
+    //   调度路径会拿到不同掩码 ⇒ loss 天然不可比。要判定"落 CPU 是否真的算错"，必须先把
+    //   RNG 因素摘掉（A/B 都关掉 dropout 后仍不等 ⇒ 才是数据问题）。
+    static const bool dropout_off = [] {
+        const char* e = std::getenv("PPML_DROPOUT_OFF");
+        return e && *e && std::atoi(e) != 0;
+    }();
+    if (dropout_off) {
+        return x;
+    }
 
     // 生成掩码（含缩放 1/(1-p)）
     std::vector<float> mask;

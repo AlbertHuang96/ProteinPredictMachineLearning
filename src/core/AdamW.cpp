@@ -39,6 +39,10 @@ bool gpu_optim_enabled() {
     static const bool on = [] {
         const char* s = std::getenv("PPML_OPTIM_GPU");
         if (s && *s && std::atoi(s) == 0) return false;   // 显式关闭（A/B 用 ✓）
+        // 【2026-10-24】PPML_GRAD_D2H=1 ⇒ 与 clip 侧统一：禁用就地 kernel，
+        //   参数/梯度/m/v 全走 host（read_tensor_values / write_tensor_values 内含 D2H/H2D）✓
+        const char* d = std::getenv("PPML_GRAD_D2H");
+        if (d && *d && std::atoi(d) != 0) return false;
         return true;
     }();
     return on && optim_cuda_available() != 0;
@@ -70,29 +74,35 @@ void AdamW::init_from_graph(ComputeGraph* cgraph) {
     // 参数 (TENSOR_FLAG_PARAM) 在 build_forward_impl 中被归类为 node 而非 leaf
     // (ComputeGraph.cpp:137: OP_NONE && !PARAM 才作 leaf)，故遍历 n_nodes()。
     // 分片（阶段 A）：idx = 参数全局序号（含被跳过的），owner = idx % world ⇒ 两端一致。
+    // 【2026-10-24】nodes 之后再扫 leafs（图前向会把部分权重建成 leaf）：
+    //   漏掉它们会让优化器看到 0 个参数（实测 params=0、grad_norm=0.00、权重完全不更新 ✗）。
+    //   idx 顺序 = 先 nodes 后 leafs（只影响分片归属，两端同序即一致 ✓）
     int idx = 0;
-    for (int i = 0; i < cgraph->n_nodes(); i++) {
-        TensorF32* node = cgraph->graph_node(i);
-        if (!(node->flag & TENSOR_FLAG_PARAM)) continue;          // 非参数，跳过
-        TensorF32* grad = cgraph->graph_get_grad(node);
-        if (!grad) continue;                                      // 无梯度（未参与 loss），跳过
+    auto consider = [&](TensorF32* t) {
+        if (!t || !(t->flag & TENSOR_FLAG_PARAM)) return;          // 非参数，跳过
+        TensorF32* grad = cgraph->graph_get_grad(t);
+        if (!grad) return;                                         // 无梯度（未参与 loss），跳过
+        for (const auto& e : states_) if (e.param == t) return;    // 去重（node/leaf 可能重叠）
         const int owner = (world_ > 1) ? (idx % world_) : 0;
         ++idx;
-        if (world_ > 1 && owner != my_rank_) continue;            // 非本 rank owner：不建状态（省 m/v）
+        if (world_ > 1 && owner != my_rank_) return;               // 非本 rank owner：不建状态（省 m/v）
         const int64_t n = grad->numel();
         ParamState s;
-        s.param            = node;
+        s.param            = t;
         s.owner_rank       = owner;
-        s.no_weight_decay  = (node->flag & TENSOR_FLAG_NO_WEIGHT_DECAY) != 0;
+        s.no_weight_decay  = (t->flag & TENSOR_FLAG_NO_WEIGHT_DECAY) != 0;
         // SE3 等变参数：梯度尺度与主图不匹配（offset→坐标→FAPE 链放大），用分层小 lr。
         // 2026-08-24: 0.1→0.01（新版 a_rows 正确 shape 后 SE3 权重梯度 l2~1e25，
         //   0.1 分层仍致权重漂移/epoch2 爆炸；降到 0.01 减缓更新步长）。
-        s.se3_lr_scale     = (node->flag & TENSOR_FLAG_SE3)  ? 0.01f : 1.0f;
-        s.lora_lr_scale    = (node->flag & TENSOR_FLAG_LORA) ? lora_lr_scale_ : 1.0f;
+        s.se3_lr_scale     = (t->flag & TENSOR_FLAG_SE3)  ? 0.01f : 1.0f;
+        s.lora_lr_scale    = (t->flag & TENSOR_FLAG_LORA) ? lora_lr_scale_ : 1.0f;
         s.m.assign(static_cast<size_t>(n), 0.0f);
         s.v.assign(static_cast<size_t>(n), 0.0f);
         states_.push_back(std::move(s));
-    }
+    };
+    for (int i = 0; i < cgraph->n_nodes(); i++) consider(cgraph->graph_node(i));
+    for (int i = 0; i < cgraph->n_leafs(); i++) consider(cgraph->graph_leaf(i));
+    n_owned_ = static_cast<int>(states_.size());
 }
 
 // ---- 内部工具：把张量数据读到 CPU 向量（兼容 backend buffer / 裸 CPU / CUDA 裸张量）----
@@ -317,14 +327,15 @@ void AdamW::import_momentum(const std::vector<TensorF32*>& params,
 }
 
 void AdamW::zero_grad(ComputeGraph* cgraph) {
-    for (int i = 0; i < cgraph->n_nodes(); i++) {
-        TensorF32* node = cgraph->graph_node(i);
-        if (!(node->flag & TENSOR_FLAG_PARAM)) continue;
-        TensorF32* grad = cgraph->graph_get_grad(node);
-        if (!grad) continue;
+    auto zero = [&](TensorF32* t) {
+        if (!t || !(t->flag & TENSOR_FLAG_PARAM)) return;
+        TensorF32* grad = cgraph->graph_get_grad(t);
+        if (!grad) return;
         std::vector<float> z(static_cast<size_t>(grad->numel()), 0.0f);
-        write_tensor_values(grad, z);
-    }
+        write_tensor_values(grad, z);   // buffer 感知：device 上走 H2D ✓
+    };
+    for (int i = 0; i < cgraph->n_nodes(); i++) zero(cgraph->graph_node(i));
+    for (int i = 0; i < cgraph->n_leafs(); i++) zero(cgraph->graph_leaf(i));   // 【2026-10-24】补 leafs
 }
 
 } // namespace ppml

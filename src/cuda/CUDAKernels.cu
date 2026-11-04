@@ -3,6 +3,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include "ppml/MulMatStats.h"   // MUL_MAT 形状/耗时统计（PPML_MULMAT_STATS=1，Step 0）
@@ -1754,16 +1756,21 @@ __device__ static inline void concat_decompose_index(
     i3 = t;
 }
 
-// 用 start/len 偏移表，将拼接维全局索引 gd 定位到所属 src 下标
+// 越界诊断计数器（PPML_CONCAT_ASSERT=1 时 host 侧清零并读回；正常路径零开销）
+__device__ unsigned int g_concat_oob_cnt = 0;
+
+// 用 start/len 偏移表，将拼接维全局索引 gd 定位到所属 src 下标。
+//   返回 -1 = 未命中（gd 不在任何 [start, start+len) 内）。
+//   ⚠ 旧版兜底 return n_src-1 会让 local 超过该 src 的 len ⇒ 越界读（illegal memory access）。
 __device__ static inline int concat_pick_src(
     int64_t gd, int n_src,
     const int64_t* __restrict__ start,
     const int64_t* __restrict__ len)
 {
     for (int s = 0; s < n_src; s++) {
-        if (gd < start[s] + len[s]) return s;
+        if (gd >= start[s] && gd < start[s] + len[s]) return s;
     }
-    return n_src - 1; // 兜底（gd 落在最后一个 src 区间）
+    return -1;
 }
 
 __global__ void concat_nary_kernel_f32(
@@ -1775,33 +1782,57 @@ __global__ void concat_nary_kernel_f32(
     int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3)
 {
     const int64_t total = ne0 * ne1 * ne2 * ne3;
-    const int64_t idx   = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
-    if (idx >= total) return;
+    // grid-stride：total 可能超过单个 grid 能覆盖的范围（也避免 host 侧 (int) 截断）
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += (int64_t)gridDim.x * blockDim.x) {
+        int64_t i0, i1, i2, i3;
+        concat_decompose_index(idx, ne0, ne1, ne2, ne3, i0, i1, i2, i3);
 
-    int64_t i0, i1, i2, i3;
-    concat_decompose_index(idx, ne0, ne1, ne2, ne3, i0, i1, i2, i3);
+        // 取出拼接维上的全局索引 gd
+        int64_t gd;
+        switch (dim) {
+            case 0:  gd = i0; break;
+            case 1:  gd = i1; break;
+            case 2:  gd = i2; break;
+            default: gd = i3; break;
+        }
 
-    // 取出拼接维上的全局索引 gd
-    int64_t gd;
-    switch (dim) {
-        case 0:  gd = i0; break;
-        case 1:  gd = i1; break;
-        case 2:  gd = i2; break;
-        default: gd = i3; break;
+        const int  s     = concat_pick_src(gd, n_src, start, len);
+        const int64_t local = (s >= 0) ? (gd - start[s]) : (int64_t)-1;
+        // 越界断言：local 必须落在该 src 的拼接维长度内，且指针非空。
+        //   命中时只打印前 8 条（atomicAdd 计数），随后直接丢弃该元素，不再越界读。
+        if (s < 0 || local < 0 || local >= len[s] || srcs[s] == nullptr) {
+            const unsigned int nth = atomicAdd(&g_concat_oob_cnt, 1u);
+            if (nth < 8u) {
+                printf("[concat-oob] idx=%lld gd=%lld s=%d local=%lld len=%lld n_src=%d dim=%d "
+                       "total=%lld ne=[%lld,%lld,%lld,%lld] ptr=%p\n",
+                       (long long)idx, (long long)gd, s, (long long)local,
+                       (s >= 0) ? (long long)len[s] : (long long)-1,
+                       n_src, dim, (long long)total,
+                       (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3,
+                       (s >= 0) ? (const void*)srcs[s] : (const void*)nullptr);
+            }
+            continue;
+        }
+        const float* src   = srcs[s];
+
+        // 拼接维用局部坐标 local，其余维沿用输出坐标。
+        // 【2026-10-24 修】strides 必须用 **src 自己的** 维度，不能用 dst 的：
+        //   src 的拼接维长度 = len[s]，当 len[s] != dst 的对应维时（例如 10 个 [32,1,2550]
+        //   沿 dim=1 拼成 [32,10,2550]，每个 src 的 len=1），用 dst 的 ne1=10 作 stride 会把
+        //   索引放大 10 倍 ⇒ 越过 src 分配边界 ⇒ illegal memory access（实测 split=444）。
+        //   非拼接维由 host 侧守卫保证与 dst 相等 ✓
+        const int64_t s_ne0 = (dim == 0) ? len[s] : ne0;
+        const int64_t s_ne1 = (dim == 1) ? len[s] : ne1;
+        const int64_t s_ne2 = (dim == 2) ? len[s] : ne2;
+
+        int64_t a0 = (dim == 0) ? local : i0;
+        int64_t a1 = (dim == 1) ? local : i1;
+        int64_t a2 = (dim == 2) ? local : i2;
+        int64_t a3 = (dim == 3) ? local : i3;
+
+        dst[idx] = src[((a3 * s_ne2 + a2) * s_ne1 + a1) * s_ne0 + a0];
     }
-
-    const int  s     = concat_pick_src(gd, n_src, start, len);
-    const int64_t local = gd - start[s];
-    const float* src   = srcs[s];
-
-    // 拼接维用局部坐标 local，其余维沿用输出坐标。
-    // 前提（无广播语义）：非拼接维与 dst 一致，故直接用 dst 的 ne 作 strides。
-    int64_t a0 = (dim == 0) ? local : i0;
-    int64_t a1 = (dim == 1) ? local : i1;
-    int64_t a2 = (dim == 2) ? local : i2;
-    int64_t a3 = (dim == 3) ? local : i3;
-
-    dst[idx] = src[((a3 * ne2 + a2) * ne1 + a1) * ne0 + a0];
 }
 
 // host 包装：srcs/start/len 均须为已拷贝到 device 的指针
@@ -1813,10 +1844,79 @@ void concat_nary_cuda(
 {
     const int64_t total = ne0 * ne1 * ne2 * ne3;
     constexpr int BLOCK = 256;
-    const int grid = ceil_div(static_cast<int>(total), BLOCK);
+    // 【2026-10-24 修】原来 `ceil_div(static_cast<int>(total), BLOCK)`：total > 2^31 时
+    //   (int) 截断成负数 ⇒ grid 非法。改为 64 位计算 + grid-stride（kernel 侧已改循环）✓
+    const int64_t nblk = (total + BLOCK - 1) / BLOCK;
+    const int grid = static_cast<int>(nblk > 0 ? (nblk < 1073741824LL ? nblk : 1073741824LL) : 1);
+
+    // PPML_CONCAT_ASSERT=1：清零越界计数 → launch → 读回总数（只在诊断时多两次 API 调用）
+    const bool assert_on = getenv("PPML_CONCAT_ASSERT") != nullptr;
+    if (assert_on) {
+        const unsigned int zero = 0;
+        cudaMemcpyToSymbol(g_concat_oob_cnt, &zero, sizeof(zero));
+    }
 
     concat_nary_kernel_f32<<<grid, BLOCK>>>(
         srcs, start, len, dst, dim, n_src, ne0, ne1, ne2, ne3);
+    cudaCheck(cudaGetLastError());
+
+    if (assert_on) {
+        unsigned int h = 0;
+        cudaMemcpyFromSymbol(&h, g_concat_oob_cnt, sizeof(h));
+        if (h > 0) {
+            fprintf(stderr,
+                    "[concat-oob] total_out_of_range=%u dst_numel=%lld n_src=%d dim=%d "
+                    "ne=[%lld,%lld,%lld,%lld]\n",
+                    h, (long long)total, n_src, dim,
+                    (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3);
+        }
+        cudaGetLastError();   // 清掉 memcpy 可能带回的 sticky error，避免影响后续节点检查
+    }
+}
+
+// ============================================================
+// concat 反向（CONCAT_BACK，2026-10-24 新增 CUDA 版）
+//   语义与 CPUBackend::kernel_concat_back 逐字一致：
+//     dst[k] = grad[k + offset*stride]，stride = prod(grad.dims[0..dim-1])
+//   即"沿 dim 取 grad 的 [offset, offset+dim_len) 段"，只是一次平移拷贝 ✓
+// ============================================================
+// 索引：dst 坐标 i_d（dim 维加 offset）→ grad 线性索引，用 **grad 自己的** strides ✓
+//   （不能像旧 CPU 版那样做 `dst[k] = grad[k + offset*stride]`：那只在 dim 以上各维
+//     与 grad 一致时才成立，实测训练图 dim=1、grad=[32,10,2550]、dst=[32,1,2550] 会错位）
+__global__ void concat_back_kernel_f32(
+    const float* __restrict__ grad,
+    float* __restrict__ dst,
+    int64_t total,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,   // dst dims
+    int64_t g0,  int64_t g1,  int64_t g2,  int64_t g3,    // grad strides
+    int dim, int64_t offset)
+{
+    for (int64_t k = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         k < total; k += (int64_t)gridDim.x * blockDim.x) {
+        int64_t t = k;
+        int64_t i0 = t % ne0; t /= ne0;
+        int64_t i1 = t % ne1; t /= ne1;
+        int64_t i2 = t % ne2; t /= ne2;
+        int64_t i3 = t;
+        const int64_t g_id0 = (dim == 0) ? (i0 + offset) : i0;
+        const int64_t g_id1 = (dim == 1) ? (i1 + offset) : i1;
+        const int64_t g_id2 = (dim == 2) ? (i2 + offset) : i2;
+        const int64_t g_id3 = (dim == 3) ? (i3 + offset) : i3;
+        dst[k] = grad[g_id0 * g0 + g_id1 * g1 + g_id2 * g2 + g_id3 * g3];
+    }
+}
+
+void concat_back_cuda(
+    const float* grad, float* dst, int64_t total,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+    int64_t g0, int64_t g1, int64_t g2, int64_t g3,
+    int dim, int64_t offset)
+{
+    constexpr int BLOCK = 256;
+    const int64_t nblk = (total + BLOCK - 1) / BLOCK;
+    const int grid = static_cast<int>(nblk > 0 ? (nblk < 1073741824LL ? nblk : 1073741824LL) : 1);
+    concat_back_kernel_f32<<<grid, BLOCK>>>(
+        grad, dst, total, ne0, ne1, ne2, ne3, g0, g1, g2, g3, dim, offset);
     cudaCheck(cudaGetLastError());
 }
 

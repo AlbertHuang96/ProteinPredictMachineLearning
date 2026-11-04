@@ -39,6 +39,17 @@ bool is_device_pointer(const TensorF32* src, const float* data);
 //   开关：PPML_EXEC_NAN_CHECK=1 启用；PPML_EXEC_NAN=1e6 阈值；PPML_EXEC_NAN_MAX=8 打印条数。
 void exec_nan_check(const TensorF32* node, const char* backend_name, int node_idx);
 
+// 零页探针（诊断，默认关；2026-10-24）：专治"CUDA split 读到全零输入"这一类静默错值。
+//   背景：混合调度实测某个 74 节点 CUDA split 里 op=41(GET_ROWS) 输出恒 0（CPU 侧同形状
+//   非零，全日志统计 CUDA 侧 164 次全零 / CPU 侧 0 次），随后 op=107→op=22 整链归零，
+//   loss 13.88→14.58。算子本身已被 PPML_AB_CHECK 证明逐元素一致 ⇒ 零来自 src 那份
+//   device 数据是**未写过的零页**（生产者本轮没写），而 [CUDA-GUARD] 只拦 host 指针。
+//   本探针只在"输出全零"的 op ∈ {GET_ROWS, PER_EDGE_MATMUL, EDGE_GATHER_ROWS} 上打印
+//   src0 的现在量级 + 生产者记录（谁写过这块、写的多大）⇒ 直接区分"上游本就零"与"零页"。
+//   开关：PPML_ZEROPAGE_CHECK=1；PPML_ZEROPAGE_MAX=16（打印上限）。
+//   ⚠ 生产者记录由 PPML_EXEC_NAN_CHECK=1 登记；不同时开则打印 生产者记录=NONE。
+void exec_zeropage_check(const TensorF32* node, const char* backend_name, int node_idx);
+
 // 设置"当前正在计算的图"（各 backend 的 graph_compute 入口调用）。
 //   作用：每次 forward_graph 重建，节点编号都从 0 开始 ⇒ 日志里 `op107@n16` 会同时
 //   指向"主图 n16"和"SE3 子图 n16"，跨子图追因会串台。设置后所有生产者记录都带
@@ -683,6 +694,12 @@ private:
     // GRAPH_DEBUG_SCHED=1 诊断：每 backend 分配的 op 计数（检测 GPU 是否被调用）
     int* sched_backend_cnt_ = nullptr;
     long* sched_backend_op_last_ = nullptr;
+
+    // 【2026-10-24】运行期"真实执行量"统计（graph_compute 每次调用复位，按 split 累加节点数）。
+    //   区分"计划期分到 GPU"与"运行期真在 GPU 上算"：CUDA-GUARD 整段放弃 / ABORTED 回退时，
+    //   计划里仍有 GPU 节点，但实际一个都没跑 ⇒ 日志外观仍是"混合 CUDA 训练"，结论被误导。
+    long long gpu_nodes_ = 0;
+    long long cpu_nodes_ = 0;
     
     std::vector<const BufferType*> bufts_;
 
@@ -923,6 +940,10 @@ public:
     const BufferType* buffer_type() const override;
     bool supports_buffer_type(const BufferType* buft) const override;
 
+    // 【2026-10-24】把 op 编号翻成名字（全量枚举表）；供 [CUDA-UNSUPPORTED] 与
+    //   train.cpp 的 PPML_OP_CHECK 覆盖度报告使用（原来只覆盖十来个算子，其余是 "?"）
+    static const char* op_name(int op);
+
     // GPU 优先级高于 CPU
     // set it 0 when we test cpu
     int priority() const override { return 1; }
@@ -966,6 +987,15 @@ private:
     static void kernel_mean_cuda     (TensorF32 * node, Status* st);
     static void kernel_max_all_cuda  (TensorF32 * node, Status* st);
     static void kernel_fape_cuda     (TensorF32 * node, Status* st);
+    // pair/MSA 专用算子（2026-10-24，kernel 在 src/cuda/PairKernels.cu）
+    static void kernel_tri_mul_cuda             (TensorF32 * node, Status* st);
+    static void kernel_tri_mul_back_cuda        (TensorF32 * node, Status* st);
+    static void kernel_outer_prod_mean_cuda     (TensorF32 * node, Status* st);
+    static void kernel_outer_prod_mean_back_cuda(TensorF32 * node, Status* st);
+    static void kernel_outer_prod_cuda          (TensorF32 * node, Status* st);
+    static void kernel_outer_prod_back_cuda     (TensorF32 * node, Status* st);
+    static void kernel_repeat_back_cross_cuda   (TensorF32 * node, Status* st);
+    static void kernel_fape_back_cuda           (TensorF32 * node, Status* st);
     static void kernel_permute_cuda  (TensorF32 * node, Status* st);
     static void kernel_transpose_cuda(TensorF32 * node, Status* st);
     static void kernel_relu_back_cuda(TensorF32 * node, Status* st);
@@ -974,6 +1004,8 @@ private:
     static void kernel_act_mul_back_x_cuda (TensorF32 * node, Status* st);
     static void kernel_act_mul_back_g_cuda (TensorF32 * node, Status* st);
     static void kernel_concat_cuda   (TensorF32 * node, Status* st);
+    // 【2026-10-24】concat 反向（此前无 CUDA 版，2886 个节点/1.09e8 元素回落 CPU）
+    static void kernel_concat_back_cuda(TensorF32 * node, Status* st);
     static void kernel_repeat_back_cuda(TensorF32 * node, Status* st);
     static void kernel_repeat_cuda      (TensorF32 * node, Status* st);
     static void kernel_set_rows_cuda    (TensorF32 * node, Status* st);

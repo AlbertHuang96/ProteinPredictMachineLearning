@@ -5,7 +5,9 @@
 #include <cmath>
 #include <algorithm>
 #include <vector>
+#include <array>     // L2 计划的 cell list（std::array 三轴计数 ✓）
 #include <cstdlib>
+#include <cstring>   // std::strcmp（PPML_L3_PROJ 解析）
 
 
 
@@ -655,6 +657,67 @@ inline uint64_t topo_key(int64_t s, int64_t t) {
     return (static_cast<uint64_t>(s) << 32) ^ static_cast<uint64_t>(t);
 }
 
+// ============================================================
+//  L2 计划（A1/A3）：均匀网格 cell list + 27 邻域查询 ✓
+//    · 建表 O(N)，N = B*L；查询 O(cell 内点数)，与 L 无直接关系 ✓
+//    · 只用 CA 坐标（与 make_graph 的几何同源 ✓）
+//    · 保证：若 |p_j − p_i| ≤ h（cell 边长），则 j 必落在 i 所在 cell 的 ±1 邻域 ✓
+// ============================================================
+struct CellGrid {
+    float h = 1.f;
+    int nx = 1, ny = 1, nz = 1;
+    float bx = 0.f, by = 0.f, bz = 0.f;
+    std::vector<int32_t> start;   // CSR 偏移，长度 nx*ny*nz + 1 ✓
+    std::vector<int32_t> items;   // 点上标（B*L 展平 ✓）
+
+    inline int clampc(int v, int m) const { return v < 0 ? 0 : (v >= m ? m - 1 : v); }
+
+    // ca: 3*N 的紧凑数组；cell: 期望的 cell 边长（> 0）
+    void build(const std::vector<float>& ca, int N, float cell) {
+        items.clear(); start.clear();
+        h = (cell > 0.f) ? cell : 1.f;
+        nx = ny = nz = 1; bx = by = bz = 0.f;
+        if (N <= 0 || (int)ca.size() < 3 * N) { start.assign(2, 0); return; }
+
+        float lo[3] = { ca[0], ca[1], ca[2] }, hi[3] = { ca[0], ca[1], ca[2] };
+        for (int i = 1; i < N; ++i) {
+            for (int c = 0; c < 3; ++c) {
+                const float v = ca[3 * (size_t)i + c];
+                lo[c] = std::min(lo[c], v);
+                hi[c] = std::max(hi[c], v);
+            }
+        }
+        bx = lo[0]; by = lo[1]; bz = lo[2];
+        // cell 数上限 8N：h 过小时把 cell 放大（只影响候选数，不影响正确性 ✓）
+        auto counts = [&](float hh) {
+            return std::array<int, 3>{ std::max(1, (int)std::floor((hi[0] - lo[0]) / hh) + 1),
+                                       std::max(1, (int)std::floor((hi[1] - lo[1]) / hh) + 1),
+                                       std::max(1, (int)std::floor((hi[2] - lo[2]) / hh) + 1) };
+        };
+        std::array<int, 3> nc = counts(h);
+        while ((int64_t)nc[0] * nc[1] * nc[2] > 8LL * N) {
+            h *= 1.5f;
+            nc = counts(h);
+        }
+        nx = nc[0]; ny = nc[1]; nz = nc[2];
+
+        const int64_t ncell = (int64_t)nx * ny * nz;
+        std::vector<int32_t> cnt((size_t)ncell + 1, 0), cid((size_t)N, 0);
+        for (int i = 0; i < N; ++i) {
+            const int ix = clampc((int)std::floor((ca[3 * (size_t)i]     - bx) / h), nx);
+            const int iy = clampc((int)std::floor((ca[3 * (size_t)i + 1] - by) / h), ny);
+            const int iz = clampc((int)std::floor((ca[3 * (size_t)i + 2] - bz) / h), nz);
+            cid[(size_t)i] = (int32_t)((iz * ny + iy) * nx + ix);
+            cnt[(size_t)cid[(size_t)i] + 1]++;
+        }
+        for (size_t i = 1; i < cnt.size(); ++i) cnt[i] += cnt[i - 1];
+        start.assign(cnt.begin(), cnt.end());          // start[c] = 起，start[c+1] = 止 ✓
+        items.assign((size_t)N, 0);
+        std::vector<int32_t> fill(cnt.begin(), cnt.end());
+        for (int i = 0; i < N; ++i) items[(size_t)fill[(size_t)cid[(size_t)i]]++] = i;
+    }
+};
+
 }  // namespace
 
 GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const TensorI64& idx,
@@ -690,6 +753,39 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
         for (size_t s = 0; s < st.margin.size(); ++s) {
             st.kappa[s] = 0.5f * cfg.sigma * st.margin[s];   // κ_i = σ·m_i/2 ✓
         }
+        // ---- L2 计划（A3）：**逐节点**球查询半径 rc_i ----
+        //   rc_i := d_(k),i(x⁰) + √3(κ_i + κ_max)
+        //   依据 Lemma 1：|d'−d| ≤ ‖δ_i‖₂+‖δ_j‖₂ ≤ √3(κ_i+κ_max)（盒投影下 ‖δ‖₂ ≤ √3κ ✓）
+        //   d_(k),i 取冻结行内距离的第 k 小（行 = top-k ∪ 序列边；前 k 小恰是 top-k ✓）
+        {
+            st.rc.assign(st.margin.size(), 0.f);
+            float kmax = 0.f;
+            for (float k : st.kappa) if (std::isfinite(k)) kmax = std::max(kmax, k);
+            std::vector<float> row;
+            for (int b = 0; b < B; ++b) {
+                for (int l = 0; l < L; ++l) {
+                    const size_t gi = (size_t)b * L + l;
+                    const size_t bi = (((size_t)b * L + l) * 3 + 1) * 3;
+                    row.clear();
+                    for (int64_t j : st.adj_out[gi]) {
+                        const size_t bj = (((size_t)j) * 3 + 1) * 3;
+                        const float dx = st.x0[bj]     - st.x0[bi];
+                        const float dy = st.x0[bj + 1] - st.x0[bi + 1];
+                        const float dz = st.x0[bj + 2] - st.x0[bi + 2];
+                        row.push_back(std::sqrt(dx * dx + dy * dy + dz * dz));
+                    }
+                    float dk = 0.f;
+                    if (kk > 0 && (int)row.size() >= kk) {
+                        std::nth_element(row.begin(), row.begin() + (kk - 1), row.end());
+                        dk = row[(size_t)(kk - 1)];
+                    } else if (!row.empty()) {
+                        dk = *std::max_element(row.begin(), row.end());
+                    }
+                    const float kap = std::isfinite(st.kappa[gi]) ? st.kappa[gi] : 0.f;
+                    st.rc[gi] = dk + 1.7320508f * (kap + kmax);
+                }
+            }
+        }
         st.ready = true; st.calls = 0; st.last_omega = 0; st.last_diff = 0;
         if (cfg.debug) {
             float mn = std::numeric_limits<float>::infinity(), md = 0.f, mx = 0.f;
@@ -707,13 +803,18 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
     }
     st.calls++;
 
-    // ---------- L3：构造**阻尼 + 信任域投影**基准 B = x⁰ + rclip_κ(γ(x−x⁰)) ✓ ----------
+    // ---------- L3：构造**阻尼 + 信任域投影**基准 B = x⁰ + Π_κ(γ(x−x⁰)) ✓ ----------
     //   数学（TopoPassRefinement.md §6.3 / 附录 A.2.2–A.2.3 ✓）：
     //     · γ 是最小方差线性组合（BLUE）⇒ 在"冻结(先验)"与"活坐标(预测)"之间做最优加权 ✓
-    //     · rclip 是**逐节点 ℓ2 球**信任域投影 Π_κ（凸集投影 ⇒ firmly nonexpansive ✓）
-    //       ⇒ 把基准限制在 margin 可证有效的区域内（σ<1/2 时 ‖B_i−x⁰_i‖₂<κ_i 可证不翻边 ✓）
-    //       2026-10-24：由逐坐标 ±κ（ℓ∞ 盒）改为径向缩放，与 Ω 的欧氏半径判定统一几何 ✓
+    //     · Π_κ 是逐节点信任域投影（凸集投影 ⇒ firmly nonexpansive ✓）
+    //       ⇒ 把基准限制在 margin 可证有效的区域内 ✓
     //     · 极限：γ=1 且 κ=∞ ⇒ B ≡ x ⇒ **退化为 per_block**（神谕锚点 ✓）；γ=0 ⇒ B ≡ x⁰（纯冻结 ✓）
+    //   【投影几何由 PPML_L3_PROJ 选择（2026-10-25），两种都保留】：
+    //     · box（**默认**）：逐坐标 |δ_c| ≤ κ（ℓ∞ 盒）✓ —— 与论文 tab:sigma/tab:long 的历史数据、
+    //       以及 python 回放脚本（topo_policy_replay.py，缺省即盒）的几何一致 ✓
+    //       最坏欧氏位移 √3·κ，证书临界 σ < 1/(2√3) ≈ 0.289 ✓
+    //     · ball：径向缩放 rclip_κ（逐节点 ℓ2 球）✓ —— 最坏欧氏位移 κ，证书临界 σ < 1/2 ✓
+    //   两种几何的 Ω 判定统一用"投影**前**是否越界"的 clipped 标志（避免球面/盒面上的浮点舍入刀口 ✓）
     //    只有 CA（原子轴 1）参与几何与门控 ⇒ 只改 CA 通道即可（其余通道下游不读基准 ✓）
     std::vector<float> basis;
     // L3：逐节点"是否被球投影截断"（r ≥ κ）——Ω 判定用它而不是重算 ‖B−x⁰‖ ✓
@@ -722,6 +823,14 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
     std::vector<char> clipped;
     const float* xg = xyz.data();                          // 默认：几何/门控用**活坐标**（L1/L2 ✓）
     if (cfg.l3) {
+        // 投影几何：PPML_L3_PROJ=ball|radial|sphere ⇒ 球投影；其余/未设 ⇒ 盒投影（**默认**）✓
+        //   每次调用读一次 env（每个 epoch 仅 4–16 次调用，开销可忽略）——不做 static 缓存，
+        //   这样单测可以在同一进程内切换几何做 A/B ✓
+        const char* proj_env = std::getenv("PPML_L3_PROJ");
+        const bool l3_ball = proj_env && *proj_env &&
+                             (std::strcmp(proj_env, "ball")   == 0 ||
+                              std::strcmp(proj_env, "radial") == 0 ||
+                              std::strcmp(proj_env, "sphere") == 0);
         basis.assign(xyz.numel(), 0.f);
         std::memcpy(basis.data(), xyz.data(), basis.size() * sizeof(float));
         clipped.assign(static_cast<size_t>(B) * L, 0);
@@ -740,59 +849,83 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                 //   · κ=0、w≠0 ⇒ 缩放到 0（等价旧盒的 clamp 到 0 ✓）；w=0 时 r=0 不做除法 ✓
                 //   · κ=+inf（k≥L−1 ⇒ m_i=+inf）⇒ r>κ 恒假 ⇒ s=1（无截断，与旧实现一致 ✓）
                 float w[3];
-                float r2 = 0.f;
-                for (int c = 0; c < 3; ++c) {
+                for (int c = 0; c < 3; ++c)
                     w[c] = cfg.gamma * (xyz.data()[base + c] - st.x0[base + c]);
-                    r2 += w[c] * w[c];
+                if (l3_ball) {
+                    // ---- 球投影（PPML_L3_PROJ=ball）：rclip_κ(w) = w / max{1, ‖w‖₂/κ} ✓ ----
+                    //   · κ=0、w≠0 ⇒ 缩放到 0；w=0 时 r=0 不做除法 ✓
+                    //   · κ=+inf（k≥L−1 ⇒ m_i=+inf）⇒ r>κ 恒假 ⇒ s=1（无截断 ✓）
+                    float r2 = 0.f;
+                    for (int c = 0; c < 3; ++c) r2 += w[c] * w[c];
+                    const float r = std::sqrt(r2);
+                    const float s = (r > kap) ? (kap / r) : 1.f;   // r>κ>0 ⇒ 除法安全 ✓
+                    clipped[gi] = (r >= kap) ? 1 : 0;              // Ω 判定的权威标志（投影前比较 ✓）
+                    for (int c = 0; c < 3; ++c) basis[base + c] = st.x0[base + c] + s * w[c];
+                } else {
+                    // ---- 盒投影（**默认**）：逐坐标 |δ_c| ≤ κ（ℓ∞ clamp）✓ ----
+                    //   · 任一坐标在**投影前**越界即记 clipped ⇒ 被 clamp 的节点投影后正好落在盒面上
+                    //     （|B_c−x⁰_c| = κ），若改用投影后的值判 Ω 会变成浮点舍入决定成败 ✓
+                    //   · κ=0 ⇒ 全部夹到 x⁰；κ=+inf ⇒ 比较恒假 ⇒ 原样通过（与球分支同一极限 ✓）
+                    char any_clip = 0;
+                    for (int c = 0; c < 3; ++c) {
+                        const float dv = w[c];
+                        if (dv >= kap || dv <= -kap) any_clip = 1;
+                        const float cl = (dv >  kap) ?  kap
+                                       : (dv < -kap) ? -kap : dv;
+                        basis[base + c] = st.x0[base + c] + cl;
+                    }
+                    clipped[gi] = any_clip;
                 }
-                const float r = std::sqrt(r2);
-                const float s = (r > kap) ? (kap / r) : 1.f;    // r>κ>0 ⇒ 除法安全 ✓
-                clipped[gi] = (r >= kap) ? 1 : 0;               // Ω 判定的权威标志（同一次比较 ✓）
-                for (int c = 0; c < 3; ++c) basis[base + c] = st.x0[base + c] + s * w[c];
-                // ---- 旧实现（ℓ∞ 盒投影，2026-10-24 停用，保留备查）：仅当需要复现 2026-10-23 及更早的
-                //      L3 记录时取消下面注释并注释掉上面的球投影（两者不可同时生效 ✓）----
-                // for (int c = 0; c < 3; ++c) {
-                //     float dv = cfg.gamma * (xyz.data()[base + c] - st.x0[base + c]);
-                //     if (dv >  kap) dv =  kap;                // ±κ 逐坐标截断（ℓ∞ 盒投影 ✓）
-                //     if (dv < -kap) dv = -kap;
-                //     basis[base + c] = st.x0[base + c] + dv;
-                // }
             }
         }
         xg = basis.data();
 
         if (cfg.debug) {
-            // 自检（不变量）：球投影后必须 ‖B_i−x⁰_i‖₂ ≤ κ_i（旧 ℓ∞ 盒在角点可达 √3·κ_i ✗）
-            //   clipped 用投影前的 r≥κ（权威）；这里的 rr 只用于报告"超出量"，被截断节点本应恰在球面上 ⇒
-            //   允许 float 级正残差（|rr−κ| ≤ ~1e-6·κ），超过 1e-4·κ 才说明投影本身写错 ✗
+            // 自检：两种几何各自的不变量（超出量应为 float 级，超过 1e-4·κ 才说明投影写错 ✗）
+            //   · 球：‖B_i−x⁰_i‖₂ ≤ κ_i  · 盒：max_c|B_{i,c}−x⁰_{i,c}| ≤ κ_i
+            //   clipped 用投影**前**的比较（权威）✓；这里只报告"超出量"和复算计数 ✓
             float viol = 0.f;
-            int64_t n_clip = 0, n_ball = 0;
+            int64_t n_clip = 0, n_recomp = 0;
             for (int b = 0; b < B; ++b) {
                 for (int l = 0; l < L; ++l) {
                     const size_t gi   = static_cast<size_t>(b) * L + l;
                     const size_t base = ((static_cast<size_t>(b) * L + l) * 3 + 1) * 3;
-                    const float dx = basis[base]     - st.x0[base];
-                    const float dy = basis[base + 1] - st.x0[base + 1];
-                    const float dz = basis[base + 2] - st.x0[base + 2];
-                    const float rr = std::sqrt(dx * dx + dy * dy + dz * dz);
-                    viol = std::max(viol, rr - st.kappa[gi]);
+                    const float dx   = basis[base]     - st.x0[base];
+                    const float dy   = basis[base + 1] - st.x0[base + 1];
+                    const float dz   = basis[base + 2] - st.x0[base + 2];
+                    const float kap  = st.kappa[gi];
+                    if (l3_ball) {
+                        const float rr = std::sqrt(dx * dx + dy * dy + dz * dz);
+                        viol = std::max(viol, rr - kap);
+                        n_recomp += (rr >= kap) ? 1 : 0;
+                    } else {
+                        const float m = std::max(std::fabs(dx), std::max(std::fabs(dy), std::fabs(dz)));
+                        viol = std::max(viol, m - kap);
+                        n_recomp += (m >= kap) ? 1 : 0;
+                    }
                     n_clip += clipped[gi] ? 1 : 0;
-                    n_ball += (rr >= st.kappa[gi]) ? 1 : 0;
                 }
             }
-            std::fprintf(stderr, "[TOPO-L3] ball rclip: max(‖B−x⁰‖₂−κ)=%.3e clipped=%lld/%d "
-                                 "(r≥κ 复算=%lld) gamma=%.3f\n",
-                         viol, (long long)n_clip, B * L, (long long)n_ball, cfg.gamma);
+            std::fprintf(stderr, "[TOPO-L3] %s: max(over-κ)=%.3e clipped=%lld/%d (recomputed=%lld) "
+                                 "gamma=%.3f\n",
+                         l3_ball ? "ball rclip" : "box clamp", viol,
+                         (long long)n_clip, B * L, (long long)n_recomp, cfg.gamma);
         }
     }
 
     // ---------- 之后每次：边集 = 冻结 E(x⁰)（L2 时按 Ω 局部替换）+ 基准几何（L3 ⇒ B ✓） ----------
     std::vector<int64_t> nsrc, ntgt;
+    // 诊断（L2 两条路径通用）：重建行数、候选总量、发出迭代量（与墙钟无关 ✓）
+    int64_t dbg_rows = 0, dbg_cand = 0, dbg_emit = 0;
+    int64_t dbg_nclip = -1;                  // |Ω_clip|（封闭前）
+    const char* dbg_closed = "-";            // 封闭方式：clip / nbh / risk
     if (!cfg.l2) {
         nsrc = st.src; ntgt = st.tgt;                       // L1：边集完全冻结 ✓
     } else {
         // 1) Ω = { i : ‖x_i − x⁰_i‖ ≥ κ_i } ✓
-        std::vector<char> om(static_cast<size_t>(B) * L, 0);
+        std::vector<char>  om(static_cast<size_t>(B) * L, 0);
+        std::vector<float> disp(static_cast<size_t>(B) * L, 0.f);
+        float disp_max = 0.f;
         for (int b = 0; b < B; ++b) {
             for (int l = 0; l < L; ++l) {
                 const size_t gi   = static_cast<size_t>(b) * L + l;
@@ -800,31 +933,81 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                 const float dx = xg[base]     - st.x0[base];   // L3 ⇒ 用基准 B 判定 Ω（附录 A.2.3 ✓）
                 const float dy = xg[base + 1] - st.x0[base + 1];
                 const float dz = xg[base + 2] - st.x0[base + 2];
-                const float disp = std::sqrt(dx * dx + dy * dy + dz * dz);
-                // L3（球投影）：被截断 ⇔ ‖B−x⁰‖ = κ（正好在球面）⇒ 用裁剪标志，避免舍入决定的刀口 ✓
+                const float d  = std::sqrt(dx * dx + dy * dy + dz * dz);
+                disp[gi] = d;
+                disp_max = std::max(disp_max, d);
+                // L3：被截断 ⇔ 投影后正好落在球面/盒面上 ⇒ 用投影**前**的裁剪标志，避免舍入决定的刀口 ✓
+                //   （球：‖B−x⁰‖₂ = κ；盒：max_c|B_c−x⁰_c| = κ —— 两种几何都由 clipped 权威给出 ✓）
                 // L1/L2：直接比欧氏位移（未投影 ✓，与旧实现逐位一致 ✓）
-                const bool over = clipped.empty() ? (disp >= st.kappa[gi])
+                const bool over = clipped.empty() ? (d >= st.kappa[gi])
                                                   : (clipped[gi] != 0);
                 if (over) om[gi] = 1;
             }
         }
-        // 2) Ω 邻居封闭（默认 ✓）：Ω ← Ω ∪ N(E(x⁰), Ω) —— 否则"邻居移动导致自己翻边"会被漏掉 ✗
+        dbg_nclip = 0;
+        for (char c : om) dbg_nclip += (c ? 1 : 0);
+
+        // 2) 封闭：默认「邻域一跳」；门控打开（cfg.l2_gate > 0）时，若**证书风险集**
+        //    U = { i : m_i ≤ 4Δ }（Δ = max 位移）比邻域一跳更小，则用 U —— 它是 sound 的
+        //    （Theorem 2：i ∉ U ⇒ top-k 不变），而邻域一跳只是启发式上近似 ✓
+        dbg_closed = "clip";
         if (cfg.closure) {
-            for (int64_t e = 0; e < st.E0; ++e) {
-                const int64_t s = st.src[e], t = st.tgt[e];
-                if (om[static_cast<size_t>(s)] && !om[static_cast<size_t>(t)]) om[static_cast<size_t>(t)] = 1;
-                else if (om[static_cast<size_t>(t)] && !om[static_cast<size_t>(s)]) om[static_cast<size_t>(s)] = 1;
+            const int64_t nL = (int64_t)B * L;
+            bool use_risk = false;
+            std::vector<char> risk;
+            if (cfg.l2_gate > 0.f && disp_max > 0.f) {
+                risk.assign(disp.size(), 0);
+                int64_t n_risk = 0;
+                for (size_t s = 0; s < disp.size(); ++s) {
+                    if (st.margin[s] <= 4.f * disp_max) { risk[s] = 1; ++n_risk; }
+                }
+                // 门控：风险集既 sound 又更小 ⇒ 用它；否则退回邻域一跳 ✓
+                if (n_risk <= (int64_t)(cfg.l2_gate * (float)nL) || n_risk < dbg_nclip) {
+                    om.swap(risk); use_risk = true; dbg_closed = "risk";
+                }
+            }
+            if (!use_risk) {
+                for (int64_t e = 0; e < st.E0; ++e) {
+                    const int64_t s = st.src[e], t = st.tgt[e];
+                    if (om[static_cast<size_t>(s)] && !om[static_cast<size_t>(t)]) om[static_cast<size_t>(t)] = 1;
+                    else if (om[static_cast<size_t>(t)] && !om[static_cast<size_t>(s)]) om[static_cast<size_t>(s)] = 1;
+                }
+                dbg_closed = "nbh";
             }
         }
         int64_t omega_n = 0;
         for (char c : om) omega_n += (c ? 1 : 0);
 
-        // 3) 逐行重建：非 Ω 行照抄冻结边 ✓；Ω 行在候选集 C_i 内按实时距离取 top-k ✓（并保留 kmin 支 ✓）
+        // 3) 逐行重建：非 Ω 行照抄冻结边 ✓；Ω 行重建 ✓
+        //    · 默认（plan=0）：两跳候选 C_i + 全表发出 —— 与 2026-10 之前逐位一致 ✓
+        //    · PPML_L2_PLAN=1：A1/A3/A4 —— 网格球查询 ∪ 序列窗（= 真 top-k 的超集 ✓）、局部位图、
+        //      升序发出（与 make_graph 同序 ⇒ 与全量重建逐位一致 ✓）
         nsrc.reserve(static_cast<size_t>(st.E0));
         ntgt.reserve(static_cast<size_t>(st.E0));
         std::vector<int64_t> cand;
         std::vector<std::pair<float, int>> ds;
         std::vector<char> in_topk(static_cast<size_t>(L), 0);
+        std::vector<char> loc;
+
+        // L2 计划：逐节点半径 rc_i ⇒ cell 边长取 max_i rc_i（保证 27 邻域覆盖任意 rc_i 球 ✓），
+        //          真正的"局部化"由候选按 rc_i 过滤完成 ✓
+        float rc_max = 0.f;
+        if (cfg.l2_plan && !st.rc.empty()) {
+            for (float r : st.rc) if (std::isfinite(r)) rc_max = std::max(rc_max, r);
+        }
+        const bool plan_ok = cfg.l2_plan && rc_max > 0.f;
+        std::vector<float> ca;
+        CellGrid grid;
+        if (plan_ok) {                                     // A1：每边界建一次 O(L) 网格（与 Ω 扫描同阶 ✓）
+            ca.resize(static_cast<size_t>(B) * L * 3);
+            for (int b = 0; b < B; ++b)
+                for (int l = 0; l < L; ++l) {
+                    const size_t base = (((size_t)b * L + l) * 3 + 1) * 3;
+                    for (int c = 0; c < 3; ++c) ca[3 * ((size_t)b * L + l) + c] = xg[base + c];
+                }
+            grid.build(ca, B * L, rc_max);
+        }
+
         for (int b = 0; b < B; ++b) {
             for (int l = 0; l < L; ++l) {
                 const int64_t gi = static_cast<int64_t>(b) * L + l;
@@ -832,6 +1015,78 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                     for (int64_t j : st.adj_out[static_cast<size_t>(gi)]) {
                         nsrc.push_back(gi); ntgt.push_back(j);
                     }
+                    continue;
+                }
+
+                // ---------- L2 计划路径（A3 候选 + A4 选择/发出） ----------
+                if (plan_ok) {
+                    cand.clear();
+                    // (i) 27 邻域（同一 batch）：cell 边长 = max rc ⇒ 半径 rc_i 内的点必在其 ±1 邻域 ✓
+                    //     再按**逐节点**半径 rc_i 过滤 ⇒ |C_i| ≈ k + O(ε)，而不是 L ✓
+                    const float  rci  = st.rc[static_cast<size_t>(gi)];
+                    const float  rci2 = rci * rci;
+                    const size_t bi2  = (((size_t)gi) * 3 + 1) * 3;
+                    const size_t g3 = static_cast<size_t>(gi) * 3;
+                    const int cx = grid.clampc((int)std::floor((ca[g3]     - grid.bx) / grid.h), grid.nx);
+                    const int cy = grid.clampc((int)std::floor((ca[g3 + 1] - grid.by) / grid.h), grid.ny);
+                    const int cz = grid.clampc((int)std::floor((ca[g3 + 2] - grid.bz) / grid.h), grid.nz);
+                    for (int dz = -1; dz <= 1; ++dz) {
+                        const int kz = cz + dz; if (kz < 0 || kz >= grid.nz) continue;
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            const int ky = cy + dy; if (ky < 0 || ky >= grid.ny) continue;
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                const int kx = cx + dx; if (kx < 0 || kx >= grid.nx) continue;
+                                const int64_t cid = ((int64_t)kz * grid.ny + ky) * grid.nx + kx;
+                                for (int32_t t = grid.start[(size_t)cid]; t < grid.start[(size_t)cid + 1]; ++t) {
+                                    const int64_t gj = grid.items[(size_t)t];
+                                    if (gj == gi || gj / L != b) continue;   // 去自身 + 同 batch ✓
+                                    const size_t bj2 = (((size_t)gj) * 3 + 1) * 3;
+                                    const float ex = xg[bj2]     - xg[bi2];
+                                    const float ey = xg[bj2 + 1] - xg[bi2 + 1];
+                                    const float ez = xg[bj2 + 2] - xg[bi2 + 2];
+                                    if (ex * ex + ey * ey + ez * ez <= rci2) cand.push_back(gj);  // rc_i 过滤 ✓
+                                }
+                            }
+                        }
+                    }
+                    // (ii) 序列窗：与距离无关，远处序列邻居不会被 cell 覆盖，必须显式补 ✓
+                    for (int d = 1; d < kmin; ++d) {
+                        if (l - d >= 0) cand.push_back(static_cast<int64_t>(b) * L + (l - d));
+                        if (l + d <  L) cand.push_back(static_cast<int64_t>(b) * L + (l + d));
+                    }
+                    std::sort(cand.begin(), cand.end());
+                    cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
+
+                    // (iii) 距离 + (dist, j) 全序 ⇒ 与 make_graph 同 tie-break ✓
+                    ds.clear();
+                    for (int64_t gj : cand) {
+                        const size_t bj2 = (((size_t)gj) * 3 + 1) * 3;
+                        const float ddx = xg[bj2]     - xg[bi2];
+                        const float ddy = xg[bj2 + 1] - xg[bi2 + 1];
+                        const float ddz = xg[bj2 + 2] - xg[bi2 + 2];
+                        ds.push_back({ std::sqrt(ddx * ddx + ddy * ddy + ddz * ddz),
+                                       static_cast<int>(gj % L) });
+                    }
+                    const int take = std::min<int>(kk, static_cast<int>(ds.size()));
+                    if (take > 0) std::partial_sort(ds.begin(), ds.begin() + take, ds.end());
+
+                    // (iv) 位图只覆盖 |C_i|（不是 L ✓）
+                    loc.assign(cand.size(), 0);
+                    for (int t = 0; t < take; ++t) {
+                        const int64_t gj = static_cast<int64_t>(b) * L + ds[t].second;
+                        const size_t pos = static_cast<size_t>(
+                            std::lower_bound(cand.begin(), cand.end(), gj) - cand.begin());
+                        if (pos < cand.size()) loc[pos] = 1;
+                    }
+                    // (v) 升序发出 ⇒ 行内顺序与 make_graph 完全一致 ✓
+                    const int64_t ridx_p = idx.data()[b * L + l];
+                    for (size_t u = 0; u < cand.size(); ++u) {
+                        const int j = static_cast<int>(cand[u] % L);
+                        if (j == l) continue;
+                        const int sep = std::abs(static_cast<int>(idx.data()[b * L + j] - ridx_p));
+                        if (loc[u] || sep < kmin) { nsrc.push_back(gi); ntgt.push_back(cand[u]); }
+                    }
+                    dbg_rows++; dbg_cand += (int64_t)cand.size(); dbg_emit += (int64_t)cand.size();
                     continue;
                 }
                 // 候选集 C_i = 冻结出邻居 ∪ 其二跳 ✓（去重、排除自身 ✓）
@@ -843,6 +1098,7 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                 std::sort(cand.begin(), cand.end());
                 cand.erase(std::unique(cand.begin(), cand.end()), cand.end());
                 cand.erase(std::remove(cand.begin(), cand.end(), gi), cand.end());
+                dbg_rows++; dbg_cand += (int64_t)cand.size();
                 // 实时距离 + (dist, j) 全序 ⇒ 与 make_graph 同 tie-break ✓
                 ds.clear();
                 const int bi = static_cast<int>(((gi / L * L + l) * 3 + 1) * 3);
@@ -866,6 +1122,7 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                         nsrc.push_back(gi); ntgt.push_back(static_cast<int64_t>(b) * L + j);
                     }
                 }
+                dbg_emit += (int64_t)L;                     // 旧路径每行扫全部 L 个 j ✓
             }
         }
         st.last_omega = omega_n;
@@ -882,10 +1139,19 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
         std::set_symmetric_difference(st.keys.begin(), st.keys.end(), k2.begin(), k2.end(),
                                       std::back_inserter(sym));
         st.last_diff = static_cast<int64_t>(sym.size());
+        // 标签：L2p = 计划路径（A1/A3/A4），L2 = 原两跳路径 ✓
+        const char* tag = cfg.l2 ? (cfg.l2_plan ? "L2p" : "L2") : "L1";
         std::fprintf(stderr, "[TOPO-%s] call=%d |E|=%zu (E0=%lld) |Omega|=%lld |E Δ E0|=%lld (D=%.4f)\n",
-                     cfg.l2 ? "L2" : "L1", st.calls, nsrc.size(), (long long)st.E0,
+                     tag, st.calls, nsrc.size(), (long long)st.E0,
                      (long long)st.last_omega, (long long)st.last_diff,
                      st.E0 > 0 ? double(st.last_diff) / double(st.E0 + nsrc.size() - st.last_diff) : 0.0);
+        if (cfg.l2) {
+            std::fprintf(stderr, "[TOPO-%s] cost: rows=%lld  sum|C_i|=%lld  emit_iters=%lld  "
+                                 "(|Omega|*L=%lld, L=%d, close=%s, |W_clip|=%lld, |W|=%lld)\n",
+                         tag, (long long)dbg_rows, (long long)dbg_cand, (long long)dbg_emit,
+                         (long long)(st.last_omega * (int64_t)L), L,
+                         dbg_closed, (long long)dbg_nclip, (long long)st.last_omega);
+        }
     }
     return G;
 }

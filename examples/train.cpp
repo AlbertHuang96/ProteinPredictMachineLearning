@@ -12,6 +12,7 @@
 #include "ppml/CpuFeatures.h"
 #include <iostream>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <cstdlib>
 #include <algorithm>
@@ -225,6 +226,123 @@ static bool no_cpu_fallback() {
     return on;
 }
 
+// ============================================================================
+// 诊断开关（2026-10-24）：PPML_GRAD_SCAN=1
+//   在"反向构建后 / 调度器切图后 / 图计算后"三个时点扫描 PARAM 节点的梯度可见性。
+//   动机：CUDA scheduler 路径实测 `[AdamW] initialized, params=0` + `grad_norm: 0.00`，
+//         而同一份代码 CPU 单后端（同配置）是 params=1066 / grad_norm=0.11。
+//         两者只差"调度器切图"这一步 ⇒ 必须区分三种成因：
+//           (a) 参数根本没有梯度张量（反向没连上）
+//           (b) 有梯度，但 hash 表查不到（visited_hash_set 被重建/溢出）
+//           (c) 切图把节点指针换掉了（grads 仍挂在旧指针上）
+// ============================================================================
+static void scan_param_grads(ComputeGraph* g, const char* tag) {
+    if (!std::getenv("PPML_GRAD_SCAN")) return;
+    int pn = 0, pg = 0, ln = 0, lg = 0;
+    long long numel_sum = 0;
+    double l2 = 0.0;
+    for (int i = 0; i < g->n_nodes(); ++i) {
+        TensorF32* t = g->graph_node(i);
+        if (!t || !(t->flag & TENSOR_FLAG_PARAM)) continue;
+        ++pn;
+        TensorF32* gr = g->graph_get_grad(t);
+        if (!gr) continue;
+        ++pg;
+        numel_sum += (long long)gr->numel();
+        if (gr->data() && gr->numel() > 0 && gr->numel() <= (1 << 22)) {
+            // 只在可读（host）且不巨大时做一次抽样范数，device 指针不能裸读
+            const bool host_ok = !gr->buffer_ || gr->buffer_->is_host();
+            if (host_ok) {
+                const float* p = gr->data();
+                for (int64_t k = 0; k < gr->numel(); ++k) l2 += (double)p[k] * (double)p[k];
+            }
+        }
+    }
+    for (int i = 0; i < g->n_leafs(); ++i) {
+        TensorF32* t = g->graph_leaf(i);
+        if (!t || !(t->flag & TENSOR_FLAG_PARAM)) continue;
+        ++ln;
+        if (g->graph_get_grad(t)) ++lg;
+    }
+    std::fprintf(stderr,
+                 "[GRAD-SCAN] %-16s n_nodes=%d n_leafs=%d node_params=%d(grad=%d) "
+                 "leaf_params=%d(grad=%d) grad_numel=%lld host_l2=%.4e\n",
+                 tag, g->n_nodes(), g->n_leafs(), pn, pg, ln, lg, numel_sum, std::sqrt(l2));
+}
+
+// ============================================================================
+// 诊断开关（2026-10-24）：PPML_OP_CHECK=1
+//   统计"CUDA 后端没有 kernel"的算子（**前向 + 反向都算**，故须在 build_backward_expand
+//   之后调用），按 op 聚合打印。用途：
+//     · PPML_CUDA_SCHED=1：这些 op 由 scheduler 依 supports_op 派给 CPU ⇒ 结果正确、只是变慢；
+//     · PPML_CUDA_SCHED=0：单后端全 GPU **没有** CPU 回落，节点会被跳过（loss 静默变坏）✗
+//   ⇒ 缺口清单 = 想彻底全 GPU 时还需要补哪些 kernel。
+// ============================================================================
+static void report_cuda_op_coverage(PPMLModel& model, ComputeGraph* g) {
+    if (!std::getenv("PPML_OP_CHECK")) return;
+    CUDABackend* cuda = model.cuda_backend();
+    if (!cuda) {
+        std::fprintf(stderr, "[OP-CHECK] 无 CUDA 后端（PPML_USE_CUDA 未开 / 设备不可用）⇒ 跳过\n");
+        return;
+    }
+    struct Ent { int op; int n; long long numel; int n_back; };
+    std::vector<Ent> bad;
+    int total = 0, n_deny = 0;
+    long long numel_deny = 0;
+    for (int i = 0; i < g->n_nodes(); ++i) {
+        TensorF32* t = g->graph_node(i);
+        if (!t || t->op == OP_NONE) continue;      // OP_NONE = 参数/叶子，不是算子
+        ++total;
+        if (cuda->supports_op(t)) continue;
+        ++n_deny;
+        numel_deny += (long long)t->numel();
+        const bool is_back = std::strstr(CUDABackend::op_name((int)t->op), "_BACK") != nullptr;
+        bool merged = false;
+        for (auto& e : bad) {
+            if (e.op != (int)t->op) continue;
+            ++e.n; e.numel += (long long)t->numel(); e.n_back += is_back ? 1 : 0;
+            merged = true;
+            break;
+        }
+        if (!merged) {
+            bad.push_back({(int)t->op, 1, (long long)t->numel(), is_back ? 1 : 0});
+            // 【2026-10-24】deny-detail：每个 op 首次被判否时打印**判定依据**。
+            //   用途：区分"有 kernel 但条件不满足"（类型/槽位/形状）与"显存不足"
+            //   —— supports_op 是纯逻辑函数，从不看显存，故这里能直接排除内存因素。
+            int nsrc = 0;
+            std::fprintf(stderr,
+                         "[OP-CHECK]   deny-detail op=%d(%s) node_type=%d dst_numel=%lld nsrc=",
+                         (int)t->op, CUDABackend::op_name((int)t->op),
+                         (int)t->type, (long long)t->numel());
+            for (int si = 0; si < GGML_MAX_SRC; ++si) {
+                const TensorF32* s = t->src[si];
+                if (!s) continue;
+                ++nsrc;
+                // ⚠ shape().dims 是 std::vector，长度 == ndim：裸读 dims[2]/dims[3] 会越界
+                //   读堆残留（本次曾因此打出 [32,2550,2550,33] 这种假 4 维，误导排查）。
+                const auto& sh = s->shape();
+                const int   nd = sh.ndim();
+                const auto  gd = [&](int d) -> long long {
+                    return d < nd ? (long long)sh.dims[static_cast<size_t>(d)] : -1;
+                };
+                std::fprintf(stderr, " src%d{type=%d nd=%d dims=[%lld,%lld,%lld,%lld] numel=%lld}",
+                             si, (int)s->type, nd, gd(0), gd(1), gd(2), gd(3),
+                             (long long)s->numel());
+            }
+            std::fprintf(stderr, " (nsrc=%d) op_params[0]=%d\n", nsrc, (int)t->op_params[0]);
+        }
+    }
+    std::fprintf(stderr, "[OP-CHECK] 算子节点=%d，CUDA 不支持=%d（%.1f%%），涉及 numel=%lld\n",
+                 total, n_deny, total ? 100.0 * (double)n_deny / (double)total : 0.0, numel_deny);
+    // 按 numel 降序（先看影响大的），最多 40 行
+    std::sort(bad.begin(), bad.end(), [](const Ent& a, const Ent& b) { return a.numel > b.numel; });
+    for (size_t i = 0; i < bad.size() && i < 40; ++i) {
+        std::fprintf(stderr, "[OP-CHECK]   op=%-3d %-28s nodes=%-5d (反向 %d) numel=%lld\n",
+                     bad[i].op, CUDABackend::op_name(bad[i].op), bad[i].n, bad[i].n_back, bad[i].numel);
+    }
+    if (bad.size() > 40) std::fprintf(stderr, "[OP-CHECK]   ... 其余 %zu 种省略\n", bad.size() - 40);
+}
+
 // 回退被禁用时的统一处置：打印现场 → flush → 退出码 3。
 //   不用 SIGSEGV 等异步崩溃兜底：图停在半算状态时后续读 loss/梯度会段错误，
 //   那样日志最后几行会丢，反而看不出失败点。
@@ -428,6 +546,22 @@ std::vector<float> read_tensor_cpu(const TensorF32* t) {
         std::memcpy(buf.data(), tcpu.data(), bytes);
     }
     return buf;
+}
+
+// ============================================================================
+// 张量是否驻留显存（诊断块的前置判据）
+//   【2026-10-25】混合 CUDA 下中间张量常常在 device buffer 上，而代码里不少诊断块只判
+//   `data() != nullptr` 就在 host 上做 `data()[k]` 下标读 ⇒ 解引用显存指针 = SIGSEGV
+//   （实测 gdb 栈 #0 main ... train.cpp:2447 `float v = pd[k]`，此时日志上一行是
+//    `[sched] 本图执行统计：CUDA 节点=9519 / CPU 节点=28`）。
+//   凡"要读数值做统计"的地方：要么先判本函数跳过（保持既有 `(on-device, skip)` 口径），
+//   要么改用上面的 read_tensor_cpu 取 host 副本 ✓。判据优先用 buffer_ 的类型（零开销），
+//   只有"无 buffer 却疑似裸 device 指针"才走 is_device_pointer 的 D2H 探测。
+// ============================================================================
+static bool tensor_on_device(const TensorF32* t) {
+    if (!t) return false;
+    if (t->buffer_) return !t->buffer_->is_host();
+    return t->data() != nullptr && is_device_pointer(t, t->data());
 }
 
 // ============================================================================
@@ -1767,9 +1901,11 @@ int main(int argc, char* argv[]) {
             int cnt = 0;
             double gmax = 0; int gidx = -1; double gsum = 0;
             int n_null = 0;   // data()==nullptr 的参数数（若>0 → 参数创建后没数据，transfer 也跳过）
+            int n_dev  = 0;   // 驻留显存的参数数（CUDA 模式；host 裸读会 SIGSEGV ⇒ 跳过）
             for (size_t i = 0; i < pvec.size(); i++) {
                 TensorF32* t = pvec[i];
                 if (!t->data()) { n_null++; continue; }
+                if (tensor_on_device(t)) { n_dev++; continue; }
                 float mx = 0;
                 for (int64_t q = 0; q < t->numel(); q++) {
                     float v = t->data()[q];
@@ -1781,8 +1917,8 @@ int main(int argc, char* argv[]) {
                 gsum += (double)mx;
                 if (mx > gmax) { gmax = mx; gidx = (int)i; }
             }
-            fprintf(stderr, "[param-dist] epoch=%d n_params=%zu n_null=%d n_overflow(>1e6)=%d gmax=%.6g@[%d] gsum=%.6g",
-                    epoch, pvec.size(), n_null, cnt, gmax, gidx, gsum);
+            fprintf(stderr, "[param-dist] epoch=%d n_params=%zu n_null=%d n_on_device=%d n_overflow(>1e6)=%d gmax=%.6g@[%d] gsum=%.6g",
+                    epoch, pvec.size(), n_null, n_dev, cnt, gmax, gidx, gsum);
             // 打印 gmax 对应参数的地址与是否被 gallocr 绑定（对比 GRAPH_DEBUG_KERNEL 里 src1 ptr，
             // 判断 kernel 读的"权重"是不是这个真实参数：若 param 正常(±1)而 kernel src1 读巨大/非负，
             // 且二者 ptr 不同 → kernel 读的是被复用的 buffer 而非参数）。
@@ -2163,6 +2299,19 @@ int main(int argc, char* argv[]) {
         // 开发开关：PPML_NO_BACKWARD=1 跳过反向，仅看前向 loss（隔离 forward/backward nan 来源）
         static const bool no_backward =
             (std::getenv("PPML_NO_BACKWARD") != nullptr) && (std::atoi(std::getenv("PPML_NO_BACKWARD")) != 0);
+        // 【2026-10-24】显式告警：这个开关会让下游全部"看起来像梯度异常"——
+        //   clip_grad_norm 找不到参数（无 [CLIP] 行）、[AdamW] params=0、grad_norm 恒 0.00、
+        //   权重完全不更新，但 loss/前向一切正常 ⇒ 极易被误诊为设备的梯度读回问题 ✗。
+        //   （2026-10-24 的 P69905 四个模式就是这么被误判的。）
+        if (no_backward) {
+            static bool warned_nobwd = false;
+            if (!warned_nobwd) {
+                warned_nobwd = true;
+                std::cerr << "[BACKWARD-OFF] PPML_NO_BACKWARD=1 ⇒ 跳过 build_backward_expand："
+                             "本进程**没有任何梯度**（clip_grad_norm 恒 0、[AdamW] params=0、权重不更新）"
+                             " —— 纯前向诊断用；要训练请 unset 该变量 ⚠️" << std::endl;
+            }
+        }
         if (!no_backward) {
             if (dbg_bwdorder) {
                 bwd_before = bwd_snapshot();
@@ -2228,10 +2377,21 @@ int main(int argc, char* argv[]) {
              (std::atoi(std::getenv("PPML_CUDA_SCHED")) != 0)) ||
             remote_backend_enabled();      // 对齐注册条件（见该函数注释）
         // 同多样本路径：远端后端就绪时也启用 scheduler（让远端后端能分到节点）。
-        const bool use_sched = ((model.device() == Device::CUDA || remote_backend_enabled()) &&
-                                sched && sched_flag);
+        // 【2026-10-24】PPML_FORCE_SCHED=1：即使只有 CPU 后端也强制走 scheduler 路径。
+        //   用途=本地复现"混合调度下 params=0 / grad_norm=0.00"——该现象在单后端 CPU 上
+        //   不复现（同配置 params=1066），差异只在本分支的 split_graph（切图会改写 node->src、
+        //   绑定 buffer）。纯诊断开关，默认关，不影响生产路径 ✓
+        static const bool force_sched = [] {
+            const char* v = std::getenv("PPML_FORCE_SCHED");
+            return v && *v && std::atoi(v) != 0;
+        }();
+        const bool use_sched = ((model.device() == Device::CUDA || remote_backend_enabled() || force_sched) &&
+                                sched && (sched_flag || force_sched));
+        scan_param_grads(cgraph, "after-backward");
+        report_cuda_op_coverage(model, cgraph);   // PPML_OP_CHECK=1：CUDA kernel 缺口清单
         if (use_sched) {
             sched->split_graph(cgraph);
+            scan_param_grads(cgraph, "after-split");
             if (sched->alloc_splits()) {
                 compute_st = sched->graph_compute();   // 跨后端拷贝 + 各 split 执行
             } else {
@@ -2258,6 +2418,7 @@ int main(int argc, char* argv[]) {
             std::cout << "[WARN] graph_compute status=" << static_cast<int>(compute_st)
                       << " (0=SUCCESS 1=ALLOC_FAILED)" << std::endl;
         }
+        scan_param_grads(cgraph, "after-compute");
 
         // ---- 读取 total loss ----
         // total_node 在混合调度 gallocr 下 buffer 可能被别名/覆盖（读出 1.00/0.00 而非真实 ~30），
@@ -2296,9 +2457,16 @@ int main(int argc, char* argv[]) {
                          + 0.01f * read_scalar(loss_conf_node);
 
         // ---- 开发诊断：pred_coords 是否含 NaN（FAPE=nan 的根因定位，无条件）----
-        if (pred_node && pred_node->data()) {
+        // 【2026-10-25 修】原实现取 `float* pd = pred_node->data()` 后**在 host 上逐元素读** ✗：
+        //   混合调度下 pred_node 的值可能落在 device buffer，data() 是显存指针 ⇒
+        //   SIGSEGV at `float v = pd[k]`（实测 gdb 栈 #0 main ... train.cpp:2447；
+        //   崩溃前一行是 `[sched] 本图执行统计：CUDA 节点=9519 / CPU 节点=28`）。
+        //   改为经 read_tensor_cpu 取 host 副本（buffer_ 优先，其次 CPU memcpy，最后 t->cpu()）✓。
+        if (pred_node && pred_node->numel() > 0 &&
+            (pred_node->data() != nullptr || pred_node->buffer_ != nullptr)) {
             const int64_t pdN = pred_node->numel();
-            float* pd = pred_node->data();
+            const std::vector<float> pd_host = read_tensor_cpu(pred_node);
+            const float* pd = pd_host.data();
             bool has_nan = false; float mn = 1e30f, mx = -1e30f;
             for (int64_t k = 0; k < pdN; ++k) {
                 float v = pd[k];
@@ -2323,9 +2491,11 @@ int main(int argc, char* argv[]) {
                 std::cout << " s0base_op=" << (int)s0->op
                           << " s0host=" << (s0->buffer_ ? (int)s0->buffer_->is_host() : -1)
                           << " s0numel=" << s0->numel();
-                if (s0->data()) {
-                    float smn = s0->data()[0], smx = s0->data()[0]; bool snan = false;
-                    for (int64_t q = 0; q < s0->numel(); ++q) { float v = s0->data()[q];
+                if (s0->numel() > 0 && (s0->data() != nullptr || s0->buffer_ != nullptr)) {
+                    // 同 pred_node：s0 也可能是 device 张量，不能在 host 裸读 ✗
+                    const std::vector<float> s0h = read_tensor_cpu(s0);
+                    float smn = s0h[0], smx = s0h[0]; bool snan = false;
+                    for (size_t q = 0; q < s0h.size(); ++q) { float v = s0h[q];
                         if (std::isnan(v)) { snan = true; break; } if (v < smn) smn = v; if (v > smx) smx = v; }
                     std::cout << " s0_nan=" << snan << " s0_min=" << smn << " s0_max=" << smx;
                 }
@@ -2335,9 +2505,11 @@ int main(int argc, char* argv[]) {
         // [2026-09-06] 值版 coords 对照（SE3 值更新路径）：区分 SE3 值版 vs 主图坐标链
         {
             const TensorF32& cval = go.coords;
-            if (cval.numel() > 0 && cval.data()) {
+            if (cval.numel() > 0 && (cval.data() != nullptr || cval.buffer_ != nullptr)) {
+                // coords 可能在 device buffer（SE3 值版回落），同样经 read_tensor_cpu 取 host 副本
+                const std::vector<float> cv_host = read_tensor_cpu(&cval);
                 bool cnan = false; long nnan = 0; float cmn = 1e30f, cmx = -1e30f;
-                for (int64_t q = 0; q < cval.numel(); ++q) { float v = cval.data()[q];
+                for (int64_t q = 0; q < cval.numel(); ++q) { float v = cv_host[(size_t)q];
                     if (std::isnan(v)) { cnan = true; ++nnan; } else { if (v < cmn) cmn = v; if (v > cmx) cmx = v; } }
                 std::cout << "[COORDS-VAL] numel=" << cval.numel() << " nnan=" << nnan
                           << " min=" << (cnan ? -1.f : cmn) << " max=" << (cnan ? -1.f : cmx)
@@ -2375,10 +2547,13 @@ int main(int argc, char* argv[]) {
                         if (std::isfinite(x)) { float ax = std::fabs(x); if (ax > maxabs) maxabs = ax; }
                     }
                     auto maxabs_of = [](TensorF32* t) -> float {
-                        if (!t || !t->data() || t->numel() <= 0) return -1.f;
+                        if (!t || t->numel() <= 0) return -1.f;
+                        if (!t->data() && !t->buffer_) return -1.f;
+                        //  src 可能驻留显存：先取 host 副本再统计（裸读 data() 会 SIGSEGV ✗）
+                        const std::vector<float> h = read_tensor_cpu(t);
                         float mx = 0.f;
-                        for (int64_t q = 0; q < t->numel(); ++q) {
-                            float x = t->data()[q];
+                        for (size_t q = 0; q < h.size(); ++q) {
+                            float x = h[q];
                             if (std::isfinite(x)) { float ax = std::fabs(x); if (ax > mx) mx = ax; }
                         }
                         return mx;
@@ -2393,9 +2568,11 @@ int main(int argc, char* argv[]) {
                     if (nd->op == 41 /*OP_GET_ROWS*/) {
                         TensorF32* W = nd->src[0];
                         TensorF32* I = nd->src[1];
-                        if (W && W->data() && W->numel() > 0) {
-                            float wmin = W->data()[0], wmax = W->data()[0];
-                            for (int64_t wv = 1; wv < W->numel(); ++wv) { float x = W->data()[wv]; if (x<wmin)wmin=x; if (x>wmax)wmax=x; }
+                        if (W && W->numel() > 0 && (W->data() != nullptr || W->buffer_ != nullptr)) {
+                            //  W/I 也可能是 device 张量 → 先取 host 副本（原来裸读 data() ✗）
+                            const std::vector<float> wh = read_tensor_cpu(W);
+                            float wmin = wh[0], wmax = wh[0];
+                            for (size_t wv = 1; wv < wh.size(); ++wv) { float x = wh[wv]; if (x<wmin)wmin=x; if (x>wmax)wmax=x; }
                             std::cout << " W{op=" << (int)W->op << " numel=" << W->numel()
                                       << " dims0=" << (W->shape().ndim()>0?W->shape().dims[0]:-1)
                                       << " dims1=" << (W->shape().ndim()>1?W->shape().dims[1]:-1)
@@ -2403,9 +2580,10 @@ int main(int argc, char* argv[]) {
                         } else {
                             std::cout << " W{data=null}";
                         }
-                        if (I && I->data() && I->numel() > 0) {
-                            float imin = I->data()[0], imax = I->data()[0];
-                            for (int64_t iv = 1; iv < I->numel(); ++iv) { float x = I->data()[iv]; if (x<imin)imin=x; if (x>imax)imax=x; }
+                        if (I && I->numel() > 0 && (I->data() != nullptr || I->buffer_ != nullptr)) {
+                            const std::vector<float> ih = read_tensor_cpu(I);
+                            float imin = ih[0], imax = ih[0];
+                            for (size_t iv = 1; iv < ih.size(); ++iv) { float x = ih[iv]; if (x<imin)imin=x; if (x>imax)imax=x; }
                             std::cout << " idx{op=" << (int)I->op << " numel=" << I->numel()
                                       << " min=" << imin << " max=" << imax << "}";
                         }
@@ -2422,15 +2600,132 @@ int main(int argc, char* argv[]) {
             }
         }
         // ---- 开发诊断：distogram head logits 是否含 nan（数据已算好，无条件，替代原 GRAPH_DEBUG_GALLOCR 块）----
+        // ⚠️【2026-10-24】打印点在 graph_compute 之后，而 gallocr 会把"已释放节点"的 buffer 复用给
+        //   后续节点（loss 子图里的 softmax/log 等）⇒ 这里读到的**未必仍是 head 的输出**（实测
+        //   CPU/GPU 两个路径的 dist sum 都是 2616.61 = 2601×(1+ε)，即都是后面某个节点的残留）。
+        //   判据请以 [LOSS5] 为准：distogram=14.14 就是四个 head 全均匀的基线
+        //   （ln60+2ln36+ln18=14.15），而正常值在本样本上是 18.15。
         if (go.distogram && go.distogram->numel() > 0) {
             auto dump4 = [&](TensorF32* t, const char* tag) {
                 if (!t || !t->data()) { std::cout << "[dist_logits] " << tag << " data=null\n"; return; }
-                if (t->buffer_ && !t->buffer_->is_host()) { std::cout << "[dist_logits] " << tag << " on-device(skip)\n"; return; }
+                // 【2026-10-24】device 张量不再 skip：GPU 路径下 pair/state 等关键输入恰在 device，
+                //   跳过等于留盲区。改为 buffer_->get_tensor 读回 host 再统计。
+                std::vector<float> hcopy;
+                const bool isdev = (t->buffer_ && !t->buffer_->is_host());
                 const float* gd = t->data();
+                if (isdev) {
+                    hcopy = read_tensor_cpu(t);
+                    if (hcopy.empty()) { std::cout << "[dist_logits] " << tag << " d2h-empty\n"; return; }
+                    gd = hcopy.data();
+                }
+                const int64_t nel = isdev ? (int64_t)hcopy.size() : t->numel();
+                if (nel <= 0) { std::cout << "[dist_logits] " << tag << " empty\n"; return; }
                 float mn=1e30f, mx=-1e30f; bool nan=false; long nnan=0;
-                for (int64_t q=0; q<t->numel(); ++q){ float v=gd[q]; if(v!=v){nan=true;++nnan;} if(v<mn)mn=v; if(v>mx)mx=v;}
-                std::cout << "[dist_logits] " << tag << " numel=" << t->numel() << " min="<<mn<<" max="<<mx
-                          << " nan="<<nan<<" nnan="<<nnan<<" head0="<<gd[0]<<" head1="<<gd[1]<<"\n";
+                double sum=0; long ndiff=0;   // sum/ndiff：判别"是否为均匀分布 1/bins"
+                for (int64_t q=0; q<nel; ++q){ float v=gd[q]; sum+=v;
+                    if(v!=v){nan=true;++nnan;} if(v<mn)mn=v; if(v>mx)mx=v; if (v!=gd[0]) ++ndiff; }
+                // 【2026-10-24】附上 op/buffer 归属：定位"CPU 与 GPU 数值不同"时，
+                //   需要区分(a)该张量真在 host（值可信）还是(b)被当成 host 读了 device 指针 ✗
+                std::cout << "[dist_logits] " << tag << " numel=" << nel << " min="<<mn<<" max="<<mx
+                          << " nan="<<nan<<" nnan="<<nnan<<" head0="<<gd[0]<<" head1="<<(nel>1?gd[1]:-1.f)
+                          << " op=" << (int)t->op << " buf=" << (t->buffer_ ? (t->buffer_->is_host() ? "host" : (isdev ? "dev(d2h)" : "dev")) : "null")
+                          << " data=" << (const void*)t->data() << " view=" << (t->view_src ? 1 : 0)
+                          << " sum=" << sum << " ndiff=" << ndiff << "\n";
+                // 视图链：打印 root 的 op/buffer/numel(原始) 便于判断是谁的 host 副本
+                {
+                    const TensorF32* r = t;
+                    int depth = 0;
+                    while (r && r->view_src && depth < 16) { r = r->view_src; ++depth; }
+                    if (depth > 0 && r) {
+                        // 【2026-10-25】root 在显存时**不能** `r->data()[0]`：那是 host 解引用显存指针
+                        //   ⇒ 实测 gdb 栈 #1 train.cpp:2643 / #2 main:2734（go.state 走 dump4，state 是
+                        //   view 而根在 device）。只取 1 个元素做 D2H，避免整块 read_tensor_cpu 的开销。
+                        float root_h0 = -1.f;
+                        if (tensor_on_device(r) && r->buffer_) {
+                            //  单元素 D2H 走 buffer_->get_tensor（带同步、按 buffer_offs_ 定位）；
+                            //  不用裸 cudaMemcpy：万一 buffer 是 device 而 data 其实是 host，
+                            //  cudaMemcpy 会返回错误并留下 sticky error，污染后续的判断。
+                            r->buffer_->get_tensor(r, &root_h0, r->buffer_offs_, sizeof(float));
+                        } else if (r->data()) {
+                            root_h0 = static_cast<const float*>(r->data())[0];
+                        }
+                        std::cout << "[dist_logits]   root depth=" << depth << " op=" << (int)r->op
+                                  << " buf=" << (r->buffer_ ? (r->buffer_->is_host() ? "host" : "dev") : "null")
+                                  << " data=" << (const void*)r->data() << " numel=" << r->numel()
+                                  << " root_head0=" << root_h0
+                                  << "\n";
+                        // 【2026-10-24】buffer 复用体检：gallocr 可能在输出被读取前就把该 buffer
+                        //   交给后续节点（如 distogram_loss 里的 softmax），若无消费者保活，
+                        //   我们读到的就不是 head 的 logits。列出所有落在同一 [data, data+bytes) 的节点。
+                        const char* base = (const char*)r->data();
+                        const int64_t bytes = (int64_t)r->numel() * (int64_t)sizeof(float);
+                        int hit = 0;
+                        for (int gi = 0; base && gi < cgraph->n_nodes() && hit < 8; ++gi) {
+                            TensorF32* nd = cgraph->graph_node(gi);
+                            if (!nd || nd == r || !nd->data()) continue;
+                            const char* p = (const char*)nd->data();
+                            if (p >= base && p < base + bytes) {
+                                std::cout << "[dist_logits]   alias node_idx=" << gi
+                                          << " op=" << (int)nd->op << " numel=" << nd->numel()
+                                          << " off=" << (long long)(p - base) << "\n";
+                                ++hit;
+                            }
+                        }
+                        // MUL_MAT root 的两个输入（激活 / 权重）各自统计，判断哪一侧退化。
+                        //   dev 张量走 D2H 读回，避免"看不清 device 侧"的盲区。
+                        auto srcstat = [&](TensorF32* s, const char* stag, int hop) {
+                            if (!s) { std::cout << "[dist_logits]   " << stag << " null\n"; return; }
+                            std::cout << "[dist_logits]   " << stag << " hop=" << hop
+                                      << " op=" << (int)s->op
+                                      << " buf=" << (s->buffer_ ? (s->buffer_->is_host() ? "host" : "dev") : "null")
+                                      << " numel=" << s->numel();
+                            if (s->shape().ndim() >= 1 && s->shape().ndim() <= 4) {
+                                std::cout << " dims=[";
+                                for (int d = 0; d < s->shape().ndim(); ++d)
+                                    std::cout << (d ? "," : "") << s->shape().dims[d];
+                                std::cout << "]";
+                            }
+                            std::vector<float> hc;
+                            const float* sd = nullptr;
+                            if (s->data()) {
+                                if (s->buffer_ && !s->buffer_->is_host()) { hc = read_tensor_cpu(s); if (!hc.empty()) sd = hc.data(); }
+                                else sd = s->data();
+                            }
+                            const int64_t sn = sd ? (hc.empty() ? s->numel() : (int64_t)hc.size()) : 0;
+                            if (sd && sn > 0) {
+                                float smn = sd[0], smx = sd[0]; double ssum = 0; long sdiff = 0, szero = 0;
+                                for (int64_t q = 0; q < sn; ++q) {
+                                    float v = sd[q]; ssum += v;
+                                    if (v < smn) smn = v; if (v > smx) smx = v;
+                                    if (v != sd[0]) ++sdiff; if (v == 0.0f) ++szero;
+                                }
+                                std::cout << " min=" << smn << " max=" << smx << " sum=" << ssum
+                                          << " ndiff=" << sdiff << " zero%=" << (100.0 * szero / (double)sn);
+                            }
+                            std::cout << "\n";
+                        };
+                        if (r->op == 30 /*OP_MUL_MAT*/) {
+                            // 本项目 mul_mat 约定：dst=[N,M]，src0=dims[K,N]，src1=dims[K,M]。
+                            //   dist/omega/theta/phi 头里 numel==128*bins 的那一侧才是权重，
+                            //   另一侧（=128*B*L*L）是 pair_normed 激活 —— 直接点名，避免误读。
+                            TensorF32* s0 = r->src[0];
+                            TensorF32* s1 = r->src[1];
+                            const int64_t n0 = s0 ? s0->numel() : -1;
+                            const int64_t n1 = s1 ? s1->numel() : -1;
+                            const bool act0 = (n0 > n1);   // 元素多的一侧是激活（M=B*L*L 主导）
+                            srcstat(act0 ? s0 : s1, act0 ? "act" : "w", 0);
+                            srcstat(act0 ? s1 : s0, act0 ? "w"   : "act", 0);
+                            // 激活链上溯 4 跳（view_src 优先，否则 src[0]）：LN(ADD/MUL/REPEAT/NORM) → pair
+                            TensorF32* a = act0 ? s0 : s1;
+                            for (int hop = 1; a && hop <= 4; ++hop) {
+                                TensorF32* up = a->view_src ? a->view_src : a->src[0];
+                                if (!up || up == a) break;
+                                srcstat(up, "act-up", hop);
+                                a = up;
+                            }
+                        }
+                    }
+                }
             };
             dump4(go.distogram, "dist");
             dump4(go.omega,     "omega");
@@ -2815,6 +3110,7 @@ int main(int argc, char* argv[]) {
             for (size_t pi = 0; pi < ps.size() && pi < ns.size(); ++pi) {
                 TensorF32* pt = ps[pi];
                 if (!pt || !pt->data()) continue;
+                if (tensor_on_device(pt)) continue;   // 显存参数：host 裸读会 SIGSEGV ⇒ 跳过
                 bool nan = false;
                 for (int64_t v = 0; v < pt->numel(); ++v) {
                     if (pt->data()[v] != pt->data()[v]) { nan = true; break; }
@@ -2865,8 +3161,8 @@ int main(int argc, char* argv[]) {
             std::cout << "  [loss] total = " << batch_loss << std::endl;
             // 手动重算 total（用 loss 分量 data()），对比 graph total，判断 total 诊断 nan 是否 buffer 复用假象
             {
-                auto v1 = [](TensorF32* n){ return (n && n->buffer_ && !n->buffer_->is_host()) ? 0.0f
-                                          : ((n && n->data() && n->numel()==1) ? n->data()[0] : 0.0f); };
+                auto v1 = [](TensorF32* n){ return (!n || tensor_on_device(n)) ? 0.0f
+                                          : ((n->data() && n->numel()==1) ? n->data()[0] : 0.0f); };
                 double manual = 0.5*v1(loss_fape_node) + 0.5*v1(loss_chi_node) + 0.3*v1(loss_distogram_node)
                               + 2.0*v1(loss_msa_node) + 0.01*v1(loss_conf_node);
                 std::cout << "  [loss] manual_total = " << manual << std::endl;
@@ -2949,15 +3245,18 @@ int main(int argc, char* argv[]) {
                 TensorF32* cur = go.msa_logits;
                 for (int depth = 0; cur && depth < 8; depth++) {
                     double s = 0; int64_t cn = cur->numel();
-                    if (cur->data()) for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
+                    //  链上的 src 可能驻留显存（同一张图上 CPU/GPU 混排）⇒ 先判 device 再读 ✓
+                    const bool cur_dev = tensor_on_device(cur);
+                    if (!cur_dev && cur->data())
+                        for (int64_t q = 0; q < cn; q++) s += cur->data()[q];
                     std::cout << "  [chain] d=" << depth << " op=" << cur->op
                               << " numel=" << cn << " sum=" << s
-                              << (cn > 0 && cur->data() ? " v0=" + std::to_string(cur->data()[0]) : "")
+                              << (cn > 0 && cur->data() && !cur_dev ? " v0=" + std::to_string(cur->data()[0]) : "")
                               << std::endl;
                     cur = cur->src[0];
                 }
             }
-            if (input.bert_mask.numel() > 0) {
+            if (input.bert_mask.numel() > 0 && !tensor_on_device(&input.bert_mask)) {
                 std::cout << "  [bert_mask] numel=" << input.bert_mask.numel()
                           << " sum=" << [&](){ double s=0; const float* d=input.bert_mask.data();
                               for (int64_t i=0;i<input.bert_mask.numel();i++) s+=d[i]; return s; }()
@@ -2980,7 +3279,7 @@ int main(int argc, char* argv[]) {
                 int shown = 0;
                 for (int i = 0; i < cgraph->n_nodes() && shown < 3; i++) {
                     TensorF32* nn = cgraph->graph_node(i);
-                    if (nn->flag & TENSOR_FLAG_PARAM && nn->data()) {
+                    if (nn->flag & TENSOR_FLAG_PARAM && nn->data() && !tensor_on_device(nn)) {
                         double s = 0; int64_t nn2 = nn->numel();
                         for (int64_t q = 0; q < nn2; q++) s += nn->data()[q];
                         std::cout << "  [param-val] numel=" << nn2 << " sum=" << s

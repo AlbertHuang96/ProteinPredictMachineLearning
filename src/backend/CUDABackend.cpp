@@ -163,6 +163,13 @@ bool CUDABackend::supports_op(TensorF32* node) const {
                    node->type == TENSOR_TYPE_F32;
 
         case OP_CONCAT: {
+            // 【2026-10-24】PPML_CUDA_NO_CONCAT=1：强制 CONCAT 回落 CPU。
+            //   实测（RTX 2050 / L=51 / MSA=8 / 3 blocks）：训练图里 split=444 是一个以
+            //   CONCAT 打头的 CUDA split，launch 后报非法访存；kernel 自身的 [concat-oob]
+            //   与 host 指针守卫都没触发 ⇒ 需要这个开关做 A/B 定位（也作为安全回落 ✓）。
+            if (getenv("PPML_CUDA_NO_CONCAT") && std::strcmp(getenv("PPML_CUDA_NO_CONCAT"), "1") == 0) {
+                return false;
+            }
             // N-ary concat：遍历所有 src。
             // 注意：concat 不支持广播语义，非拼接维必须与 dst 一致，
             // 该约束在 kernel_concat_cuda 内强制校验。
@@ -170,13 +177,60 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             //     `if (!s || s->type != F32) return false`，任何 n-ary 节点（空槽存在）
             //     都被判成不支持 ⇒ CONCAT 永远回落 CPU + 单后端模式刷 [CUDA-UNSUPPORTED]
             //     误报（2026-10-24 修）。
+            //   ⚠ 单源 concat（n_src==1）不是非法输入：GMABSE3/GSE3Res 对**单度 fiber**
+            //     调 concat_ptr(k_nodes, 0) 时就只有 1 个源，其语义是 identity（dst 与 src
+            //     同形，builder 的 ne[dim] 只累加了一个 src）。CPU kernel_concat 早已按
+            //     「memcpy 直通」处理；原判据写成 n_src >= 2 ⇒ 实测训练图里 472 个该节点
+            //     （3.74e7 元素）被判不支持、整片回落 CPU（2026-10-24 修，与 CPU 对齐 ✓）。
             int n_src = 0;
             for (const auto* s : node->src) {
                 if (!s) continue;
                 if (s->type != TENSOR_TYPE_F32) return false;
                 ++n_src;
             }
-            return n_src >= 2 && node->type == TENSOR_TYPE_F32;
+            // PPML_CUDA_NO_CONCAT1=1：只把**单源（identity）** concat 赶回 CPU，用于判别
+            //   「concat 的 CPU 实现数值偏差」vs「混合调度换分区本身就改变数值」——
+            //   identity 拷贝在数学上不可能改值，若 loss 因此变动，责任只在分区/暂存侧。
+            if (n_src == 1) {
+                const char* nc1 = std::getenv("PPML_CUDA_NO_CONCAT1");
+                if (nc1 && std::atoi(nc1) == 1) return false;
+            } else {
+                const char* ncn = std::getenv("PPML_CUDA_NO_CONCATN");   // 多源
+                if (ncn && std::atoi(ncn) == 1) return false;
+            }
+            return n_src >= 1 && node->type == TENSOR_TYPE_F32;
+        }
+
+        // 【2026-10-24】concat 反向：dst[k] = grad[k + offset*stride]（平移拷贝）
+        //   实测训练图里有 2886 个 CONCAT_BACK 节点、1.09e8 元素，原来全落 CPU。
+        //   判据只需类型 + 越界可行性（不看指针，放置期数据可能尚未分配 ✓）
+        case OP_CONCAT_BACK: {
+            // A/B 开关（与 PPML_CUDA_NO_CONCAT 对称）：强制回落 CPU，用于定位数值差异 ✓
+            if (getenv("PPML_CUDA_NO_CONCAT_BACK") &&
+                std::strcmp(getenv("PPML_CUDA_NO_CONCAT_BACK"), "1") == 0) {
+                return false;
+            }
+            TensorF32* g = node->src[0];
+            if (!g || g->type != TENSOR_TYPE_F32) return false;
+            if (node->type != TENSOR_TYPE_F32) return false;
+            const int dim = node->op_params[0];
+            const int offset = node->op_params[1];
+            if (dim < 0 || dim >= 4 || offset < 0) return false;
+            // 越界可行性（与 kernel 侧同式）：最大索引 = Σ (ne[d] - (d==dim) + offset) * gs[d]
+            int64_t ne[4] = {1, 1, 1, 1};
+            for (int d = 0; d < node->shape().ndim() && d < 4; ++d) {
+                ne[d] = node->shape().dims[static_cast<size_t>(d)];
+            }
+            int64_t gs[4] = {1, 1, 1, 1};
+            for (int d = 1; d < g->shape().ndim() && d < 4; ++d) {
+                gs[d] = gs[d - 1] * g->shape().dims[static_cast<size_t>(d - 1)];
+            }
+            int64_t max_idx = 0;
+            for (int d = 0; d < 4; ++d) {
+                const int64_t hi = (d == dim) ? (ne[d] + offset) : ne[d];
+                max_idx += (hi > 0 ? hi - 1 : 0) * gs[d];
+            }
+            return node->numel() > 0 && max_idx < g->numel();
         }
 
         case OP_SOFT_MAX:
@@ -194,6 +248,17 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             if (node->op == OP_SCATTER_ADD &&
                 getenv("PPML_CUDA_NO_SCATTER") &&
                 std::strcmp(getenv("PPML_CUDA_NO_SCATTER"), "1") == 0) {
+                return false;
+            }
+            //  诊断开关（PPML_CUDA_NO_PEM=1）：强制 PER_EDGE_MATMUL 回落 CPU（± 反向两核）。
+            //    动机：混合调度下强制 CONCAT 落 CPU 会让 split 结构剧变（84→683），预算逐出集合
+            //    随之改变 —— 实测 A(13.88) 里 op=107 被逐出 944 次走 CPU，B(14.58) 里它改跑 GPU。
+            //    用它把"GPU 侧 PER_EDGE_MATMUL 是否数值不对"一次问清。
+            if ((node->op == OP_PER_EDGE_MATMUL ||
+                 node->op == OP_PER_EDGE_MATMUL_BACK_KERNEL ||
+                 node->op == OP_PER_EDGE_MATMUL_BACK_GATHERED) &&
+                getenv("PPML_CUDA_NO_PEM") &&
+                std::strcmp(getenv("PPML_CUDA_NO_PEM"), "1") == 0) {
                 return false;
             }
             return true;
@@ -250,20 +315,17 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
 
         case OP_REPEAT_BACK: {
-            // 2026-08-27：OP_REPEAT_BACK CUDA kernel（原结构：每线程一 dst 元素，串行累加
-            // 所有重复拷贝；越界已修复）。仅支持同 ndim 且 src/dst 各维整数倍（CUDA kernel
-            // 为 4D 对齐布局）；跨 ndim 广播（src 前导维多于 dst）回落 CPU。
+            // 2026-08-27：OP_REPEAT_BACK CUDA kernel（每线程一 dst 元素，串行累加所有重复拷贝）。
+            // 2026-10-24：新增跨 ndim 通用版 repeat_back4_cuda（四重循环 + 维度对齐规则完全
+            //   照抄 CPU kernel_repeat_back，含 src 前导广播维整体累加）⇒ 不再要求 nd_src==nd_dst。
+            //   实测该情形占残差大头（正向 372 / 反向 372 个节点，numel=57621）。
             if (!src0) return false;
             if (src0->type != TENSOR_TYPE_F32 || node->type != TENSOR_TYPE_F32) return false;
             const int nd_src = src0->shape().ndim();
             const int nd_dst = node->shape().ndim();
-            if (nd_src != nd_dst) return false;   // 跨 ndim 广播 → CPU
-            // 各维 src/dst 需整数倍（保证归约次数 rd>=1 无除零）
-            for (int d = 0; d < 4; d++) {
-                const int64_t sd = (d < nd_src) ? src0->shape().dims[d] : 1;
-                const int64_t dd = (d < nd_dst) ? node->shape().dims[d] : 1;
-                if (dd <= 0 || sd % dd != 0) return false;
-            }
+            if (nd_src > 4 || nd_dst > 4) return false;   // kernel 只解 4 维（与 CPU 一致）
+            // 分流在 dispatch：同 ndim 且各维整数倍 → 原 kernel（数值逐位不变）；
+            // 跨 ndim / 非整数倍 → 通用 4 维 kernel（维度对齐与归约次数照抄 CPU）。
             return true;
         }
 
@@ -327,6 +389,53 @@ bool CUDABackend::supports_op(TensorF32* node) const {
             // 2026-09-01: OP_FAPE CUDA kernel（FAPE 结构损失）。前置: F32 + 5 输入存在
             //   （pred/true coords、frame_indices、frames_mask、positions_mask）。
             if (!src0 || !src1 || !src2 || !src3 || !src4) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
+        // ===== pair/MSA 专用算子（2026-10-24，kernel 在 src/cuda/PairKernels.cu）=====
+        case OP_TRI_MUL:
+            // 三角乘法：left/right 与 dst 均 4D F32
+            //   outgoing left[D,I,K,B]·right[D,J,K,B]→dst[D,I,J,B]；incoming 为 left[D,K,I,B]
+            if (!src0 || !src1) return false;
+            if (src0->type != TENSOR_TYPE_F32 || src1->type != TENSOR_TYPE_F32 ||
+                node->type != TENSOR_TYPE_F32) return false;
+            return src0->shape().ndim() == 4 && src1->shape().ndim() == 4 &&
+                   node->shape().ndim() == 4;
+
+        case OP_TRI_MUL_BACK:
+            // 多输出反向：grad_left(src[3]) / grad_right(src[4]) 至少其一，kernel 内一并写
+            if (!src0 || !src1 || !src2) return false;
+            if (!node->src[3] && !node->src[4]) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
+        case OP_OUTER_PROD_MEAN:
+            // msa2pair：left/right [D,L,N,B] → dst [D*D,L,L,B]
+            if (!src0 || !src1) return false;
+            if (src0->type != TENSOR_TYPE_F32 || src1->type != TENSOR_TYPE_F32 ||
+                node->type != TENSOR_TYPE_F32) return false;
+            return src0->shape().ndim() == 4 && src1->shape().ndim() == 4 &&
+                   src0->shape().dims[0] > 0 && src0->shape().dims[2] > 0;
+
+        case OP_OUTER_PROD_MEAN_BACK:
+            if (!src0 || !src1 || !src2) return false;
+            if (!node->src[3] && !node->src[4]) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
+        case OP_OUTER_PROD:
+            // pair2pair 门控：left/right [D,L,B] → dst [D*D,L,L,B]
+            if (!src0 || !src1) return false;
+            if (src0->type != TENSOR_TYPE_F32 || src1->type != TENSOR_TYPE_F32 ||
+                node->type != TENSOR_TYPE_F32) return false;
+            return src0->shape().ndim() == 3 && src1->shape().ndim() == 3;
+
+        case OP_OUTER_PROD_BACK:
+            if (!src0 || !src1 || !src2) return false;
+            if (!node->src[3] && !node->src[4]) return false;
+            return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
+
+        case OP_FAPE_BACK:
+            // FAPE 反向（Phase 1）：src[0]=上游标量 … src[5]=positions_mask，共 6 个输入
+            if (!src0 || !src1 || !src2 || !src3 || !src4 || !node->src[5]) return false;
+            if (src1->shape().ndim() != 2 || src3->shape().ndim() != 2) return false;
             return src0->type == TENSOR_TYPE_F32 && node->type == TENSOR_TYPE_F32;
 
         case OP_DUP:
@@ -467,31 +576,134 @@ void CUDABackend::release_host_shadows() {
     host_shadow_saved_.clear();
 }
 
-// 少数"CUDA 无 kernel"的算子名（只用于把 [CUDA-UNSUPPORTED] 日志从数字变成可读名字；
-//   其余算子返回 "?"：日志里同时打印 op 编号，仍可在枚举里查到）
+// 全量算子名表（由 build/gen_names.awk 从 include/ppml/Tensor.h 的 enum tensor_op 生成，
+//   2026-10-24 补齐：原表只覆盖十来个"CUDA 无 kernel"的算子，其余打印成 "?"，
+//   导致 [CUDA-UNSUPPORTED] / [OP-CHECK] 难以对号 ✓）
 static const char* cuda_op_name(int op) {
     switch (op) {
-        case OP_CONCAT:                  return "CONCAT";
-        case OP_GET_ROWS:                return "GET_ROWS";
-        case OP_TRI_MUL:                 return "TRI_MUL";
-        case OP_TRI_MUL_BACK:            return "TRI_MUL_BACK";
-        case OP_OUTER_PROD_MEAN:         return "OUTER_PROD_MEAN";
-        case OP_OUTER_PROD_MEAN_BACK:    return "OUTER_PROD_MEAN_BACK";
-        case OP_OUTER_PROD:              return "OUTER_PROD";
-        case OP_OUTER_PROD_BACK:         return "OUTER_PROD_BACK";
-        case OP_FAPE:                    return "FAPE";
-        case OP_FAPE_BACK:               return "FAPE_BACK";
-        case OP_EDGE_GATHER_ROWS:        return "EDGE_GATHER_ROWS";
-        case OP_PER_EDGE_MATMUL:         return "PER_EDGE_MATMUL";
-        case OP_SCATTER_ADD:             return "SCATTER_ADD";
-        case OP_PER_EDGE_MATMUL_BACK_KERNEL:   return "PER_EDGE_MATMUL_BACK_KERNEL";
-        case OP_PER_EDGE_MATMUL_BACK_GATHERED: return "PER_EDGE_MATMUL_BACK_GATHERED";
-        case OP_CONCAT_BACK:             return "CONCAT_BACK";
-        case OP_RELU_BACK:               return "RELU_BACK";
-        case OP_ACT_MUL:                 return "ACT_MUL";
+        case OP_NONE:                        return "NONE";
+        case OP_DUP:                         return "DUP";
+        case OP_ADD:                         return "ADD";
+        case OP_ADD_ID:                      return "ADD_ID";
+        case OP_ADD1:                        return "ADD1";
+        case OP_ACC:                         return "ACC";
+        case OP_SUB:                         return "SUB";
+        case OP_MUL:                         return "MUL";
+        case OP_DIV:                         return "DIV";
+        case OP_SQR:                         return "SQR";
+        case OP_SQRT:                        return "SQRT";
+        case OP_LOG:                         return "LOG";
+        case OP_SIN:                         return "SIN";
+        case OP_COS:                         return "COS";
+        case OP_SUM:                         return "SUM";
+        case OP_SUM_ROWS:                    return "SUM_ROWS";
+        case OP_CUMSUM:                      return "CUMSUM";
+        case OP_MEAN:                        return "MEAN";
+        case OP_ARGMAX:                      return "ARGMAX";
+        case OP_COUNT_EQUAL:                 return "COUNT_EQUAL";
+        case OP_REPEAT:                      return "REPEAT";
+        case OP_REPEAT_BACK:                 return "REPEAT_BACK";
+        case OP_CONCAT:                      return "CONCAT";
+        case OP_SILU_BACK:                   return "SILU_BACK";
+        case OP_NORM:                        return "NORM";
+        case OP_NORM_BACK:                   return "NORM_BACK";
+        case OP_RMS_NORM:                    return "RMS_NORM";
+        case OP_RMS_NORM_BACK:               return "RMS_NORM_BACK";
+        case OP_GROUP_NORM:                  return "GROUP_NORM";
+        case OP_L2_NORM:                     return "L2_NORM";
+        case OP_MUL_MAT:                     return "MUL_MAT";
+        case OP_MUL_MAT_ID:                  return "MUL_MAT_ID";
+        case OP_OUT_PROD:                    return "OUT_PROD";
+        case OP_SCALE:                       return "SCALE";
+        case OP_SET:                         return "SET";
+        case OP_CPY:                         return "CPY";
+        case OP_CONT:                        return "CONT";
+        case OP_RESHAPE:                     return "RESHAPE";
+        case OP_VIEW:                        return "VIEW";
+        case OP_PERMUTE:                     return "PERMUTE";
+        case OP_TRANSPOSE:                   return "TRANSPOSE";
+        case OP_GET_ROWS:                    return "GET_ROWS";
+        case OP_GET_ROWS_BACK:               return "GET_ROWS_BACK";
+        case OP_SET_ROWS:                    return "SET_ROWS";
+        case OP_DIAG:                        return "DIAG";
+        case OP_DIAG_MASK_INF:               return "DIAG_MASK_INF";
+        case OP_DIAG_MASK_ZERO:              return "DIAG_MASK_ZERO";
+        case OP_SOFT_MAX:                    return "SOFT_MAX";
+        case OP_SOFT_MAX_BACK:               return "SOFT_MAX_BACK";
+        case OP_ROPE:                        return "ROPE";
+        case OP_ROPE_BACK:                   return "ROPE_BACK";
+        case OP_CLAMP:                       return "CLAMP";
+        case OP_CONV_TRANSPOSE_1D:           return "CONV_TRANSPOSE_1D";
+        case OP_IM2COL:                      return "IM2COL";
+        case OP_IM2COL_BACK:                 return "IM2COL_BACK";
+        case OP_IM2COL_3D:                   return "IM2COL_3D";
+        case OP_COL2IM_1D:                   return "COL2IM_1D";
+        case OP_CONV_2D:                     return "CONV_2D";
+        case OP_CONV_3D:                     return "CONV_3D";
+        case OP_CONV_2D_DW:                  return "CONV_2D_DW";
+        case OP_CONV_TRANSPOSE_2D:           return "CONV_TRANSPOSE_2D";
+        case OP_POOL_1D:                     return "POOL_1D";
+        case OP_POOL_2D:                     return "POOL_2D";
+        case OP_POOL_2D_BACK:                return "POOL_2D_BACK";
+        case OP_UPSCALE:                     return "UPSCALE";
+        case OP_PAD:                         return "PAD";
+        case OP_PAD_REFLECT_1D:              return "PAD_REFLECT_1D";
+        case OP_ROLL:                        return "ROLL";
+        case OP_ARANGE:                      return "ARANGE";
+        case OP_TIMESTEP_EMBEDDING:          return "TIMESTEP_EMBEDDING";
+        case OP_ARGSORT:                     return "ARGSORT";
+        case OP_TOP_K:                       return "TOP_K";
+        case OP_LEAKY_RELU:                  return "LEAKY_RELU";
+        case OP_TRI:                         return "TRI";
+        case OP_FILL:                        return "FILL";
+        case OP_FLASH_ATTN_EXT:              return "FLASH_ATTN_EXT";
+        case OP_FLASH_ATTN_BACK:             return "FLASH_ATTN_BACK";
+        case OP_SSM_CONV:                    return "SSM_CONV";
+        case OP_SSM_SCAN:                    return "SSM_SCAN";
+        case OP_WIN_PART:                    return "WIN_PART";
+        case OP_WIN_UNPART:                  return "WIN_UNPART";
+        case OP_GET_REL_POS:                 return "GET_REL_POS";
+        case OP_ADD_REL_POS:                 return "ADD_REL_POS";
+        case OP_RWKV_WKV6:                   return "RWKV_WKV6";
+        case OP_GATED_LINEAR_ATTN:           return "GATED_LINEAR_ATTN";
+        case OP_RWKV_WKV7:                   return "RWKV_WKV7";
+        case OP_SOLVE_TRI:                   return "SOLVE_TRI";
+        case OP_GATED_DELTA_NET:             return "GATED_DELTA_NET";
+        case OP_UNARY:                       return "UNARY";
+        case OP_MAP_CUSTOM1:                 return "MAP_CUSTOM1";
+        case OP_MAP_CUSTOM2:                 return "MAP_CUSTOM2";
+        case OP_MAP_CUSTOM3:                 return "MAP_CUSTOM3";
+        case OP_CUSTOM:                      return "CUSTOM";
+        case OP_CROSS_ENTROPY_LOSS:          return "CROSS_ENTROPY_LOSS";
+        case OP_CROSS_ENTROPY_LOSS_BACK:     return "CROSS_ENTROPY_LOSS_BACK";
+        case OP_OPT_STEP_ADAMW:              return "OPT_STEP_ADAMW";
+        case OP_OPT_STEP_SGD:                return "OPT_STEP_SGD";
+        case OP_GLU:                         return "GLU";
+        case OP_FAPE:                        return "FAPE";
+        case OP_FAPE_BACK:                   return "FAPE_BACK";
+        case OP_TRI_MUL:                     return "TRI_MUL";
+        case OP_TRI_MUL_BACK:                return "TRI_MUL_BACK";
+        case OP_OUTER_PROD_MEAN:             return "OUTER_PROD_MEAN";
+        case OP_OUTER_PROD_MEAN_BACK:        return "OUTER_PROD_MEAN_BACK";
+        case OP_OUTER_PROD:                  return "OUTER_PROD";
+        case OP_OUTER_PROD_BACK:             return "OUTER_PROD_BACK";
+        case OP_EDGE_GATHER_ROWS:            return "EDGE_GATHER_ROWS";
+        case OP_PER_EDGE_MATMUL:             return "PER_EDGE_MATMUL";
+        case OP_SCATTER_ADD:                 return "SCATTER_ADD";
+        case OP_PER_EDGE_MATMUL_BACK_KERNEL: return "PER_EDGE_MATMUL_BACK_KERNEL";
+        case OP_PER_EDGE_MATMUL_BACK_GATHERED:   return "PER_EDGE_MATMUL_BACK_GATHERED";
+        case OP_CONCAT_BACK:                 return "CONCAT_BACK";
+        case OP_MAX_ALL:                     return "MAX_ALL";
+        case OP_RELU_BACK:                   return "RELU_BACK";
+        case OP_ACT_MUL:                     return "ACT_MUL";
+        case OP_ACT_MUL_BACK_X:              return "ACT_MUL_BACK_X";
+        case OP_ACT_MUL_BACK_G:              return "ACT_MUL_BACK_G";
         default:                         return "?";
     }
 }
+
+// 公开入口（见 Backend.h）：诊断代码据此把 op 编号打印成名字 ✓
+const char* CUDABackend::op_name(int op) { return cuda_op_name(op); }
 
 Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
     cudaSetDevice(device_id_);
@@ -578,17 +790,32 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
         // 解析 view src：view（view_src 共享源数据）被跳过 dispatch 后 data() 为 null，
         // 但其作为本 op 的 src 时 kernel 要读数据。沿 view_src 链解析到底层数据载体，
         // 让本 op 的 kernel 拿到真实 device 指针（否则读 null → [CUDA-ERR]/illegal）。
+        // 【2026-10-24 方案 A】兼容"只置 src[0]、没置 view_src"的 OP_VIEW/OP_RESHAPE
+        //   （reshape()/unsqueeze() 就是这么建的）：这类节点被 scheduler 当 view 跳过 backend
+        //   指派 ⇒ gallocr 按默认 CPU 分配**私有 host buffer**，由 CPU split 的 kernel_cpy 写入。
+        //   若其消费者在本 CUDA split 内，内核直接读它 = 裸读 host ⇒
+        //   [CUDA-GUARD] 放弃整图（1AKE L=214 exit 3 的根因）。
+        //   这里把它与 view_src 视图同路解析到**根**，拿根的真实 device 指针（数据来源相同，
+        //   只是省掉那次"拷到 host 再被 GPU 读回"的往返）。
+        auto resolve_view_root = [](TensorF32* t) -> TensorF32* {
+            TensorF32* r = t;
+            int g = 0;
+            while (r && g++ < 64) {
+                TensorF32* nxt = r->view_src;
+                if (!nxt && (r->op == OP_VIEW || r->op == OP_RESHAPE)) nxt = r->src[0];
+                if (!nxt) break;
+                r = nxt;
+            }
+            return r;
+        };
         for (int s = 0; s < GGML_MAX_SRC; s++) {
             TensorF32* src = node->src[s];
-            if (!src || !src->view_src) continue;
-            TensorF32* base = src;
-            int guard = 0;
-            while (base->view_src && guard++ < 64) base = base->view_src;
-            if (base->data()) {
-                src->bind_data(base->data());
-                src->buffer_      = base->buffer_;
-                src->buffer_offs_ = base->buffer_offs_;
-            }
+            if (!src) continue;
+            TensorF32* base = resolve_view_root(src);
+            if (!base || base == src || !base->data()) continue;
+            src->bind_data(base->data());
+            src->buffer_      = base->buffer_;
+            src->buffer_offs_ = base->buffer_offs_;
         }
 
         // ---- host 叶子 → 设备影子（仅单后端全 GPU；scheduler 由 build_splits 建 H2D cpy）----
@@ -798,6 +1025,7 @@ Status CUDABackend::graph_compute(ComputeGraph* cgraph) {
         // 执行期 NaN/爆炸检查（PPML_EXEC_NAN_CHECK=1）：紧跟本节点 kernel，按执行顺序
         //   报告第一个坏节点 ⇒ 直接定位"第一个产生 NaN/Inf 的 CUDA kernel"。
         exec_nan_check(node, "CUDA", node_n);
+        exec_zeropage_check(node, "CUDA", node_n);   // 零页探针（PPML_ZEROPAGE_CHECK=1）
         exec_pem_stat(node, "CUDA", node_n, "out");   // per_edge_matmul 实际写出内容（PPML_PEM_STAT=1）
         exec_probe_op(node, "CUDA", node_n);   // 定点算子探针（PPML_PROBE_OP=...）
         exec_view_probe(node, "CUDA", node_n);   // view 别名消费探针（PPML_EXEC_VIEW_PROBE=1）

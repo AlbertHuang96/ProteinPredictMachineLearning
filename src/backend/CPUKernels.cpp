@@ -1014,7 +1014,10 @@ void CPUBackend::kernel_outer_prod_mean(TensorF32 * node, ComputeParams * p) {
         //   并造成 OPS=47 远端 vs 单机 loss 差 0.08（chi 分量 11.01 vs 11.19）。
         int64_t i   = tmp % L; tmp /= L;
         int64_t d2  = tmp % D; tmp /= D;
-        int64_t d1  = tmp / D;
+        // 【2026-10-24 修复】原为 `d1 = tmp / D`：tmp 此时已 < D（= idx/(B·L·L·D)）⇒ d1 恒为 0，
+        //   即左特征的 d1 维**永远只取第 0 个通道**（msa2pair 输出的 D×D 里有一半轴被钉死）。
+        //   这是 2026-09-14 "漏 tmp /= L" 修复后的残余错误：补齐除法后这里应直接取 tmp。
+        int64_t d1  = tmp;
 
         float sum = 0.0f;
         for (int64_t n = 0; n < N; n++) {
@@ -1143,7 +1146,9 @@ void CPUBackend::kernel_outer_prod(TensorF32 * node, ComputeParams * p) {
         // 【2026-09-14 修复】同 kernel_outer_prod_mean：原实现漏 `tmp /= L` ⇒ d1 越界（读 src 之外的内存）。
         int64_t i   = tmp % L; tmp /= L;
         int64_t d2  = tmp % D; tmp /= D;
-        int64_t d1  = tmp / D;
+        // 【2026-10-24 修复】同 kernel_outer_prod_mean：tmp 已 < D，原 `tmp / D` 恒为 0 ⇒
+        //   pair2pair 门控的左特征轴被钉死在通道 0。
+        int64_t d1  = tmp;
 
         const float lv = left_data[((d1 * L + i) * B + b)];
         const float rv = right_data[((d2 * L + j) * B + b)];
@@ -1619,6 +1624,9 @@ void CPUBackend::kernel_cpy(TensorF32 * node, ComputeParams * p) {
     }
     // 零拷贝 view：view 共享源数据（view_src 已置），不拷贝、不写独立 buffer。
     // 直接把 node 的 data()/buffer_/buffer_offs_ 解析为 src0 的（源已计算时 data 有效）。
+    // 【2026-10-24 方案 A】OP_RESHAPE 仍走下面的整块拷贝分支（保持 CPU 数值逐位不变）：
+    //   reshape/unsqueeze 不置 view_src ⇒ 它有独立 buffer、这里 memcpy 出一份快照。
+    //   CUDA 消费者的"拿不到根设备指针"问题在 CUDABackend 的解析侧修，不改这里。
     if (node->op == OP_VIEW) {
         TensorF32* src_t = node->src[0];
         if (src_t && src_t->data()) {
@@ -2252,8 +2260,17 @@ void CPUBackend::kernel_concat_back(TensorF32 * node, ComputeParams * p) {
     const int64_t dim    = node->op_params[0];
     const int64_t offset = node->op_params[1];
 
-    int64_t stride = 1;
-    for (int64_t d = 0; d < dim && d < grad->shape().ndim(); ++d) stride *= grad->shape().dims[d];
+    // 【2026-10-24 修】原来用 `d[k] = g[k + offset*stride]`（stride = prod(grad.dims[0..dim-1])），
+    //   这只在 **dim 以上各维与 grad 完全一致** 时才等价于"沿 dim 平移"。
+    //   反例（实测训练图的形状）：grad=[32,10,2550]、dst=[32,1,2550]、dim=1、offset=k，
+    //   正确应为 dst[i0,0,i2] = grad[i0,k,i2] = g[i0 + k*32 + i2*320]，
+    //   而旧式给出 g[i0 + k*32 + i2*32] ⇒ **读到错误的元素**（越界则在 CUDA 侧直接崩）。
+    //   现在按坐标分解，用 **grad 自己的 strides** 重新合成索引 ✓
+    const int   dnd = dst->shape().ndim();
+    int64_t     gs[4] = {1, 1, 1, 1};
+    for (int d = 1; d < grad->shape().ndim() && d < 4; ++d) {
+        gs[d] = gs[d - 1] * grad->shape().dims[static_cast<size_t>(d - 1)];
+    }
 
     const int64_t total = dst->numel();
     const int64_t per   = (total + p->nth - 1) / p->nth;
@@ -2262,7 +2279,16 @@ void CPUBackend::kernel_concat_back(TensorF32 * node, ComputeParams * p) {
     const float * g = grad->data();
     float * d = dst->data();
     for (int64_t k = i_lo; k < i_hi; ++k) {
-        d[k] = g[k + offset * stride];
+        int64_t t = k;
+        int64_t gi = 0;
+        for (int d = 0; d < 4; ++d) {
+            const int64_t nd = (d < dnd) ? dst->shape().dims[static_cast<size_t>(d)] : 1;
+            const int64_t id = (nd > 0) ? (t % nd) : 0;
+            if (nd > 0) t /= nd;
+            const int64_t g_id = (d == dim) ? (id + offset) : id;
+            gi += g_id * gs[d];
+        }
+        d[k] = g[gi];
     }
 }
 

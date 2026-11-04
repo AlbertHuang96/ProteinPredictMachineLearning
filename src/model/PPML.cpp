@@ -3167,16 +3167,24 @@ GraphOutput PPMLModel::forward_graph(const ModelInput& input, bool enable_se3,
     topo_cfg.l2 = topo_l2 || topo_l3;
     topo_cfg.closure = !(std::getenv("PPML_TOPO_L2_CLOSURE") &&
                          std::strcmp(std::getenv("PPML_TOPO_L2_CLOSURE"), "0") == 0);
+    // 【L2 计划】PPML_L2_PLAN=1 ⇒ A1/A3/A4（网格候选 + 局部位图 + 升序发出）；
+    //   缺省/0 ⇒ 原两跳候选 + 全表发出（逐位不变 ✓）。只在 l2/l3 下有意义 ✓
+    if (const char* _lp = std::getenv("PPML_L2_PLAN")) {
+        topo_cfg.l2_plan = (std::strcmp(_lp, "0") != 0 && std::strcmp(_lp, "") != 0);
+    }
+    // 【L2 门控】PPML_L2_GATE=β（默认 0 = 关）：若证书风险集 {m_i ≤ 4Δ} 不超过 β·L
+    //   或比 Ω_clip 更小，则用它替代邻域一跳（sound ✓，且通常更小 ✓）
+    if (const char* _gt = std::getenv("PPML_L2_GATE")) topo_cfg.l2_gate = static_cast<float>(std::atof(_gt));
     if (const char* _sg = std::getenv("PPML_TOPO_SIGMA")) topo_cfg.sigma = static_cast<float>(std::atof(_sg));
     if (const char* _gm = std::getenv("PPML_TOPO_GAMMA")) topo_cfg.gamma = static_cast<float>(std::atof(_gm));
     topo_cfg.debug = (std::getenv("PPML_TOPO_DEBUG") != nullptr);
     // ★ 状态是**本函数局部** ⇒ 跨 block 边界存活、随每次 forward 自然重置 ✓（x⁰ 快照/冻结索引/margin ✓）
     se3::TopoRefineState topo_st;
     if (run_se3 && (topo_l1 || topo_l2 || topo_l3)) {
-        std::fprintf(stderr, "[SE3-TOPO] mode=%s  sigma=%.3f  gamma=%.3f  closure=%d  (refined topo pass ✓；"
+        std::fprintf(stderr, "[SE3-TOPO] mode=%s  sigma=%.3f  gamma=%.3f  closure=%d  l2_plan=%d  (refined topo pass ✓；"
                              "求解见 TopoPassRefinement.md 附录 A ✓)\n",
                      topo_l3 ? "l3" : (topo_l1 ? "l1" : "l2"), topo_cfg.sigma, topo_cfg.gamma,
-                     (int)topo_cfg.closure);
+                     (int)topo_cfg.closure, (int)topo_cfg.l2_plan);
     }
     if (run_se3 && getenv("GRAPH_DEBUG_COORD")) {
         std::fprintf(stderr, "[SE3-TOPO] mode=%s (fixed=%d per_block=%d l1=%d l2=%d l3=%d)\n",

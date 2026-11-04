@@ -157,10 +157,17 @@ GraphData make_graph(const TensorF32& xyz,
 struct TopoRefineCfg {
     bool  l1      = false;   // 冻结边索引 + 实时几何 ✓
     bool  l2      = false;   // margin 门控局部重算 ✓
-    bool  l3      = false;   // ★ 阻尼 + 信任域基准 B = x⁰ + rclip_κ(γ(x−x⁰)) ✓（逐节点 ℓ2 球，见下 ✓）
+    bool  l3      = false;   // ★ 阻尼 + 信任域基准 B = x⁰ + Π_κ(γ(x−x⁰)) ✓
+                             //   几何由环境变量 PPML_L3_PROJ 选择：缺省/其它 ⇒ 盒 clamp（**默认** ✓）；
+                             //   ball|radial|sphere ⇒ 逐节点 ℓ2 球 rclip ✓（两种几何都保留，见 .cpp）
     bool  closure = true;    // L2 的 Ω 邻居封闭（默认开 ✓，附录 A.4.3 推论 3 ✓）
+    bool  l2_plan = false;   // ★ L2 的 A1/A3/A4 实现：网格候选（球查询 ∪ 序列窗）+ 局部位图 + 升序发出 ✓
+                             //   环境变量 PPML_L2_PLAN=1 打开；关闭时走原来的两跳候选 + 全表发出（逐位不变 ✓）
+    float l2_gate = 0.f;     // ★ closure 门控（PPML_L2_GATE）：>0 时若证书风险集 {m_i ≤ 4Δ} 比
+                             //   邻域一跳更小，就用风险集（sound ✓），否则退回邻域一跳；
+                             //   0 = 关闭门控（保持原行为 ✓）
     float sigma   = 0.5f;    // κ_i = σ·m_i/2 ✓（σ≤1/2 = "可证不翻边"；σ≈2~4 = "追踪真值" ✓）
-    float gamma   = 1.0f;    // L3 的回放阻尼 ✓（γ=1 纯球投影；γ<1 滞后跟踪 ✓；γ=0 ⇒ 冻结基准 ✓）
+    float gamma   = 1.0f;    // L3 的回放阻尼 ✓（γ=1 纯投影；γ<1 滞后跟踪 ✓；γ=0 ⇒ 冻结基准 ✓）
     bool  debug   = false;   // 打印 [TOPO-L1/L2/L3] 统计 ✓
 };
 
@@ -174,6 +181,8 @@ struct TopoRefineState {
     std::vector<float>   x0;                         // x⁰ 的整份骨架坐标 (B*L*3*3) ✓
     std::vector<float>   margin;                     // m_i（B*L；k ≥ L−1 ⇒ +inf ✓）
     std::vector<float>   kappa;                      // κ_i = σ·m_i/2 ✓
+    std::vector<float>   rc;                         // L2 计划：逐节点球查询半径
+                                                     //   rc_i = d_(k),i(x⁰) + √3(κ_i + κ_max)（Lemma 1 ✓）
     int      calls = 0;                              // refined 调用次数（首次建立快照 ✓）
     int64_t  last_omega = 0, last_diff = 0;          // 上次 |Ω| / |E_t Δ E(x⁰)|（诊断 ✓）
     void reset() { *this = TopoRefineState(); }
