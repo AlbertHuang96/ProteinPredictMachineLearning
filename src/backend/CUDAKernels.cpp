@@ -285,6 +285,13 @@ extern void concat_nary_cuda(
     float* dst, int dim,
     int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3);
 
+// concat 反向：按坐标分解 + grad strides 重新合成（见 CUDAKernels.cu concat_back_kernel_f32）
+extern void concat_back_cuda(
+    const float* grad, float* dst, int64_t total,
+    int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3,
+    int64_t g0, int64_t g1, int64_t g2, int64_t g3,
+    int dim, int64_t offset);
+
 // SE3 消息传递三件套（方案 B）+ per_edge_matmul 反向核（实现于 src/cuda/SE3MessagePassingKernel.cu）
 extern void edge_gather_rows_cuda(
     const float* node_feat, const float* src_idx, float* dst,
@@ -301,6 +308,41 @@ extern void per_edge_matmul_back_kernel_cuda(
 extern void per_edge_matmul_back_gathered_cuda(
     const float* grad, const float* kernel, float* dst,
     int M, int K, int E);
+
+// ===== pair/MSA 专用算子（实现于 src/cuda/PairKernels.cu，2026-10-24）=====
+// 全部 ggml 布局（dims[0]=最内维），与 CPU kernel 同序累加 ⇒ 可逐位对齐。
+// OP_TRI_MUL：outgoing dst[d,i,j,b]=(1/L)Σ_k left[d,i,k,b]·right[d,j,k,b]（K=left.dims[2]）
+//             incoming dst[d,i,j,b]=(1/L)Σ_k left[d,k,i,b]·right[d,k,j,b]（K=left.dims[1]）
+extern void tri_mul_cuda(const float* left, const float* right, float* dst,
+                         int64_t D, int64_t I, int64_t J, int64_t K, int64_t B,
+                         float inv_L, int outgoing);
+// OP_TRI_MUL_BACK：两个输出槽各自独立（gleft/gright 可为 nullptr ⇒ 跳过）
+extern void tri_mul_back_cuda(const float* grad, const float* left, const float* right,
+                              float* gleft, float* gright,
+                              int64_t D, int64_t I, int64_t J, int64_t K, int64_t B,
+                              float inv_L, int outgoing);
+// OP_OUTER_PROD_MEAN（msa2pair）：dst[((d1*D+d2),i,j,b)]=(1/N)Σ_n left[d1,i,n,b]·right[d2,j,n,b]
+extern void outer_prod_mean_cuda(const float* left, const float* right, float* dst,
+                                 int64_t D, int64_t L, int64_t N, int64_t B, float inv_N);
+extern void outer_prod_mean_back_cuda(const float* grad, const float* left, const float* right,
+                                      float* gleft, float* gright,
+                                      int64_t D, int64_t L, int64_t N, int64_t B, float inv_N);
+// OP_OUTER_PROD（pair2pair gate）：dst[((d1*D+d2),i,j,b)] = left[d1,i,b]·right[d2,j,b]
+extern void outer_prod_cuda(const float* left, const float* right, float* dst,
+                            int64_t D, int64_t L, int64_t B);
+extern void outer_prod_back_cuda(const float* grad, const float* left, const float* right,
+                                 float* gleft, float* gright, int64_t D, int64_t L, int64_t B);
+// OP_REPEAT_BACK（跨 ndim 通用版）：逐 dst 元素四重循环，rd[] 由 host 按 CPU 规则算好
+extern void repeat_back4_cuda(const float* src, float* dst,
+                              int64_t s0, int64_t s1, int64_t s2, int64_t s3,
+                              int64_t d0, int64_t d1, int64_t d2, int64_t d3,
+                              int64_t r0, int64_t r1, int64_t r2, int64_t r3);
+// OP_FAPE_BACK：Phase-1 反向（Steps 3~6），多帧命中同一原子 ⇒ kernel 内 atomicAdd
+extern void fape_back_cuda(const float* upstream, const float* pred, const float* truth,
+                           const float* frame_idx, const float* frames_mask,
+                           const float* positions_mask, float* d_pred,
+                           int64_t N_atoms, int64_t N_frames,
+                           float d_clamp, float epsilon, float length_scale);
 
 // ============================================================
 // CUDABackend::dispatch_node
@@ -324,6 +366,29 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
 
         case OP_FAPE:
             kernel_fape_cuda(node, &st);
+            break;
+
+        // ===== pair/MSA 专用算子（2026-10-24，PairKernels.cu）=====
+        case OP_TRI_MUL:
+            kernel_tri_mul_cuda(node, &st);
+            break;
+        case OP_TRI_MUL_BACK:
+            kernel_tri_mul_back_cuda(node, &st);
+            break;
+        case OP_OUTER_PROD_MEAN:
+            kernel_outer_prod_mean_cuda(node, &st);
+            break;
+        case OP_OUTER_PROD_MEAN_BACK:
+            kernel_outer_prod_mean_back_cuda(node, &st);
+            break;
+        case OP_OUTER_PROD:
+            kernel_outer_prod_cuda(node, &st);
+            break;
+        case OP_OUTER_PROD_BACK:
+            kernel_outer_prod_back_cuda(node, &st);
+            break;
+        case OP_FAPE_BACK:
+            kernel_fape_back_cuda(node, &st);
             break;
 
         case OP_PERMUTE:
@@ -360,6 +425,10 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
 
         case OP_CONCAT:
             kernel_concat_cuda(node, &st);
+            break;
+
+        case OP_CONCAT_BACK:
+            kernel_concat_back_cuda(node, &st);
             break;
 
         case OP_EDGE_GATHER_ROWS:
@@ -508,9 +577,23 @@ Status CUDABackend::dispatch_node(TensorF32 * node, ComputeParams * p) {
             kernel_repeat_cuda(node, &st);
             break;
 
-        case OP_REPEAT_BACK:
-            kernel_repeat_back_cuda(node, &st);
-            break;
+        case OP_REPEAT_BACK: {
+            // 2026-10-24：跨 ndim（如 grad[51,256] → bias[256]）或存在"非整数倍"维时，
+            //   走通用 4 维版 repeat_back4_cuda（维度对齐/归约次数完全照抄 CPU
+            //   kernel_repeat_back）；同 ndim 且各维整数倍仍走原 kernel（数值逐位不变）。
+            bool general = true;
+            const TensorF32* s0 = node->src[0];
+            if (s0 && s0->shape().ndim() == node->shape().ndim()) {
+                general = false;
+                for (int d = 0; d < 4; ++d) {
+                    const int64_t sd = (d < s0->shape().ndim()) ? s0->shape().dims[d] : 1;
+                    const int64_t dd = (d < node->shape().ndim()) ? node->shape().dims[d] : 1;
+                    if (dd <= 0 || sd % dd != 0) { general = true; break; }
+                }
+            }
+            if (general) kernel_repeat_back_cross_cuda(node, &st);
+            else         kernel_repeat_back_cuda(node, &st);
+        } break;
 
         case OP_GET_ROWS: {
             // embedding 查表: W (N,M), idx(K,) → dst (K,M)
@@ -1053,6 +1136,211 @@ void CUDABackend::kernel_fape_cuda(TensorF32 * node, Status* st) {
     if (st) *st = Status::SUCCESS;
 }
 
+// ============================================================
+// pair/MSA 专用算子包装（2026-10-24，kernel 在 src/cuda/PairKernels.cu）
+//   op_params 语义与 CPU 完全一致：
+//     TRI_MUL(_BACK)：op_params[0..3]=L(f32)，op_params[4..7]=outgoing(bool)
+//     OUTER_PROD_MEAN(_BACK)：op_params[0..3]=N(f32)（实际以 shape 为准）
+//     FAPE_BACK：op_params[0]=d_clamp，[2]=epsilon，[4]=length_scale（均为 f32 位模式）
+// ============================================================
+void CUDABackend::kernel_tri_mul_cuda(TensorF32 * node, Status* st) {
+    // src0=left src1=right，dst=dst[D,I,J,B]（ggml 布局）
+    //   outgoing ⇒ K = left.dims[2]；incoming ⇒ K = left.dims[1]
+    const TensorF32* left  = node->src[0];
+    const TensorF32* right = node->src[1];
+    if (!left || !right || !left->data() || !right->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    float L = 1.0f;
+    bool  outgoing = true;
+    memcpy(&L, node->op_params, sizeof(float));
+    memcpy(&outgoing, node->op_params + 4, sizeof(bool));
+
+    const int64_t D = node->shape().dims[0];
+    const int64_t I = node->shape().dims[1];
+    const int64_t J = node->shape().dims[2];
+    const int64_t B = node->shape().dims[3];
+    const int64_t K = outgoing ? left->shape().dims[2] : left->shape().dims[1];
+    if (L == 0.0f) { if (st) *st = Status::NOT_SUPPORTED; return; }
+
+    tri_mul_cuda(left->data(), right->data(), node->data(),
+                 D, I, J, K, B, 1.0f / L, outgoing ? 1 : 0);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_tri_mul_back_cuda(TensorF32 * node, Status* st) {
+    // src: [0]=grad [1]=left [2]=right [3]=grad_left [4]=grad_right（两个输出槽可缺其一）
+    const TensorF32* grad  = node->src[0];
+    const TensorF32* left  = node->src[1];
+    const TensorF32* right = node->src[2];
+    TensorF32* grad_left   = node->src[3];
+    TensorF32* grad_right  = node->src[4];
+    if (!grad || !left || !right || !grad->data() || !left->data() || !right->data() ||
+        (!grad_left && !grad_right) ||
+        (grad_left && !grad_left->data()) || (grad_right && !grad_right->data())) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    float L = 1.0f;
+    bool  outgoing = true;
+    memcpy(&L, node->op_params, sizeof(float));
+    memcpy(&outgoing, node->op_params + 4, sizeof(bool));
+    if (L == 0.0f) { if (st) *st = Status::NOT_SUPPORTED; return; }
+
+    const int64_t D = left->shape().dims[0];
+    const int64_t B = left->shape().dims[3];
+    const int64_t I = outgoing ? left->shape().dims[1]  : left->shape().dims[2];
+    const int64_t J = outgoing ? right->shape().dims[1] : right->shape().dims[2];
+    const int64_t K = outgoing ? left->shape().dims[2]  : left->shape().dims[1];
+
+    tri_mul_back_cuda(grad->data(), left->data(), right->data(),
+                      grad_left ? grad_left->data() : nullptr,
+                      grad_right ? grad_right->data() : nullptr,
+                      D, I, J, K, B, 1.0f / L, outgoing ? 1 : 0);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_outer_prod_mean_cuda(TensorF32 * node, Status* st) {
+    // src0=left [D,L,N,B] src1=right [D,L,N,B] → dst [D*D,L,L,B]
+    const TensorF32* left  = node->src[0];
+    const TensorF32* right = node->src[1];
+    if (!left || !right || !left->data() || !right->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int64_t D = left->shape().dims[0];
+    const int64_t L = left->shape().dims[1];
+    const int64_t N = left->shape().dims[2];
+    const int64_t B = left->shape().dims[3];
+    if (N <= 0) { if (st) *st = Status::NOT_SUPPORTED; return; }
+
+    outer_prod_mean_cuda(left->data(), right->data(), node->data(),
+                         D, L, N, B, 1.0f / static_cast<float>(N));
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_outer_prod_mean_back_cuda(TensorF32 * node, Status* st) {
+    // src: [0]=grad [D*D,L,L,B] [1]=left [D,L,N,B] [2]=right [D,L,N,B]
+    //      [3]=grad_left [4]=grad_right（可缺其一）
+    const TensorF32* grad  = node->src[0];
+    const TensorF32* left  = node->src[1];
+    const TensorF32* right = node->src[2];
+    TensorF32* grad_left   = node->src[3];
+    TensorF32* grad_right  = node->src[4];
+    if (!grad || !left || !right || !grad->data() || !left->data() || !right->data() ||
+        (!grad_left && !grad_right) ||
+        (grad_left && !grad_left->data()) || (grad_right && !grad_right->data())) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int64_t D = left->shape().dims[0];
+    const int64_t L = left->shape().dims[1];
+    const int64_t N = left->shape().dims[2];
+    const int64_t B = left->shape().dims[3];
+    if (N <= 0) { if (st) *st = Status::NOT_SUPPORTED; return; }
+
+    outer_prod_mean_back_cuda(grad->data(), left->data(), right->data(),
+                              grad_left ? grad_left->data() : nullptr,
+                              grad_right ? grad_right->data() : nullptr,
+                              D, L, N, B, 1.0f / static_cast<float>(N));
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_outer_prod_cuda(TensorF32 * node, Status* st) {
+    // src0=left [D,L,B] src1=right [D,L,B] → dst [D*D,L,L,B]
+    const TensorF32* left  = node->src[0];
+    const TensorF32* right = node->src[1];
+    if (!left || !right || !left->data() || !right->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int64_t D = left->shape().dims[0];
+    const int64_t L = left->shape().dims[1];
+    const int64_t B = left->shape().dims[2];
+
+    outer_prod_cuda(left->data(), right->data(), node->data(), D, L, B);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_outer_prod_back_cuda(TensorF32 * node, Status* st) {
+    // src: [0]=grad [D*D,L,L,B] [1]=left [D,L,B] [2]=right [D,L,B] [3]=grad_left [4]=grad_right
+    const TensorF32* grad  = node->src[0];
+    const TensorF32* left  = node->src[1];
+    const TensorF32* right = node->src[2];
+    TensorF32* grad_left   = node->src[3];
+    TensorF32* grad_right  = node->src[4];
+    if (!grad || !left || !right || !grad->data() || !left->data() || !right->data() ||
+        (!grad_left && !grad_right) ||
+        (grad_left && !grad_left->data()) || (grad_right && !grad_right->data())) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int64_t D = left->shape().dims[0];
+    const int64_t L = left->shape().dims[1];
+    const int64_t B = left->shape().dims[2];
+
+    outer_prod_back_cuda(grad->data(), left->data(), right->data(),
+                         grad_left ? grad_left->data() : nullptr,
+                         grad_right ? grad_right->data() : nullptr,
+                         D, L, B);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_repeat_back_cross_cuda(TensorF32 * node, Status* st) {
+    // 跨 ndim 广播的 repeat_back：维度对齐/归约次数完全照抄 CPU kernel_repeat_back
+    //   off = (nd_src >= nd_dst) ? 0 : (nd_src - nd_dst)   （仅 dst 维更多时右对齐兜底）
+    //   rd[d] = sd[d+off] / dd[d]（缺维按 1）；src 多出的前导维整体累加
+    const TensorF32* src0 = node->src[0];
+    if (!src0 || !src0->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int nd_src = src0->shape().ndim();
+    const int nd_dst = node->shape().ndim();
+    const int off    = (nd_src >= nd_dst) ? 0 : (nd_src - nd_dst);
+
+    int64_t sd[4] = {1, 1, 1, 1};
+    int64_t dd[4] = {1, 1, 1, 1};
+    int64_t rd[4] = {1, 1, 1, 1};
+    for (int d = 0; d < nd_dst && d < 4; ++d) dd[d] = node->shape().dims[d];
+    for (int d = 0; d < nd_src && d < 4; ++d) sd[d] = src0->shape().dims[d];
+    for (int d = 0; d < 4; ++d) {
+        const int s_idx = d + off;
+        const int64_t sdim = (s_idx >= 0 && s_idx < 4) ? sd[s_idx] : 1;
+        rd[d] = (dd[d] > 0) ? (sdim / dd[d]) : 1;
+    }
+
+    repeat_back4_cuda(src0->data(), node->data(),
+                      sd[0], sd[1], sd[2], sd[3],
+                      dd[0], dd[1], dd[2], dd[3],
+                      rd[0], rd[1], rd[2], rd[3]);
+    if (st) *st = Status::SUCCESS;
+}
+
+void CUDABackend::kernel_fape_back_cuda(TensorF32 * node, Status* st) {
+    // src: [0]=upstream[1] [1]=pred[3,N] [2]=true[3,N] [3]=frame_idx[3,F]
+    //      [4]=frames_mask[F] [5]=positions_mask[N]；dst=d_pred[3,N_atoms]
+    if (!node->src[0] || !node->src[1] || !node->src[2] || !node->src[3] ||
+        !node->src[4] || !node->src[5] ||
+        !node->src[0]->data() || !node->src[1]->data() || !node->src[2]->data() ||
+        !node->src[3]->data() || !node->src[4]->data() || !node->src[5]->data() ||
+        !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int64_t N_atoms  = node->src[1]->shape().dims[1];
+    const int64_t N_frames = node->src[3]->shape().dims[1];
+    const float d_clamp      = reinterpret_cast<const float&>(node->op_params[0]);
+    const float epsilon      = reinterpret_cast<const float&>(node->op_params[2]);
+    const float length_scale = reinterpret_cast<const float&>(node->op_params[4]);
+
+    fape_back_cuda(node->src[0]->data(), node->src[1]->data(), node->src[2]->data(),
+                   node->src[3]->data(), node->src[4]->data(), node->src[5]->data(),
+                   node->data(), N_atoms, N_frames, d_clamp, epsilon, length_scale);
+    if (st) *st = Status::SUCCESS;
+}
+
 void CUDABackend::kernel_transpose_cuda(TensorF32 * node, Status* st) {
     // OP_TRANSPOSE：2D 用 tile+XOR swizzle 专用 kernel（对齐用户 transposeSharedSwizzling）；
     //   3D/4D（交换倒数两维）回落通用 permute（用 op_params 映射）。
@@ -1386,7 +1674,8 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, Status* st) {
     for (int s = 0; s < GGML_MAX_SRC; s++) {
         if (node->src[s]) srcs_tmp[n_src++] = node->src[s];
     }
-    if (n_src < 2) { if (st) *st = Status::NOT_SUPPORTED; return; }
+    // 单源 concat = identity（见下方 n_src==1 直通），故只拒绝零源
+    if (n_src < 1) { if (st) *st = Status::NOT_SUPPORTED; return; }
 
     // ============================================================
     // concat 不支持广播语义：强制要求所有 src 的非拼接维与 dst 一致
@@ -1444,6 +1733,54 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, Status* st) {
             return;
         }
     }
+    // 【2026-10-24】dst 也必须是 device 指针：kernel 会直接 `dst[idx] = ...` 写。
+    //   原实现只守卫了 src，dst 落在 host 时同样会 illegal memory access（且报在下个 checkpoint 上，
+    //   表现为"op=22 出错"的假象）。检测不到就回落 CPU（比崩掉整个 CUDA 上下文好 ✓）。
+    if (!node->data() || !cuda_ptr_is_device(node->data())) {
+        static long concat_dst_hits = 0;
+        if (concat_dst_hits++ < 10) {
+            fprintf(stderr,
+                    "[concat-guard] DST 不在 device：dst=%p buffer=%p buf_host=%d numel=%lld → NOT_SUPPORTED\n",
+                    (const void*)node->data(), (void*)node->buffer_,
+                    (node->buffer_ ? (int)node->buffer_->is_host() : -1),
+                    (long long)node->numel());
+        }
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+
+    // 【2026-10-24】单源 concat = identity（与 CPU kernel_concat 的 n_src==1 分支对齐）：
+    //   GMABSE3/GSE3Res 对**单度 fiber** 调 concat_ptr(k_nodes, 0) 时只有 1 个源，
+    //   builder 的 ne[dim] 只累加这一个 src ⇒ dst 与 src 形状完全相同，语义等价 memcpy。
+    //   此处走 D2D 整块拷贝，比进 n-ary kernel 少 3 次 cudaMalloc + 逐元素索引反解。
+    //   形状不等（理论不该发生）时仍回落 CPU，避免静默错值。
+    if (n_src == 1) {
+        const size_t nb_dst = node->nbytes();
+        const size_t nb_src = srcs_tmp[0]->nbytes();
+        if (nb_src != nb_dst) {
+            static long concat_1src_hits = 0;
+            if (concat_1src_hits++ < 5) {
+                fprintf(stderr,
+                        "[concat-1src] 形状不等 src_numel=%lld dst_numel=%lld → NOT_SUPPORTED\n",
+                        (long long)srcs_tmp[0]->numel(), (long long)node->numel());
+            }
+            if (st) *st = Status::NOT_SUPPORTED;
+            return;
+        }
+        if (cudaMemcpy(node->data(), srcs_tmp[0]->data(), nb_dst,
+                       cudaMemcpyDeviceToDevice) != cudaSuccess) {
+            static long concat_1src_cp_hits = 0;
+            if (concat_1src_cp_hits++ < 5) {
+                fprintf(stderr, "[concat-1src] cudaMemcpy D2D 失败 nbytes=%lld: %s → NOT_SUPPORTED\n",
+                        (long long)nb_dst, cudaGetErrorString(cudaGetLastError()));
+            }
+            cudaGetLastError();
+            if (st) *st = Status::NOT_SUPPORTED;
+            return;
+        }
+        return;
+    }
+
     for (int s = 1; s < n_src; s++) start[s] = start[s - 1] + len[s - 1];
 
     // 【2026-10-20】拼接维长度必须等于 dst 的对应维：否则 kernel 里 local = gd - start[s]
@@ -1508,13 +1845,117 @@ void CUDABackend::kernel_concat_cuda(TensorF32 * node, Status* st) {
     cudaMemcpy(d_start, start.data(), sizeof(int64_t) * n_src, cudaMemcpyHostToDevice);
     cudaMemcpy(d_len,   len.data(),   sizeof(int64_t) * n_src, cudaMemcpyHostToDevice);
 
+    // ---- 诊断（PPML_CONCAT_TRACE=1）：打印本次 concat 的完整形状/指针，定位非法访存 ----
+    static const bool concat_trace = [] {
+        const char* e = std::getenv("PPML_CONCAT_TRACE");
+        return e && *e && std::atoi(e) == 1;
+    }();
+    if (concat_trace) {
+        fprintf(stderr, "[concat-trace] dim=%d n_src=%d dst nd=%d dims=[%lld,%lld,%lld,%lld] numel=%lld "
+                        "ptr=%p | ne=[%lld,%lld,%lld,%lld]\n",
+                dim, n_src, (int)nd,
+                (long long)(nd > 0 ? node->shape().dims[0] : -1),
+                (long long)(nd > 1 ? node->shape().dims[1] : -1),
+                (long long)(nd > 2 ? node->shape().dims[2] : -1),
+                (long long)(nd > 3 ? node->shape().dims[3] : -1),
+                (long long)node->numel(), (const void*)node->data(),
+                (long long)ne0, (long long)ne1, (long long)ne2, (long long)ne3);
+        for (int s = 0; s < n_src; s++) {
+            const auto& sh = srcs_tmp[s]->shape();
+            fprintf(stderr, "[concat-trace]   src[%d] op=%d nd=%d dims=[%lld,%lld,%lld,%lld] numel=%lld "
+                            "start=%lld len=%lld ptr=%p\n",
+                    s, (int)srcs_tmp[s]->op, (int)sh.ndim(),
+                    (long long)(sh.ndim() > 0 ? sh.dims[0] : -1),
+                    (long long)(sh.ndim() > 1 ? sh.dims[1] : -1),
+                    (long long)(sh.ndim() > 2 ? sh.dims[2] : -1),
+                    (long long)(sh.ndim() > 3 ? sh.dims[3] : -1),
+                    (long long)srcs_tmp[s]->numel(), (long long)start[s], (long long)len[s],
+                    (const void*)srcs[s]);
+        }
+        cudaError_t epre = cudaGetLastError();   // 清掉历史 sticky error，确保下面拿到的是本次的
+        (void)epre;
+    }
+
     concat_nary_cuda(
         d_srcs, n_src, d_start, d_len, node->data(), dim,
         ne0, ne1, ne2, ne3);
 
+    if (concat_trace) {
+        cudaError_t e = cudaGetLastError();
+        if (e != cudaSuccess) {
+            fprintf(stderr, "[concat-trace] LAUNCH-ERR %s (dim=%d n_src=%d)\n", cudaGetErrorString(e), dim, n_src);
+        }
+    }
+
     cudaFree(d_srcs);
     cudaFree(d_start);
     cudaFree(d_len);
+}
+
+// ============================================================
+// concat 反向（CONCAT_BACK，2026-10-24 新增）
+//   语义与 CPUBackend::kernel_concat_back 逐字一致：
+//     src[0]=grad（concat 输出梯度）、src[1]=参考 src（决定 dst 形状）
+//     op_params[0]=dim、op_params[1]=offset
+//     dst[k] = grad[k + offset*stride]，stride = prod(grad.dims[0..dim-1])
+//   即沿 dim 把 grad 的 [offset, offset+dim_len) 段**平移拷贝**出来 ✓
+//   守卫：dst/grad 均须为 device 指针；越界（total+shift > grad.numel）⇒ 回落 CPU。
+// ============================================================
+void CUDABackend::kernel_concat_back_cuda(TensorF32* node, Status* st) {
+    const TensorF32* grad = node->src[0];
+    if (!grad || !grad->data() || !node->data()) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    const int64_t dim    = node->op_params[0];
+    const int64_t offset = node->op_params[1];
+    if (dim < 0 || dim >= 4 || offset < 0) {
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+
+    // dst 维度与 grad strides（grad 的 dims[0] 最内）
+    int64_t ne[4] = {1, 1, 1, 1};
+    const int dnd = node->shape().ndim();
+    for (int d = 0; d < dnd && d < 4; ++d) ne[d] = node->shape().dims[static_cast<size_t>(d)];
+    int64_t gs[4] = {1, 1, 1, 1};
+    for (int d = 1; d < grad->shape().ndim() && d < 4; ++d) {
+        gs[d] = gs[d - 1] * grad->shape().dims[static_cast<size_t>(d - 1)];
+    }
+    const int64_t total = node->numel();
+    // 越界守卫：最大索引 = Σ (ne[d] - (d==dim) + offset) * gs[d]
+    int64_t max_idx = 0;
+    for (int d = 0; d < 4; ++d) {
+        const int64_t hi = (d == dim) ? (ne[d] + offset) : ne[d];
+        max_idx += (hi > 0 ? hi - 1 : 0) * gs[d];
+    }
+    if (total <= 0 || max_idx >= grad->numel()) {
+        static long cb_guard = 0;
+        if (cb_guard++ < 10) {
+            fprintf(stderr,
+                    "[concat-back-guard] 越界 total=%lld max_idx=%lld grad_numel=%lld dim=%lld offset=%lld "
+                    "→ NOT_SUPPORTED\n",
+                    (long long)total, (long long)max_idx, (long long)grad->numel(),
+                    (long long)dim, (long long)offset);
+        }
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+    if (!cuda_ptr_is_device(grad->data()) || !cuda_ptr_is_device(node->data())) {
+        static long cb_host = 0;
+        if (cb_host++ < 10) {
+            fprintf(stderr, "[concat-back-guard] 指针不在 device（grad=%p dst=%p）→ NOT_SUPPORTED\n",
+                    (const void*)grad->data(), (const void*)node->data());
+        }
+        if (st) *st = Status::NOT_SUPPORTED;
+        return;
+    }
+
+    concat_back_cuda(static_cast<const float*>(grad->data()),
+                     static_cast<float*>(node->data()), total,
+                     ne[0], ne[1], ne[2], ne[3],
+                     gs[0], gs[1], gs[2], gs[3],
+                     (int)dim, offset);
 }
 
 } // namespace ppml

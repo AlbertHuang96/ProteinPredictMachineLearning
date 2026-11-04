@@ -395,6 +395,35 @@ bool Gallocr::reserve(
 
     compute_refcounts(graph, backend_id_of);
 
+    // ---- 诊断（2026-10-23）：reserve 前的图规模 + 「待分配总量」 ----
+    // sum_alloc = Σ_(managed 张量) 对齐后的分配字节 = 若**完全不复用**所需内存。
+    // 与 Phase1 得到的 peak 相比：
+    //   peak ≪ sum_alloc → refcount 空间复用生效
+    //   peak ≈ sum_alloc → 几乎没复用（内存随节点数线性增长，正是 OOM 的形态）
+    size_t diag_sum_alloc = 0;
+    {
+        size_t sum_nodes = 0, sum_leafs = 0;
+        long n_mn = 0, n_ml = 0;
+        auto add_alloc = [&](NodeInfo& ni, size_t& acc, long& cnt) {
+            if (!ni.managed || !ni.tensor) return;
+            int b = ni.backend_id;
+            if (b < 0 || b >= (int)backends_.size() || !backends_[b].buft) return;
+            acc += GGML_PAD(backends_[b].buft->get_alloc_size(ni.tensor),
+                            backends_[b].buft->get_alignment());
+            ++cnt;
+        };
+        for (auto& ni : nodes_)  add_alloc(ni, sum_nodes, n_mn);
+        for (auto& li : leaves_) add_alloc(li, sum_leafs, n_ml);
+        diag_sum_alloc = sum_nodes + sum_leafs;
+        fprintf(stderr,
+                "[gallocr-reserve] n_nodes=%d n_leafs=%d managed_nodes=%ld managed_leafs=%ld"
+                " sum_alloc=%.2f GB (nodes %.2f + leafs %.2f)\n",
+                graph->n_nodes(), graph->n_leafs(), n_mn, n_ml,
+                (double)diag_sum_alloc / (1024.0 * 1024.0 * 1024.0),
+                (double)sum_nodes / (1024.0 * 1024.0 * 1024.0),
+                (double)sum_leafs / (1024.0 * 1024.0 * 1024.0));
+    }
+
     // Phase1 模拟：每个后端用虚拟大空间 DynTalloc（仅追踪偏移/大小，不占用真实内存）
     recording_phase1_ = true;
     for (auto& ba : backends_) {
@@ -472,6 +501,19 @@ bool Gallocr::reserve(
     bool any_peak_huge = false;
     for (auto& ba : backends_) {
         if (ba.peak > (64ull << 30)) any_peak_huge = true;
+    }
+
+    // ---- 诊断（2026-10-23）：峰值 vs 待分配总量 → 空间复用率 ----
+    // peak/sum ≈ 1.0 说明 refcount 复用基本没生效（内存 ≈ 全部节点之和）。
+    {
+        size_t peak_max = 0;
+        for (auto& ba : backends_) peak_max = std::max(peak_max, ba.peak);
+        fprintf(stderr,
+                "[gallocr-reserve] peak=%.2f GB sum_alloc=%.2f GB (peak/sum=%.2f, n_nodes=%d)\n",
+                (double)peak_max / (1024.0 * 1024.0 * 1024.0),
+                (double)diag_sum_alloc / (1024.0 * 1024.0 * 1024.0),
+                diag_sum_alloc ? (double)peak_max / (double)diag_sum_alloc : 0.0,
+                graph->n_nodes());
     }
     if (getenv("GRAPH_DEBUG_GALLOCR") || max_node_bytes > (32ull << 30) || any_peak_huge) {
         for (auto& ba : backends_) {

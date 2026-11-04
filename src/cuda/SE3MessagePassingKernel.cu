@@ -163,7 +163,11 @@ void per_edge_matmul_back_kernel_cuda(
     int M, int K, int E)
 {
     constexpr int BLOCK = 256;
-    const int grid = se3_ceil_div(E, BLOCK);
+    // 【2026-10-24】E==0（该块没有边）时 ceil_div 得 0 ⇒ <<<0,BLOCK>>> = cudaLaunchKernel
+    //   "invalid argument"，而错误会滞后到下一个 API 调用才被捕获、被误报成别的算子 ✗。
+    //   与 edge_gather_rows/per_edge_matmul/scatter_add 统一：至少发 1 个 block，由内核里
+    //   `if (e >= E) return` 变成空操作 ✓。
+    const int grid = E > 0 ? se3_ceil_div(E, BLOCK) : 1;
     per_edge_matmul_back_kernel_kernel<<<grid, BLOCK>>>(grad, gathered, dst, M, K, E);
 }
 
@@ -198,7 +202,8 @@ void per_edge_matmul_back_gathered_cuda(
     int M, int K, int E)
 {
     constexpr int BLOCK = 256;
-    const int grid = se3_ceil_div(E, BLOCK);
+    // 【2026-10-24】同上：E==0 不得发 0 个 block（否则 invalid argument ✗）
+    const int grid = E > 0 ? se3_ceil_div(E, BLOCK) : 1;
     per_edge_matmul_back_gathered_kernel<<<grid, BLOCK>>>(grad, kernel, dst, M, K, E);
 }
 

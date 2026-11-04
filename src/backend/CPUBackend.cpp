@@ -602,6 +602,7 @@ void CPUBackend::compute_thread(ThreadState * state) {
         //   多线程下会读到"别的线程还在写"的部分数据（实测 src0 被误报为 nan=804/inf=268，
         //   单线程同一位置是干净的 6.3e5）✗。故最后一个节点挪到循环后的公共 barrier 之后再查。
         if (ith == 0 && node_n + 1 < cgraph->n_nodes()) exec_nan_check(node, "CPU", node_n);
+        if (ith == 0) exec_zeropage_check(node, "CPU", node_n);    // 零页探针（PPML_ZEROPAGE_CHECK=1）
         if (ith == 0) exec_pem_stat(node, "CPU", node_n, "out");   // PPML_PEM_STAT=1
         // 定点算子探针（PPML_PROBE_OP=8,51,...）：按 op 对齐 CPU/CUDA 两条路径的量级
         if (ith == 0) exec_probe_op(node, "CPU", node_n);

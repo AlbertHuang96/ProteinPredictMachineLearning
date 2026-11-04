@@ -542,6 +542,10 @@ public:
     // 不能用 active_backend()（CUDA 模式下它返回 CUDABackend，算不出 loss 链）。
     Backend* active_cpu_backend();
 
+    // 【2026-10-24】CUDA 后端裸访问器（可能为 nullptr）：只给诊断用 ——
+    //   train.cpp 的 PPML_OP_CHECK 用它查 supports_op，列出"CUDA 没有 kernel"的算子缺口。
+    CUDABackend* cuda_backend() const { return cuda_backend_.get(); }
+
     // 调度器访问器：返回后端调度器（CPU+CUDA 注册后按 priority 分配算子）。
     // 供训练循环用 split_graph + alloc_splits + graph_compute 让受支持算子跑 CUDA、
     // 不支持的自动跨后端拷贝回落 CPU。

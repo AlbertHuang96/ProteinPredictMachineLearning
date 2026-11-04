@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <cstdlib>   // std::getenv / std::atoi（PPML_GRAD_D2H 开关）
 #include <cassert>
 
 namespace ppml {
@@ -38,6 +39,21 @@ bool tensor_on_device(const TensorF32* t) {
     return t && t->buffer_ && !t->buffer_->is_host() && t->data() != nullptr;
 }
 float* dev_f32(TensorF32* t) { return reinterpret_cast<float*>(t->data()); }
+
+// 【2026-10-24】device→host 梯度读回的总开关与统计
+//   PPML_GRAD_D2H=1 ⇒ **禁用一切 GPU 就地 kernel**，所有梯度统一经 buffer 读回 host 再算
+//     （语义与 CPU 逐字一致；代价是每参数一次 D2H，仅用于"GPU kernel 不可用/结果可疑"时的对照 ✓）
+//   默认 0 ⇒ 保持 2026-09-19 的就地 kernel 快路径；kernel 调用失败时**自动**退回 D2H（不再静默跳过 ✗）
+bool force_d2h() {
+    static const bool on = [] {
+        const char* v = std::getenv("PPML_GRAD_D2H");
+        return v && *v && std::atoi(v) != 0;
+    }();
+    return on;
+}
+// 统计：本步有多少梯度走了"kernel 失败 ⇒ D2H 兜底"，供 [GRAD-IO] 报告 ✓
+struct GradIoStat { long n_d2h_fallback = 0; long n_d2h_forced = 0; long n_read_fail = 0; };
+GradIoStat g_grad_io;
 
 std::vector<float> read_tensor_values(const TensorF32* t) {
     std::vector<float> buf(static_cast<size_t>(t->numel()));
@@ -104,12 +120,21 @@ static void activate_single_loss(
     }
 }
 
-/// @brief 清空所有参数的梯度缓冲区（grad_accs）。参数是 node 非 leaf，遍历 n_nodes()。
+/// @brief 清空所有参数的梯度缓冲区（grad_accs）。
+/// 【2026-10-24】nodes 之外**再扫 leafs**：图前向会把部分权重建成 leaf（见 collect_params 注释）。
 static void clear_param_grads(ComputeGraph* cgraph) {
     for (int i = 0; i < cgraph->n_nodes(); i++) {
         TensorF32* node = cgraph->graph_node(i);
         if (!(node->flag & TENSOR_FLAG_PARAM)) continue;
         TensorF32* grad = cgraph->graph_get_grad(node);
+        if (grad) {
+            fill_tensor_values(grad, 0.0f);
+        }
+    }
+    for (int i = 0; i < cgraph->n_leafs(); i++) {
+        TensorF32* leaf = cgraph->graph_leaf(i);
+        if (!(leaf->flag & TENSOR_FLAG_PARAM)) continue;
+        TensorF32* grad = cgraph->graph_get_grad(leaf);
         if (grad) {
             fill_tensor_values(grad, 0.0f);
         }
@@ -130,18 +155,28 @@ static float compute_total_grad_norm(const std::vector<TensorF32*>& param_list, 
         if (!grad) continue;
         const int64_t n = grad->numel();
         double pl2 = 0.0; double pmax = 0.0; long nnan = 0;
-        if (tensor_on_device(grad)) {
+        bool stats_ok = false;
+        if (tensor_on_device(grad) && !force_d2h()) {
             // 【2026-09-19】device ⇒ 只回传 3 个统计量（Σg²/max|g|/NaN 数），**不搬整张量** ✓
             double s2 = 0.0, mx = 0.0;
             long long nn = 0;
             if (grad_stats_cuda(dev_f32(grad), n, &s2, &mx, &nn) == 0) {
                 pl2 = s2; pmax = mx; nnan = (long)nn;
                 norm_sq += s2;                      // 与 CPU 同：跨参数用 double 累加 ✓
+                stats_ok = true;
             } else {
-                continue;                           // 统计失败 ⇒ 跳过该参数（保守 ✓）
+                // 【2026-10-24】原来这里 `continue` ⇒ **静默跳过该参数**：kernel 一旦不可用，
+                //   grad_norm 就凭空变小甚至为 0（看起来像"没有梯度"✗，极难定位）。
+                //   现在改为 device→host 读回，与 CPU 分支逐字同口径 ✓
+                ++g_grad_io.n_d2h_fallback;
             }
-        } else {
+        }
+        if (!stats_ok) {
             std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
+            if (static_cast<int64_t>(g.size()) != n) {        // 读回失败（data 未分配）⇒ 跳过但记账 ✓
+                ++g_grad_io.n_read_fail;
+                continue;
+            }
             for (int64_t j = 0; j < n; j++) {
                 const double v = static_cast<double>(g[static_cast<size_t>(j)]);
                 if (v != v) { ++nnan; continue; }   // NaN 不计入 l2/max，只统计数量
@@ -193,7 +228,8 @@ static void scale_param_grads(const std::vector<TensorF32*>& param_list, Compute
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
         // 【2026-09-19】device ⇒ 就地缩放（判据与下面 CPU 版逐字一致：NaN/Inf→0 ✓），零往返 ✓
-        if (tensor_on_device(grad) &&
+        // 【2026-10-24】PPML_GRAD_D2H=1 ⇒ 跳过 kernel，统一走 D2H/H2D（对照用 ✓）
+        if (tensor_on_device(grad) && !force_d2h() &&
             grad_scale_cuda(dev_f32(grad), grad->numel(), scale) == 0) {
             continue;
         }
@@ -211,17 +247,19 @@ static void scale_param_grads(const std::vector<TensorF32*>& param_list, Compute
 /// @brief 收集所有带梯度的参数节点。
 /// 注意: 参数 (TENSOR_FLAG_PARAM) 在 build_forward_impl 中归类为 node 而非 leaf
 ///       (ComputeGraph.cpp:137: OP_NONE && !PARAM 才作 leaf)，故必须遍历 n_nodes()。
+/// 【2026-10-24】补上 leafs：图前向（forward_graph / 值 leaf 化）会把部分权重建成 leaf，
+///   只扫 nodes 会**漏掉**它们 ⇒ 优化器看到 0 个参数（实测 params=0 且无 [CLIP] 行）。
+///   两边都扫是幂等的：同指针不会重复入表（带 set 去重）✓
 static std::vector<TensorF32*> collect_params(ComputeGraph* cgraph) {
     std::vector<TensorF32*> params;
-    for (int i = 0; i < cgraph->n_nodes(); i++) {
-        TensorF32* node = cgraph->graph_node(i);
-        if (node->flag & TENSOR_FLAG_PARAM) {
-            TensorF32* grad = cgraph->graph_get_grad(node);
-            if (grad) {
-                params.push_back(node);
-            }
-        }
-    }
+    auto push = [&](TensorF32* t) {
+        if (!t || !(t->flag & TENSOR_FLAG_PARAM)) return;
+        if (!cgraph->graph_get_grad(t)) return;
+        for (TensorF32* e : params) if (e == t) return;   // 去重（node 与 leaf 可能重叠）
+        params.push_back(t);
+    };
+    for (int i = 0; i < cgraph->n_nodes(); i++) push(cgraph->graph_node(i));
+    for (int i = 0; i < cgraph->n_leafs(); i++) push(cgraph->graph_leaf(i));
     return params;
 }
 
@@ -233,7 +271,34 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
     if (max_norm <= 0.0f) return 0.0f;
 
     auto params = collect_params(cgraph);
-    if (params.empty()) return 0.0f;
+    if (params.empty()) {
+        // 【2026-10-24】不再静默返回 0：本步**没有任何可更新参数**（典型成因：反向根本没构建，
+        //   例如 PPML_NO_BACKWARD=1，或 build_backward_expand 未被调用）⇒ grad_norm 恒 0.00，
+        //   在日志里与"梯度恰好很小"完全无法区分 ✗（2026-10-24 的 P69905 就是这种假象）。
+        //   只告警一次，避免每 step 刷屏 ✓
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            int n_param = 0, n_with_grad = 0;
+            for (int i = 0; i < cgraph->n_nodes(); ++i) {
+                TensorF32* t = cgraph->graph_node(i);
+                if (!t || !(t->flag & TENSOR_FLAG_PARAM)) continue;
+                ++n_param;
+                if (cgraph->graph_get_grad(t)) ++n_with_grad;
+            }
+            for (int i = 0; i < cgraph->n_leafs(); ++i) {
+                TensorF32* t = cgraph->graph_leaf(i);
+                if (!t || !(t->flag & TENSOR_FLAG_PARAM)) continue;
+                ++n_param;
+                if (cgraph->graph_get_grad(t)) ++n_with_grad;
+            }
+            std::fprintf(stderr,
+                "[GRAD-NONE] clip_grad_norm: 0 个可裁剪参数（图中 PARAM=%d，其中带梯度=%d）"
+                " ⇒ 本步不会有任何权重更新；常见成因 PPML_NO_BACKWARD=1 / 未建反向 ✗\n",
+                n_param, n_with_grad);
+        }
+        return 0.0f;
+    }
 
     // [2026-09-07 Epoch2 NaN 止损] 显式清零含 NaN 的参数梯度：
     //   compute_total_grad_norm 跳过 NaN（不计入 norm）→ 若整体 norm 未超 clip 阈值，
@@ -249,25 +314,31 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
         TensorF32* grad = cgraph->graph_get_grad(param);
         if (!grad) continue;
         // 【2026-09-19】device ⇒ 用统计量判 NaN（只回传计数 ✓），命中则**整张清零**（memset ✓）
-        if (tensor_on_device(grad)) {
+        if (tensor_on_device(grad) && !force_d2h()) {
             const int64_t n = grad->numel();
             double s2 = 0.0, mx = 0.0;
             long long nn = 0;
-            if (grad_stats_cuda(dev_f32(grad), n, &s2, &mx, &nn) != 0) continue;
-            // 【2026-09-22】kernel 的 nn 只数 NaN ✓；±inf 会让 max|g| 变 inf ⇒ 一并判非有限 ✓
-            const bool nonfinite = (nn > 0) || !std::isfinite(mx);
-            if (nonfinite) {
-                optim_fill_cuda(dev_f32(grad), n, 0.0f);
-                ++n_cleared;
-                if (getenv("GRAPH_DEBUG_GRAD_NAN")) {
-                    fprintf(stderr,
-                            "[GRAD-NAN-CLR] param cleared (%s grad->0) [device, nnan=%lld max_abs=%.4e]\n",
-                            (nn > 0) ? "NaN" : "Inf", nn, mx);
+            if (grad_stats_cuda(dev_f32(grad), n, &s2, &mx, &nn) != 0) {
+                // 【2026-10-24】kernel 失败不再静默跳过（会让 NaN 梯度直接进 AdamW ✗），
+                //   落到下面的 host 分支做同样的判据 ✓
+                ++g_grad_io.n_d2h_fallback;
+            } else {
+                // 【2026-09-22】kernel 的 nn 只数 NaN ✓；±inf 会让 max|g| 变 inf ⇒ 一并判非有限 ✓
+                const bool nonfinite = (nn > 0) || !std::isfinite(mx);
+                if (nonfinite) {
+                    optim_fill_cuda(dev_f32(grad), n, 0.0f);
+                    ++n_cleared;
+                    if (getenv("GRAPH_DEBUG_GRAD_NAN")) {
+                        fprintf(stderr,
+                                "[GRAD-NAN-CLR] param cleared (%s grad->0) [device, nnan=%lld max_abs=%.4e]\n",
+                                (nn > 0) ? "NaN" : "Inf", nn, mx);
+                    }
                 }
+                continue;      // device 分支已处理完（kernel 成功）⇒ 不再做 D2H ✓
             }
-            continue;
         }
         std::vector<float> g = read_tensor_values(grad);  // D2H（若 device）
+        if (static_cast<int64_t>(g.size()) != grad->numel()) { ++g_grad_io.n_read_fail; continue; }
         long n_nan = 0, n_inf = 0;
         for (const float v : g) {
             if (v != v) ++n_nan;
@@ -332,6 +403,18 @@ float clip_grad_norm(ComputeGraph* cgraph, float max_norm) {
                 "[CLIP] main=%.4e se3=%.4e scale_main=%.3e scale_se3=%.3e applied=%.4f cleared=%ld nonfinite=%s\n",
                 (double)main_norm, (double)se3_norm, scale_main, scale_se3,
                 (double)(applied_main + applied_se3), n_cleared, nonfinite ? "yes" : "no");
+        // 【2026-10-24】device→host 读回的可观测性：正常 CUDA 快路径下两行都不该出现；
+        //   一旦出现说明走到了 D2H 兜底（kernel 不可用 / PPML_GRAD_D2H=1）——性能掉但数值正确 ✓
+        if (force_d2h()) {
+            std::fprintf(stderr,
+                "[GRAD-IO] PPML_GRAD_D2H=1 ⇒ 全部梯度经 device→host 读回（params=%zu，无就地 kernel）\n",
+                params.size());
+        } else if (g_grad_io.n_d2h_fallback > 0 || g_grad_io.n_read_fail > 0) {
+            std::fprintf(stderr,
+                "[GRAD-IO] kernel 失败 ⇒ D2H 兜底 params=%ld；梯度读回失败(跳过) params=%ld\n",
+                g_grad_io.n_d2h_fallback, g_grad_io.n_read_fail);
+        }
+        g_grad_io = GradIoStat{};   // 每步清零（计数只对本 step 有意义 ✓）
     }
     return applied_main + applied_se3;
 }

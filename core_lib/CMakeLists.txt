@@ -63,6 +63,7 @@ set(CORE_SOURCES
     # int8 分块量化（W8A8，2026-10-17）：设备端量化/反量化 + MMVQ(dp4a)
     ../src/cuda/QuantKernels.cu
     ../src/cuda/MulMatQ8Kernel.cu
+    ../src/cuda/PairKernels.cu
 )
 
 # 启用 CUDA 语言

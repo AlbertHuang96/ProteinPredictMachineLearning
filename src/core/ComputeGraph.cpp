@@ -1248,8 +1248,11 @@ void ComputeGraph::compute_backward(
                 fape_grad->src[1] = src0;          // pred_coords (forward)
                 fape_grad->src[2] = src1;          // true_coords (forward)
                 fape_grad->src[3] = src2;          // frame_atom_indices
-                fape_grad->src[4] = src2;          // frames_mask (reuse src2 for now)
-                fape_grad->src[5] = src2;          // positions_mask (reuse src2 for now)
+                // 【2026-10-24 修复】原为 `= src2`（三点都用 frame_indices 顶替），
+                //   但 frames_mask/positions_mask 在前向节点的 src[3]/src[4] 上。
+                //   用索引当 mask ⇒ sum_fm/sum_pm 变成"原子下标之和"，梯度整体错量级。
+                fape_grad->src[4] = tensor->src[3] ? tensor->src[3] : src2;   // frames_mask
+                fape_grad->src[5] = tensor->src[4] ? tensor->src[4] : src2;   // positions_mask
 
                 // Copy op_params (d_clamp, epsilon, length_scale)
                 memcpy(fape_grad->op_params, tensor->op_params, sizeof(tensor->op_params));
