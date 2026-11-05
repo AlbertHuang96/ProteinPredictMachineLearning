@@ -753,36 +753,41 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
         for (size_t s = 0; s < st.margin.size(); ++s) {
             st.kappa[s] = 0.5f * cfg.sigma * st.margin[s];   // κ_i = σ·m_i/2 ✓
         }
-        // ---- L2 计划（A3）：**逐节点**球查询半径 rc_i ----
-        //   rc_i := d_(k),i(x⁰) + √3(κ_i + κ_max)
-        //   依据 Lemma 1：|d'−d| ≤ ‖δ_i‖₂+‖δ_j‖₂ ≤ √3(κ_i+κ_max)（盒投影下 ‖δ‖₂ ≤ √3κ ✓）
-        //   d_(k),i 取冻结行内距离的第 k 小（行 = top-k ∪ 序列边；前 k 小恰是 top-k ✓）
+        // ---- L2 计划（A3）：快照处只存 ρ_i = d_(k),i(x⁰)，**不加壳** ----
+        //   半径在**每个边界**由实测位移现算：r_i = ρ_i + Δ_i + Δ_max，
+        //     Δ_j := ‖B_j − x⁰_j‖₂（就是该边界真正用于建图的几何的位移 ✓）。
+        //   为什么不在快照处加壳：
+        //     · 旧写法 r_i = ρ + √3(κ_i+κ_max) 依赖 ‖B−x⁰‖₂ ≤ √3κ，**该前提只在 L3 成立**
+        //       （只有 L3 施加 Π_κ）；纯 L2 用未投影的 live 坐标 ⇒ 小 σ 时球偏小、真 top-k 漏出
+        //       （1105_v2/v3 实测 D=0.0035 @ σ=0.05）；大 σ 时壳 2.7 Å 又把球撑大、白算候选。
+        //     · 用实测 Δ 后不再需要 √3（那是用盒半宽去界欧氏位移才引入的），且 L2/L3 通用。
+        //   ρ_i 必须是 x⁰ 下**全体节点**的真实第 k 近邻距离（不是冻结行的第 k 小）。
+        //   代价：快照处一次 O(L²) 距离计算（L=333 约 1.1e5 次，可忽略）。
         {
-            st.rc.assign(st.margin.size(), 0.f);
-            float kmax = 0.f;
-            for (float k : st.kappa) if (std::isfinite(k)) kmax = std::max(kmax, k);
-            std::vector<float> row;
+            st.rho.assign(st.margin.size(), 0.f);
+            std::vector<float> alld;
+            alld.reserve((size_t)std::max(0, L - 1));
             for (int b = 0; b < B; ++b) {
                 for (int l = 0; l < L; ++l) {
                     const size_t gi = (size_t)b * L + l;
                     const size_t bi = (((size_t)b * L + l) * 3 + 1) * 3;
-                    row.clear();
-                    for (int64_t j : st.adj_out[gi]) {
-                        const size_t bj = (((size_t)j) * 3 + 1) * 3;
+                    alld.clear();
+                    for (int j = 0; j < L; ++j) {
+                        if (j == l) continue;
+                        const size_t bj = (((size_t)b * L + j) * 3 + 1) * 3;
                         const float dx = st.x0[bj]     - st.x0[bi];
                         const float dy = st.x0[bj + 1] - st.x0[bi + 1];
                         const float dz = st.x0[bj + 2] - st.x0[bi + 2];
-                        row.push_back(std::sqrt(dx * dx + dy * dy + dz * dz));
+                        alld.push_back(std::sqrt(dx * dx + dy * dy + dz * dz));
                     }
                     float dk = 0.f;
-                    if (kk > 0 && (int)row.size() >= kk) {
-                        std::nth_element(row.begin(), row.begin() + (kk - 1), row.end());
-                        dk = row[(size_t)(kk - 1)];
-                    } else if (!row.empty()) {
-                        dk = *std::max_element(row.begin(), row.end());
+                    if (kk > 0 && (int)alld.size() >= kk) {
+                        std::nth_element(alld.begin(), alld.begin() + (kk - 1), alld.end());
+                        dk = alld[(size_t)(kk - 1)];
+                    } else if (!alld.empty()) {
+                        dk = *std::max_element(alld.begin(), alld.end());
                     }
-                    const float kap = std::isfinite(st.kappa[gi]) ? st.kappa[gi] : 0.f;
-                    st.rc[gi] = dk + 1.7320508f * (kap + kmax);
+                    st.rho[gi] = dk;
                 }
             }
         }
@@ -967,10 +972,16 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                 }
             }
             if (!use_risk) {
+                // 审查意见 §2.3：必须用**独立初始掩码**。原来的写法在扫描中原地增长 om，
+                // 会沿边表顺序把 1 继续传播（二跳甚至更远），结果依赖边序，与文档里的
+                // “静态一跳邻域”并不一致。这里固定 seed，只扩一跳 ✓
+                const std::vector<char> seed = om;
                 for (int64_t e = 0; e < st.E0; ++e) {
                     const int64_t s = st.src[e], t = st.tgt[e];
-                    if (om[static_cast<size_t>(s)] && !om[static_cast<size_t>(t)]) om[static_cast<size_t>(t)] = 1;
-                    else if (om[static_cast<size_t>(t)] && !om[static_cast<size_t>(s)]) om[static_cast<size_t>(s)] = 1;
+                    if (seed[static_cast<size_t>(s)] || seed[static_cast<size_t>(t)]) {
+                        om[static_cast<size_t>(s)] = 1;
+                        om[static_cast<size_t>(t)] = 1;
+                    }
                 }
                 dbg_closed = "nbh";
             }
@@ -989,13 +1000,22 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
         std::vector<char> in_topk(static_cast<size_t>(L), 0);
         std::vector<char> loc;
 
-        // L2 计划：逐节点半径 rc_i ⇒ cell 边长取 max_i rc_i（保证 27 邻域覆盖任意 rc_i 球 ✓），
-        //          真正的"局部化"由候选按 rc_i 过滤完成 ✓
-        float rc_max = 0.f;
-        if (cfg.l2_plan && !st.rc.empty()) {
-            for (float r : st.rc) if (std::isfinite(r)) rc_max = std::max(rc_max, r);
+        // L2 计划：**逐边界**的球查询半径 r_i = ρ_i + Δ_i + Δ_max
+        //   Δ_j = ‖B_j − x⁰_j‖₂ 是这一边界真正用于建图的几何相对 x⁰ 的位移（上面 Ω 扫描已算好）。
+        //   · 无 √3：直接用欧氏位移，等价于 Lemma 1 的 |d'−d| ≤ Δ_i+Δ_j；
+        //   · L2（xg = live x）与 L3（xg = Π_κ(…)）都成立，不再依赖 ‖B−x⁰‖≤√3κ 这个只在 L3 有的前提；
+        //   · cell 边长取 max_i r_i（保证 27 邻域覆盖任意 r_i 球），真正的过滤仍按逐节点 r_i 做 ✓。
+        std::vector<float> rq;
+        float rq_max = 0.f;
+        if (cfg.l2_plan && !st.rho.empty() && !disp.empty()) {
+            rq.resize(disp.size(), 0.f);
+            for (size_t s = 0; s < disp.size(); ++s) {
+                const float r = st.rho[s] + disp[s] + disp_max;
+                rq[s] = std::isfinite(r) ? r : 0.f;
+                rq_max = std::max(rq_max, rq[s]);
+            }
         }
-        const bool plan_ok = cfg.l2_plan && rc_max > 0.f;
+        const bool plan_ok = cfg.l2_plan && rq_max > 0.f;
         std::vector<float> ca;
         CellGrid grid;
         if (plan_ok) {                                     // A1：每边界建一次 O(L) 网格（与 Ω 扫描同阶 ✓）
@@ -1005,7 +1025,7 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                     const size_t base = (((size_t)b * L + l) * 3 + 1) * 3;
                     for (int c = 0; c < 3; ++c) ca[3 * ((size_t)b * L + l) + c] = xg[base + c];
                 }
-            grid.build(ca, B * L, rc_max);
+            grid.build(ca, B * L, rq_max);
         }
 
         for (int b = 0; b < B; ++b) {
@@ -1023,7 +1043,7 @@ GraphData make_graph_refined(const TensorF32& xyz, const TensorF32& pair, const 
                     cand.clear();
                     // (i) 27 邻域（同一 batch）：cell 边长 = max rc ⇒ 半径 rc_i 内的点必在其 ±1 邻域 ✓
                     //     再按**逐节点**半径 rc_i 过滤 ⇒ |C_i| ≈ k + O(ε)，而不是 L ✓
-                    const float  rci  = st.rc[static_cast<size_t>(gi)];
+                    const float  rci  = rq[static_cast<size_t>(gi)];
                     const float  rci2 = rci * rci;
                     const size_t bi2  = (((size_t)gi) * 3 + 1) * 3;
                     const size_t g3 = static_cast<size_t>(gi) * 3;
