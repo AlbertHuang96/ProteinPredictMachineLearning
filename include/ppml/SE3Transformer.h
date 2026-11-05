@@ -181,8 +181,9 @@ struct TopoRefineState {
     std::vector<float>   x0;                         // x⁰ 的整份骨架坐标 (B*L*3*3) ✓
     std::vector<float>   margin;                     // m_i（B*L；k ≥ L−1 ⇒ +inf ✓）
     std::vector<float>   kappa;                      // κ_i = σ·m_i/2 ✓
-    std::vector<float>   rc;                         // L2 计划：逐节点球查询半径
-                                                     //   rc_i = d_(k),i(x⁰) + √3(κ_i + κ_max)（Lemma 1 ✓）
+    std::vector<float>   rho;                        // L2 计划：快照处的 ρ_i = d_(k),i(x⁰)（全体 L−1 个节点）
+                                                     //   半径在每个边界现算：r_i = ρ_i + Δ_i + Δ_max，
+                                                     //   Δ_j = ‖B_j − x⁰_j‖₂（该边界真正用于建图的几何）
     int      calls = 0;                              // refined 调用次数（首次建立快照 ✓）
     int64_t  last_omega = 0, last_diff = 0;          // 上次 |Ω| / |E_t Δ E(x⁰)|（诊断 ✓）
     void reset() { *this = TopoRefineState(); }
